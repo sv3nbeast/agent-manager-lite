@@ -1,0 +1,300 @@
+package executor
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/sjson"
+	"golang.org/x/net/proxy"
+)
+
+const (
+	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
+	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
+	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
+)
+
+func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+	dialer, proxyURL := newProxyAwareWebsocketDialerWithRoute(e.cfg, auth)
+	if dialer.Proxy != nil {
+		proxyFunc := dialer.Proxy
+		dialer.Proxy = func(req *http.Request) (*url.URL, error) {
+			selected, errProxy := proxyFunc(req)
+			if errProxy == nil {
+				proxyURL = ""
+				if selected != nil {
+					proxyURL = selected.String()
+				}
+			}
+			return selected, errProxy
+		}
+	}
+	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
+	if e.cfg != nil {
+		// The per-turn context applies the selected normal/image budget. Keep
+		// Gorilla's handshake cap from cutting off a larger configured budget.
+		if ms := max(e.cfg.Streaming.StreamOpenTimeoutMS, e.cfg.Streaming.ImageStreamOpenTimeoutMS); ms > 0 {
+			dialer.HandshakeTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	dialer.EnableCompression = true
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Gorilla's context stops dialing, but cancellation after TCP connect does
+	// not interrupt a stalled HTTP upgrade. Bind the raw connection until the
+	// handshake ends, then detach so completing one turn keeps session reuse.
+	baseDial := dialer.NetDialContext
+	var stopHandshakeCancellation func() bool
+	dialer.NetDialContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		raw, err := baseDial(dialCtx, network, address)
+		if err == nil {
+			stopHandshakeCancellation = context.AfterFunc(ctx, func() { _ = raw.Close() })
+		}
+		return raw, err
+	}
+	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	if stopHandshakeCancellation != nil {
+		stopHandshakeCancellation()
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		if conn != nil {
+			_ = conn.Close()
+			conn = nil
+		}
+		err = cause
+	}
+	if err != nil {
+		cliproxyexecutor.MarkUpstreamAttempt(ctx)
+	}
+	closer := newWebsocketConnectionCloser(conn)
+	if conn != nil {
+		closer.proxyRouteGetter = helps.ObserveRequestProxyRoute(proxyURL, conn.UnderlyingConn())
+		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
+		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
+		conn.EnableWriteCompression(false)
+	}
+	return conn, closer, resp, err
+}
+
+func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
+	if sess != nil {
+		return sess.writeMessage(conn, websocket.TextMessage, payload)
+	}
+	if conn == nil {
+		return fmt.Errorf("codex websockets executor: websocket conn is nil")
+	}
+	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+func mapCodexWebsocketWriteError(sess *codexWebsocketSession, conn *websocket.Conn, err error) error {
+	if err == nil || sess == nil || conn == nil {
+		return err
+	}
+	upstreamErr := sess.upstreamDisconnectError(conn)
+	var closeErr *websocket.CloseError
+	if !errors.As(upstreamErr, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
+		return err
+	}
+	return mapCodexWebsocketReadError(upstreamErr)
+}
+
+func shouldRetryCodexWebsocketSend(err error) bool {
+	if err == nil {
+		return false
+	}
+	var requestErr cliproxyexecutor.RequestScopedError
+	return !errors.As(err, &requestErr) || !requestErr.IsRequestScoped()
+}
+
+type codexWebsocketMessageTooBigError struct {
+	statusErr
+}
+
+func (codexWebsocketMessageTooBigError) IsRequestScoped() bool {
+	return true
+}
+
+func mapCodexWebsocketReadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
+		return codexWebsocketMessageTooBigError{statusErr: statusErr{
+			code: http.StatusRequestEntityTooLarge,
+			msg:  `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`,
+		}}
+	}
+	return err
+}
+
+func normalizeCodexWebsocketParallelToolCalls(body []byte, headers http.Header) []byte {
+	if !isCodexResponsesLiteRequest(body, headers) {
+		return body
+	}
+	body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
+	return body
+}
+
+func buildCodexWebsocketRequestBody(body []byte) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+
+	// Match codex-rs websocket v2 semantics: every request is `response.create`.
+	// Incremental follow-up turns continue on the same websocket using
+	// `previous_response_id` + incremental `input`, not `response.append`.
+	body = helps.SanitizeCodexInputItemIDs(body)
+	wsReqBody, errSet := sjson.SetBytes(body, "type", "response.create")
+	if errSet == nil && len(wsReqBody) > 0 {
+		return wsReqBody
+	}
+	return body
+}
+
+func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
+	if sess == nil {
+		if conn == nil {
+			return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		msgType, payload, errRead := conn.ReadMessage()
+		return msgType, payload, errRead
+	}
+	if conn == nil {
+		return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
+	}
+	if readCh == nil {
+		return 0, nil, fmt.Errorf("codex websockets executor: session read channel is nil")
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		case ev, ok := <-readCh:
+			if !ok {
+				return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")
+			}
+			if ev.conn != conn {
+				continue
+			}
+			if ev.err != nil {
+				return 0, nil, ev.err
+			}
+			return ev.msgType, ev.payload, nil
+		}
+	}
+}
+
+func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+	dialer, _ := newProxyAwareWebsocketDialerWithRoute(cfg, auth)
+	return dialer
+}
+
+func codexWebsocketProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth != nil && strings.TrimSpace(auth.ProxyURL) != "" {
+		return strings.TrimSpace(auth.ProxyURL)
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
+}
+
+func newProxyAwareWebsocketDialerWithRoute(cfg *config.Config, auth *cliproxyauth.Auth) (*websocket.Dialer, string) {
+	dialer := &websocket.Dialer{
+		Proxy:             http.ProxyFromEnvironment,
+		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
+		EnableCompression: true,
+		NetDialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
+	proxyURL := codexWebsocketProxyURL(cfg, auth)
+	if proxyURL == "" {
+		return dialer, "unknown"
+	}
+
+	setting, errParse := proxyutil.Parse(proxyURL)
+	if errParse != nil {
+		log.Errorf("codex websockets executor: %v", errParse)
+		return dialer, "unknown"
+	}
+
+	switch setting.Mode {
+	case proxyutil.ModeDirect:
+		dialer.Proxy = nil
+		return dialer, ""
+	case proxyutil.ModeProxy:
+	default:
+		return dialer, "unknown"
+	}
+
+	switch setting.URL.Scheme {
+	case "socks5", "socks5h":
+		var proxyAuth *proxy.Auth
+		if setting.URL.User != nil {
+			username := setting.URL.User.Username()
+			password, _ := setting.URL.User.Password()
+			proxyAuth = &proxy.Auth{User: username, Password: password}
+		}
+		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second})
+		if errSOCKS5 != nil {
+			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
+			return dialer, "unknown"
+		}
+		dialer.Proxy = nil
+		dialer.NetDialContext = socksDialer.(proxy.ContextDialer).DialContext
+	case "https":
+		// Gorilla only registers plain HTTP proxies. Establish the TLS CONNECT
+		// tunnel first, then let Gorilla perform the target websocket handshake.
+		connectDialer, _, errDialer := proxyutil.BuildDialer(proxyURL)
+		if errDialer != nil {
+			log.Errorf("codex websockets executor: create HTTPS proxy dialer failed: %v", errDialer)
+			return dialer, "unknown"
+		}
+		dialer.Proxy = nil
+		dialer.NetDialContext = connectDialer.(proxy.ContextDialer).DialContext
+	case "http":
+		dialer.Proxy = http.ProxyURL(setting.URL)
+	default:
+		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", setting.URL.Scheme)
+	}
+
+	return dialer, setting.URL.String()
+}
+
+func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(httpURL))
+	if err != nil {
+		return "", err
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+		parsed.Scheme = "ws"
+	case "https":
+		parsed.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("codex websockets executor: unsupported responses websocket URL scheme %q", parsed.Scheme)
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return "", fmt.Errorf("codex websockets executor: responses websocket URL host is empty")
+	}
+	return parsed.String(), nil
+}

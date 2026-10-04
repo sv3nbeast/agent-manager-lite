@@ -1,0 +1,105 @@
+name: Build release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag, for example v0.1.1'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
+  package:
+    name: macOS arm64 installer
+    needs: checks
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '25.8.2'
+          cache: npm
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.1'
+          cache-dependency-path: sidecars/codex-proxy/go.sum
+      - name: Check tag, source and package version
+        run: npm run release:check -- "$RELEASE_TAG"
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Install pinned Electron runtime
+        run: npm run setup:electron
+      - name: Build macOS arm64 DMG and ZIP
+        run: |
+          npm run build:proxy
+          npm run build
+          npx electron-builder --mac --arm64 --publish never --config.directories.output=release-ci
+      - name: Verify packaged application
+        env:
+          CML_PACKAGED_APP_PATH: ${{ github.workspace }}/release-ci/mac-arm64/Agent Manager Lite.app
+          CML_PACKAGED_EVIDENCE_DIR: ${{ github.workspace }}/.local/release-evidence
+        run: npm run test:packaged
+      - name: Record artifact checksums
+        run: |
+          cd release-ci
+          # GitHub replaces spaces in uploaded asset names with periods.
+          # Normalize first so the checksum manifest names match downloads.
+          for artifact in *.dmg *.zip; do
+            normalized=${artifact// /.}
+            if [ "$artifact" != "$normalized" ]; then
+              mv -- "$artifact" "$normalized"
+            fi
+          done
+          shasum -a 256 -- *.dmg *.zip > SHA256SUMS.txt
+      - name: Save installers and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-manager-lite-${{ env.RELEASE_TAG }}-macos-arm64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release-ci/*.dmg
+            release-ci/*.zip
+            release-ci/SHA256SUMS.txt
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/check-release-version.mjs "$RELEASE_TAG"
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          status=$(printf '%s' "$existing" | jq -r --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag) | .draft')
+          if [ "$status" = false ]; then
+            echo 'This version is already published; use a new version tag.' >&2
+            exit 1
+          fi
+          if [ -z "$status" ]; then
+            release_flags=(--draft)
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${release_flags[@]}" --title "Agent Manager Lite $RELEASE_TAG" --notes-file .github/RELEASE_TEMPLATE.md
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber release-ci/*.dmg release-ci/*.zip release-ci/SHA256SUMS.txt

@@ -1,0 +1,50 @@
+name: Verify source
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: macOS arm64 checks
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '25.8.2'
+          cache: npm
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.1'
+          cache-dependency-path: |
+            sidecars/codex-proxy/go.sum
+            sidecars/codex-proxy/third_party/CLIProxyAPI/go.sum
+      - name: Check public repository contents
+        run: node scripts/check-public-repository.mjs
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Install pinned Electron runtime
+        run: npm run setup:electron
+      - name: Build Go sidecar
+        run: npm run build:proxy
+      - name: Test Go sidecar
+        run: npm run test:proxy
+      - name: Test vendored Responses handlers
+        run: npm run test:proxy:handlers
+      - name: Test TypeScript and loopback forwarding
+        timeout-minutes: 8
+        run: npm run test:ci
+      - name: Typecheck and build Electron source
+        run: npm run build

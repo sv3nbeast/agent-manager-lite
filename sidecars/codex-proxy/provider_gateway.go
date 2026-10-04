@@ -1,0 +1,1152 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+
+	"encoding/json"
+
+	"fmt"
+	"io"
+
+	"net/http"
+	"net/url"
+
+	"sort"
+
+	"strings"
+
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codex/historyprojection"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+
+	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+)
+
+func (s *relayServer) requireAPIKey(c *gin.Context) (*apiKeySpec, bool) {
+	if c != nil && c.Request != nil {
+		if spec, _ := c.Request.Context().Value(clientAPIKeyContextKey).(*apiKeySpec); spec != nil {
+			return spec, true
+		}
+	}
+	writeAPIError(c, http.StatusUnauthorized, "missing or invalid API key", "invalid_api_key")
+	if c != nil {
+		c.Abort()
+	}
+	return nil, false
+}
+
+func (s *relayServer) handleExecutorRequest(c *gin.Context, sourceFormat sdktranslator.Format, fixedAlt string) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	body, err := readAndRestoreBody(c.Request)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		writeAPIError(c, http.StatusBadRequest, "request body is required", "invalid_request")
+		return
+	}
+	s.handleExecutorBody(c, spec, body, sourceFormat, fixedAlt)
+}
+
+func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body []byte, sourceFormat sdktranslator.Format, fixedAlt string) {
+	if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) || sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI) {
+		var tierErr error
+		body, tierErr = util.NormalizeServiceTierRequest(body)
+		if tierErr != nil {
+			writeAPIError(c, http.StatusBadRequest, tierErr.Error(), "invalid_request")
+			return
+		}
+	}
+	if spec == nil {
+		writeAPIError(c, http.StatusUnauthorized, "missing or invalid API key", "invalid_api_key")
+		return
+	}
+	model := requestBodyModel(body)
+	if model == "" {
+		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
+		return
+	}
+	if spec.ModelRouting != nil && spec.ModelRouting.Automatic {
+		s.handleAutomaticModelRequest(c, spec, body, model, sourceFormat, fixedAlt)
+		return
+	}
+	if route, upstreamModel, routeStatus := resolveModelRoutingRoute(spec, model); routeStatus != "none" {
+		if routeStatus == "native" {
+			// 原生 provider 路由：只剥掉命名空间，把请求交给该 provider 的执行器。
+			if route == nil || route.NativeProvider == "" || strings.TrimSpace(route.ProviderAccountID) == "" {
+				writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model route %s is not available", model), "model_route_not_available")
+				return
+			}
+			// The configured route authorizes its bound account independently of the
+			// default OAuth pool. Keep this override request-local and singleton so
+			// neither failover nor later requests can select another route's account.
+			routeAccountID := strings.TrimSpace(route.ProviderAccountID)
+			routeSpec := *spec
+			routeSpec.AccountIDs = []string{routeAccountID}
+			originalRequest := c.Request
+			routeContext := context.WithValue(originalRequest.Context(), clientAPIKeyContextKey, &routeSpec)
+			routeContext = context.WithValue(routeContext, targetAccountIDContextKey, routeAccountID)
+			c.Request = originalRequest.WithContext(routeContext)
+			defer func() { c.Request = originalRequest }()
+			nativeBody := rewriteProviderGatewayBodyModel(body, upstreamModel)
+			alt := fixedAlt
+			if alt == "" {
+				alt = requestAlt(c)
+			}
+			if requestBodyStream(nativeBody) && fixedAlt != "responses/compact" {
+				s.handleStream(c, nativeBody, upstreamModel, sourceFormat, alt, []string{route.NativeProvider})
+				return
+			}
+			s.handleNonStream(c, nativeBody, upstreamModel, sourceFormat, alt, []string{route.NativeProvider})
+			return
+		}
+		if routeStatus != "matched" {
+			writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model route %s is not available", model), "model_route_not_available")
+			return
+		}
+		if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI) && isGPTImageGenerationModel(upstreamModel) {
+			writeAPIError(c, http.StatusBadRequest, "This model is not supported on the Chat Completions endpoint", "invalid_request")
+			return
+		}
+		if s.policy != nil && s.policy.tracker != nil && s.manifest != nil {
+			s.policy.tracker.recordSelectedAccount(
+				internallogging.GetRequestID(c.Request.Context()),
+				s.manifest.accountByID[strings.TrimSpace(route.ProviderAccountID)],
+				"",
+			)
+		}
+		s.handleProviderGatewayRequest(c, route.ProviderGateway, body, upstreamModel, sourceFormat, fixedAlt)
+		return
+	}
+
+	canonicalModel := canonicalModelForClientModel(s.manifest, spec, model)
+	if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI) && isGPTImageGenerationModel(canonicalModel) {
+		writeAPIError(c, http.StatusBadRequest, "This model is not supported on the Chat Completions endpoint", "invalid_request")
+		return
+	}
+
+	if spec.ProviderGateway != nil {
+		s.handleProviderGatewayRequest(c, spec.ProviderGateway, body, model, sourceFormat, fixedAlt)
+		return
+	}
+
+	alt := fixedAlt
+	if alt == "" {
+		alt = requestAlt(c)
+	}
+	stream := requestBodyStream(body) && fixedAlt != "responses/compact"
+	if stream {
+		s.handleStream(c, body, model, sourceFormat, alt, executionProviders())
+		return
+	}
+	s.handleNonStream(c, body, model, sourceFormat, alt, executionProviders())
+}
+
+func resolveModelRouting(spec *apiKeySpec, clientModel string) (*providerGatewaySpec, string, string) {
+	route, upstreamModel, status := resolveModelRoutingRoute(spec, clientModel)
+	if route == nil {
+		return nil, upstreamModel, status
+	}
+	return route.ProviderGateway, upstreamModel, status
+}
+
+func resolveModelRoutingRoute(spec *apiKeySpec, clientModel string) (*modelRouteSpec, string, string) {
+	if spec == nil || spec.ModelRouting == nil {
+		return nil, "", "none"
+	}
+	model := stripModelPrefix(clientModel, spec)
+	if spec.ModelRouting.Automatic {
+		if automaticNativeModel(spec, model) {
+			return nil, model, "none"
+		}
+		for i := range spec.ModelRouting.Routes {
+			route := &spec.ModelRouting.Routes[i]
+			for _, candidate := range route.Models {
+				if route.ProviderGateway != nil && strings.EqualFold(candidate.ClientModel, model) {
+					return route, candidate.UpstreamModel, "matched"
+				}
+			}
+		}
+		return nil, "", "missing"
+	}
+	separator := strings.Index(model, "/")
+	if separator < 0 {
+		for i := range spec.ModelRouting.Routes {
+			route := &spec.ModelRouting.Routes[i]
+			if route.ProviderGateway == nil {
+				continue
+			}
+			for _, candidate := range route.Models {
+				if strings.EqualFold(candidate.ClientModel, model) {
+					return route, candidate.UpstreamModel, "matched"
+				}
+			}
+		}
+		return nil, model, "none"
+	}
+	namespace := strings.ToLower(strings.TrimSpace(model[:separator]))
+	upstreamModel := strings.TrimSpace(model[separator+1:])
+	if namespace == "" || upstreamModel == "" {
+		return nil, "", "missing"
+	}
+	for i := range spec.ModelRouting.Routes {
+		route := &spec.ModelRouting.Routes[i]
+		if !strings.EqualFold(route.Namespace, namespace) {
+			continue
+		}
+		if route.NativeProvider != "" {
+			return route, upstreamModel, "native"
+		}
+		if route.ProviderGateway == nil {
+			return nil, "", "missing"
+		}
+		if len(route.ProviderGateway.UpstreamModels) == 0 {
+			return nil, "", "missing"
+		}
+		for _, candidate := range route.ProviderGateway.UpstreamModels {
+			if strings.EqualFold(candidate, upstreamModel) {
+				return route, candidate, "matched"
+			}
+		}
+		return nil, "", "missing"
+	}
+	return nil, "", "missing"
+}
+
+// providerGatewayUpstreamModel 把客户端模型名解析成真正的上游模型名。
+//
+// 先按 manifest 的别名表解析（例如 DeepSeek 网关的目录壳位 gpt-5.5 → deepseek-flash），
+// 再对照 provider gateway 的模型清单。未声明的 Codex/GPT 官方 id 会解析为空字符串，
+// 由调用方返回明确的「模型不可用」，避免把 GPT 请求静默交给非 GPT 上游。
+func (s *relayServer) providerGatewayUpstreamModel(gateway *providerGatewaySpec, model string) string {
+	resolved := strings.TrimSpace(model)
+	if resolved == "" {
+		return ""
+	}
+	var m *manifest
+	if s != nil {
+		m = s.manifest
+	}
+	if m != nil {
+		if source := s.manifest.aliasToSource[strings.ToLower(resolved)]; source != "" {
+			resolved = source
+		}
+	}
+	if isCodexShellModelID(resolved) && !providerGatewayDeclaresModel(m, gateway, resolved) {
+		return ""
+	}
+	return providerGatewayCanonicalModel(gateway, resolved)
+}
+
+func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *providerGatewaySpec, body []byte, model string, sourceFormat sdktranslator.Format, fixedAlt string) {
+	if gateway == nil {
+		writeAPIError(c, http.StatusBadGateway, "provider gateway is not configured", "bad_gateway")
+		return
+	}
+	if fixedAlt == "responses/compact" {
+		writeAPIError(c, http.StatusNotFound, "provider gateway does not support responses/compact", "not_found")
+		return
+	}
+	stream := requestBodyStream(body)
+	wireAPI := normalizeProviderGatewayWireAPI(gateway.WireAPI)
+	upstreamModel := s.providerGatewayUpstreamModel(gateway, model)
+	if strings.TrimSpace(upstreamModel) == "" {
+		writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model %s is not available for this provider gateway", model), "model_not_available")
+		return
+	}
+	supportsVision := providerGatewayModelSupportsVision(gateway, upstreamModel)
+	if wireAPI == "chat_completions" {
+		if modelSupportsVision, ok := providerGatewayModelCapabilityOverridesVision(gateway, upstreamModel); ok {
+			supportsVision = modelSupportsVision
+		}
+	}
+	if providerGatewayRequestHasVisionInput(body) && !supportsVision {
+		visionRoutingModel := providerGatewayVisionRoutingModel(gateway)
+		if strings.TrimSpace(visionRoutingModel) == "" {
+			omittedBody, omittedCount, err := omitProviderGatewayVisionInput(body, sourceFormat)
+			if err != nil || omittedCount == 0 {
+				writeAPIError(c, http.StatusBadRequest, fmt.Sprintf("model %s does not support image input", upstreamModel), "unsupported_image_input")
+				return
+			}
+			body = omittedBody
+			if s.emitter != nil {
+				s.emitter.emit(requestDiagnosticPayload{
+					Type:         "provider_gateway_vision_omitted",
+					RequestID:    internallogging.GetRequestID(c.Request.Context()),
+					Method:       c.Request.Method,
+					Path:         requestPath(c.Request),
+					RequestKind:  requestKindFromPath(requestPath(c.Request)),
+					Model:        upstreamModel,
+					Transport:    diagnosticTransport(c.Request),
+					ErrorMessage: fmt.Sprintf("omitted %d image input item(s) for text-only model", omittedCount),
+				})
+			}
+		} else {
+			originalModel := upstreamModel
+			upstreamModel = visionRoutingModel
+			if s.emitter != nil {
+				s.emitter.emit(requestDiagnosticPayload{
+					Type:         "provider_gateway_vision_routed",
+					RequestID:    internallogging.GetRequestID(c.Request.Context()),
+					Method:       c.Request.Method,
+					Path:         requestPath(c.Request),
+					RequestKind:  requestKindFromPath(requestPath(c.Request)),
+					Model:        upstreamModel,
+					Transport:    diagnosticTransport(c.Request),
+					ErrorMessage: fmt.Sprintf("routed image input from %s to %s", originalModel, upstreamModel),
+				})
+			}
+		}
+	}
+	var multiAgentV2Optimized bool
+	if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
+		// 统一历史投影：把 Codex 私有历史项（web_search_call、浮点参数等）
+		// 投影成目标上游能反序列化的形状，避免严格上游直接 422。
+		historyProfile := historyprojection.ProfileFor(historyprojection.UpstreamGeneric)
+		if isDeepSeekResponsesGateway(gateway.BaseURL) {
+			historyProfile = historyprojection.ProfileFor(historyprojection.UpstreamDeepSeek)
+		}
+		body = historyprojection.Project(body, historyProfile)
+		// Codex 客户端的 Multi-Agent V2 会带 collaboration 工具与 agent_message
+		// 输入项；第三方上游不认识这些私有形态，这里按 CLIProxyAPI 的既有优化
+		// 逻辑改写请求，响应出口再还原 collaboration namespace。
+		body, multiAgentV2Optimized = helps.OptimizeCodexMultiAgentV2Request(relayContext(c), c.Request.Header, body, s.cfg)
+		body = helps.RewriteCodexMultiAgentV2Input(relayContext(c), c.Request.Header, body, s.cfg)
+		// DeepSeek 等严格 Responses 上游按字段反序列化整个 input。历史里缺 call_id
+		// 时整包 422，不会进入后面的工具顺序修复。补 ID 必须在重排之前，
+		// 否则缺 ID 的调用项会让重排直接放弃。
+		body = normalizeProviderGatewayCallIDs(body)
+	}
+	if wireAPI == "responses" && providerGatewayRepairsToolCallOrder(gateway) {
+		// 先关掉并行工具调用（从源头避免竞态），再还原已经落盘历史里的顺序。
+		body = providerGatewaySerializeToolCalls(body)
+		ordered, relocated, ok := providerGatewayRepairsToolCallOrderBody(body)
+		if ok && relocated > 0 {
+			body = ordered
+			if s.emitter != nil {
+				s.emitter.emit(requestDiagnosticPayload{
+					Type:         "provider_gateway_tool_call_outputs_relocated",
+					RequestID:    internallogging.GetRequestID(c.Request.Context()),
+					Method:       c.Request.Method,
+					Path:         requestPath(c.Request),
+					RequestKind:  requestKindFromPath(requestPath(c.Request)),
+					Model:        upstreamModel,
+					Transport:    diagnosticTransport(c.Request),
+					ErrorMessage: providerGatewayToolOrderDiagnostic(relocated),
+				})
+			}
+		}
+	}
+	upstreamPath := "/v1/responses"
+	upstreamBody := rewriteProviderGatewayBodyModel(body, upstreamModel)
+	if wireAPI == "chat_completions" {
+		switch {
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse):
+			upstreamBody = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(upstreamModel, body, stream)
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI):
+			upstreamBody = rewriteProviderGatewayBodyModel(body, upstreamModel)
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatClaude), sourceFormatEqual(sourceFormat, sdktranslator.FormatGemini):
+			upstreamBody = sdktranslator.TranslateRequest(sourceFormat, sdktranslator.FormatOpenAI, upstreamModel, body, stream)
+		default:
+			writeAPIError(c, http.StatusBadRequest, "provider gateway does not support this request format", "invalid_request")
+			return
+		}
+		upstreamPath = "/v1/chat/completions"
+	} else if !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
+		writeAPIError(c, http.StatusBadRequest, "provider gateway responses wire API only accepts responses requests", "invalid_request")
+		return
+	} else if isDeepSeekResponsesGateway(gateway.BaseURL) {
+		// DeepSeek 思考模式要求回放的历史带 reasoning_text，而响应出口为了兼容官方账号
+		// 已经把正文改写成 summary（见 responses_reasoning_replay.go）。
+		upstreamBody = restoreResponsesReasoningTextForReplay(upstreamBody)
+	}
+	// The direct provider gateway bypasses the executor, so it must apply the
+	// same payload rules after translation and before constructing the request.
+	// In particular, payload.default must reach the wire rather than merely
+	// appearing in the saved config or usage labels. Defaults consult the
+	// original body, preserving an explicit client service_tier.
+	protocol := "openai-response"
+	if wireAPI == "chat_completions" {
+		protocol = "openai"
+	}
+	if gateway.DefaultServiceTier != nil {
+		upstreamBody = helps.ApplyManagedServiceTier(upstreamBody, body, *gateway.DefaultServiceTier)
+	}
+	upstreamBody = helps.ApplyPayloadConfigWithRequest(s.cfg, upstreamModel, protocol, string(sourceFormat), "", upstreamBody, body, model, requestPath(c.Request), c.Request.Header)
+	upstreamURL, err := providerGatewayURL(gateway.BaseURL, upstreamPath)
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	req, err := http.NewRequestWithContext(relayContext(c), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+gateway.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	copyProviderGatewayDiagnosticHeaders(req.Header, c.Request.Header)
+	if isOpenCodeGoGateway(gateway.BaseURL) {
+		applyOpenCodeSessionHeader(req.Header, c.Request.Header, body)
+	}
+
+	usageObserver := &providerUsageObserver{wireAPI: wireAPI}
+	usageStart := time.Now()
+	defer s.recordProviderUsage(c, upstreamModel, body, upstreamBody, usageStart, usageObserver, stream)
+	// Provider credentials and prompt bodies belong to the configured endpoint.
+	// Do not forward them to a redirect target, including another port on the
+	// same host (where net/http otherwise retains Authorization).
+	client := *http.DefaultClient
+	if gateway.ProxyURL != "" {
+		transport, mode, proxyErr := proxyutil.BuildHTTPTransport(gateway.ProxyURL)
+		if proxyErr != nil || transport == nil || (mode != proxyutil.ModeProxy && mode != proxyutil.ModeDirect) {
+			writeAPIError(c, http.StatusBadGateway, "upstream proxy configuration is invalid", "upstream_proxy_error")
+			return
+		}
+		client.Transport = transport
+		defer transport.CloseIdleConnections()
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	var resp *http.Response
+	if stream {
+		resp, err = doProviderStream(&client, req, s.streamTimeoutsForRequest(c.Request, body, model))
+	} else {
+		resp, err = client.Do(req)
+	}
+	if err != nil {
+		usageObserver.readErr = err
+		if c.Request.Context().Err() != nil {
+			return
+		}
+		status := statusCodeFromError(err)
+		writeAPIError(c, status, err.Error(), errorCategory(status, err.Error(), false))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		writeAPIError(c, http.StatusBadGateway, "upstream redirected; configure the final provider endpoint", "upstream_redirect")
+		return
+	}
+	writeUpstreamHeaders(c.Writer.Header(), resp.Header)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(resp.Body)
+		if s.tryWriteModerationNotice(c, resp.StatusCode, string(payload), sourceFormat, stream) {
+			return
+		}
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		c.Data(resp.StatusCode, contentType, payload)
+		return
+	}
+
+	if stream {
+		usageObserver.body = resp.Body
+		resp.Body = usageObserver
+		if wireAPI == "chat_completions" {
+			switch {
+			case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse):
+				s.writeProviderGatewayChatStream(c, resp.Body, upstreamModel, body, upstreamBody, multiAgentV2Optimized)
+			case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI):
+				c.Status(http.StatusOK)
+				c.Stream(func(w io.Writer) bool {
+					_, readErr := io.Copy(providerFlushWriter{writer: w, flush: c.Writer.Flush}, resp.Body)
+					if c.Request.Context().Err() == nil && !usageObserver.doneSeen && !usageObserver.failed {
+						if readErr == nil {
+							readErr = relayStatusError{status: http.StatusBadGateway, message: "upstream stream closed before [DONE]"}
+						}
+						writeProviderStreamError(c, readErr, sourceFormat)
+					}
+					return false
+				})
+			default:
+				alt := fixedAlt
+				if alt == "" {
+					alt = requestAlt(c)
+				}
+				s.writeProviderGatewayTranslatedChatStream(c, resp.Body, upstreamModel, body, upstreamBody, sourceFormat, alt)
+			}
+			return
+		}
+		c.Status(http.StatusOK)
+		s.writeProviderGatewayResponsesStream(c, resp.Body, multiAgentV2Optimized)
+		return
+	}
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	usageObserver.observeJSON(payload)
+	if wireAPI == "chat_completions" {
+		switch {
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse):
+			payload = responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(relayContext(c), upstreamModel, body, upstreamBody, payload, nil)
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI):
+		default:
+			payload = sdktranslator.TranslateNonStream(relayContext(c), sdktranslator.FormatOpenAI, sourceFormat, upstreamModel, body, upstreamBody, payload, nil)
+		}
+	}
+	if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
+		payload = normalizeResponsesReasoningContentBody(payload)
+		payload = helps.RestoreCodexMultiAgentV2Response(payload, multiAgentV2Optimized)
+		payload = helps.NormalizeCodexCollaborationToolCalls(payload)
+		payload = newProviderGatewayItemIDRewriter().RewritePayload(payload)
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" || (wireAPI == "chat_completions" && !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI)) {
+		contentType = "application/json"
+	}
+	c.Data(http.StatusOK, contentType, payload)
+}
+
+func isOpenCodeGoGateway(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return host == "opencode.ai" || strings.HasSuffix(host, ".opencode.ai")
+}
+
+func applyOpenCodeSessionHeader(dst, src http.Header, payload []byte) {
+	if dst.Get("x-opencode-session") != "" {
+		return
+	}
+	if value := strings.TrimSpace(src.Get("x-opencode-session")); value != "" {
+		dst.Set("x-opencode-session", value)
+		return
+	}
+	if info, ok := cliproxysession.ExtractSessionInfo(src, payload, nil); ok && info.SessionID != "" {
+		dst.Set("x-opencode-session", info.SessionID)
+		return
+	}
+	// A request-scoped opaque fallback is preferable to dropping the required
+	// header. Clients that expose a conversation identity are handled above.
+	var randomID [16]byte
+	if _, err := rand.Read(randomID[:]); err == nil {
+		dst.Set("x-opencode-session", fmt.Sprintf("cockpit-%x", randomID[:]))
+	}
+}
+
+func rewriteProviderGatewayBodyModel(body []byte, model string) []byte {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	payload["model"] = model
+	next, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return next
+}
+
+func copyProviderGatewayDiagnosticHeaders(dst http.Header, src http.Header) {
+	if dst == nil || src == nil {
+		return
+	}
+	for key, values := range src {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		lowerKey := strings.ToLower(trimmedKey)
+		if lowerKey != "x-client-request-id" && !strings.HasPrefix(lowerKey, "x-agtools-") {
+			continue
+		}
+		canonicalKey := http.CanonicalHeaderKey(trimmedKey)
+		dst.Del(canonicalKey)
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			dst.Add(canonicalKey, value)
+		}
+	}
+}
+
+func (s *relayServer) writeProviderGatewayChatStream(c *gin.Context, body io.Reader, model string, originalBody []byte, chatBody []byte, multiAgentV2Optimized bool) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Status(http.StatusOK)
+	var state any
+	startedAt := time.Now()
+	doneSeen := false
+	completedEventSeen := false
+	convertedEventCount := 0
+	rawLineCount := 0
+	eventCounts := make(map[string]int)
+	itemIDRewriter := newProviderGatewayItemIDRewriter()
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		rawLineCount++
+		if providerGatewayStreamLineIsDone(line) {
+			doneSeen = true
+		}
+		events := responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponses(relayContext(c), model, originalBody, chatBody, line, &state)
+		for index := range events {
+			events[index] = helps.RestoreCodexMultiAgentV2Response(events[index], multiAgentV2Optimized)
+			events[index] = helps.NormalizeCodexCollaborationToolCalls(events[index])
+			events[index] = itemIDRewriter.RewriteSSEFrame(events[index])
+		}
+		for _, event := range events {
+			if len(event) == 0 {
+				continue
+			}
+			eventName := providerGatewayResponseSSEEventName(event)
+			if eventName != "" {
+				eventCounts[eventName]++
+				if eventName == "response.completed" {
+					completedEventSeen = true
+				}
+			}
+			convertedEventCount++
+			if _, err := c.Writer.Write(providerGatewaySSEFrame(event)); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+	if relayContext(c).Err() != nil {
+		return
+	}
+	if err := scanner.Err(); err != nil && !doneSeen {
+		s.emitExecutorDiagnostic(c, "provider_gateway_stream_scan_failed", model, "provider_gateway_chat_stream", startedAt, err.Error())
+		writeProviderStreamError(c, err, sdktranslator.FormatOpenAIResponse)
+		return
+	}
+	if !doneSeen {
+		if relayContext(c).Err() != nil {
+			return
+		}
+		err := relayStatusError{status: http.StatusBadGateway, message: "upstream stream closed before [DONE]"}
+		s.emitExecutorDiagnostic(c, "provider_gateway_stream_truncated", model, "provider_gateway_chat_stream", startedAt, err.Error())
+		writeProviderStreamError(c, err, sdktranslator.FormatOpenAIResponse)
+		return
+	}
+	s.emitExecutorDiagnostic(
+		c,
+		"provider_gateway_stream_completed",
+		model,
+		"provider_gateway_chat_stream",
+		startedAt,
+		fmt.Sprintf(
+			"done_seen=%t completed_event_seen=%t raw_line_count=%d converted_event_count=%d event_counts=%s",
+			doneSeen,
+			completedEventSeen,
+			rawLineCount,
+			convertedEventCount,
+			providerGatewayFormatEventCounts(eventCounts),
+		),
+	)
+}
+
+func (s *relayServer) writeProviderGatewayTranslatedChatStream(c *gin.Context, body io.Reader, model string, originalBody []byte, chatBody []byte, targetFormat sdktranslator.Format, alt string) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Status(http.StatusOK)
+
+	var state any
+	itemIDRewriter := newProviderGatewayItemIDRewriter()
+	doneSeen := false
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if providerGatewayStreamLineIsDone(line) {
+			doneSeen = true
+		}
+		outputs := sdktranslator.TranslateStream(relayContext(c), sdktranslator.FormatOpenAI, targetFormat, model, originalBody, chatBody, line, &state)
+		for _, output := range outputs {
+			if len(bytes.TrimSpace(output)) == 0 {
+				continue
+			}
+			if sourceFormatEqual(targetFormat, sdktranslator.FormatGemini) && alt == "" {
+				output = frameOpenAIStreamChunk(output)
+			}
+			if sourceFormatEqual(targetFormat, sdktranslator.FormatOpenAIResponse) {
+				output = itemIDRewriter.RewriteSSEFrame(output)
+			}
+			if _, err := c.Writer.Write(output); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+	if relayContext(c).Err() != nil {
+		return
+	}
+	if err := scanner.Err(); err != nil && !doneSeen {
+		writeProviderStreamError(c, err, targetFormat)
+		return
+	}
+	if !doneSeen {
+		if relayContext(c).Err() != nil {
+			return
+		}
+		err := relayStatusError{status: http.StatusBadGateway, message: "upstream stream closed before [DONE]"}
+		writeProviderStreamError(c, err, targetFormat)
+	}
+}
+
+type providerFlushWriter struct {
+	writer io.Writer
+	flush  func()
+}
+
+func (w providerFlushWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		w.flush()
+	}
+	return n, err
+}
+
+// writeProviderGatewayResponsesStream 透传 provider gateway 的 Responses SSE，
+// 只在出口清洗第三方推理项，并在需要时还原 Multi-Agent V2 collaboration
+// namespace；完整事件保持原有字节。仅暂存当前 SSE 事件，截断的末帧不送给客户端。
+func (s *relayServer) writeProviderGatewayResponsesStream(c *gin.Context, body io.Reader, multiAgentV2Optimized bool) {
+	if body == nil {
+		return
+	}
+	itemIDRewriter := newProviderGatewayItemIDRewriter()
+	state := &providerUsageObserver{}
+	reader := bufio.NewReaderSize(body, 64*1024)
+	var frame []byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			// [DONE] alone is not a Responses terminal event. Do not make a
+			// truncated response look complete to clients that stop at this marker.
+			if providerGatewayStreamLineIsDone(bytes.TrimSpace(line)) && !state.responseTerminal {
+				err = relayStatusError{status: http.StatusBadGateway, message: "upstream stream closed before a Responses terminal event"}
+				line = nil
+			}
+			complete := bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
+			line = normalizeResponsesReasoningContentSSELine(line)
+			line = restoreProviderGatewayMultiAgentV2SSELine(line, multiAgentV2Optimized)
+			line = itemIDRewriter.RewriteSSEFrame(line)
+			frame = append(frame, line...)
+			if complete {
+				// The metadata observer deliberately caps retained bytes. Completion
+				// must still be recognized in a large (e.g. image) event already
+				// buffered here, without retaining the response in the usage record.
+				if payload, ok := responsesSSEDataPayload(frame); ok {
+					state.observeJSON(payload)
+					if observer, ok := body.(*providerUsageObserver); ok && state.responseTerminal && !observer.responseTerminal {
+						observer.observeJSON(payload)
+					}
+				}
+				if _, writeErr := c.Writer.Write(frame); writeErr != nil {
+					return
+				}
+				c.Writer.Flush()
+				frame = frame[:0]
+			}
+		}
+		if err != nil {
+			if relayContext(c).Err() == nil && !state.responseTerminal {
+				if err == io.EOF {
+					err = relayStatusError{status: http.StatusBadGateway, message: "upstream stream closed before a Responses terminal event"}
+				}
+				writeProviderStreamError(c, err, sdktranslator.FormatOpenAIResponse)
+			}
+			return
+		}
+	}
+}
+
+func writeProviderStreamError(c *gin.Context, err error, format sdktranslator.Format) {
+	if relayContext(c).Err() != nil {
+		return
+	}
+	if !c.Writer.Written() {
+		// Keep a failure before output available to the account pool's ordinary
+		// status-based failover; do not commit a synthetic successful SSE first.
+		status := statusCodeFromError(err)
+		c.Header("Content-Type", "application/json")
+		writeAPIError(c, status, err.Error(), errorCategory(status, err.Error(), false))
+		return
+	}
+	// A broken final data line must not swallow the following error frame.
+	_, _ = io.WriteString(c.Writer, "\n\n")
+	writeStreamTerminalErrorForFormat(c, err, format)
+	c.Writer.Flush()
+}
+
+// restoreProviderGatewayMultiAgentV2SSELine 只改写 data 行内的 JSON，
+// event:、空行和 [DONE] 保持原样。
+func restoreProviderGatewayMultiAgentV2SSELine(line []byte, optimized bool) []byte {
+	if len(line) == 0 {
+		return line
+	}
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return line
+	}
+	payload := bytes.TrimSpace(trimmed[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return line
+	}
+	restored := payload
+	if optimized {
+		restored = helps.RestoreCodexMultiAgentV2Response(restored, true)
+	}
+	restored = helps.NormalizeCodexCollaborationToolCalls(restored)
+	if bytes.Equal(restored, payload) {
+		return line
+	}
+	out := make([]byte, 0, len(restored)+len("data: ")+2)
+	out = append(out, "data: "...)
+	out = append(out, restored...)
+	if bytes.HasSuffix(line, []byte("\r\n")) {
+		out = append(out, '\r', '\n')
+	} else if bytes.HasSuffix(line, []byte("\n")) {
+		out = append(out, '\n')
+	}
+	return out
+}
+
+func providerGatewaySSEFrame(event []byte) []byte {
+	if len(event) == 0 || bytes.HasSuffix(event, []byte("\n\n")) || bytes.HasSuffix(event, []byte("\r\n\r\n")) {
+		return event
+	}
+	out := make([]byte, 0, len(event)+2)
+	out = append(out, event...)
+	if bytes.HasSuffix(event, []byte("\n")) {
+		out = append(out, '\n')
+	} else {
+		out = append(out, '\n', '\n')
+	}
+	return out
+}
+
+func providerGatewayResponseSSEEventName(event []byte) string {
+	for _, line := range bytes.Split(event, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("event:")) {
+			continue
+		}
+		return strings.TrimSpace(string(bytes.TrimSpace(line[len("event:"):])))
+	}
+	return ""
+}
+
+func providerGatewayFormatEventCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s:%d", name, counts[name]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func providerGatewayStreamLineIsDone(line []byte) bool {
+	line = bytes.TrimSpace(line)
+	if bytes.HasPrefix(line, []byte("data:")) {
+		line = bytes.TrimSpace(line[len("data:"):])
+	}
+	return bytes.Equal(line, []byte("[DONE]"))
+}
+
+func providerGatewayURL(baseURL string, path string) (string, error) {
+	trimmedBase := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmedBase == "" {
+		return "", fmt.Errorf("provider gateway base URL is empty")
+	}
+	parsed, err := url.Parse(trimmedBase)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("provider gateway base URL is invalid")
+	}
+	cleanPath := "/" + strings.TrimLeft(path, "/")
+	basePath := strings.TrimRight(parsed.Path, "/")
+	endpointPath := providerGatewayEndpointPath(cleanPath)
+	if strings.HasSuffix(basePath, strings.TrimSuffix(cleanPath, "/")) {
+		parsed.Path = basePath
+	} else if endpointPath != "" && strings.HasSuffix(basePath, strings.TrimSuffix(endpointPath, "/")) {
+		parsed.Path = basePath
+	} else if endpointPath != "" && providerGatewayBasePathHasVersionSegment(basePath) {
+		parsed.Path = basePath + endpointPath
+	} else {
+		parsed.Path = basePath + cleanPath
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func providerGatewayEndpointPath(path string) string {
+	cleanPath := "/" + strings.TrimLeft(strings.TrimSpace(path), "/")
+	if strings.HasPrefix(cleanPath, "/v1/") {
+		return strings.TrimPrefix(cleanPath, "/v1")
+	}
+	return ""
+}
+
+func providerGatewayBasePathHasVersionSegment(basePath string) bool {
+	for _, segment := range strings.Split(strings.Trim(basePath, "/"), "/") {
+		if providerGatewayPathSegmentIsVersion(segment) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerGatewayPathSegmentIsVersion(segment string) bool {
+	segment = strings.TrimSpace(segment)
+	if len(segment) < 2 || (segment[0] != 'v' && segment[0] != 'V') {
+		return false
+	}
+	hasDigit := false
+	for i := 1; i < len(segment); i++ {
+		ch := segment[i]
+		if ch >= '0' && ch <= '9' {
+			hasDigit = true
+			continue
+		}
+		if !hasDigit {
+			return false
+		}
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '-' || ch == '_' || ch == '.' {
+			continue
+		}
+		return false
+	}
+	return hasDigit
+}
+
+func (s *relayServer) handleNonStream(c *gin.Context, body []byte, model string, sourceFormat sdktranslator.Format, alt string, providers []string) {
+	req, opts := buildExecutorRequest(c, body, model, sourceFormat, alt, false)
+	startedAt := time.Now()
+	s.emitExecutorDiagnostic(c, "executor_started", model, "execute", startedAt, "")
+	stopWaitLogger := s.startExecutorWaitLogger(c, model, "execute", startedAt)
+	if len(providers) == 0 {
+		providers = executionProviders()
+	}
+	resp, err := s.runtime.Execute(relayContext(c), providers, req, opts)
+	stopWaitLogger()
+	if err != nil {
+		s.emitExecutorDiagnostic(c, "executor_failed", model, "execute", startedAt, err.Error())
+		s.writeExecutorError(c, err)
+		return
+	}
+	s.emitExecutorDiagnostic(c, "executor_completed", model, "execute", startedAt, "")
+	writeUpstreamHeaders(c.Writer.Header(), resp.Headers)
+	if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
+		// 出口统一清洗第三方推理项，避免客户端把不兼容的 reasoning content 落盘。
+		resp.Payload = normalizeResponsesReasoningContentBody(resp.Payload)
+	}
+	contentType := resp.Headers.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	c.Data(http.StatusOK, contentType, resp.Payload)
+}
+
+func (s *relayServer) handleStream(c *gin.Context, body []byte, model string, sourceFormat sdktranslator.Format, alt string, providers []string) {
+	req, opts := buildExecutorRequest(c, body, model, sourceFormat, alt, true)
+	if len(providers) == 0 {
+		providers = executionProviders()
+	}
+	startedAt := time.Now()
+	timeouts := s.streamTimeoutsForRequest(c.Request, body, model)
+	immediateSSE := s.manifest != nil && s.manifest.ImmediateSSEResponse
+	var immediateFlusher http.Flusher
+	if immediateSSE {
+		flusher, ok := c.Writer.(http.Flusher)
+		if !ok {
+			writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+			return
+		}
+		setEventStreamHeaders(c.Writer.Header())
+		c.Status(http.StatusOK)
+		_, _ = c.Writer.Write([]byte(": accepted\n\n"))
+		flusher.Flush()
+		immediateFlusher = flusher
+	}
+	s.emitExecutorDiagnostic(c, "executor_started", model, "execute_stream", startedAt, "")
+	stopWaitLogger := s.startExecutorWaitLogger(c, model, "execute_stream", startedAt)
+	streamCtx, cancelStream := context.WithCancel(relayContext(c))
+	defer cancelStream()
+	result, err := s.executeStreamWithOpenTimeout(c, streamCtx, providers, req, opts, model, startedAt, timeouts.open)
+	stopWaitLogger()
+	if err != nil {
+		s.emitExecutorDiagnostic(c, "executor_failed", model, "execute_stream", startedAt, err.Error())
+		if immediateSSE {
+			writeStreamTerminalErrorForFormat(c, err, sourceFormat)
+			immediateFlusher.Flush()
+			return
+		}
+		s.writeExecutorError(c, err)
+		return
+	}
+	if result == nil || result.Chunks == nil {
+		s.emitExecutorDiagnostic(c, "executor_failed", model, "execute_stream", startedAt, "upstream stream is unavailable")
+		if immediateSSE {
+			writeStreamTerminalErrorForFormat(c, relayStatusError{status: http.StatusBadGateway, message: "upstream stream is unavailable"}, sourceFormat)
+			immediateFlusher.Flush()
+		} else {
+			writeAPIError(c, http.StatusBadGateway, "upstream stream is unavailable", "bad_gateway")
+		}
+		return
+	}
+	s.emitExecutorDiagnostic(c, "stream_opened", model, "execute_stream", startedAt, "")
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+		return
+	}
+
+	if !immediateSSE {
+		setEventStreamHeaders(c.Writer.Header())
+		writeUpstreamHeaders(c.Writer.Header(), result.Headers)
+		c.Status(http.StatusOK)
+	}
+
+	framer := newRelayStreamFramer(sourceFormat, requestPath(c.Request))
+	keepAlive := streamKeepAliveInterval(s.cfg)
+	var ticker *time.Ticker
+	var tickerC <-chan time.Time
+	if keepAlive > 0 {
+		ticker = time.NewTicker(keepAlive)
+		tickerC = ticker.C
+		defer ticker.Stop()
+	}
+
+	received := 0
+	endReason := "done"
+	firstChunkLogged := false
+	idleTimer := time.NewTimer(timeouts.idle)
+	defer idleTimer.Stop()
+	defer func() {
+		s.emitStreamCompleted(c, model, received, endReason)
+	}()
+
+	for {
+		select {
+		case <-idleTimer.C:
+			cancelStream()
+			endReason = "stream_idle_timeout"
+			err := relayTimeoutError{phase: "stream_idle", timeout: timeouts.idle}
+			s.emitExecutorDiagnostic(c, "stream_idle_timeout", model, "stream_loop", startedAt, err.Error())
+			writeStreamTerminalErrorForFormat(c, err, sourceFormat)
+			flusher.Flush()
+			return
+		case <-c.Request.Context().Done():
+			cancelStream()
+			endReason = "client_gone"
+			s.emitExecutorDiagnostic(c, "stream_client_gone", model, "stream_loop", startedAt, c.Request.Context().Err().Error())
+			return
+		case <-tickerC:
+			if _, err := c.Writer.Write([]byte(": keep-alive\n\n")); err != nil {
+				endReason = "write_failed"
+				s.emitExecutorDiagnostic(c, "stream_write_failed", model, "stream_loop", startedAt, err.Error())
+				return
+			}
+			if received == 0 {
+				s.emitExecutorDiagnostic(c, "stream_keepalive", model, "stream_loop", startedAt, "received=0")
+			}
+			flusher.Flush()
+		case chunk, ok := <-result.Chunks:
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(timeouts.idle)
+			if !ok {
+				if err := framer.Close(c.Writer); err != nil {
+					endReason = "write_failed"
+					s.emitExecutorDiagnostic(c, "stream_write_failed", model, "stream_loop", startedAt, err.Error())
+					return
+				}
+				flusher.Flush()
+				return
+			}
+			if chunk.Err != nil {
+				endReason = "stream_error"
+				s.emitExecutorDiagnostic(c, "stream_error", model, "stream_loop", startedAt, chunk.Err.Error())
+				writeStreamTerminalErrorForFormat(c, chunk.Err, sourceFormat)
+				flusher.Flush()
+				return
+			}
+			if len(chunk.Payload) == 0 {
+				continue
+			}
+			if !firstChunkLogged {
+				firstChunkLogged = true
+				s.emitExecutorDiagnostic(c, "stream_first_chunk", model, "stream_loop", startedAt, fmt.Sprintf("bytes=%d", len(chunk.Payload)))
+			}
+			if err := framer.Write(c.Writer, chunk.Payload); err != nil {
+				endReason = "write_failed"
+				s.emitExecutorDiagnostic(c, "stream_write_failed", model, "stream_loop", startedAt, err.Error())
+				return
+			}
+			received++
+			flusher.Flush()
+		}
+	}
+}
+
+type executeStreamResult struct {
+	result *cliproxyexecutor.StreamResult
+	err    error
+}

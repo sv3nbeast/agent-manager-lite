@@ -1,0 +1,23 @@
+name: 问题反馈
+description: 描述可复现的问题，避免提交账号密钥或登录凭据。
+body:
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本与系统
+      placeholder: 'v0.1.0，macOS arm64'
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤与预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 可附截图或相关错误；请移除 API Key、Token、代理认证信息及个人账号数据。
+    validations:
+      required: true

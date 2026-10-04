@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Agent Manager Lite</title>
+  <rect x="40" y="40" width="944" height="944" rx="224" fill="#181b1a"/>
+  <!-- Three open, interlocking loops form an original geometric conversation mark. -->
+  <g fill="none" stroke="#f7faf8" stroke-width="48" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M512 560 330 455V275L486 185Q512 170 538 185L694 275V360"/>
+    <path d="M512 560 330 455V275L486 185Q512 170 538 185L694 275V360" transform="rotate(120 512 430)"/>
+    <path d="M512 560 330 455V275L486 185Q512 170 538 185L694 275V360" transform="rotate(240 512 430)"/>
+  </g>
+  <rect x="332" y="738" width="360" height="148" rx="74" fill="#d1f7e5"/>
+  <!-- Outlined lettering stays identical without any system font dependency. -->
+  <g fill="none" stroke="#181b1a" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M407 775v74M446 810v39M490 789v47q0 13 16 13M478 810h26M584 837q-9 15-28 12-20-4-20-21t20-21q22-2 26 21h-45"/>
+  </g>
+  <circle cx="446" cy="784" r="10" fill="#181b1a"/>
+</svg>

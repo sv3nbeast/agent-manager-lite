@@ -1,0 +1,179 @@
+{
+  "name": "codex-manager-lite",
+  "version": "0.1.0",
+  "description": "Lightweight Agent client, instance, account and provider manager",
+  "private": true,
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "setup:electron": "node node_modules/electron/install.js",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
+    "test": "tsx --test --test-concurrency=4 tests/*.test.ts",
+    "test:ci": "tsx --test --test-concurrency=4 --test-reporter=tap --test-timeout=180000 tests/*.test.ts",
+    "test:proxy": "cd sidecars/codex-proxy && go test ./...",
+    "test:proxy:handlers": "cd sidecars/codex-proxy/third_party/CLIProxyAPI && go test ./sdk/api/handlers ./sdk/api/handlers/openai",
+    "test:desktop:fast-settings": "node scripts/run-desktop-smoke.cjs --fast-settings",
+    "test:desktop": "node scripts/run-desktop-smoke.cjs",
+    "test:desktop:probes": "node scripts/run-desktop-smoke.cjs --provider-probes",
+    "test:desktop:instances": "node scripts/run-desktop-smoke.cjs --instances",
+    "test:desktop:trash": "node scripts/run-desktop-smoke.cjs --session-trash",
+    "test:desktop:account-recycle": "node scripts/run-desktop-smoke.cjs --account-recycle",
+    "test:desktop:temp-login": "node scripts/run-desktop-smoke.cjs --temp-login",
+    "test:desktop:account-proxy": "node scripts/run-desktop-smoke.cjs --account-proxy",
+    "test:desktop:legacy-trash": "node scripts/run-desktop-smoke.cjs --legacy-trash",
+    "test:desktop:sessions": "node scripts/run-desktop-smoke.cjs --sessions",
+    "test:desktop:session-visibility": "node scripts/run-desktop-smoke.cjs --session-visibility",
+    "test:desktop:tray": "node scripts/run-desktop-smoke.cjs --tray",
+    "test:desktop:local-access": "node scripts/run-desktop-smoke.cjs --local-access",
+    "test:desktop:identity": "node scripts/run-desktop-smoke.cjs --client-identity",
+    "test:desktop:keychain": "node scripts/run-desktop-smoke.cjs --system-keychain",
+    "test:packaged": "node scripts/smoke-packaged.mjs",
+    "build:proxy": "node scripts/build-proxy.mjs",
+    "build": "npm run build:icons && npm run typecheck && electron-vite build",
+    "build:mac": "npm run build:proxy && npm run build && electron-builder --mac",
+    "build:unpack": "npm run build:proxy && npm run build && electron-builder --dir",
+    "test:proxy:vendor": "cd sidecars/codex-proxy/third_party/CLIProxyAPI && go test ./internal/translator/openai/openai/responses ./internal/translator/codex/openai/responses ./internal/translator/codex/openai/chat-completions ./sdk/api/handlers/openai ./internal/runtime/executor",
+    "test:native-cli": "tsx scripts/smoke-native-cli.ts",
+    "test:client-config-cli": "tsx scripts/smoke-client-config-cli.ts",
+    "test:copy-cli": "tsx scripts/smoke-instance-copy.ts",
+    "test:trash-cli": "tsx scripts/smoke-session-trash.ts",
+    "test:desktop:unified-proxy": "node scripts/run-desktop-smoke.cjs --unified-proxy",
+    "test:desktop:proxy-batch": "node scripts/run-desktop-smoke.cjs --proxy-batch",
+    "test:desktop:proxy-engine": "node scripts/run-desktop-smoke.cjs --proxy-engine",
+    "test:proxy-engine": "tsx scripts/smoke-proxy-engine.ts",
+    "test:desktop:proxy-nodes": "node scripts/run-desktop-smoke.cjs --proxy-nodes",
+    "test:proxy-nodes": "tsx scripts/smoke-proxy-nodes.ts",
+    "test:desktop:proxy-catalog": "node scripts/run-desktop-smoke.cjs --proxy-catalog",
+    "test:desktop:proxy-subscriptions": "node scripts/run-desktop-smoke.cjs --proxy-subscriptions",
+    "test:desktop:proxy-strategy": "node scripts/run-desktop-smoke.cjs --proxy-strategy",
+    "test:desktop:provider-usage": "node scripts/run-desktop-smoke.cjs --provider-usage",
+    "test:desktop:quota-details": "node scripts/run-desktop-smoke.cjs --quota-details",
+    "test:desktop:account-cards": "node scripts/run-desktop-smoke.cjs --account-cards",
+    "test:desktop:data-backups": "node scripts/run-desktop-smoke.cjs --data-backups",
+    "build:icons": "node scripts/build-icons.mjs",
+    "test:desktop:polish": "node scripts/run-desktop-smoke.cjs --product-polish",
+    "test:desktop:local-onboarding": "node scripts/run-desktop-smoke.cjs --local-onboarding",
+    "preview:isolated": "electron scripts/preview-product.cjs",
+    "test:desktop:agent-manager": "node scripts/run-desktop-smoke.cjs --agent-manager",
+    "test:desktop:upstream-proxy": "node scripts/run-desktop-smoke.cjs --upstream-proxy",
+    "check:public": "node scripts/check-public-repository.mjs",
+    "release:check": "node scripts/check-release-version.mjs"
+  },
+  "dependencies": {
+    "toml-eslint-parser": "1.0.3",
+    "undici": "7.30.0",
+    "yaml": "2.9.1",
+    "yauzl": "3.4.0",
+    "yazl": "3.3.1",
+    "zod": "3.24.2"
+  },
+  "devDependencies": {
+    "@ant-design/icons-vue": "7.0.1",
+    "@resvg/resvg-js": "2.6.2",
+    "@types/node": "22.13.10",
+    "@types/yauzl": "3.4.0",
+    "@types/yazl": "3.3.1",
+    "@vitejs/plugin-vue": "5.2.3",
+    "ant-design-vue": "4.2.6",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "electron-vite": "3.1.0",
+    "pinia": "3.0.1",
+    "tsx": "4.20.5",
+    "typescript": "5.8.2",
+    "vite": "6.4.3",
+    "vue": "3.5.13",
+    "vue-tsc": "2.2.8"
+  },
+  "build": {
+    "appId": "local.codex-manager-lite",
+    "productName": "Agent Manager Lite",
+    "directories": {
+      "output": "release-agent-manager"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "node_modules/yaml/LICENSE",
+        "to": "licenses/yaml-LICENSE"
+      },
+      {
+        "from": "licenses/Mihomo-LICENSE",
+        "to": "licenses/Mihomo-LICENSE"
+      },
+      {
+        "from": "licenses/OpenAI-Codex-LICENSE",
+        "to": "licenses/OpenAI-Codex-LICENSE"
+      },
+      {
+        "from": "licenses/OpenAI-Codex-NOTICE",
+        "to": "licenses/OpenAI-Codex-NOTICE"
+      },
+      {
+        "from": "resources/bin",
+        "to": "bin"
+      },
+      {
+        "from": "resources/tray.png",
+        "to": "tray.png"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "sidecars/codex-proxy/third_party/CLIProxyAPI/LICENSE",
+        "to": "licenses/CLIProxyAPI-LICENSE"
+      },
+      {
+        "from": "node_modules/toml-eslint-parser/LICENSE",
+        "to": "licenses/toml-eslint-parser-LICENSE"
+      },
+      {
+        "from": "node_modules/eslint-visitor-keys/LICENSE",
+        "to": "licenses/eslint-visitor-keys-LICENSE"
+      },
+      {
+        "from": "resources/icons/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "LICENSE",
+        "to": "licenses/Agent-Manager-Lite-LICENSE"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "resources/icons/icon.icns"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/icons/icon.ico"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "resources/icons/icon.png"
+    },
+    "electronDist": "node_modules/electron/dist"
+  },
+  "license": "CC-BY-NC-SA-4.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sv3nbeast/agent-manager-lite.git"
+  },
+  "homepage": "https://github.com/sv3nbeast/agent-manager-lite#readme",
+  "bugs": {
+    "url": "https://github.com/sv3nbeast/agent-manager-lite/issues"
+  }
+}

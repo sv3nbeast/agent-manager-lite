@@ -1,0 +1,163 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,renameSync,symlinkSync,readdirSync,appendFileSync,existsSync} from 'node:fs'
+import {join} from 'node:path'
+import {tmpdir} from 'node:os'
+import {randomUUID,createHash} from 'node:crypto'
+import {DatabaseSync} from 'node:sqlite'
+import {Store} from '../src/main/store'
+import {ClientConfigs} from '../src/main/clientConfig'
+import {SessionCatalog,classifySession} from '../src/main/sessions'
+import {openSessionFile,reverseSessionLines,sessionContains,sessionTokens} from '../src/main/sessionFiles'
+
+const when='2026-10-01T08:00:00.000Z'
+function fixture(t:{after(fn:()=>void):void}){
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-sessions-'))),store=new Store(join(root,'manager'),{encrypt:text=>Buffer.from(text),decrypt:raw=>raw.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store)
+  const source=(name:string)=>{const home=join(root,name);mkdirSync(home);const target=configs.register(home);return {home,target}}
+  const scan=(extra:Record<string,unknown>={})=>catalog.scan({runId:randomUUID(),titleQuery:'',contentQuery:'',kind:'all',...extra})
+  t.after(()=>{catalog.stop();rmSync(root,{recursive:true,force:true})})
+  return {root,store,configs,catalog,source,scan}
+}
+function rollout(home:string,id:string,extra:Record<string,unknown>[]=[] ,folder='sessions',suffix=id){
+  const dir=join(home,folder,'2026','10','01');mkdirSync(dir,{recursive:true})
+  const path=join(dir,`rollout-${suffix}.jsonl`)
+  writeFileSync(path,[{type:'session_meta',timestamp:when,payload:{id,cwd:'/fixture/project/src'}},...extra].map(value=>JSON.stringify(value)).join('\n')+'\n')
+  return path
+}
+const usage=(input=100,output=25)=>({type:'event_msg',timestamp:when,payload:{type:'token_count',info:{total_token_usage:{input_tokens:input,output_tokens:output,total_tokens:input+output}}}})
+function hashes(root:string):Record<string,string>{const result:Record<string,string>={};for(const entry of readdirSync(root,{withFileTypes:true})){const file=join(root,entry.name);if(entry.isDirectory())Object.assign(result,hashes(file));else if(entry.isFile())result[file]=createHash('sha256').update(readFileSync(file)).digest('hex')}return result}
+
+test('catalog merges duplicate sessions, preserves archived locations and applies real display/title/project precedence without changing source files',async t=>{
+  const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID(),indexId=randomUUID(),previewId=randomUUID()
+  const file=rollout(a.home,id,[usage(),{type:'response_item',payload:{type:'message',content:[{text:'private-body-never-in-snapshot'}]}}])
+  rollout(b.home,id,[],'archived_sessions');rollout(a.home,indexId);rollout(a.home,previewId)
+  writeFileSync(join(a.home,'session_index.jsonl'),[JSON.stringify({id,thread_name:'Index title',updated_at:when}),JSON.stringify({id:indexId,thread_name:'Latest index title'})].join('\n'))
+  const db=new DatabaseSync(join(a.home,'state_5.sqlite'))
+  db.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, preview TEXT); CREATE TABLE projects (id TEXT PRIMARY KEY,name TEXT); CREATE TABLE project_roots (project_id TEXT,path TEXT)')
+  db.prepare('INSERT INTO threads VALUES(?,?,?)').run(id,'State title','Preview title')
+  db.prepare('INSERT INTO threads VALUES(?,?,?)').run(previewId,'','空白   折叠\n'+ '中'.repeat(80))
+  db.prepare('INSERT INTO projects VALUES(?,?)').run('p','Root project');db.prepare('INSERT INTO project_roots VALUES(?,?)').run('p','/fixture/project')
+  db.prepare('INSERT INTO projects VALUES(?,?)').run('s','Named child');db.prepare('INSERT INTO project_roots VALUES(?,?)').run('s','/fixture/project/src');db.close()
+  mkdirSync(join(a.home,'sqlite'));const ui=new DatabaseSync(join(a.home,'sqlite','catalog.db'))
+  ui.exec('CREATE TABLE local_thread_catalog(thread_id TEXT,display_title TEXT,host_id TEXT)')
+  ui.prepare('INSERT INTO local_thread_catalog VALUES(?,?,?)').run(id,'Local catalog title','local');ui.prepare('INSERT INTO local_thread_catalog VALUES(?,?,?)').run(id,'Remote must not win','remote');ui.close()
+  const before=hashes(a.home),page=await f.scan();assert.equal(page.total,3);assert.deepEqual(page.warnings,[])
+  const record=page.items.find(value=>value.id===id)!
+  assert.equal(record.title,'Local catalog title');assert.equal(record.projectName,'Named child');assert.equal(record.locations.length,2)
+  assert.equal(record.locations[1].archived,true);assert.equal(record.locations[0].ambiguous,false)
+  assert.equal(page.items.find(value=>value.id===indexId)!.title,'Latest index title')
+  assert.equal(Array.from(page.items.find(value=>value.id===previewId)!.title).length,60)
+  assert.ok(page.items.find(value=>value.id===previewId)!.title.endsWith('…'));assert.equal(JSON.stringify(page).includes('private-body-never-in-snapshot'),false)
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),file)
+  assert.deepEqual(await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[id,indexId]}),[{id,tokens:{input:100,output:25,total:125},targetId:a.target.id},{id:indexId}])
+  assert.deepEqual(hashes(a.home),before)
+})
+
+test('filters combine title and raw content in one location, retain every copy and correct stale activity timestamps',async t=>{
+  const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID(),other=randomUUID()
+  rollout(a.home,id,[{type:'event_msg',timestamp:when,payload:{text:'MixedCASE 中文检索'}}]);rollout(b.home,id)
+  rollout(a.home,other,[{type:'event_msg',timestamp:'2026-10-01T09:00:00Z',payload:{text:'nothing'}}])
+  writeFileSync(join(a.home,'session_index.jsonl'),[{id,title:'Wanted title',updated_at:'2035-01-01T00:00:00Z'},{id:other,title:'subagent worker'}].map(value=>JSON.stringify(value)).join('\n'))
+  let page=await f.scan({titleQuery:'WANTED',contentQuery:'mixedcase'})
+  assert.equal(page.total,1);assert.equal(page.items[0].locations.length,2);assert.equal(page.items[0].updatedAt,Date.parse(when))
+  page=await f.scan({contentQuery:'中文检索'});assert.equal(page.total,1)
+  page=await f.scan({kind:'subagent'});assert.equal(page.total,1);assert.equal(page.items[0].id,other)
+  page=await f.scan({targetId:b.target.id,titleQuery:'Wanted'});assert.equal(page.total,0)
+  assert.equal(classifySession('external transfer','/project'),'external');assert.equal(classifySession('','/project'),'conversation')
+})
+
+test('stream readers handle UTF-8 split across chunks, giant lines, partial final events and latest cumulative usage without inventing zero values',async t=>{
+  const f=fixture(t),a=f.source('a'),id=randomUUID(),file=rollout(a.home,id)
+  const initial=readFileSync(file),padding=Buffer.alloc(65535-initial.length,32)
+  writeFileSync(file,Buffer.concat([initial,padding,Buffer.from('中文边界\n'),Buffer.from(JSON.stringify(usage())+'\n'),Buffer.alloc(5*1024*1024,120),Buffer.from('\n'+JSON.stringify(usage(200,50))+'\n{"type":"event_msg"')]))
+  const opened=await openSessionFile(a.home,file),signal=new AbortController().signal
+  try{
+    assert.equal(await sessionContains(opened.file,opened.stat.size,'中文边界',signal),true)
+    assert.deepEqual(await sessionTokens(opened.file,opened.stat.size,signal),{input:200,output:50,total:250})
+    const lines:Buffer[]=[];for await(const line of reverseSessionLines(opened.file,opened.stat.size,signal))lines.push(line)
+    assert.ok(lines.every(line=>line.length<=4*1024*1024));assert.ok(lines.some(line=>line.includes('session_meta')))
+  }finally{await opened.file.close()}
+  const missing=rollout(a.home,randomUUID(),[{type:'event_msg',payload:{type:'token_count',info:{total_token_usage:{input_tokens:30}}}}])
+  const second=await openSessionFile(a.home,missing);try{assert.equal(await sessionTokens(second.file,second.stat.size,signal),undefined)}finally{await second.file.close()}
+})
+
+test('file operations reject replaced homes/files, symlinks, foreign targets, stale snapshots and ambiguous IDs',async t=>{
+  const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID(),file=rollout(a.home,id,[usage()])
+  let page=await f.scan(),selection={snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}
+  await assert.rejects(f.catalog.location({...selection,targetId:b.target.id}),/不属于/)
+  renameSync(file,file+'.old');writeFileSync(file,readFileSync(file+'.old'))
+  await assert.rejects(f.catalog.location(selection),/替换/)
+  rmSync(file);symlinkSync(file+'.old',file);page=await f.scan();assert.equal(page.total,0)
+  rmSync(file);renameSync(file+'.old',file);rollout(a.home,id,[],'archived_sessions','duplicate')
+  page=await f.scan();assert.equal(page.total,1);assert.equal(page.items[0].locations[0].ambiguous,true)
+  await assert.rejects(f.catalog.location({...selection,snapshotId:page.snapshotId}),/多个同 ID/)
+  const old=page.snapshotId;page=await f.scan();assert.throws(()=>f.catalog.page({snapshotId:old,page:1}),/已更新/)
+  rmSync(join(a.home,'archived_sessions'),{recursive:true});page=await f.scan()
+  renameSync(a.home,a.home+'-old');mkdirSync(a.home)
+  await assert.rejects(f.catalog.location({...selection,snapshotId:page.snapshotId}),/替换|变化/)
+  page=await f.scan();assert.ok(page.warnings.some(value=>value.includes('目录已变化')));assert.equal(page.total,0)
+  await assert.rejects(f.scan({targetId:randomUUID()}),/不存在/)
+  await assert.rejects(f.catalog.location({...selection,path:'/etc/passwd'}))
+})
+
+test('ten thousand session files paginate in the main process and cancellation never publishes a partial result',async t=>{
+  const f=fixture(t),a=f.source('large'),entries:{id:string;thread_name:string}[]=[]
+  for(let i=0;i<10001;i++){const id=randomUUID();entries.push({id,thread_name:'会话 '+i});rollout(a.home,id)}
+  writeFileSync(join(a.home,'session_index.jsonl'),entries.map(value=>JSON.stringify(value)).join('\n'))
+  const page=await f.scan();assert.equal(page.total,10001);assert.equal(page.items.length,25)
+  const last=f.catalog.page({snapshotId:page.snapshotId,page:401,pageSize:25});assert.equal(last.items.length,1)
+  assert.equal(new Set([...page.items,...last.items].map(value=>value.id)).size,26)
+  const batch=await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:entries.slice(0,1000).map(value=>value.id)})
+  assert.equal(batch.length,1000);assert.ok(batch.every(value=>value.tokens===undefined))
+  await assert.rejects(f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[...entries.slice(0,1000),entries[1000]].map(value=>value.id)}),/1000/)
+  assert.throws(()=>f.catalog.page({snapshotId:page.snapshotId,page:1,pageSize:10000}))
+  const runId=randomUUID(),pending=f.scan({runId});f.catalog.cancel(runId)
+  await assert.rejects(pending,/已取消/);assert.throws(()=>f.catalog.page({snapshotId:page.snapshotId,page:1}),/已更新/)
+  const first=f.scan(),second=f.scan({titleQuery:'会话 10000'});await assert.rejects(first,/已取消/);assert.equal((await second).total,1)
+})
+
+test('live WAL state databases provide committed titles without changing logical rows and oversized IDs cannot alias valid sessions',async t=>{
+  const f=fixture(t),a=f.source('wal'),id='a'.repeat(256),other=randomUUID()
+  rollout(a.home,id,[],'sessions','long-id');rollout(a.home,other)
+  const path=join(a.home,'state_7.sqlite'),db=new DatabaseSync(path)
+  t.after(()=>db.close())
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads(id TEXT,title TEXT)')
+  db.prepare('INSERT INTO threads VALUES(?,?)').run(id+'x','Must not alias a truncated ID')
+  db.prepare('INSERT INTO threads VALUES(?,?)').run(other,'Live WAL title')
+  db.exec('CREATE TABLE local_thread_catalog(thread_id TEXT,display_title TEXT,host_id TEXT)')
+  db.prepare('INSERT INTO local_thread_catalog VALUES(?,?,?)').run(id+'x','Catalog must not alias either','local')
+  assert.ok(existsSync(path+'-wal'))
+  const before=db.prepare('SELECT * FROM threads').all(),page=await f.scan()
+  assert.deepEqual(page.warnings,[]);assert.equal(page.total,2)
+  assert.equal(page.items.find(row=>row.id===id)!.title,id)
+  assert.equal(page.items.find(row=>row.id===other)!.title,'Live WAL title')
+  assert.deepEqual(db.prepare('SELECT * FROM threads').all(),before)
+})
+
+test('usage cancellation and changes during reading never return stale cumulative tokens',async t=>{
+  const f=fixture(t),a=f.source('changing'),id=randomUUID(),path=rollout(a.home,id,[usage()])
+  const page=await f.scan(),request={snapshotId:page.snapshotId,sessionIds:[id]}
+  const pending=f.catalog.tokenStats(request);f.catalog.cancelTokens(page.snapshotId)
+  await assert.rejects(pending,/已取消/)
+  const probe=await openSessionFile(a.home,path),prototype=Object.getPrototypeOf(probe.file),original=prototype.read
+  await probe.file.close()
+  let reads=0
+  const mock=t.mock.method(prototype,'read',async function(this:unknown,...args:unknown[]){
+    const value=await original.apply(this,args)
+    if(++reads===2)appendFileSync(path,JSON.stringify(usage(500,60))+'\n')
+    return value
+  })
+  const results=await f.catalog.tokenStats(request);mock.mock.restore()
+  assert.equal(reads,2);assert.equal(results[0].tokens,undefined);assert.match(results[0].error!,/刷新/)
+  assert.deepEqual((await f.catalog.tokenStats(request))[0].tokens,{input:500,output:60,total:560})
+})
+
+test('corrupt display databases fall back visibly, links outside the home are skipped and no unregistered default directory is traversed',async t=>{
+  const f=fixture(t),a=f.source('a'),id=randomUUID();rollout(a.home,id)
+  writeFileSync(join(a.home,'state_5.sqlite'),'fixture invalid database');mkdirSync(join(a.home,'sqlite'))
+  symlinkSync(f.root,join(a.home,'sessions','outside'),'dir')
+  const unregistered=join(f.root,'unregistered');mkdirSync(unregistered);rollout(unregistered,randomUUID())
+  const before=hashes(a.home),page=await f.scan()
+  assert.equal(page.total,1);assert.equal(page.items[0].title,id);assert.ok(page.warnings.some(value=>value.includes('数据库')))
+  assert.deepEqual(hashes(a.home),before)
+})
