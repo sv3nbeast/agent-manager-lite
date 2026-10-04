@@ -8,6 +8,7 @@ import { HTTPError, nonempty, object, requestJSON, type JSONRequest } from './ne
 import { bulkRefreshIds, groupRefreshMinutes } from './groups'
 import { ProviderUsageUnavailable, queryProviderUsage, sameUsageAccount } from './providerUsage'
 import { parseCreditUsage, quotaField, quotaNumber } from './quotaDetails'
+import { subscriptionFromToken } from './subscriptionClaims'
 
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 const ACCOUNT_CHECK_URL = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27'
@@ -67,7 +68,7 @@ export function parseQuota(value: Record<string, unknown>, now = Date.now()): { 
   } }
 }
 
-export interface SubscriptionSnapshot { accountId?: string; plan?: string; activeUntil?: number }
+export interface SubscriptionSnapshot { accountId?: string; plan?: string; activeUntil?: number; source?: 'token' | 'web' }
 
 export function parseSubscriptionTimestamp(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -169,6 +170,18 @@ function subscriptionMissingOrExpired(value: number | undefined, now = Date.now(
   return value === undefined || value <= now
 }
 
+function currentTokenSubscription(account: StoredAccount, now = Date.now()) {
+  const snapshot = subscriptionFromToken(account.credentials)
+  if (!snapshot || snapshot.activeUntil <= now) return
+  if (account.subscriptionActiveUntil !== undefined && account.subscriptionActiveUntil > now
+    && (account.subscriptionSource === 'web' || account.subscriptionSource === undefined && account.subscriptionQueryLastSuccessAt !== undefined)) return
+  if (account.subscriptionActiveUntil === undefined || account.subscriptionActiveUntil === snapshot.activeUntil) return snapshot
+  // A cached token must not replace an entitlement observed more recently by
+  // the web API (or an imported snapshot with unknown observation time).
+  if (snapshot.observedAt !== undefined && account.subscriptionQueryLastSuccessAt !== undefined
+    && snapshot.observedAt > account.subscriptionQueryLastSuccessAt) return snapshot
+}
+
 function subscriptionWebHeaders(account: StoredAccount, targetPath: string): Record<string, string> {
   const headers = subscriptionHeaders(account, targetPath)
   headers['User-Agent'] = CHATGPT_WEB_USER_AGENT
@@ -176,7 +189,7 @@ function subscriptionWebHeaders(account: StoredAccount, targetPath: string): Rec
   return headers
 }
 
-interface SubscriptionJob { account: StoredAccount; controller: AbortController; task: Promise<void> }
+interface SubscriptionJob { account: StoredAccount; controller: AbortController; task: Promise<void>; preferWeb: boolean }
 
 export class QuotaService {
   private status: RefreshStatus = { running: false, total: 0, completed: 0, failed: 0, cancelled: false }
@@ -388,15 +401,20 @@ export class QuotaService {
   private enqueueSubscription(account: StoredAccount, force = false): Promise<void> | undefined {
     if (this.stopping || account.kind !== 'oauth' || this.suspended()) return
     const pending = this.subscriptionJobs.get(account.id)
-    if (pending && pending.account.generation === account.generation) return pending.task
+    if (pending && pending.account.generation === account.generation) {
+      if (force) pending.preferWeb = true
+      return pending.task
+    }
     pending?.controller.abort()
     const now = Date.now()
+    const tokenSubscription = currentTokenSubscription(account, now)
     const fresh = (account.subscriptionQueryLastSuccessAt ?? 0) + SUBSCRIPTION_CACHE_MS > now
-    if (!force && ((account.subscriptionQueryNextRetryAt ?? 0) > now
-      || fresh && (account.subscriptionActiveUntil === undefined || !subscriptionMissingOrExpired(account.subscriptionActiveUntil, now)))) return
+    if (!force && (((account.subscriptionQueryNextRetryAt ?? 0) > now && !tokenSubscription)
+      || fresh && !account.subscriptionQueryLastError
+        && (account.subscriptionActiveUntil === undefined || !subscriptionMissingOrExpired(account.subscriptionActiveUntil, now)))) return
     const controller = new AbortController()
     let current = account
-    const job: SubscriptionJob = { account, controller, task: Promise.resolve() }
+    const job: SubscriptionJob = { account, controller, task: Promise.resolve(), preferWeb: force }
     job.task = this.subscriptionTail.then(async () => {
       controller.signal.throwIfAborted()
       const saved = this.store.read().accounts.find(value => value.id === account.id)
@@ -404,7 +422,7 @@ export class QuotaService {
       current = await this.tokens.ensure(account.id)
       controller.signal.throwIfAborted()
       if (current.kind !== 'oauth' || current.generation !== account.generation) return
-      const result = await this.querySubscription(current, controller.signal)
+      const result = await this.querySubscription(current, controller.signal, job.preferWeb)
       controller.signal.throwIfAborted()
       this.saveSubscription(current, result)
     }).catch(error => {
@@ -417,7 +435,14 @@ export class QuotaService {
     this.subscriptionTail = job.task.catch(() => {})
     return job.task
   }
-  private async querySubscription(account: StoredAccount, signal: AbortSignal): Promise<SubscriptionSnapshot> {
+  private async querySubscription(account: StoredAccount, signal: AbortSignal, preferWeb = false): Promise<SubscriptionSnapshot> {
+    signal.throwIfAborted()
+    // The login response already carries the entitlement for this workspace.
+    // Read that real date first; the web endpoints are needed only if it is
+    // absent or expired, not for every account's ordinary quota refresh.
+    const tokenSubscription = currentTokenSubscription(account)
+    // A manual refresh explicitly asks for a current upstream observation.
+    if (tokenSubscription && !preferWeb) return {...tokenSubscription,source:'token'}
     const claimAccountId = (token?: string) => nonempty(object(tokenClaims(token)['https://api.openai.com/auth']).chatgpt_account_id)
     const preferred = account.credentials.accountId ?? claimAccountId(account.credentials.idToken) ?? claimAccountId(account.credentials.accessToken)
     const checkPath = '/backend-api/accounts/check/v4-2023-04-27'
@@ -436,7 +461,7 @@ export class QuotaService {
       snapshot = { accountId, plan: next.plan ?? snapshot.plan, activeUntil: next.activeUntil ?? snapshot.activeUntil }
     }
     if (!snapshot.activeUntil && !snapshot.plan) throw new Error('订阅接口未返回可识别的套餐或有效期')
-    return snapshot
+    return {...snapshot,source:'web'}
   }
   private async queryResetCredits(account: StoredAccount, signal: AbortSignal): Promise<ResetCreditsSnapshot> {
     const value = await this.request(RESET_CREDITS_URL, { headers: subscriptionHeaders(account, '/backend-api/wham/rate-limit-reset-credits'), signal }, '查询主动重置额度', account)
@@ -446,9 +471,13 @@ export class QuotaService {
     let updated: StoredAccount | undefined
     this.store.transaction(state => {
       const current = state.accounts.find(value => value.id === account.id)
-      if (!current || current.kind !== account.kind || current.generation !== account.generation || current.credentials.accessToken !== account.credentials.accessToken) return
-      if (result.plan) current.plan = result.plan
-      if (result.activeUntil !== undefined) current.subscriptionActiveUntil = result.activeUntil
+      if (!current || current.kind !== account.kind || current.generation !== account.generation || current.credentials.accessToken !== account.credentials.accessToken
+        || current.credentials.idToken !== account.credentials.idToken || current.credentials.accountId !== account.credentials.accountId) return
+      if (result.plan) current.plan = result.plan.toLowerCase() === 'chatgptplusplan' ? 'plus' : result.plan
+      if (result.activeUntil !== undefined) {
+        current.subscriptionActiveUntil = result.activeUntil
+        current.subscriptionSource = result.source ?? 'web'
+      }
       current.subscriptionQueryLastAttemptAt = Date.now()
       current.subscriptionQueryLastSuccessAt = Date.now()
       delete current.subscriptionQueryNextRetryAt
@@ -460,7 +489,8 @@ export class QuotaService {
   private saveSubscriptionError(account: StoredAccount, message: string): void {
     this.store.transaction(state => {
       const current = state.accounts.find(value => value.id === account.id)
-      if (!current || current.kind !== account.kind || current.generation !== account.generation || current.credentials.accessToken !== account.credentials.accessToken) return
+      if (!current || current.kind !== account.kind || current.generation !== account.generation || current.credentials.accessToken !== account.credentials.accessToken
+        || current.credentials.idToken !== account.credentials.idToken || current.credentials.accountId !== account.credentials.accountId) return
       current.subscriptionQueryLastAttemptAt = Date.now()
       current.subscriptionQueryNextRetryAt = Date.now() + SUBSCRIPTION_RETRY_MS
       current.subscriptionQueryLastError = message.slice(0, 16_384)

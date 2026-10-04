@@ -102,6 +102,7 @@ export interface Account {
   quota?: Quota; error?: string; errorAt?: number
   providerUsage?: import('./providerUsage').ProviderUsageState
   subscriptionActiveUntil?: number
+  subscriptionSource?: 'token' | 'web'
   subscriptionQueryLastAttemptAt?: number
   subscriptionQueryNextRetryAt?: number
   subscriptionQueryLastSuccessAt?: number

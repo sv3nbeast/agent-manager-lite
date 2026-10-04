@@ -9,6 +9,7 @@ import { providerEndpoint } from '../shared/providerLibrary'
 import {accountIdentity,strongIdentityConflict} from './accountIdentity'
 import {invalidateProviderUsage} from './providerUsage'
 import { parseQuota, parseSubscriptionTimestamp } from './quota'
+import { projectSubscriptionClaim } from './subscriptionClaims'
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('账号必须是 JSON 对象')
@@ -228,7 +229,12 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
       }
       account.createdAt = importedCreatedAt(source)
       const activeUntil = parseSubscriptionTimestamp(source.subscription_active_until ?? source.subscriptionActiveUntil)
-      if (activeUntil !== undefined) account.subscriptionActiveUntil = activeUntil
+      if (activeUntil !== undefined) {
+        account.subscriptionActiveUntil = activeUntil
+        const subscriptionSource = source.subscription_source ?? source.subscriptionSource
+        if (subscriptionSource === 'token' || subscriptionSource === 'web') account.subscriptionSource = subscriptionSource
+      }
+      else projectSubscriptionClaim(account)
       // Provider quotas can represent money rather than ChatGPT token windows.
       // Preserve those snapshots only in source until their provider parser runs.
       if (account.kind !== 'api_key') account.quota = importedQuota(source)
@@ -290,9 +296,11 @@ export function saveOAuthAccount(store: Store, tokens: Tokens): StoredAccount {
       || Boolean(tokens.accountId) && a.credentials.accountId === tokens.accountId && a.email === email))
     if (existing) {
       if(state.clientAuthorities?.some(binding=>binding.accountId===existing.id))throw new Error('此账号由客户端维护登录，请先在客户端退出并解除关联后再重新登录')
+      const previousIDToken = existing.credentials.idToken
       existing.credentials = { ...existing.credentials, ...tokens }
       existing.email = email ?? existing.email
       existing.plan = text(auth.chatgpt_plan_type) ?? existing.plan
+      projectSubscriptionClaim(existing, { previousIDToken, returnedIDToken: tokens.idToken })
       delete existing.error; delete existing.errorAt
       result = structuredClone(existing)
     } else {
@@ -301,6 +309,7 @@ export function saveOAuthAccount(store: Store, tokens: Tokens): StoredAccount {
         baseUrl: 'https://chatgpt.com/backend-api/codex', models: [], wireApi: 'responses',
         defaultTier: 'inherit', note: '', tags: [], createdAt: Date.now(), credentials: { ...tokens }
       }
+      projectSubscriptionClaim(result)
       state.accounts.push(result)
     }
   })

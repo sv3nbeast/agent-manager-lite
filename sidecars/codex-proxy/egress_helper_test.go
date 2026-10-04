@@ -39,6 +39,23 @@ func TestAccountEgressAllowsExactSubscriptionRoutingHeaders(t *testing.T) {
 	}
 }
 
+func TestAccountEgressRetainsOnlyFailureClassificationHeaders(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Cf-Mitigated", "challenge")
+		w.Header().Set("Set-Cookie", "fixture-secret-cookie")
+		w.Header().Set("Authorization", "fixture-secret-token")
+		w.Header().Set("X-Other", "fixture-secret-other")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "<html>challenge</html>")
+	}))
+	defer target.Close()
+	output := egressRequest(context.Background(), egressInput{URL: target.URL, Method: "GET", Proxy: "direct"})
+	if output.Error != "" || output.Status != http.StatusForbidden || len(output.Headers) != 2 || output.Headers["cf-mitigated"] != "challenge" || output.Headers["content-type"] != "text/html" {
+		t.Fatalf("response metadata was not preserved safely: %+v", output)
+	}
+}
+
 func TestAccountEgressSOCKSAuthenticationAndRemoteName(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Proxy-Authorization") != "" {

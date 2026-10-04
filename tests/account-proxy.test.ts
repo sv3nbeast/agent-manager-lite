@@ -92,6 +92,22 @@ test('proxy helper does not follow redirects or fall back after refusal; HTTP er
  assert.equal(targetHits,0)
 })
 
+test('proxy helper preserves challenge metadata for diagnosis while excluding upstream secrets',async t=>{
+ const f=fixture(t)
+ const target=await listen(t,createServer((_req,res)=>{
+  res.writeHead(403,{'Content-Type':'text/html','Cf-Mitigated':'challenge','Set-Cookie':'fixture-private-cookie','X-Private':'fixture-private-header'})
+  res.end('<html>verification required</html>')
+ }))
+ const account={...f.account,proxy:{mode:'direct' as const}}
+ const response=await f.network.fetchUpstream(target,{},account)
+ assert.equal(response.headers.get('cf-mitigated'),'challenge')
+ assert.equal(response.headers.get('content-type'),'text/html')
+ assert.equal(response.headers.get('set-cookie'),null)
+ assert.equal(response.headers.get('x-private'),null)
+ await response.body?.cancel()
+ await assert.rejects(f.network.request(target,{},'查询订阅账号信息',account),error=>error instanceof HTTPError&&error.status===403&&error.diagnostic==='cloudflare_challenge'&&!String(error).includes('fixture-private'))
+})
+
 test('token-free egress probe supports saved/draft/direct, cancellation, account revisions and save exclusion',async t=>{
  const f=fixture(t);let tokensSeen=false,waiting=false,hits=0
  const target=await listen(t,createServer((req,res)=>{tokensSeen||=!!req.headers.authorization;res.end('{"ip":"203.0.113.42"}')}))

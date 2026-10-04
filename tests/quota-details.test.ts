@@ -52,13 +52,13 @@ test('manual subscription refresh queries account entitlement, persists expiry a
     assert.equal((init?.headers as Record<string, string>)['x-openai-target-path'], '/backend-api/accounts/check/v4-2023-04-27')
     assert.match((init?.headers as Record<string, string>)['User-Agent'], /^Mozilla\/5\.0 .*Chrome\//)
     assert.equal((init?.headers as Record<string, string>)['ChatGPT-Account-Id'], undefined)
-    return { accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'Plus', expires_at: new Date(activeUntil).toISOString() } }] }
+    return { accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'chatgptplusplan', expires_at: new Date(activeUntil).toISOString() } }] }
   })
   t.after(async () => { await service.stop() })
   await service.refreshSubscriptionInfo(account.id)
   const saved = store.snapshot().accounts[0]
   assert.deepEqual(urls, [`https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=${new Date().getTimezoneOffset()}`])
-  assert.equal(saved.plan, 'Plus')
+  assert.equal(saved.plan, 'plus')
   assert.equal(saved.subscriptionActiveUntil, activeUntil)
   assert.equal(saved.quota?.credits?.remaining, 5)
   assert.equal(saved.subscriptionQueryLastError, undefined)
@@ -75,6 +75,67 @@ function subscriptionFixture(t: { after: (cleanup: () => void | Promise<void>) =
   t.after(() => tokens.stop())
   return { store, account, tokens }
 }
+
+test('existing OAuth accounts recover the real token subscription date despite a previous web 403 cooldown', async t => {
+  const f = subscriptionFixture(t), expiry = Date.now() + 30 * 86_400_000
+  const idToken = `fixture.${Buffer.from(JSON.stringify({exp: Math.floor(Date.now()/1000)+7200, 'https://api.openai.com/auth': {chatgpt_account_id:'fixture-account',chatgpt_plan_type:'plus',chatgpt_subscription_active_until:new Date(expiry).toISOString()}})).toString('base64url')}.signature`
+  f.store.transaction(state=>{
+    state.accounts[0].credentials.idToken=idToken
+    state.accounts[0].subscriptionQueryLastError='查询订阅账号信息失败（HTTP 403）'
+    state.accounts[0].subscriptionQueryNextRetryAt=Date.now()+30*60_000
+    delete state.accounts[0].subscriptionActiveUntil
+  })
+  const urls:string[]=[]
+  const service=new QuotaService(f.store,f.tokens,async url=>{
+    urls.push(url)
+    if(new URL(url).pathname.endsWith('/accounts/check/v4-2023-04-27'))return {accounts:[{account:{id:'fixture-account'},entitlement:{subscription_plan:'plus',expires_at:expiry+6*3600_000}}]}
+    assert.equal(new URL(url).pathname,'/backend-api/wham/usage','automatic refresh can reuse the current login entitlement')
+    return {plan_type:'plus',rate_limit:{primary_window:{used_percent:8}}}
+  })
+  t.after(()=>service.stop())
+  service.start([f.account.id]);await service.settled();await service.subscriptionsSettled()
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil,expiry)
+  assert.equal(f.store.snapshot().accounts[0].subscriptionQueryLastError,undefined)
+  assert.equal(f.store.snapshot().accounts[0].quota?.windows[0].usedPercent,8)
+  assert.equal(urls.length,1,'automatic refresh does not add an upstream web call for a current login entitlement')
+  await service.refreshSubscriptionInfo(f.account.id)
+  assert.equal(urls.length,2,'manual refresh explicitly retrieves the current web entitlement')
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil,expiry+6*3600_000)
+})
+
+test('an older token cannot roll back a newer web subscription date', async t => {
+  const f=subscriptionFixture(t), oldExpiry=Date.now()+10*86_400_000, latestExpiry=Date.now()+40*86_400_000
+  const idToken=`fixture.${Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+7200,iat:Math.floor(Date.now()/1000)-3600,'https://api.openai.com/auth':{chatgpt_account_id:'fixture-account',chatgpt_subscription_active_until:oldExpiry}})).toString('base64url')}.signature`
+  f.store.transaction(state=>{
+    state.accounts[0].credentials.idToken=idToken
+    state.accounts[0].subscriptionActiveUntil=latestExpiry
+    state.accounts[0].subscriptionQueryLastSuccessAt=Date.now()
+  })
+  const calls:string[]=[]
+  const service=new QuotaService(f.store,f.tokens,async url=>{calls.push(url);return {accounts:[{account:{id:'fixture-account'},entitlement:{subscription_plan:'plus',expires_at:latestExpiry}}]}})
+  t.after(()=>service.stop())
+  await service.refreshSubscriptionInfo(f.account.id)
+  assert.equal(calls.length,1,'manual refresh must use the web rather than accept an older differing token claim')
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil,latestExpiry)
+})
+
+test('a subscription result cannot overwrite a same-access-token account whose ID Token changed in flight', async t => {
+  for(const fail of [false,true]){
+    const f=subscriptionFixture(t)
+    let started!:()=>void,complete!:(value:Record<string,unknown>)=>void,reject!:(error:Error)=>void
+    const waiting=new Promise<void>(resolve=>{started=resolve})
+    const service=new QuotaService(f.store,f.tokens,async()=>{started();return await new Promise((resolve,fail)=>{complete=resolve;reject=fail})})
+    t.after(()=>service.stop())
+    const operation=service.refreshSubscriptionInfo(f.account.id).catch(()=>{})
+    await waiting
+    f.store.transaction(state=>{state.accounts[0].credentials.idToken='updated-id-token-same-access-token'})
+    if(fail)reject(new HTTPError(403,'查询订阅账号信息'))
+    else complete({accounts:[{account:{id:'fixture-account'},entitlement:{subscription_plan:'plus',expires_at:Date.now()+86_400_000}}]})
+    await operation
+    assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil,undefined)
+    assert.equal(f.store.snapshot().accounts[0].subscriptionQueryLastError,undefined)
+  }
+})
 
 test('ordinary quota refresh retrieves the real subscription using both web endpoints and caches it', async t => {
   const f = subscriptionFixture(t), expiry = Date.now() + 30 * 86_400_000

@@ -3,6 +3,7 @@ import {createJSONRequest,requestJSON,type JSONFetch,type JSONRequest} from './n
 import {accountProxyURL,defaultProxyURL,normalizeStoredProxy,type ProxyState} from './proxyPolicy'
 import {needsProxyTunnel} from './proxyCatalogBinding'
 import type {ProxyTunnels,ProxyLease} from './proxyTunnels'
+import {isChatGPTSubscriptionURL,fetchSubscriptionWeb} from './subscriptionTransport'
 
 // Bounded helper processes reuse the vendored transport for HTTP/HTTPS/SOCKS.
 // They never receive credentials in argv, environment, files or renderer IPC.
@@ -37,6 +38,7 @@ export class AccountNetwork {
           lease=await this.tunnels.acquire(proxy,scope,signal)
         }
         signal.throwIfAborted()
+        if(isChatGPTSubscriptionURL(url))return await fetchSubscriptionWeb(url,{...init,signal},lease?.url??proxy)
         const raw=JSON.stringify({url,method:init.method??'GET',headers,body:init.body??'',proxy:lease?.url??proxy})
         if(Buffer.byteLength(raw)>1024*1024)throw new Error('请求超过大小限制')
         return await new Promise<Response>((resolve,reject)=>{
@@ -55,7 +57,15 @@ export class AccountNetwork {
           const value=JSON.parse(Buffer.concat(chunks).toString())
           if(value.error||!Number.isInteger(value.status)||value.status<200||value.status>599||value.body!==undefined&&typeof value.body!=='string')throw 0
           const body=Buffer.from(value.body??'','base64');if(body.length>2*1024*1024)throw 0
-          resolve(new Response([204,205,304].includes(value.status)?null:body,{status:value.status}))
+          const headers:Record<string,string>={}
+          if(value.headers!==undefined){
+            if(!value.headers||typeof value.headers!=='object'||Array.isArray(value.headers))throw 0
+            for(const [name,content] of Object.entries(value.headers)){
+              if(!['content-type','cf-mitigated'].includes(name)||typeof content!=='string'||content.length>2048||/[\r\n]/.test(content))throw 0
+              headers[name]=content
+            }
+          }
+          resolve(new Response([204,205,304].includes(value.status)?null:body,{status:value.status,headers}))
         }catch{reject(new Error('账号代理响应无效'))}
       })
       child.stdin.end(raw)

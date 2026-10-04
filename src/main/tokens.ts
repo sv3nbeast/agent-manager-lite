@@ -1,5 +1,6 @@
 import { Store, type StoredAccount } from './store'
 import { nonempty, object, requestJSON, type JSONRequest } from './network'
+import { projectSubscriptionClaim } from './subscriptionClaims'
 
 // Protocol values adapted from Cockpit codex_oauth.rs at the pinned source baseline.
 export const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
@@ -52,23 +53,38 @@ export class TokenAuthority {
       // Persisted links must fail closed even before the resolver is installed
       // after restart; never fall back to rotating the copied refresh token.
       if(!this.external)return Promise.reject(new Error('客户端凭据同步尚未就绪，本地刷新已暂停'))
-      const operation=Promise.resolve().then(()=>this.external!(id,options)).finally(()=>this.pending.delete(id))
+      const operation=Promise.resolve().then(()=>this.external!(id,options)).then(account=>this.withSubscriptionClaim(account)).finally(()=>this.pending.delete(id))
       this.pending.set(id,operation);return operation
     }
     if (account.kind !== 'oauth') return Promise.resolve(account)
     // A competing 401 may refer to credentials already rotated by another caller.
-    if (options.rejectedToken && account.credentials.accessToken !== options.rejectedToken) return Promise.resolve(account)
-    if (!options.force && tokenFresh(account.credentials.accessToken) && tokenFresh(account.credentials.idToken, 600)) return Promise.resolve(account)
+    if (options.rejectedToken && account.credentials.accessToken !== options.rejectedToken) return Promise.resolve(this.withSubscriptionClaim(account))
+    if (!options.force && tokenFresh(account.credentials.accessToken) && tokenFresh(account.credentials.idToken, 600)) return Promise.resolve(this.withSubscriptionClaim(account))
     if (!account.credentials.refreshToken) {
       // PATs/opaque access tokens carry no local expiry claim; the provider is
       // authoritative. A known expired JWT or an upstream 401 is still rejected.
       const expiry = tokenClaims(account.credentials.accessToken).exp
-      if (!options.force && account.credentials.accessToken && (tokenFresh(account.credentials.accessToken) || expiry === undefined)) return Promise.resolve(account)
+      if (!options.force && account.credentials.accessToken && (tokenFresh(account.credentials.accessToken) || expiry === undefined)) return Promise.resolve(this.withSubscriptionClaim(account))
       return Promise.reject(new Error('登录已过期且没有 refresh_token，请重新登录'))
     }
     const operation = this.refresh(account).finally(() => this.pending.delete(id))
     this.pending.set(id, operation)
     return operation
+  }
+  private withSubscriptionClaim(account: StoredAccount): StoredAccount {
+    if (account.kind !== 'oauth') return account
+    const candidate = structuredClone(account)
+    if (!projectSubscriptionClaim(candidate)) return account
+    let updated = account
+    this.store.transaction(state => {
+      const current = state.accounts.find(value => value.id === account.id)
+      if (!current || current.kind !== 'oauth' || current.generation !== account.generation
+        || current.credentials.accountId !== account.credentials.accountId || current.credentials.idToken !== account.credentials.idToken
+        || current.credentials.accessToken !== account.credentials.accessToken) return
+      projectSubscriptionClaim(current)
+      updated = structuredClone(current)
+    })
+    return updated
   }
   private async refresh(before: StoredAccount): Promise<StoredAccount> {
     const value = await this.request(TOKEN_ENDPOINT, {
@@ -89,6 +105,7 @@ export class TokenAuthority {
       const identity = tokenClaims(tokens.idToken)
       current.email = nonempty(identity.email) ?? current.email
       current.plan = nonempty(object(identity['https://api.openai.com/auth']).chatgpt_plan_type) ?? current.plan
+      projectSubscriptionClaim(current, { previousIDToken: before.credentials.idToken, returnedIDToken: nonempty(value.id_token) })
       delete current.error; delete current.errorAt
       updated = structuredClone(current)
     })

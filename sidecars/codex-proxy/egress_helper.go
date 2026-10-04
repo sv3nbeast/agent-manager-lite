@@ -26,9 +26,10 @@ type egressInput struct {
 	Proxy   string            `json:"proxy"`
 }
 type egressOutput struct {
-	Status int    `json:"status,omitempty"`
-	Body   []byte `json:"body,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Status  int               `json:"status,omitempty"`
+	Body    []byte            `json:"body,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Error   string            `json:"error,omitempty"`
 }
 
 func egressRequest(ctx context.Context, input egressInput) egressOutput {
@@ -67,7 +68,15 @@ func egressRequest(ctx context.Context, input egressInput) egressOutput {
 	if err != nil || len(body) > egressOutputLimit {
 		return egressOutput{Error: "response"}
 	}
-	return egressOutput{Status: response.StatusCode, Body: body}
+	// Only metadata needed for response parsing and failure classification crosses
+	// the helper boundary. Cookies and all other upstream headers stay here.
+	headers := make(map[string]string)
+	for _, name := range []string{"content-type", "cf-mitigated"} {
+		if value := response.Header.Get(name); value != "" && len(value) <= 2048 {
+			headers[name] = value
+		}
+	}
+	return egressOutput{Status: response.StatusCode, Body: body, Headers: headers}
 }
 func runEgressHelper(ctx context.Context, input io.Reader, output io.Writer) error {
 	raw, err := io.ReadAll(io.LimitReader(input, egressInputLimit+1))

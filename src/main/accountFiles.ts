@@ -13,6 +13,8 @@ export function serializeAccounts(accounts: StoredAccount[]): string {
     auth_mode: account.kind === 'api_key' ? 'apikey' : account.kind === 'agent_identity' ? 'agentIdentity' : 'oauth',
     account_name: account.name, account_note: account.note, tags: account.tags,
     email: account.email, plan_type: account.plan, defaultTier: account.defaultTier,
+    ...(account.subscriptionActiveUntil !== undefined ? { subscription_active_until: account.subscriptionActiveUntil,
+      subscription_source: account.subscriptionSource ?? (account.subscriptionQueryLastSuccessAt !== undefined ? 'web' : undefined) } : {}),
     api_base_url: account.baseUrl, api_wire_api: account.wireApi, models: account.models,
     ...(account.kind === 'api_key' ? { integrationType: account.integrationType } : {}),
     ...(account.kind === 'agent_identity' ? { agent_identity: account.credentials.agentIdentity } : account.kind === 'api_key' ? { openai_api_key: account.credentials.apiKey } : {
