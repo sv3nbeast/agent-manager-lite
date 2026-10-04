@@ -4,11 +4,24 @@
 
 简体中文 · [English](README.en.md) · [版本下载](https://github.com/sv3nbeast/agent-manager-lite/releases) · [问题反馈](https://github.com/sv3nbeast/agent-manager-lite/issues)
 
-以实例为入口的轻量 Agent 客户端管理器，统一管理账号、供应商密钥和客户端配置。
+以实例为入口的轻量 Agent 工作台，统一管理账号、供应商密钥和客户端配置，逐步连接终端 Agent、桌面客户端与 AI 编辑器。
 
 **创建实例 → 选择客户端 → 选择兼容账号或供应商 → 配置项目 → 启动**
 
-当前支持 **Codex**。后续计划接入 **Claude Code** 与 **Claude Desktop（Chat / Cowork / Code）**；这些 Claude 客户端及模式尚未实现。名称和模式划分参考 [Claude 官方说明](https://code.claude.com/docs/en/desktop)。
+当前支持 **Codex** 桌面和 CLI。更多 Agent 客户端与编辑器正在规划与评估，见下方「接入方向」。
+
+## 软件界面
+
+以下为实际应用界面，账号、供应商与用量均使用演示数据。
+
+![Agent Manager Lite 工作空间概览](assets/screenshots/overview.png)
+
+<details>
+<summary>查看账号管理界面</summary>
+
+![Agent Manager Lite 账号管理](assets/screenshots/accounts.png)
+
+</details>
 
 ## 功能
 
@@ -21,6 +34,18 @@
 - **本地 API**：使用多个账号、调度策略及独立访问密钥，提供模型范围和 Token 上限控制。
 - **会话与记录**：管理已登记目录的会话、导入导出、复制和回收站；查询调用记录、统计并导出 CSV。
 - **数据备份**：预览导入内容，导出账号或创建加密的便携数据备份。
+
+## 接入方向
+
+后续接入范围不限于 Claude，希望从统一的实例入口连接更多值得使用的 Agent 和编辑器。以下为候选示例，尚未实现，不代表完整名单或确定的发布排期。
+
+| 类型 | 接入候选 |
+| --- | --- |
+| 终端 Agent | [Claude Code](https://code.claude.com/docs/en/overview)、[Gemini CLI](https://geminicli.com/docs/)、[OpenCode](https://opencode.ai/docs/)、[Kiro CLI](https://kiro.dev/docs/) |
+| 桌面 Agent | [Claude Desktop（Chat / Cowork / Code）](https://code.claude.com/docs/en/desktop)、[OpenCode Desktop](https://opencode.ai/docs/) |
+| AI 编辑器与 IDE | [Kiro IDE](https://kiro.dev/docs/)、[Cursor](https://cursor.com/docs)、[VS Code / GitHub Copilot](https://code.visualstudio.com/docs/agents/overview)、[Zed](https://zed.dev/docs/ai/overview)、[Devin Desktop（原 Windsurf）](https://docs.devin.ai/desktop/getting-started) |
+
+接入后仍通过「创建实例 → 选择客户端」使用，账号与供应商保持统一管理。登录方式、模型、上下文、速度及实例隔离按各客户端实际能力提供；同一供应商密钥只在兼容的客户端之间复用。
 
 ## 安装与使用
 

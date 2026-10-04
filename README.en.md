@@ -4,11 +4,24 @@
 
 [简体中文](README.md) · English · [Downloads](https://github.com/sv3nbeast/agent-manager-lite/releases) · [Issues](https://github.com/sv3nbeast/agent-manager-lite/issues)
 
-A lightweight Agent client manager organized around instances, with shared accounts, provider keys and client settings.
+A lightweight Agent workspace organized around instances, with shared accounts, provider keys and client settings, gradually connecting terminal agents, desktop clients and AI editors.
 
 **Create an instance → Choose a client → Choose a compatible account or provider → Configure the project → Launch**
 
-**Codex** is currently supported. **Claude Code** and **Claude Desktop (Chat / Cowork / Code)** are planned and are not implemented yet. Client and mode names follow the [official Claude documentation](https://code.claude.com/docs/en/desktop).
+**Codex** desktop and CLI are currently supported. More Agent clients and editors are being planned and evaluated; see Integration direction below.
+
+## Screenshots
+
+Actual application screens with demo accounts, providers and usage data.
+
+![Agent Manager Lite workspace overview](assets/screenshots/overview.png)
+
+<details>
+<summary>View account management</summary>
+
+![Agent Manager Lite account management](assets/screenshots/accounts.png)
+
+</details>
 
 ## Features
 
@@ -21,6 +34,18 @@ A lightweight Agent client manager organized around instances, with shared accou
 - **Local API**: use multiple accounts, scheduling strategies and separate access keys with model restrictions and Token limits.
 - **Sessions and records**: manage sessions from registered directories, import, export, copy and restore them; query request history, view statistics and export CSV files.
 - **Data backups**: preview imports, export accounts or create encrypted portable data backups.
+
+## Integration direction
+
+Future integrations extend beyond Claude, aiming to connect more useful agents and editors through one instance entry point. The examples below are candidates and are not implemented yet; they are neither an exhaustive list nor a committed release schedule.
+
+| Type | Integration candidates |
+| --- | --- |
+| Terminal agents | [Claude Code](https://code.claude.com/docs/en/overview), [Gemini CLI](https://geminicli.com/docs/), [OpenCode](https://opencode.ai/docs/), [Kiro CLI](https://kiro.dev/docs/) |
+| Desktop agents | [Claude Desktop (Chat / Cowork / Code)](https://code.claude.com/docs/en/desktop), [OpenCode Desktop](https://opencode.ai/docs/) |
+| AI editors and IDEs | [Kiro IDE](https://kiro.dev/docs/), [Cursor](https://cursor.com/docs), [VS Code / GitHub Copilot](https://code.visualstudio.com/docs/agents/overview), [Zed](https://zed.dev/docs/ai/overview), [Devin Desktop (formerly Windsurf)](https://docs.devin.ai/desktop/getting-started) |
+
+New integrations will use the same Create an instance → Choose a client flow, with shared account and provider management. Sign-in, models, context windows, speed settings and instance isolation will follow each client's actual capabilities; provider keys will only be reused between compatible clients.
 
 ## Install and use
 
