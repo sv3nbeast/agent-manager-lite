@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { privateContentIssues } from './public-repository-policy.mjs'
 
 const privatePaths = /^(?:docs|\.local|\.upstream|node_modules|out|dist|coverage|test-results|playwright-report|release(?:-[^/]+)?)\/|^(?:AGENTS\.md|TASK_PROMPT\.md|CHANGELOG\.md)$|^sidecars\/codex-proxy\/USAGE_ATTRIBUTION_REVIEW\.md$/
 const privateFiles = /(?:^|\/)(?:auth\.json|\.env(?:\.(?!example$)[^/]+)?|[^/]+\.(?:vault|cmlbackup|sqlite(?:-shm|-wal)?|db|pem|key|dmg|log))$/
@@ -62,13 +63,10 @@ function checkRepository() {
     if (!buffer) throw new Error('Missing index object contents.')
     if (buffer.includes(0)) continue
     const content = buffer.toString('utf8')
-    // Only synthetic account names used by source fixtures are allowed.
-    if (/\/Users\/(?!example\/|alice\/|bob\/|Alice Smith\/)[^/\r\n]+\//.test(content)) {
-      failures.push(`${file}: personal machine path`)
-    }
-    if (!file.endsWith('check-public-repository.mjs') && /docs\/(?:evidence\/|[A-Z][A-Z_]+\.md)/.test(content)) {
-      // Smoke scripts may write local evidence; public docs must not link to it.
-      if (/\.md$/.test(file) || file.startsWith('.github/')) failures.push(`${file}: private document reference`)
+    // Smoke scripts may write local evidence; public docs must not link to it.
+    const checkDocumentReferences = !file.endsWith('check-public-repository.mjs') && (/\.md$/.test(file) || file.startsWith('.github/'))
+    for (const issue of privateContentIssues(content, { checkDocumentReferences })) {
+      failures.push(`${file}: ${issue}`)
     }
   }
 
