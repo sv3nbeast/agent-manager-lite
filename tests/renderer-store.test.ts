@@ -44,3 +44,28 @@ test('an earlier UI operation cannot clear the loading state of a newer operatio
   assert.equal(manager.loading, false)
   assert.equal(manager.data?.dataDirectory, 'second')
 })
+
+test('IPC errors show the service message and HTTP status while retaining the last snapshot', async () => {
+  setActivePinia(createPinia())
+  const manager = useManager()
+  await manager.execute(async () => snapshot('last-success'))
+  assert.equal(await manager.execute(async () => {
+    throw new Error("Error invoking remote method 'manager:invoke': Error: 查询订阅账号信息失败（HTTP 403）")
+  }), false)
+  assert.equal(manager.error, '查询订阅账号信息失败（HTTP 403）')
+  assert.equal(manager.data?.dataDirectory, 'last-success')
+  await manager.execute(async () => { throw new Error('HTTP 429: 请稍后重试') })
+  assert.equal(manager.error, 'HTTP 429: 请稍后重试')
+})
+
+test('background IPC failures remove the transport wrapper', async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { manager: {
+    load: async () => { throw new Error("Error invoking remote method 'manager:invoke': Error: 无法读取账号") }
+  } } })
+  t.after(() => { if (original) Object.defineProperty(globalThis, 'window', original); else Reflect.deleteProperty(globalThis, 'window') })
+  setActivePinia(createPinia())
+  const manager = useManager()
+  await manager.refresh()
+  assert.equal(manager.error, '无法读取账号')
+})

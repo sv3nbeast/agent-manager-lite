@@ -144,11 +144,11 @@ async function main(): Promise<void> {
   await sessionTransfers.recover()
   await sessionSync.recover()
   const quotas = new QuotaService(store, tokens, accountNetwork.request, agents,projectRouting,maintenance)
-  const accountProxies=new AccountProxies(store,accountNetwork,id=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||quotas.current().running||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||wakeups.usesAccount(id)||[...commands.values()].includes('fetchProviderModels'))
+  const accountProxies=new AccountProxies(store,accountNetwork,id=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||quotas.busy()||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||wakeups.usesAccount(id)||[...commands.values()].includes('fetchProviderModels'))
   const accountBusy=(id:string)=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||accountProxies.busy(id)||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||[...commands.values()].includes('fetchProviderModels')
-  const proxyResources=new ProxyResources(store,id=>accountBusy(id)||quotas.current().running)
-  const proxyBatch=new ProxyBatch(store,id=>accountBusy(id)||quotas.current().running)
-  const proxyCatalog=new ProxyCatalog(store,id=>accountBusy(id)||quotas.current().running)
+  const proxyResources=new ProxyResources(store,id=>accountBusy(id)||quotas.busy())
+  const proxyBatch=new ProxyBatch(store,id=>accountBusy(id)||quotas.busy())
+  const proxyCatalog=new ProxyCatalog(store,id=>accountBusy(id)||quotas.busy())
   const proxySubscriptions=new ProxySubscriptions(store,proxyCatalog,undefined,Date.now,maintenance)
   const wakeups = new WakeupScheduler(store, runId => new Gateway(binary, join(runtimeRoot, 'wakeup'), event => history.record(runId, event),
     (id, identity, expectedTask, generation) => agents.adopt(id, identity, expectedTask, generation), () => store.proxyState(), proxyTunnels),
@@ -166,7 +166,7 @@ async function main(): Promise<void> {
     return account.id
   } })
   const upstreamProxies=new UpstreamProxies(store,accountNetwork,()=>
-    store.read().accounts.some(account=>accountBusyWithWakeups(account.id))||quotas.current().running||
+    store.read().accounts.some(account=>accountBusyWithWakeups(account.id))||quotas.busy()||
     providerUsageQueries.snapshot().running||providerProbes.snapshot().running||['starting','waiting','exchanging'].includes(login.current().status)||
     [...commands.values()].some(command=>!['saveUpstreamProxy','load','probeUpstreamProxy','cancelUpstreamProxyProbe'].includes(command)))
   const tempLogin=new OfficialTempLogin(store,()=>instances.applications(),undefined,accountBusy,()=>quotas.schedule())
@@ -182,7 +182,7 @@ async function main(): Promise<void> {
     if([...commands.values()].some(command=>!['restoreDataBackup','load','cancelDataBackup'].includes(command)))throw new Error('其他操作正在进行，请等待完成后重新恢复')
     const local=localAccess.view(),copy=instances.copyView(),sync=sessionSync.view(),transfer=sessionTransfers.view(),trash=sessionTrash.state()
     if(gateway.current().running||local.running||local.starting||local.singleStarting||instances.views().some(value=>instances.inUse(value.id))||copy&&['scanning','copying'].includes(copy.status)||wakeups.running())throw new Error('请先停止本地 API 和所有实例，并处理实例复制或待恢复事项')
-    if(providerUsageQueries.snapshot().running||quotas.current().running||providerProbes.snapshot().running||tempLogin.current().running||['starting','waiting','exchanging'].includes(login.current().status)||store.read().accounts.some(a=>tokens.busy(a.id)||agents.busy(a.id)||clientAuthority.busy(a.id)||accountProxies.busy(a.id)))throw new Error('请先完成或取消登录、用量查询与凭据刷新')
+    if(providerUsageQueries.snapshot().running||quotas.busy()||providerProbes.snapshot().running||tempLogin.current().running||['starting','waiting','exchanging'].includes(login.current().status)||store.read().accounts.some(a=>tokens.busy(a.id)||agents.busy(a.id)||clientAuthority.busy(a.id)||accountProxies.busy(a.id)))throw new Error('请先完成或取消登录、用量查询与凭据刷新')
     if(proxySubscriptions.list().some(job=>job.phase==='fetching'))throw new Error('请等待现有网络配置更新结束')
     if(sessionTransfers.active()||sessionTrash.active()||['preparing','running'].includes(sync.sync?.status??'')||['preparing','running'].includes(sessionArchives.view()?.status??'')||sync.recoveries.length||transfer.recoveries.length||trash.recoveries.length)throw new Error('请先完成会话操作并处理待恢复事项')
   })

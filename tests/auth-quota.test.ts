@@ -187,19 +187,21 @@ test('quota parser keeps absent/unknown windows unknown and supports review/addi
 test('quota 401 refreshes once, sends account identity, persists real usage, and retains prior data on errors', async t => {
   const store = vault(t)
   const account = saveOAuthAccount(store, tokens())
-  let rotations = 0, requests = 0
+  let rotations = 0, requests = 0, rotatedAccess = ''
   const authority = new TokenAuthority(store, async () => {
     rotations++
-    return { access_token: tokens('quota').accessToken, id_token: tokens().idToken, refresh_token: 'quota-next' }
+    rotatedAccess = tokens('quota').accessToken!
+    return { access_token: rotatedAccess, id_token: tokens().idToken, refresh_token: 'quota-next' }
   })
   let fail = false,projected=0,projectionFails=false
-  const service = new QuotaService(store, authority, async (_url, init) => {
+  const service = new QuotaService(store, authority, async (url, init) => {
+    if (!url.endsWith('/usage')) throw new HTTPError(403, '查询订阅')
     const headers = init?.headers as Record<string, string>
     assert.equal(headers['ChatGPT-Account-Id'], 'account-one')
     requests++
     if (fail) throw new HTTPError(429, '查询用量')
     if (requests === 1) throw new HTTPError(401, '查询用量')
-    assert.equal(headers.Authorization, `Bearer ${tokens('quota').accessToken}`)
+    assert.equal(headers.Authorization, `Bearer ${rotatedAccess}`)
     return { plan_type: 'team', rate_limit: { primary_window: { used_percent: 42, reset_after_seconds: 90 } } }
   },undefined,current=>{
     projected++

@@ -12,21 +12,21 @@ A lightweight Agent workspace organized around instances, with shared accounts, 
 
 ## Screenshots
 
-Actual application screens with demo accounts, providers and usage data.
-
-![Agent Manager Lite workspace overview](assets/screenshots/overview.png)
-
-<details>
-<summary>View account management</summary>
+These screenshots capture the running v0.1.0 application content at its default window size and system theme. Accounts, providers and usage use demo data.
 
 ![Agent Manager Lite account management](assets/screenshots/accounts.png)
+
+<details>
+<summary>View workspace overview</summary>
+
+![Agent Manager Lite workspace overview](assets/screenshots/overview.png)
 
 </details>
 
 ## Features
 
 - **Independent instances**: manage Codex desktop and CLI instances, choose an account, connection mode and project, then preview, launch, stop or archive.
-- **Accounts**: sign in to ChatGPT using a browser or device code, import accounts, and manage tags, groups, usage windows and the account recycle bin.
+- **Accounts**: sign in to ChatGPT using a browser or device code, import accounts, and manage tags, groups, usage windows, subscription expiry and the account recycle bin. Expiry dates depend on the upstream response.
 - **Providers and keys**: manage multiple API providers and keys, discover models through their APIs, and run cancellable connection and conversation tests.
 - **Models and configuration**: choose a model, reasoning effort and preset or custom context window; preview configuration changes and restore them.
 - **Standard / Fast**: choose a speed in the existing menu of supported Codex desktop instances. The local API supports service tier settings and outbound tier records. Availability depends on the client version, model and provider.

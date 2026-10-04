@@ -91,7 +91,7 @@ export interface LoginStatus {
   id?: string; method?: 'browser' | 'device'; status: 'idle' | 'starting' | 'waiting' | 'exchanging' | 'success' | 'error' | 'cancelled'
   userCode?: string; verificationUrl?: string; expiresAt?: number; error?: string; accountId?: string
 }
-export interface RefreshStatus { running: boolean; total: number; completed: number; failed: number; cancelled: boolean }
+export interface RefreshStatus { running: boolean; total: number; completed: number; failed: number; cancelled: boolean; subscriptionPending?: number }
 export interface Account {
   egressProxy?:AccountProxyView
   id: string; name: string; email?: string; kind: 'oauth' | 'api_key' | 'agent_identity'; plan?: string

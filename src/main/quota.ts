@@ -15,6 +15,10 @@ const SUBSCRIPTIONS_URL = 'https://chatgpt.com/backend-api/subscriptions'
 const RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 const RESET_CREDITS_CONSUME_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume'
 const SUBSCRIPTION_RETRY_MS = 30 * 60_000
+const SUBSCRIPTION_CACHE_MS = 24 * 60 * 60_000
+// Cockpit's pinned subscription endpoints use the ChatGPT web contract, not
+// the Codex usage contract. In particular they omit ChatGPT-Account-Id.
+const CHATGPT_WEB_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
 function number(value: unknown): number | undefined { return typeof value === 'number' && Number.isFinite(value) ? value : undefined }
 function boolean(value: unknown): boolean | undefined { return typeof value === 'boolean' ? value : undefined }
 // Cockpit codex_local_access_quota_cooldown.rs: credits/spend_control can
@@ -121,10 +125,15 @@ function subscriptionRecordParts(value: unknown): Array<{ key?: string; record: 
 export function parseSubscriptionSnapshot(value: Record<string, unknown>, preferredAccountId?: string): SubscriptionSnapshot {
   const records = subscriptionRecordParts(value)
   const preferred = preferredAccountId?.trim() || undefined
-  const selected = records.find(({ key, record }) => {
-    const nested = object(record.account), candidate = nonempty(nested.account_id) ?? nonempty(nested.id) ?? nonempty(record.account_id) ?? nonempty(record.id)
-    return candidate === preferred || key === preferred
-  }) ?? records.find(({ record }) => object(record.account).is_default === true || record.is_default === true)
+  const recordAccountId = (record: Record<string, unknown>) => {
+    const nested = object(record.account)
+    return nonempty(nested.account_id) ?? nonempty(nested.id) ?? nonempty(nested.chatgpt_account_id) ?? nonempty(nested.workspace_id)
+      ?? nonempty(record.account_id) ?? nonempty(record.id) ?? nonempty(record.chatgpt_account_id) ?? nonempty(record.workspace_id)
+  }
+  const matched = preferred ? records.find(({ key, record }) => recordAccountId(record) === preferred || key === preferred) : undefined
+  // Subscription discovery is a read operation, never a workspace switch.
+  if (preferred && records.length && !matched) return { accountId: preferred }
+  const selected = matched ?? records.find(({ record }) => object(record.account).is_default === true || record.is_default === true)
     ?? records.find(({ record }) => {
       const nested = object(record.account), plan = nonempty(object(record.entitlement).subscription_plan) ?? nonempty(nested.plan_type) ?? nonempty(record.plan_type)
       return !!plan && !plan.toLowerCase().includes('free')
@@ -132,11 +141,12 @@ export function parseSubscriptionSnapshot(value: Record<string, unknown>, prefer
   if (selected) {
     const nested = object(selected.record.account), entitlement = object(selected.record.entitlement)
     return {
-      accountId: nonempty(nested.account_id) ?? nonempty(nested.id) ?? nonempty(selected.record.account_id) ?? nonempty(selected.record.id) ?? selected.key,
+      accountId: recordAccountId(selected.record) ?? selected.key,
       plan: nonempty(entitlement.subscription_plan) ?? nonempty(nested.plan_type) ?? nonempty(nested.planType) ?? nonempty(selected.record.plan_type) ?? nonempty(selected.record.planType),
       activeUntil: parseSubscriptionTimestamp(entitlement.expires_at ?? nested.expires_at ?? selected.record.expires_at ?? selected.record.active_until)
     }
   }
+  if (preferred && nonempty(value.account_id) && nonempty(value.account_id) !== preferred) return { accountId: preferred }
   return {
     accountId: nonempty(value.account_id) ?? preferred,
     plan: nonempty(value.subscription_plan) ?? nonempty(value.plan_type),
@@ -159,17 +169,31 @@ function subscriptionMissingOrExpired(value: number | undefined, now = Date.now(
   return value === undefined || value <= now
 }
 
+function subscriptionWebHeaders(account: StoredAccount, targetPath: string): Record<string, string> {
+  const headers = subscriptionHeaders(account, targetPath)
+  headers['User-Agent'] = CHATGPT_WEB_USER_AGENT
+  delete headers['ChatGPT-Account-Id']
+  return headers
+}
+
+interface SubscriptionJob { account: StoredAccount; controller: AbortController; task: Promise<void> }
+
 export class QuotaService {
   private status: RefreshStatus = { running: false, total: 0, completed: 0, failed: 0, cancelled: false }
   private controller?: AbortController
   private job?: Promise<void>
   private timer?: NodeJS.Timeout
   private readonly scheduled = new Map<string, { minutes: number; due: number }>()
+  private readonly subscriptionJobs = new Map<string, SubscriptionJob>()
+  private subscriptionTail: Promise<void> = Promise.resolve()
+  private stopping = false
   constructor(private readonly store: Store, private readonly tokens: TokenAuthority, private readonly request: JSONRequest = requestJSON,
     private readonly agents?: AgentIdentityService,private readonly onUpdated:(account:StoredAccount)=>void=()=>{},private readonly suspended:()=>boolean=()=>false) {}
-  current(): RefreshStatus { return { ...this.status } }
+  current(): RefreshStatus { return { ...this.status, ...(this.subscriptionJobs.size ? { subscriptionPending: this.subscriptionJobs.size } : {}) } }
+  busy(id?: string): boolean { return this.status.running || (id ? this.subscriptionJobs.has(id) : this.subscriptionJobs.size > 0) }
   schedule(): void {
     clearTimeout(this.timer)
+    if (this.stopping) return
     const state = this.store.read(), now = Date.now()
     const alive = new Set<string>()
     // API keys enter automatic refresh only after an explicit successful query.
@@ -194,6 +218,7 @@ export class QuotaService {
   }
   startAll(): void { this.start(bulkRefreshIds(this.store.read())) }
   start(ids: string[]): void {
+    if (this.stopping) throw new Error('应用正在退出')
     if (this.status.running) throw new Error('用量刷新正在进行')
     const wanted = new Set(ids)
     const accounts = this.store.read().accounts.filter(a => wanted.has(a.id))
@@ -249,6 +274,7 @@ export class QuotaService {
   }
   /** Refresh the ChatGPT subscription/entitlement snapshot without changing quota windows. */
   async refreshSubscriptionInfo(id: string): Promise<void> {
+    if (this.stopping) throw new Error('应用正在退出')
     if (this.status.running) throw new Error('已有用量或订阅刷新正在进行')
     const account = this.store.read().accounts.find(value => value.id === id)
     if (!account) throw new Error('账号不存在，请重新加载')
@@ -258,16 +284,21 @@ export class QuotaService {
     const signal = this.controller.signal
     this.status = { running: true, total: 1, completed: 0, failed: 0, cancelled: false }
     this.job = (async () => {
+      let enqueued = false
       try {
         const current = await this.tokens.ensure(id)
-        if (current.kind === 'api_key' || current.kind === 'agent_identity') throw new Error('该账号类型不支持刷新订阅信息')
-        const result = await this.querySubscription(current, signal)
         signal.throwIfAborted()
-        this.saveSubscription(current, result)
+        if (current.generation !== account.generation) return
+        if (current.kind === 'api_key' || current.kind === 'agent_identity') throw new Error('该账号类型不支持刷新订阅信息')
+        const job = this.enqueueSubscription(current, true)
+        if (!job) throw new Error('订阅查询已暂停，请稍后重试')
+        enqueued = true
+        await job
+        signal.throwIfAborted()
       } catch (error) {
         if (!signal.aborted) {
           this.status.failed++
-          this.saveSubscriptionError(account, error instanceof Error ? error.message : '订阅信息查询失败')
+          if (!enqueued) this.saveSubscriptionError(account, error instanceof Error ? error.message : '订阅信息查询失败')
           throw error
         }
       } finally {
@@ -330,35 +361,77 @@ export class QuotaService {
       this.save(result.account, result.value)
       return
     }
-    for (let attempt = 0; attempt < 2; attempt++) {
-      signal.throwIfAborted()
-      const headers: Record<string, string> = { Accept: 'application/json', Authorization: `Bearer ${account.credentials.accessToken}` }
-      if (account.credentials.accountId) headers['ChatGPT-Account-Id'] = account.credentials.accountId
-      try {
-        const value = await this.request(USAGE_URL, { headers, signal }, '查询用量',account)
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
         signal.throwIfAborted()
-        this.save(account, value)
-        return
-      } catch (error) {
-        if (error instanceof HTTPError && error.status === 401 && attempt === 0 && !signal.aborted) {
-          const current=this.store.read().accounts.find(value=>value.id===account.id)
-          if(!current||current.generation!==account.generation)return
-          account = await this.tokens.ensure(id, { force: true, rejectedToken: account.credentials.accessToken })
-        } else throw error
+        const headers: Record<string, string> = { Accept: 'application/json', Authorization: `Bearer ${account.credentials.accessToken}` }
+        if (account.credentials.accountId) headers['ChatGPT-Account-Id'] = account.credentials.accountId
+        try {
+          const value = await this.request(USAGE_URL, { headers, signal }, '查询用量',account)
+          signal.throwIfAborted()
+          this.save(account, value)
+          return
+        } catch (error) {
+          if (error instanceof HTTPError && error.status === 401 && attempt === 0 && !signal.aborted) {
+            const current=this.store.read().accounts.find(value=>value.id===account.id)
+            if(!current||current.generation!==account.generation)return
+            account = await this.tokens.ensure(id, { force: true, rejectedToken: account.credentials.accessToken })
+          } else throw error
+        }
       }
+    } finally {
+      // Query even after a usage failure, but never delay or downgrade the
+      // independent quota result. Cancellation does not launch new requests.
+      if (!signal.aborted) void this.enqueueSubscription(account)?.catch(() => {})
     }
+  }
+  private enqueueSubscription(account: StoredAccount, force = false): Promise<void> | undefined {
+    if (this.stopping || account.kind !== 'oauth' || this.suspended()) return
+    const pending = this.subscriptionJobs.get(account.id)
+    if (pending && pending.account.generation === account.generation) return pending.task
+    pending?.controller.abort()
+    const now = Date.now()
+    const fresh = (account.subscriptionQueryLastSuccessAt ?? 0) + SUBSCRIPTION_CACHE_MS > now
+    if (!force && ((account.subscriptionQueryNextRetryAt ?? 0) > now
+      || fresh && (account.subscriptionActiveUntil === undefined || !subscriptionMissingOrExpired(account.subscriptionActiveUntil, now)))) return
+    const controller = new AbortController()
+    let current = account
+    const job: SubscriptionJob = { account, controller, task: Promise.resolve() }
+    job.task = this.subscriptionTail.then(async () => {
+      controller.signal.throwIfAborted()
+      const saved = this.store.read().accounts.find(value => value.id === account.id)
+      if (!saved || saved.kind !== 'oauth' || saved.generation !== account.generation || this.suspended()) return
+      current = await this.tokens.ensure(account.id)
+      controller.signal.throwIfAborted()
+      if (current.kind !== 'oauth' || current.generation !== account.generation) return
+      const result = await this.querySubscription(current, controller.signal)
+      controller.signal.throwIfAborted()
+      this.saveSubscription(current, result)
+    }).catch(error => {
+      if (!controller.signal.aborted) this.saveSubscriptionError(current, error instanceof Error ? error.message : '订阅信息查询失败')
+      throw error
+    }).finally(() => { if (this.subscriptionJobs.get(account.id) === job) this.subscriptionJobs.delete(account.id) })
+    this.subscriptionJobs.set(account.id, job)
+    // Only one subscription request chain runs at once, including across quota
+    // batches and manual refreshes. A failed job cannot poison the next one.
+    this.subscriptionTail = job.task.catch(() => {})
+    return job.task
   }
   private async querySubscription(account: StoredAccount, signal: AbortSignal): Promise<SubscriptionSnapshot> {
     const claimAccountId = (token?: string) => nonempty(object(tokenClaims(token)['https://api.openai.com/auth']).chatgpt_account_id)
     const preferred = account.credentials.accountId ?? claimAccountId(account.credentials.idToken) ?? claimAccountId(account.credentials.accessToken)
     const checkPath = '/backend-api/accounts/check/v4-2023-04-27'
-    const checked = await this.request(ACCOUNT_CHECK_URL, { headers: subscriptionHeaders(account, checkPath), signal }, '查询订阅账号信息', account)
+    const checkURL = `${ACCOUNT_CHECK_URL}?timezone_offset_min=${new Date().getTimezoneOffset()}`
+    const checked = await this.request(checkURL, { headers: subscriptionWebHeaders(account, checkPath), signal }, '查询订阅账号信息', account)
+    signal.throwIfAborted()
     let snapshot = parseSubscriptionSnapshot(checked, preferred)
+    if (preferred && snapshot.accountId && snapshot.accountId !== preferred) throw new Error('订阅接口返回的账号身份不匹配')
     if (subscriptionMissingOrExpired(snapshot.activeUntil) || !snapshot.plan) {
       const accountId = snapshot.accountId ?? preferred
       if (!accountId) throw new Error('订阅接口未返回账号标识，无法继续查询')
       const url = `${SUBSCRIPTIONS_URL}?account_id=${encodeURIComponent(accountId)}`
-      const subscription = await this.request(url, { headers: subscriptionHeaders(account, '/backend-api/subscriptions'), signal }, '查询订阅信息', account)
+      const subscription = await this.request(url, { headers: subscriptionWebHeaders(account, '/backend-api/subscriptions'), signal }, '查询订阅信息', account)
+      signal.throwIfAborted()
       const next = parseSubscriptionSnapshot(subscription, accountId)
       snapshot = { accountId, plan: next.plan ?? snapshot.plan, activeUntil: next.activeUntil ?? snapshot.activeUntil }
     }
@@ -374,7 +447,6 @@ export class QuotaService {
     this.store.transaction(state => {
       const current = state.accounts.find(value => value.id === account.id)
       if (!current || current.kind !== account.kind || current.generation !== account.generation || current.credentials.accessToken !== account.credentials.accessToken) return
-      if (result.accountId) current.credentials.accountId = result.accountId
       if (result.plan) current.plan = result.plan
       if (result.activeUntil !== undefined) current.subscriptionActiveUntil = result.activeUntil
       current.subscriptionQueryLastAttemptAt = Date.now()
@@ -388,7 +460,7 @@ export class QuotaService {
   private saveSubscriptionError(account: StoredAccount, message: string): void {
     this.store.transaction(state => {
       const current = state.accounts.find(value => value.id === account.id)
-      if (!current || current.kind !== account.kind || current.generation !== account.generation) return
+      if (!current || current.kind !== account.kind || current.generation !== account.generation || current.credentials.accessToken !== account.credentials.accessToken) return
       current.subscriptionQueryLastAttemptAt = Date.now()
       current.subscriptionQueryNextRetryAt = Date.now() + SUBSCRIPTION_RETRY_MS
       current.subscriptionQueryLastError = message.slice(0, 16_384)
@@ -419,7 +491,12 @@ export class QuotaService {
     })
     if(updated)this.onUpdated(updated)
   }
-  cancel(): void { if (this.controller) { this.status.cancelled = true; this.controller.abort() } }
+  cancel(): void {
+    if (this.controller || this.subscriptionJobs.size) this.status.cancelled = true
+    this.controller?.abort()
+    for (const job of this.subscriptionJobs.values()) job.controller.abort()
+  }
   async settled(): Promise<void> { await this.job }
-  async stop(): Promise<void> { clearTimeout(this.timer); this.cancel(); await this.settled(); clearTimeout(this.timer) }
+  async subscriptionsSettled(): Promise<void> { await this.subscriptionTail }
+  async stop(): Promise<void> { this.stopping = true; clearTimeout(this.timer); this.cancel(); await Promise.allSettled([this.settled(), this.subscriptionsSettled()]); clearTimeout(this.timer) }
 }

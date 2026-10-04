@@ -12,21 +12,21 @@
 
 ## 软件界面
 
-以下为实际应用界面，账号、供应商与用量均使用演示数据。
-
-![Agent Manager Lite 工作空间概览](assets/screenshots/overview.png)
-
-<details>
-<summary>查看账号管理界面</summary>
+以下截图来自 v0.1.0 实际运行的应用内容区，使用默认窗口尺寸和系统主题。账号、供应商与用量均为演示数据。
 
 ![Agent Manager Lite 账号管理](assets/screenshots/accounts.png)
+
+<details>
+<summary>查看工作空间概览</summary>
+
+![Agent Manager Lite 工作空间概览](assets/screenshots/overview.png)
 
 </details>
 
 ## 功能
 
 - **独立实例**：管理 Codex 桌面和 CLI 实例，选择账号、接入方式及项目，预览配置后启动、停止或归档。
-- **账号管理**：ChatGPT 浏览器或设备码登录，导入账号，管理标签、分组、用量窗口和账号回收站。
+- **账号管理**：ChatGPT 浏览器或设备码登录，导入账号，管理标签、分组、用量窗口、订阅到期信息和账号回收站。到期日以上游实际返回为准。
 - **供应商与密钥**：管理多个 API 供应商及密钥，从 API 读取模型列表，执行可取消的连接和对话测试。
 - **模型与配置**：选择模型、推理档位、上下文窗口预设或自定义值，预览配置差异并支持恢复。
 - **普通 / Fast**：受支持的 Codex 桌面实例可在原有速度菜单中选择；本地 API 支持服务等级配置和实际出站等级记录。可用性取决于客户端版本、模型和服务商。

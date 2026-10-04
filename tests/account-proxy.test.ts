@@ -60,18 +60,18 @@ test('proxy validation, account scope, secret-free snapshots, rollback and recyc
 test('source-built helper routes token rotation and usage through the authenticated proxy with no target credential leakage',async t=>{
  const f=fixture(t),requests:{url:string;auth:string|undefined;proxy:string|undefined}[]=[],proxies:string[]=[]
  const jwt=(suffix:string)=>'fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+7200,suffix,email:'proxy@example.invalid','https://api.openai.com/auth':{chatgpt_account_id:'fixture-workspace'}})).toString('base64url')+'.signature'
- const target=await listen(t,createServer(async(req,res)=>{for await(const _ of req){};requests.push({url:req.url!,auth:req.headers.authorization,proxy:req.headers['proxy-authorization'] as string|undefined});res.setHeader('Content-Type','application/json');res.end(JSON.stringify(req.url==='/token'?{access_token:jwt('new'),id_token:jwt('id'),refresh_token:'rotated-fixture'}:{plan_type:'plus',rate_limit:{primary_window:{used_percent:20,limit_window_seconds:18000}}}))}))
+ const target=await listen(t,createServer(async(req,res)=>{for await(const _ of req){};requests.push({url:req.url!,auth:req.headers.authorization,proxy:req.headers['proxy-authorization'] as string|undefined});res.setHeader('Content-Type','application/json');res.end(JSON.stringify(req.url==='/token'?{access_token:jwt('new'),id_token:jwt('id'),refresh_token:'rotated-fixture'}:req.url==='/subscription'?{accounts:[{account:{id:'fixture-workspace'},entitlement:{subscription_plan:'plus',expires_at:Date.now()+30*86400000}}]}:{plan_type:'plus',rate_limit:{primary_window:{used_percent:20,limit_window_seconds:18000}}}))}))
  const proxy=await listen(t,createServer(async(req,res)=>{
   proxies.push(req.url!);assert.equal(req.headers['proxy-authorization'],'Basic '+Buffer.from('fixture:proxy-secret').toString('base64'))
   const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk))
   const response=await fetch(req.url!,{method:req.method,headers:{Authorization:req.headers.authorization??'','Content-Type':'application/json'},...(chunks.length?{body:Buffer.concat(chunks)}:{})});res.writeHead(response.status);res.end(await response.text())
  }))
  f.store.transaction(state=>{const account=state.accounts[0];account.credentials.refreshToken='refresh-fixture';account.credentials.accountId='fixture-workspace';account.proxy={mode:'custom',url:proxy.replace('://','://fixture:proxy-secret@')}})
- const request:JSONRequest=(url,init,operation,account)=>f.network.request(target+(url.includes('/oauth/token')?'/token':'/usage'),init,operation,account)
+ const request:JSONRequest=(url,init,operation,account)=>f.network.request(target+(url.includes('/oauth/token')?'/token':url.includes('/accounts/check/')?'/subscription':'/usage'),init,operation,account)
  const tokens=new TokenAuthority(f.store,request),quota=new QuotaService(f.store,tokens,request)
  t.after(async()=>{await quota.stop();await tokens.stop()})
- quota.start([f.account.id]);await until(()=>!quota.current().running)
- assert.equal(quota.current().failed,0);assert.equal(proxies.length,2);assert.deepEqual(requests.map(value=>value.url),['/token','/usage']);assert.equal(requests[1].auth,'Bearer '+f.store.read().accounts[0].credentials.accessToken);assert.ok(requests.every(value=>value.proxy===undefined))
+ quota.start([f.account.id]);await quota.settled();await quota.subscriptionsSettled()
+ assert.equal(quota.current().failed,0);assert.equal(proxies.length,3);assert.deepEqual(requests.map(value=>value.url),['/token','/usage','/subscription']);assert.equal(requests[1].auth,'Bearer '+f.store.read().accounts[0].credentials.accessToken);assert.ok(requests.every(value=>value.proxy===undefined));assert.ok(f.store.snapshot().accounts[0].subscriptionActiveUntil)
  assert.equal(f.store.read().accounts[0].credentials.refreshToken,'rotated-fixture');assert.equal(f.store.read().accounts[0].quota?.windows[0].usedPercent,20)
  const before=proxies.length;await f.network.request(target+'/usage',{},'fixture',{...f.store.read().accounts[0],kind:'api_key'});assert.equal(proxies.length,before+1,'an API account with an explicit proxy retains its selected exit')
 })

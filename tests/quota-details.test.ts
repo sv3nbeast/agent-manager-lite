@@ -8,6 +8,7 @@ import { Store } from '../src/main/store'
 import { saveOAuthAccount } from '../src/main/accounts'
 import { TokenAuthority } from '../src/main/tokens'
 import { HTTPError } from '../src/main/network'
+import type { StoredAccount } from '../src/main/store'
 
 const now = 1_790_000_000_000
 test('subscription snapshots select the matching entitlement and normalize expiry timestamps', () => {
@@ -19,6 +20,8 @@ test('subscription snapshots select the matching entitlement and normalize expir
     { account: { id: 'wanted' }, entitlement: { subscription_plan: 'Plus', expires_at: '2026-10-03T00:00:00Z' } }
   ] }, 'wanted'), { accountId: 'wanted', plan: 'Plus', activeUntil: Date.parse('2026-10-03T00:00:00Z') })
   assert.deepEqual(parseSubscriptionSnapshot({ account_id: 'acct', subscription_plan: 'Pro', active_until: 1791000000 }), { accountId: 'acct', plan: 'Pro', activeUntil: 1791000000000 })
+  assert.deepEqual(parseSubscriptionSnapshot({ accounts: [{ account: { id: 'other', is_default: true }, entitlement: { subscription_plan: 'Pro', expires_at: 1791000000 } }] }, 'wanted'), { accountId: 'wanted' })
+  assert.deepEqual(parseSubscriptionSnapshot({ account_id: 'other', subscription_plan: 'Pro', active_until: 1791000000 }, 'wanted'), { accountId: 'wanted' })
 })
 
 test('reset credit snapshots filter status and retain the next expiry', () => {
@@ -47,16 +50,217 @@ test('manual subscription refresh queries account entitlement, persists expiry a
     urls.push(url)
     assert.equal((init?.headers as Record<string, string>).Authorization, `Bearer ${jwt}`)
     assert.equal((init?.headers as Record<string, string>)['x-openai-target-path'], '/backend-api/accounts/check/v4-2023-04-27')
+    assert.match((init?.headers as Record<string, string>)['User-Agent'], /^Mozilla\/5\.0 .*Chrome\//)
+    assert.equal((init?.headers as Record<string, string>)['ChatGPT-Account-Id'], undefined)
     return { accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'Plus', expires_at: new Date(activeUntil).toISOString() } }] }
   })
   t.after(async () => { await service.stop() })
   await service.refreshSubscriptionInfo(account.id)
   const saved = store.snapshot().accounts[0]
-  assert.deepEqual(urls, ['https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27'])
+  assert.deepEqual(urls, [`https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=${new Date().getTimezoneOffset()}`])
   assert.equal(saved.plan, 'Plus')
   assert.equal(saved.subscriptionActiveUntil, activeUntil)
   assert.equal(saved.quota?.credits?.remaining, 5)
   assert.equal(saved.subscriptionQueryLastError, undefined)
+})
+
+function subscriptionFixture(t: { after: (cleanup: () => void | Promise<void>) => void }) {
+  const directory = mkdtempSync(join(tmpdir(), 'cml-subscription-refresh-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const store = new Store(directory, { encrypt: value => Buffer.from(value), decrypt: value => value.toString() })
+  const jwt = `fixture.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 7200 })).toString('base64url')}.signature`
+  const account = saveOAuthAccount(store, { accessToken: jwt, idToken: jwt, accountId: 'fixture-account' })
+  store.transaction(state => { state.settings.refreshMinutes = 0 })
+  const tokens = new TokenAuthority(store)
+  t.after(() => tokens.stop())
+  return { store, account, tokens }
+}
+
+test('ordinary quota refresh retrieves the real subscription using both web endpoints and caches it', async t => {
+  const f = subscriptionFixture(t), expiry = Date.now() + 30 * 86_400_000
+  const paths: string[] = []
+  const service = new QuotaService(f.store, f.tokens, async (url, init, _operation, account) => {
+    const target = new URL(url); paths.push(target.pathname)
+    assert.equal(account?.id, f.account.id, 'subscription follows the account-selected network path')
+    if (target.pathname.endsWith('/usage')) return { plan_type: 'plus', rate_limit: { primary_window: { used_percent: 8 } } }
+    const headers = init?.headers as Record<string, string>
+    assert.equal(headers['ChatGPT-Account-Id'], undefined)
+    assert.match(headers['User-Agent'], /^Mozilla\/5\.0 .*Chrome\//)
+    assert.equal(headers['x-openai-target-path'], target.pathname)
+    if (target.pathname.endsWith('/v4-2023-04-27')) {
+      assert.equal(target.searchParams.get('timezone_offset_min'), String(new Date().getTimezoneOffset()))
+      return { accounts: { 'fixture-account': { account: { id: 'fixture-account', plan_type: 'plus' } } } }
+    }
+    assert.equal(target.pathname, '/backend-api/subscriptions')
+    assert.equal(target.searchParams.get('account_id'), 'fixture-account')
+    return { account_id: 'fixture-account', plan_type: 'plus', active_until: new Date(expiry).toISOString() }
+  })
+  t.after(() => service.stop())
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil, expiry)
+  assert.equal(f.store.snapshot().accounts[0].quota?.windows[0].usedPercent, 8)
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  assert.deepEqual(paths, ['/backend-api/wham/usage', '/backend-api/accounts/check/v4-2023-04-27', '/backend-api/subscriptions', '/backend-api/wham/usage'])
+})
+
+test('slow subscription lookup does not hold quota completion and manual refresh reuses its in-flight request', async t => {
+  const f = subscriptionFixture(t), expiry = Date.now() + 30 * 86_400_000
+  let complete!: (value: Record<string, unknown>) => void, calls = 0
+  const service = new QuotaService(f.store, f.tokens, async url => {
+    if (url.endsWith('/usage')) return { rate_limit: { primary_window: { used_percent: 9 } } }
+    calls++
+    return new Promise(resolve => { complete = resolve })
+  })
+  t.after(() => service.stop())
+  service.start([f.account.id]); await service.settled()
+  while (!complete) await new Promise(resolve => setImmediate(resolve))
+  assert.equal(service.current().running, false)
+  assert.equal(service.busy(), true)
+  assert.equal(f.store.snapshot().accounts[0].quota?.windows[0].usedPercent, 9)
+  const manual = service.refreshSubscriptionInfo(f.account.id)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(calls, 1)
+  complete({ accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'Plus', expires_at: expiry } }] })
+  await manual; await service.subscriptionsSettled()
+  assert.equal(service.busy(), false)
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil, expiry)
+})
+
+test('subscription failures stay independent of successful quota, retain expiry and respect retry cooldown', async t => {
+  const f = subscriptionFixture(t), expiry = Date.now() + 30 * 86_400_000
+  f.store.transaction(state => { state.accounts[0].subscriptionActiveUntil = expiry })
+  let calls = 0, fail = true
+  const service = new QuotaService(f.store, f.tokens, async url => {
+    if (url.endsWith('/usage')) return { rate_limit: { primary_window: { used_percent: 10 } } }
+    calls++
+    if (fail) throw new HTTPError(403, '查询订阅账号信息')
+    return { accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'Plus', expires_at: expiry } }] }
+  })
+  t.after(() => service.stop())
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  const saved = f.store.snapshot().accounts[0]
+  assert.equal(service.current().failed, 0)
+  assert.equal(saved.error, undefined)
+  assert.match(saved.subscriptionQueryLastError!, /403/)
+  assert.equal(saved.subscriptionActiveUntil, expiry)
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  assert.equal(calls, 1)
+  fail = false
+  f.store.transaction(state => { state.accounts[0].subscriptionQueryNextRetryAt = Date.now() - 1 })
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  assert.equal(calls, 2)
+  assert.equal(f.store.snapshot().accounts[0].subscriptionQueryLastError, undefined)
+})
+
+test('usage rejection does not prevent an independent subscription lookup or erase its usage error', async t => {
+  const f = subscriptionFixture(t), expiry = Date.now() + 30 * 86_400_000
+  const service = new QuotaService(f.store, f.tokens, async url => {
+    if (url.endsWith('/usage')) throw new HTTPError(429, '查询用量')
+    return { accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'Plus', expires_at: expiry } }] }
+  })
+  t.after(() => service.stop())
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  assert.equal(service.current().failed, 1)
+  assert.match(f.store.snapshot().accounts[0].error!, /429/)
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil, expiry)
+})
+
+test('subscription queue is serial, cancellable after quota completion and ignores deleted or replaced accounts', async t => {
+  const f = subscriptionFixture(t)
+  const jwt = f.account.credentials.accessToken!
+  const second = saveOAuthAccount(f.store, { accessToken: `${jwt}-second`, idToken: `${jwt}-second`, accountId: 'second-account' })
+  assert.notEqual(second.id, f.account.id)
+  let calls = 0, started!: () => void
+  const waiting = new Promise<void>(resolve => { started = resolve })
+  const service = new QuotaService(f.store, f.tokens, async (url, init) => {
+    if (url.endsWith('/usage')) return { rate_limit: {} }
+    calls++; started()
+    return new Promise((_resolve, reject) => {
+      init!.signal!.addEventListener('abort', () => reject(new Error('fixture cancelled')), { once: true })
+    })
+  })
+  t.after(() => service.stop())
+  service.start([f.account.id, second.id]); await service.settled(); await waiting
+  assert.equal(calls, 1)
+  assert.equal(service.busy(), true)
+  service.cancel(); await service.subscriptionsSettled()
+  assert.equal(calls, 1)
+  assert.equal(service.busy(), false)
+  assert.equal(f.store.snapshot().accounts.some(account => account.subscriptionQueryLastError || account.subscriptionActiveUntil), false)
+
+  let complete!: (value: Record<string, unknown>) => void
+  const replacement = new QuotaService(f.store, f.tokens, async url => {
+    if (url.endsWith('/usage')) return { rate_limit: {} }
+    return new Promise(resolve => { complete = resolve })
+  })
+  t.after(() => replacement.stop())
+  replacement.start([f.account.id]); await replacement.settled()
+  while (!complete) await new Promise(resolve => setImmediate(resolve))
+  f.store.transaction(state => { state.accounts[0].generation = 'replacement' })
+  complete({ accounts: [{ account: { id: 'fixture-account' }, entitlement: { subscription_plan: 'Plus', expires_at: Date.now() + 86_400_000 } }] })
+  await replacement.subscriptionsSettled()
+  assert.equal(f.store.snapshot().accounts[0].subscriptionActiveUntil, undefined)
+})
+
+test('subscription discovery never changes the bound workspace or uses another account expiry', async t => {
+  const f = subscriptionFixture(t)
+  const service = new QuotaService(f.store, f.tokens, async url => {
+    if (url.endsWith('/usage')) return { rate_limit: {} }
+    if (url.includes('/accounts/check/')) return { accounts: [{ account: { id: 'other', is_default: true }, entitlement: { subscription_plan: 'Pro', expires_at: Date.now() + 86_400_000 } }] }
+    assert.equal(new URL(url).searchParams.get('account_id'), 'fixture-account')
+    return { account_id: 'other', subscription_plan: 'Pro', active_until: Date.now() + 86_400_000 }
+  })
+  t.after(() => service.stop())
+  service.start([f.account.id]); await service.settled(); await service.subscriptionsSettled()
+  const account = f.store.read().accounts[0]
+  assert.equal(account.credentials.accountId, 'fixture-account')
+  assert.equal(account.subscriptionActiveUntil, undefined)
+  assert.notEqual(account.plan, 'Pro')
+  assert.ok(account.subscriptionQueryLastError)
+})
+
+test('cancel or shutdown during a pending credential sync cannot start a new subscription request', async t => {
+  for (const stop of [false, true]) {
+    const f = subscriptionFixture(t)
+    let complete!: (account: StoredAccount) => void, requests = 0
+    f.tokens.ensure = async () => new Promise(resolve => { complete = resolve })
+    const service = new QuotaService(f.store, f.tokens, async () => { requests++; return {} })
+    t.after(() => service.stop())
+    const manual = service.refreshSubscriptionInfo(f.account.id)
+    const stopping = stop ? service.stop() : undefined
+    if (!stop) service.cancel()
+    complete(f.account)
+    await manual; await stopping; await service.subscriptionsSettled()
+    assert.equal(requests, 0)
+    assert.equal(service.busy(), false)
+    assert.equal(f.store.snapshot().accounts[0].subscriptionQueryLastError, undefined)
+    if (stop) assert.throws(() => service.start([f.account.id]), /退出/)
+  }
+})
+
+test('a manual credential-sync rejection records the independent subscription error without querying upstream', async t => {
+  const f = subscriptionFixture(t)
+  f.tokens.ensure = async () => { throw new Error('登录已过期，请重新登录') }
+  const service = new QuotaService(f.store, f.tokens, async () => assert.fail('invalid credentials must not query subscription'))
+  t.after(() => service.stop())
+  await assert.rejects(service.refreshSubscriptionInfo(f.account.id), /登录已过期/)
+  const account = f.store.snapshot().accounts[0]
+  assert.match(account.subscriptionQueryLastError!, /登录已过期/)
+  assert.ok(account.subscriptionQueryNextRetryAt! > Date.now())
+  assert.equal(account.error, undefined)
+})
+
+test('restoring the account during manual credential sync discards the old subscription operation', async t => {
+  const f = subscriptionFixture(t)
+  let complete!: (account: StoredAccount) => void
+  f.tokens.ensure = async () => new Promise(resolve => { complete = resolve })
+  const service = new QuotaService(f.store, f.tokens, async () => assert.fail('old operation must not query restored credentials'))
+  t.after(() => service.stop())
+  const manual = service.refreshSubscriptionInfo(f.account.id)
+  f.store.transaction(state => { state.accounts[0].generation = 'restored' })
+  complete(f.store.read().accounts[0])
+  await manual; await service.subscriptionsSettled()
+  assert.equal(f.store.snapshot().accounts[0].subscriptionQueryLastAttemptAt, undefined)
 })
 
 test('reset credit query and explicit consume use separate authenticated requests', async t => {

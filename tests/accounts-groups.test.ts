@@ -240,7 +240,8 @@ test('group quotas override global interval; bulk refresh skips disabled groups 
   assert.deepEqual(bulkRefreshIds(store.read()), [a.id, c.id])
   const requested: string[] = []
   const authority = new TokenAuthority(store, async () => { assert.fail('fresh fixture must not rotate') })
-  const quotas = new QuotaService(store, authority, async (_url, init) => {
+  const quotas = new QuotaService(store, authority, async (url, init) => {
+    if (!url.endsWith('/usage')) return {}
     requested.push((init?.headers as Record<string, string>)['ChatGPT-Account-Id'])
     return { rate_limit: { primary_window: { used_percent: 20 } } }
   })
