@@ -160,7 +160,7 @@ export class Instances {
       if(source.externalHome)validateExternalHome(this.root,source.externalHome)
     })
   }
-  // Only the native directory chooser calls this; renderer receives a short-lived
+  // Native choosers or validated discovery capabilities call this; the renderer receives a short-lived
   // capability, never an IPC accepting an arbitrary filesystem path.
   selectCopySource(selected:string,purpose:'copy'|'attach'='copy'):InstanceCopySource {
     this.externalCopySource=undefined

@@ -30,6 +30,8 @@ function mount() {
   const targetId = randomUUID(), jobId = randomUUID()
   const api: Record<string, (...args: any[]) => Promise<any>> = {
     listInstanceWorkingDirectories: async () => [], readModelContextDefaults: async () => [],
+    discoverExternalInstanceSources: async () => ({sources:[],issues:[]}),
+    selectExternalInstanceSource: async () => ({ticket:randomUUID(),name:'External',directory:'/fixture/external',history:structuredClone(history)}),
     previewInstanceHistory: async input => { calls.push({ method: 'history', input }); return structuredClone(history) },
     chooseInstanceCopySource: async () => ({ ticket: randomUUID(), name: 'External', directory: '/fixture/external', history: structuredClone(history) }),
     chooseExistingInstanceDirectory: async () => ({ ticket: randomUUID(), name: 'External', directory: '/fixture/external', history: structuredClone(history) }),
@@ -58,6 +60,34 @@ function mount() {
   function complete(id = jobId) { manager.data.instanceCopy = { ...manager.data.instanceCopy!, id, status: 'completed', targetId }; manager.data.instances.push({ ...source, id: targetId, revision: 0, directory: '/fixture/target' }) }
   return { state, manager, calls, api, source, sourceId, targetId, jobId, draft, selectCopy, complete, unmount: () => renderer.render(null, container) }
 }
+
+test('discovered external instances are selectable without registration and require closure before independent copying',async t=>{
+  const ui=mount();t.after(ui.unmount);ui.manager.data.instances=[];ui.draft()
+  const id=randomUUID(),ticket=randomUUID()
+  ui.api.discoverExternalInstanceSources=async()=>({sources:[{id,name:'Other workspace',directory:'/fixture/external',sourceName:'兼容工具',clientType:'codex',launchMode:'desktop',runtimeState:'running'}],issues:[]})
+  ui.api.selectExternalInstanceSource=async input=>{assert.equal(input.id,id);assert.deepEqual(Object.keys(input),['id']);return {ticket,name:'External',directory:'/fixture/external',history:structuredClone(history)}}
+  await ui.state.selectHistoryChoice('instance')
+  assert.equal(ui.manager.data.instances.length,0);assert.equal(ui.state.discoveredSources[0].runtimeState,'running')
+  assert.equal(ui.state.instanceSourceOptions[0].options[0].disabled,undefined,'Discovery remains available while the source runs')
+  await ui.state.chooseInstanceSource('external:'+id)
+  assert.equal(ui.state.externalSource.name,'Other workspace');assert.equal(ui.state.chosenHistory.sessions,5)
+  await ui.state.nextStep();assert.equal(ui.state.step,2);assert.match(ui.state.error,/关闭/);assert.equal(ui.calls.length,0)
+  ui.state.sourceClosed=true;await ui.state.nextStep();assert.equal(ui.state.step,3);await ui.state.save()
+  assert.equal(ui.calls[0].method,'external');assert.equal(ui.calls[0].input.ticket,ticket);assert.equal(ui.calls[0].input.sourceClosed,true)
+  assert.equal('directory' in ui.calls[0].input,false);assert.equal(ui.calls.some(call=>call.method==='start'),false)
+})
+
+test('external rescan invalidates its selected copy ticket and ignores responses from a closed draft',async t=>{
+  const ui=mount();t.after(ui.unmount);ui.manager.data.instances=[];ui.draft()
+  const id=randomUUID(),source={id,name:'Other workspace',directory:'/fixture/external',sourceName:'兼容工具',clientType:'codex',launchMode:'desktop',runtimeState:'not_detected'}
+  ui.api.discoverExternalInstanceSources=async()=>({sources:[source],issues:[]})
+  await ui.state.selectHistoryChoice('instance');await ui.state.chooseInstanceSource('external:'+id);ui.state.sourceClosed=true
+  await ui.state.refreshExternalSources();assert.equal(ui.state.externalSource,undefined);assert.equal(ui.state.sourceClosed,false)
+  const pending=deferred<any>();ui.api.discoverExternalInstanceSources=()=>pending.promise
+  const scan=ui.state.refreshExternalSources();ui.state.closeEditor();ui.draft()
+  pending.resolve({sources:[source],issues:[]});await scan
+  assert.equal(ui.state.discoveredSources.length,0);assert.equal(ui.state.historyMode,'empty');assert.equal(ui.state.externalSource,undefined)
+})
 
 test('a blank draft stays a four-step wizard and creates independent history without any copy IPC', async t => {
   const ui = mount(); t.after(ui.unmount); ui.draft()

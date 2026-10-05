@@ -61,6 +61,11 @@ export const saveInstanceSchema=z.object({id:z.string().uuid().optional(),revisi
 export const copyInstanceSchema=instanceRevisionSchema.extend({details:instanceInputSchema}).strict()
 export type InstanceCopyInput=z.infer<typeof copyInstanceSchema>
 export interface InstanceCopySource {ticket:string;name:string;directory:string;history?:InstanceHistorySummary}
+export interface ExternalInstanceSource {
+  id:string;name:string;directory:string;sourceName:string;clientType:'codex'
+  launchMode:'desktop'|'cli';runtimeState:'running'|'not_detected'|'unknown'
+}
+export interface ExternalInstanceDiscovery {sources:ExternalInstanceSource[];issues:string[]}
 export const copyExternalInstanceSchema=z.object({ticket:z.string().uuid(),sourceClosed:z.literal(true),details:instanceInputSchema}).strict()
 export type ExternalInstanceCopyInput=z.infer<typeof copyExternalInstanceSchema>
 export const attachInstanceSchema=copyExternalInstanceSchema

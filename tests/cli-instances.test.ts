@@ -26,10 +26,10 @@ if(supported)execFileSync('go',['build','-o',binary,'tests/fixtures/desktop-clie
 after(()=>rmSync(build,{recursive:true,force:true}))
 async function waitFor<T>(read:()=>T|undefined):Promise<T>{const end=Date.now()+5000;for(;;){const result=read();if(result!==undefined)return result;if(Date.now()>end)throw new Error('Fixture evidence timeout');await new Promise(resolve=>setTimeout(resolve,30))}}
 function oauthInput(generation:string){const jwt='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+7200,generation,'https://api.openai.com/auth':{chatgpt_account_id:'cli-workspace',chatgpt_user_id:'cli-user'}})).toString('base64url')+'.sig';return JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:jwt,id_token:jwt,refresh_token:'fixture-cli-rt-'+generation,account_id:'cli-workspace'}})}
-function fixture(t:{after(fn:()=>void|Promise<void>):void}){
+function fixture(t:{after(fn:()=>void|Promise<void>):void},open?:(script:string)=>Promise<void>){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-cli-instance-'))),store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()})
   const children:ChildProcess[]=[],gateways:Gateway[]=[]
-  const cli=new MacCliRuntime(async script=>{const child=spawn('/bin/bash',[script],{env:{...process.env,OPENAI_API_KEY:'fixture-inherited',CODEX_MANAGED_BY_BUN:'1',LC_ALL:'fr_FR.UTF-8'},stdio:'ignore'});children.push(child)})
+  const cli=new MacCliRuntime(open??(async script=>{const child=spawn('/bin/bash',[script],{env:{...process.env,OPENAI_API_KEY:'fixture-inherited',CODEX_MANAGED_BY_BUN:'1',LC_ALL:'fr_FR.UTF-8'},stdio:'ignore'});children.push(child)}))
   const runtime=new MacInstanceRuntime(undefined,cli),tokens=new TokenAuthority(store,async()=>assert.fail('No real OAuth'))
   const configs=new ClientConfigs(store),identity=new ClientIdentities(store,configs,async()=>assert.fail('No OS keychain'))
   const authority=new ClientAuthority(store,configs,identity,tokens)
@@ -68,6 +68,48 @@ test('CLI stop saves the final OAuth rotation and manager restart finds the reco
   await reopened.stop(instance.id)
   assert.equal(f.store.read().accounts.find(item=>item.id===account.id)?.credentials.refreshToken,'fixture-cli-rt-at-exit')
   assert.equal(existsSync(join(instance.directory,'auth.json')),false);assert.equal(f.store.read().clientSwitches?.length,0)
+})
+
+test('CLI recovery accepts a real unreaped zombie and saves its completed final OAuth rotation',{skip:!supported},async t=>{
+  // The parent deliberately waits for stdin before waitpid, so the native
+  // client's exited PID remains observable as Z rather than disappearing.
+  const parentSource=['import os,sys,select,signal','pid=os.fork()',
+    'if pid==0: os.execve("/bin/bash",["/bin/bash",sys.argv[1]],os.environ)',
+    'try:',' if select.select([sys.stdin],[],[],20)[0]: sys.stdin.readline()',
+    'finally:',' try: os.kill(pid,signal.SIGKILL)',' except ProcessLookupError: pass',' os.waitpid(pid,0)'].join('\n')
+  let parent:ChildProcess|undefined
+  const f=fixture(t,async script=>{parent=spawn('/usr/bin/python3',['-c',parentSource,script],{stdio:['pipe','ignore','pipe']})})
+  try{
+    importParsedAccounts(f.store,parseAccountImport(oauthInput('zombie-before')).accounts)
+    const account=f.store.read().accounts.find(item=>item.kind==='oauth')!,instance=f.add('Zombie OAuth CLI','native',undefined,account.id)
+    await f.start(instance.id);const evidence=await f.evidence(instance.directory)
+    const launch=JSON.parse(readFileSync(join(f.store.directory,'instances',instance.id,'launch.json'),'utf8'))
+    const plan={application:binary,executable:binary,directory:instance.directory,desktopDirectory:instance.desktopDirectory,workingDirectory:join(f.store.directory,'instances',instance.id,'workspace'),args:[],nonce:launch.nonce,mode:'cli' as const}
+    assert.equal((await f.cli.find(plan))?.pid,evidence.pid)
+    const finalAuth=oauthInput('zombie-at-exit')
+    writeFileSync(join(instance.directory,'fixture-rotate-auth.json'),finalAuth)
+    process.kill(evidence.pid,'SIGTERM')
+    const snapshot=await waitFor(()=>{
+      const value=execFileSync('/bin/ps',['-ww','-p',String(evidence.pid),'-o','lstart=,stat=,args='],{env:{...process.env,LC_ALL:'C'}}).toString().trim()
+      return /^.{24}\s+Z\S*(?:\s|$)/.test(value)?value:undefined
+    })
+    t.diagnostic('Real unreaped client: '+snapshot)
+    assert.doesNotThrow(()=>process.kill(evidence.pid,0))
+    assert.equal(readFileSync(join(instance.directory,'auth.json'),'utf8'),finalAuth)
+    assert.equal(await f.cli.find(plan),undefined)
+    await f.instances.stop(instance.id)
+    assert.equal(f.instances.views()[0].status,'stopped')
+    assert.equal(f.store.read().accounts.find(item=>item.id===account.id)?.credentials.refreshToken,'fixture-cli-rt-zombie-at-exit')
+    assert.equal(existsSync(join(instance.directory,'auth.json')),false);assert.equal(f.store.read().clientSwitches?.length,0)
+    assert.equal(existsSync(cliLaunchFiles(plan).record),false)
+    // Recovery did not require reaping or signaling this already-dead client.
+    assert.doesNotThrow(()=>process.kill(evidence.pid,0))
+  }finally{
+    if(parent&&parent.exitCode===null&&parent.signalCode===null){
+      const closed=new Promise<void>(resolve=>parent!.once('close',()=>resolve()))
+      parent.stdin!.end('reap\n');await closed
+    }
+  }
 })
 
 test('CLI startup cancellation revokes a deferred terminal launch before it can access the profile',{skip:!supported},async t=>{

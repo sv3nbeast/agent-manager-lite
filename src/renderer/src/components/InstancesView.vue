@@ -2,7 +2,7 @@
 import { computed, reactive, ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 import { PlusOutlined, DesktopOutlined, CopyOutlined, FolderOpenOutlined, CheckCircleFilled, LoadingOutlined } from '@ant-design/icons-vue'
-import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary } from '../../../shared/instances'
+import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource } from '../../../shared/instances'
 import { accountCompatibility, getAgentClient, implementedAgentClients, resolveAgentClientType } from '../../../shared/agentClients'
 import { instanceInputSchema } from '../../../shared/instances'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
@@ -25,6 +25,8 @@ const availableApplications=computed(()=>applications.value.filter(app=>{try{ret
 onMounted(async()=>{try{workingDirectories.value=await window.manager.listInstanceWorkingDirectories()}catch(cause){error.value=String(cause)}})
 const copySource=ref<InstanceView>()
 const externalSource=ref<InstanceCopySource>(),sourceClosed=ref(false)
+const discoveredSources=ref<ExternalInstanceSource[]>([]),discoveredSourceId=ref(''),discoveryLoading=ref(false),discoveryError=ref(''),discoveryIssues=ref<string[]>([])
+let discoveryRequest=0
 const sourceMode=ref<'copy'|'attach'>('copy'),editorFlow=ref<'wizard'|'direct'>('wizard')
 const historyMode=ref<'empty'|'copy'>('empty'),historySourceKind=ref<'instance'|'directory'>('instance')
 const sourceHistory=ref<InstanceHistorySummary>(),historyLoading=ref(false),historyError=ref('')
@@ -41,17 +43,52 @@ const historyChoices=[
   {value:'directory' as const,title:'从目录复制',description:'导入其他工具的历史',icon:FolderOpenOutlined}
 ]
 const sourceReady=computed(()=>!!chosenHistory.value&&!historyLoading.value&&!historyError.value&&(!!copySource.value||!!externalSource.value))
-function clearHistorySource(){historyRequest++;historyLoading.value=false;historyError.value='';sourceHistory.value=undefined;copySource.value=undefined;externalSource.value=undefined;sourceClosed.value=false}
+function clearHistorySource(){historyRequest++;discoveryRequest++;discoveryLoading.value=false;historyLoading.value=false;historyError.value='';sourceHistory.value=undefined;copySource.value=undefined;externalSource.value=undefined;discoveredSourceId.value='';sourceClosed.value=false}
+const externalStateLabel=(value:ExternalInstanceSource['runtimeState'])=>value==='running'?'正在运行':value==='not_detected'?'未检测到后台':'运行状态待确认'
+const instanceSourceOptions=computed(()=>[
+  ...(compatibleSources.value.length?[{label:'本应用实例',options:compatibleSources.value.map(item=>({value:'managed:'+item.id,label:item.name+' · '+labels[item.status],disabled:item.status!=='stopped'||!!item.copying}))}]:[]),
+  ...(discoveredSources.value.length?[{label:'本机其他实例',options:discoveredSources.value.filter(item=>item.clientType===form.clientType).map(item=>({value:'external:'+item.id,label:item.name+' · '+item.sourceName+' · '+externalStateLabel(item.runtimeState)}))}]:[])
+])
+async function refreshExternalSources(){
+  if(committing.value||discoveryLoading.value)return
+  if(discoveredSourceId.value)clearHistorySource()
+  const request=++discoveryRequest,generation=draftGeneration
+  discoveryLoading.value=true;discoveryError.value='';discoveryIssues.value=[];discoveredSources.value=[]
+  try{
+    const result=await window.manager.discoverExternalInstanceSources()
+    if(request!==discoveryRequest||generation!==draftGeneration||!open.value||historyChoice.value!=='instance')return
+    discoveredSources.value=result.sources;discoveryIssues.value=result.issues
+  }catch(cause){if(request===discoveryRequest&&generation===draftGeneration)discoveryError.value='本机实例扫描失败：'+String(cause)}
+  finally{if(request===discoveryRequest)discoveryLoading.value=false}
+}
+async function chooseInstanceSource(value:string){
+  if(value.startsWith('managed:'))return chooseHistoryInstance(value.slice(8))
+  const id=value.startsWith('external:')?value.slice(9):''
+  const source=discoveredSources.value.find(item=>item.id===id&&item.clientType===form.clientType)
+  clearHistorySource()
+  if(!source){historyError.value='来源已变化，请重新扫描本机实例。';return}
+  const request=++historyRequest,generation=draftGeneration
+  historyLoading.value=true
+  try{
+    const selected=await window.manager.selectExternalInstanceSource({id})
+    if(request!==historyRequest||generation!==draftGeneration||!open.value||historyChoice.value!=='instance')return
+    externalSource.value={...selected,name:source.name};discoveredSourceId.value=id;sourceMode.value='copy'
+  }catch(cause){if(request===historyRequest&&generation===draftGeneration)historyError.value=String(cause)}
+  finally{if(request===historyRequest)historyLoading.value=false}
+}
 function changeHistoryMode(){clearHistorySource()}
 function changeHistorySourceKind(){clearHistorySource()}
 async function selectHistoryChoice(choice:'empty'|'instance'|'directory'){
   if(committing.value||busy.value||historyChoice.value===choice)return
+  const generation=draftGeneration
   clearHistorySource();error.value=''
   historyMode.value=choice==='empty'?'empty':'copy'
   if(choice!=='empty')historySourceKind.value=choice
   if(choice==='instance'){
+    await refreshExternalSources()
+    if(!open.value||generation!==draftGeneration||historyChoice.value!=='instance'||copySource.value||externalSource.value)return
     const sources=compatibleSources.value.filter(item=>item.status==='stopped'&&!item.copying)
-    if(sources.length===1)await chooseHistoryInstance(sources[0].id)
+    if(sources.length===1&&!discoveredSources.value.length)await chooseHistoryInstance(sources[0].id)
   }
 }
 async function chooseHistoryInstance(id:string){
@@ -212,7 +249,7 @@ function providerCreated(accountId:string){
   if(choice)selectSupplier(choice.value)
   else error.value='供应商已保存，请刷新资源后选择密钥。'
 }
-function closeEditor(){if(committing.value)return;draftGeneration++;historyRequest++;historyLoading.value=false;busy.value=false;open.value=false;pendingLogin=undefined;providerOpen.value=false;cancelCopyPreview()}
+function closeEditor(){if(committing.value)return;draftGeneration++;historyRequest++;discoveryRequest++;discoveryLoading.value=false;historyLoading.value=false;busy.value=false;open.value=false;pendingLogin=undefined;providerOpen.value=false;cancelCopyPreview()}
 async function ensureResource(generation=draftGeneration):Promise<boolean>{
   const selection=supplierSelection.value,mode=form.connectionMode,clientType=form.clientType,kind=resourceKind.value
   if(!open.value||generation!==draftGeneration)return false
@@ -259,7 +296,7 @@ watch(()=>[open.value,form.model,form.clientType],async()=>{
   try{const values=await window.manager.readModelContextDefaults([form.model.trim()]);if(request===contextRequest)contextDefault.value=values[0]}catch{/* Preview remains the authority if catalog lookup fails. */}
   finally{if(request===contextRequest)contextLoading.value=false}
 })
-onBeforeUnmount(()=>{contextRequest++;historyRequest++;draftGeneration++;launchRequest++;pendingCopyPreview.value=undefined;pendingLogin=undefined})
+onBeforeUnmount(()=>{contextRequest++;historyRequest++;discoveryRequest++;draftGeneration++;launchRequest++;pendingCopyPreview.value=undefined;pendingLogin=undefined})
 const contextLabel=computed(()=>{
   const connectionValue=getModelContextWindow(selectedAccount.value?.modelContextWindows,form.model)
   if(connectionValue!==undefined)return formatModelContextWindow(connectionValue)+' · API 连接设置'
@@ -278,6 +315,7 @@ function edit(instance?:InstanceView) {
   try{clientType=resolveAgentClientType(instance?.clientType)}catch(cause){error.value=String(cause);return}
   step.value=0;advanced.value=[];pendingLogin=undefined
   clearHistorySource();historyMode.value='empty';historySourceKind.value='instance';editorFlow.value='wizard'
+  discoveredSources.value=[];discoveryError.value='';discoveryIssues.value=[]
   sourceMode.value='copy'
   editing.value=instance;clearValidation();manager.error='';generatedName='';launchMode.value=instance?.launchMode??'desktop'
   Object.assign(form,instance ? {clientType,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
@@ -449,10 +487,14 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <div v-if="historyMode==='empty'" class="instance-history-empty-note"><span>新实例将从空白会话开始，已有对话保持原样。</span></div>
             <div v-else class="instance-history-source-panel">
               <template v-if="historySourceKind==='instance'">
-                <div class="instance-source-heading"><label for="instance-history-source">来源实例</label><span v-if="sourceReady" class="instance-source-status"><CheckCircleFilled />已读取</span></div>
-                <a-select id="instance-history-source" :value="copySource?.id" aria-label="来源实例" class="instance-source-select" placeholder="选择已停止的实例" :disabled="committing" :options="compatibleSources.map(item=>({value:item.id,label:item.name+' · '+labels[item.status],disabled:item.status!=='stopped'||!!item.copying}))" @change="chooseHistoryInstance(String($event))" />
-                <p v-if="!compatibleSources.length" class="instance-source-note">还没有可复制的实例，可以改选「从目录复制」。</p>
-                <p v-else-if="!copySource" class="instance-source-note">选择一个已停止的实例，查看它的历史概况。</p>
+                <div class="instance-source-heading"><label for="instance-history-source">来源实例</label><a-button size="small" :loading="discoveryLoading" :disabled="committing||historyLoading" @click="refreshExternalSources">重新扫描本机</a-button></div>
+                <a-select id="instance-history-source" :value="copySource?'managed:'+copySource.id:discoveredSourceId?'external:'+discoveredSourceId:undefined" aria-label="来源实例" class="instance-source-select" placeholder="选择本应用或本机其他实例" :disabled="committing||historyLoading" :loading="discoveryLoading" :options="instanceSourceOptions" @change="chooseInstanceSource(String($event))" />
+                <p v-if="discoveryLoading" class="instance-source-note" role="status">正在查找本机的 Codex 配置和兼容工具实例…</p>
+                <p v-else-if="!compatibleSources.length&&!discoveredSources.length" class="instance-source-note">未找到可用来源，可以改选「从目录复制」手动选择配置目录。</p>
+                <p v-else-if="!copySource&&!externalSource" class="instance-source-note">可识别正在运行的外部实例；选择后查看历史，复制前请先关闭来源客户端。</p>
+                <a-alert v-if="discoveryError" type="warning" :message="discoveryError" :show-icon="true" />
+                <p v-for="issue in discoveryIssues" :key="issue" class="instance-source-note">{{issue}}</p>
+                <div v-if="discoveredSourceId&&externalSource" class="instance-source-closure"><p class="instance-path">{{externalSource.directory}}</p><a-checkbox v-model:checked="sourceClosed" aria-label="来源客户端已关闭">来源客户端已关闭，可以复制</a-checkbox><span>只复制已保存的历史。来源保留；复制时会重新检查目录和后台状态。</span></div>
               </template>
               <template v-else>
                 <div class="instance-directory-picker">

@@ -10,6 +10,7 @@ import {EngineError} from './proxyEngineFiles'
 import {engineErrors} from '../shared/proxyEngine'
 import { app, BrowserWindow, ipcMain, safeStorage, dialog, clipboard, shell, Tray, Menu, nativeImage } from 'electron'
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
@@ -40,6 +41,7 @@ import { ProviderProbes } from './providerProbe'
 import { ProviderModels } from './providerModels'
 import {ProviderUsageQueries} from './providerUsageRefresh'
 import { Instances } from './instances'
+import {ExternalInstanceSources} from './externalInstanceSources'
 import { LocalAccess } from './localAccess'
 import {SessionCatalog} from './sessions'
 import {SessionTransfers} from './sessionTransfers'
@@ -131,6 +133,7 @@ async function main(): Promise<void> {
     const instanceRunId=randomUUID()
     return new Gateway(binary,runtimeRoot,event=>history.record(instanceRunId,event),(id,identity,expected,generation)=>agents.adopt(id,identity,expected,generation),()=>store.proxyState(),proxyTunnels)
   },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages())
+  const externalInstanceSources=new ExternalInstanceSources({managerRoot:realpathSync(store.directory),managedDirectories:()=>instances.views().map(instance=>instance.directory),...(isolatedTest?{home:join(realpathSync(store.directory),'external-source-home')}:{})})
   const localAccess=new LocalAccess(store,gateway,async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},ids=>effectiveKeyUsage(store.read(),history.keyTokenUsage(ids)))
   const sessions=new SessionCatalog(store,id=>instances.inUse(id))
   sessionTransfers=new SessionTransfers(store,sessions,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionSync?.busy(id)||!!sessionTrash?.busy(id))
@@ -212,6 +215,7 @@ async function main(): Promise<void> {
     sessionVisibility.stop()
     clientIdentities.stop()
     clientSwitches.stop()
+    externalInstanceSources.clear()
     proxyResources.stop()
     proxyBatch.stop()
     const subscriptionStop=proxySubscriptions.stop()
@@ -420,6 +424,8 @@ async function main(): Promise<void> {
       case 'saveInstance': instances.save(input); break
       case 'copyInstance': instances.startCopy(input);break
       case 'copyExternalInstance': instances.startExternalCopy(input);break
+      case 'discoverExternalInstanceSources': return externalInstanceSources.discover()
+      case 'selectExternalInstanceSource': return externalInstanceSources.select(input,directory=>instances.selectCopySource(directory))
       case 'attachExistingInstance': await instances.attachExisting(input);break
       case 'chooseExistingInstanceDirectory': {
         const selection=await dialog.showOpenDialog(window,{title:'选择直接使用的 Codex 配置目录（不复制）',properties:['openDirectory']})

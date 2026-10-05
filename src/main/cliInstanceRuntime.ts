@@ -40,10 +40,22 @@ async function processTextFiles(pid:number):Promise<string>{
 }
 async function processIdentity(pid:number):Promise<{started:string;args:string}|undefined>{
   try{
-    const result=await exec('/bin/ps',['-ww','-p',String(pid),'-o','lstart=,args='],{env:{...process.env,LC_ALL:'C'},timeout:3000,maxBuffer:128*1024})
-    const line=result.stdout.trim(),match=line.match(/^(.{24})\s+(.+)$/)
-    if(!match)throw new Error('Invalid process snapshot')
-    return {started:match[1],args:match[2]}
+    for(let attempt=0;;attempt++){
+      const result=await exec('/bin/ps',['-ww','-p',String(pid),'-o','lstart=,stat=,args='],{env:{...process.env,LC_ALL:'C'},timeout:3000,maxBuffer:128*1024})
+      const line=result.stdout.trim(),match=line.match(/^(.{24})\s+(\S+)(?:\s+(.*))?$/)
+      if(!match)throw new Error('Invalid process snapshot')
+      // A zombie has finished execution even while its parent has not reaped
+      // the PID. kill(pid, 0) still succeeds and argv no longer has our nonce.
+      if(match[2].startsWith('Z'))return undefined
+      // The E modifier means still exiting: wait for Z/disappearance before allowing
+      // profile recovery, including the client's final credential writes.
+      if(match[2].includes('E')){
+        if(attempt>=10)throw new Error('Process is still exiting')
+        await delay(50);continue
+      }
+      if(!match[3])throw new Error('Invalid process arguments')
+      return {started:match[1],args:match[3]}
+    }
   }catch(error){
     try{process.kill(pid,0)}catch(cause){if((cause as NodeJS.ErrnoException).code==='ESRCH')return undefined}
     throw new Error('无法确认 CLI 进程状态，尚未恢复登录配置')

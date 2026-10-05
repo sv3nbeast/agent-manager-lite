@@ -11,7 +11,7 @@ import type {ProviderConfigInput,ProviderConfigView} from './providerConfig'
 import type { ProviderSummary, ProviderMutation } from './providerLibrary'
 import type { ProviderProbeInput, ProviderProbeState } from './providerProbe'
 import type { LocalAccessMutation,LocalAccessView } from './localAccess'
-import type { InstanceProfile, InstanceView, InstanceApplication, InstanceInput, InstanceLaunchPreview, InstanceWorkingDirectory, InstanceCopyInput, InstanceCopyView, InstanceCopySource, ExternalInstanceCopyInput, AttachInstanceInput, InstanceHistorySummary } from './instances'
+import type { InstanceProfile, InstanceView, InstanceApplication, InstanceInput, InstanceLaunchPreview, InstanceWorkingDirectory, InstanceCopyInput, InstanceCopyView, InstanceCopySource, ExternalInstanceCopyInput, AttachInstanceInput, InstanceHistorySummary, ExternalInstanceDiscovery } from './instances'
 import type {ClientIdentityInput,ClientIdentityView} from './clientIdentity'
 import type {ClientSwitchView,ClientSwitchPreview} from './clientSwitch'
 import type {ClientAuthorityView} from './clientAuthority'
@@ -232,6 +232,8 @@ export interface ManagerAPI {
   saveInstance(input:{id?:string;revision?:number;details:InstanceInput}):Promise<AppSnapshot>
   copyInstance(input:InstanceCopyInput):Promise<AppSnapshot>
   chooseInstanceCopySource():Promise<InstanceCopySource|undefined>
+  discoverExternalInstanceSources():Promise<ExternalInstanceDiscovery>
+  selectExternalInstanceSource(input:{id:string}):Promise<InstanceCopySource>
   copyExternalInstance(input:ExternalInstanceCopyInput):Promise<AppSnapshot>
   chooseExistingInstanceDirectory():Promise<InstanceCopySource|undefined>
   attachExistingInstance(input:AttachInstanceInput):Promise<AppSnapshot>

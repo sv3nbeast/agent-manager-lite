@@ -20,7 +20,7 @@ const application = join(fs.realpathSync(directory), 'Fixture.app'), executable 
 fs.mkdirSync(join(application, 'Contents/MacOS'), { recursive: true })
 fs.writeFileSync(executable, '#!/bin/sh\nexit 1\n', { mode: 0o700 })
 let selectedDirectory
-// Electron's native picker is the only source of the external capability ticket.
+// Manual directory selection remains available alongside metadata discovery.
 dialog.showOpenDialog = async (...args) => { const options = args.at(-1); return { canceled: false, filePaths: [options.properties?.includes('openDirectory') ? selectedDirectory : application] } }
 globalThis.fetch = async () => { throw new Error('History choice smoke forbids external requests') }
 function seedHistory(home) {
@@ -268,6 +268,25 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(snapshot.instances.length, 3); assert.ok(snapshot.instances.every(instance => instance.status === 'stopped'))
       assert.deepEqual(snapshotFiles(source.directory), originalSourceFiles, 'Both copies preserve the original managed source')
       assert.deepEqual(snapshotFiles(external), originalExternalFiles, 'External source files are unchanged')
+      const registryRoot=join(directory,'external-source-home','.antigravity_cockpit')
+      fs.mkdirSync(registryRoot,{recursive:true})
+      const registry=join(registryRoot,'codex_instances.json')
+      const registryText=JSON.stringify({instances:[{id:'fixture-external',name:'本机外部工作空间',userDataDir:external,launchMode:'app',lastPid:process.pid}]})
+      fs.writeFileSync(registry,registryText)
+      await beginWizard('扫描来源副本','Codex 2');await historyChoice('instance')
+      await wait('!document.querySelector(".instance-history-choice").innerText.includes("正在查找")')
+      await selectSource('本机外部工作空间')
+      await wait('document.querySelector(".instance-history-choice").innerText.includes("105")&&!!document.querySelector("[aria-label=来源客户端已关闭]")')
+      assert.equal(await run(`document.querySelector(${JSON.stringify(checkbox)}).checked`),false)
+      await resize(940,680);await verifyLayout('discovered-source-940x680');await capture('discovered-source-940x680.png')
+      await click('.instance-editor-dialog .ant-modal-footer button','下一步')
+      await verifyValidation('discovered-source-not-closed-940x680','关闭')
+      await run(`document.querySelector(${JSON.stringify(checkbox)}).click()`)
+      await next(3);await click('.ant-modal-footer button','仅创建')
+      await wait('(async()=>{const s=await window.manager.load();return s.instanceCopy?.status==="completed"&&s.instances.length===4})()')
+      assert.equal(fs.readFileSync(registry,'utf8'),registryText,'Metadata discovery preserves the other tool registry')
+      assert.deepEqual(snapshotFiles(external),originalExternalFiles,'Discovered-source copy preserves all original files')
+      await resize(1280,800)
       const openNavigation = async label => {
         const item = `${visible('.navigation .ant-menu-item')}.find(el=>el.textContent.includes(${JSON.stringify(label)}))`
         await wait(`!!(${item})`); await run(`(${item}).click()`)
@@ -313,7 +332,8 @@ app.on('browser-window-created', (_event, window) => {
       await click('.settings-actions button', '放弃更改')
       await wait(`document.querySelector('[data-settings-field="port"] input').value===${JSON.stringify(String(settingsBeforeValidation.port))}`)
       fs.writeFileSync(join(output, 'validation.json'), JSON.stringify({ passed: true, blankDefault: true, managedSourceReadOnlyPreview: true, projectCounts: { sessions: 105, archived: 32, projects: 12, projectSessions: 67, unassigned: 38 },
-        fourStepWizardPreserved: true, sourceClosedExplicit: true, copiedTargetPreviewOnly: true, originalStateUnchanged: true, allSourceFilesUnchanged: true, instanceCount: 3, accountCount: 1,
+        fourStepWizardPreserved: true, sourceClosedExplicit: true, copiedTargetPreviewOnly: true, originalStateUnchanged: true, allSourceFilesUnchanged: true, instanceCount: 4, accountCount: 1,
+        externalMetadataDiscovery:true,externalSourceSelection:true,externalRegistryUnchanged:true,discoveredClosureValidation:true,
         keyboardOptionsReachable: true, switchingClearsSource: true, projectSearch: true, detailEscapePreservesParent: true, lightAndDarkTheme: true,
         automaticName: true, automaticNameCollisionAvoided: true, clearedNameRestored: true, customNamePreserved: true, missingModelPreventsAdvance: true,
         validationChecks, providerValidation, settingsValidation, layoutChecks, realAccountsTouched: false, externalRequests: 0, officialClientLaunched: false }, null, 2))
