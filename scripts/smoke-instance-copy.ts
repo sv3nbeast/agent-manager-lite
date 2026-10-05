@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import {spawn,execFileSync} from 'node:child_process'
 import {createServer} from 'node:http'
-import {mkdtempSync,rmSync,realpathSync,existsSync,readFileSync,readdirSync,mkdirSync,copyFileSync} from 'node:fs'
+import {mkdtempSync,rmSync,realpathSync,existsSync,readFileSync,readdirSync,mkdirSync,copyFileSync,writeFileSync} from 'node:fs'
 import {createHash,randomUUID} from 'node:crypto'
 import {join,isAbsolute,basename} from 'node:path'
 import {tmpdir} from 'node:os'
@@ -18,6 +18,8 @@ import {SessionTransfers} from '../src/main/sessionTransfers'
 import {SessionArchives} from '../src/main/sessionArchives'
 import {ClientConfigs} from '../src/main/clientConfig'
 import {SessionSync} from '../src/main/sessionSync'
+import {DatabaseSync} from 'node:sqlite'
+import {TomlDocument} from '../src/main/tomlPatch'
 
 async function main(){
   const binary=process.env.CML_TEST_CODEX_BINARY
@@ -55,11 +57,35 @@ async function main(){
   const importedInstances=new Instances(importStore,()=>assert.fail('Native copy must not start a gateway'),id=>importTokens.ensure(id),new MacInstanceRuntime(undefined,cli),new NativeInstanceAccounts(importStore,importTokens))
   const account=createAPIAccount({name:'Fixture copy',apiKey:'fixture-copy-api',baseUrl:`http://127.0.0.1:${address.port}/v1`,models:['gpt-5.5'],wireApi:'responses',defaultTier:'fast'});importParsedAccounts(store,[account])
   const app=instances.registerApplication(binary,'cli'),args=['-c','features.plugins=false','-c','features.remote_models=false','-c','analytics.enabled=false','exec','--json','--ignore-rules','--skip-git-repo-check','--sandbox','read-only']
-  async function run(id:string,service=instances){
+  async function visibleUnderActualProvider(home:string,sessionId:string){
+    const provider=new TomlDocument(readFileSync(join(home,'config.toml'),'utf8')).scalar(['model_provider']);assert.equal(provider,'cml_native_account')
+    const child=spawn(binary!,['app-server','--listen','stdio://','-c','analytics.enabled=false','-c','features.plugins=false','-c','features.remote_models=false'],{cwd:home,env:{CODEX_HOME:home,PATH:process.env.PATH,TMPDIR:process.env.TMPDIR,LANG:'en_US.UTF-8'},stdio:['pipe','pipe','pipe'],detached:true})
+    let next=0,pending='',stderr=''
+    const requests=new Map<number,{resolve:(value:any)=>void;reject:(error:Error)=>void}>()
+    const exited=new Promise<void>(resolve=>child.once('close',()=>resolve()))
+    const fail=(message:string)=>{for(const request of requests.values())request.reject(new Error(message));requests.clear()}
+    child.once('error',error=>fail(error.message));child.once('close',()=>fail('Fixture app-server exited: '+stderr))
+    child.stderr.on('data',data=>{stderr+=data.toString().slice(0,2000-stderr.length)})
+    child.stdout.on('data',data=>{
+      pending+=data.toString()
+      for(;;){const at=pending.indexOf('\n');if(at<0)break;const line=pending.slice(0,at);pending=pending.slice(at+1);let reply:any;try{reply=JSON.parse(line)}catch{continue}const request=requests.get(reply.id);if(!request)continue;requests.delete(reply.id);if(reply.error)request.reject(new Error('Fixture RPC rejected: '+JSON.stringify(reply.error)));else request.resolve(reply.result)}
+    })
+    const request=(method:string,params:unknown)=>new Promise<any>((resolve,reject)=>{const id=++next;requests.set(id,{resolve,reject});child.stdin.write(JSON.stringify({id,method,params})+'\n')})
+    const timer=setTimeout(()=>{fail('Fixture provider-list RPC timed out');try{if(child.pid)process.kill(-child.pid,'SIGKILL')}catch{}},15000)
+    try{
+      await request('initialize',{clientInfo:{name:'agent_manager_lite_copy_fixture',version:'0.1.0'},capabilities:{experimentalApi:true}})
+      child.stdin.write(JSON.stringify({method:'initialized'})+'\n')
+      const page=await request('thread/list',{limit:100,modelProviders:[provider],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],archived:false,useStateDbOnly:true})
+      assert.ok(page.data.some((thread:{id:string})=>thread.id===sessionId),'Copied history must be visible in official thread/list with the active provider filter')
+    }finally{clearTimeout(timer);try{if(child.pid)process.kill(-child.pid,'SIGTERM')}catch{}await exited}
+  }
+  async function run(id:string,service=instances,verifyVisibilityId?:string){
     const instance=service.views().find(value=>value.id===id)!;current=undefined
     service.start(service.preview({id,revision:instance.revision}).ticket);await service.settled(id)
     const child=current as {output:string;done:Promise<number|null>}|undefined;assert.ok(child,'CLI was not dispatched')
-    assert.equal(await child.done,0,child.output);await service.refresh()
+    assert.equal(await child.done,0,child.output)
+    if(verifyVisibilityId)await visibleUnderActualProvider(instance.directory,verifyVisibilityId)
+    await service.refresh()
     assert.equal(service.views().find(value=>value.id===id)?.status,'stopped',JSON.stringify(service.views()))
     return child.output
   }
@@ -77,6 +103,14 @@ async function main(){
     const source=instances.views()[0],output=await run(source.id)
     const event=output.split('\n').flatMap(line=>{try{return [JSON.parse(line)]}catch{return []}}).find(event=>event.type==='thread.started')
     assert.ok(event?.thread_id,output);assert.ok(output.includes('fixture-first-turn'),output)
+    // Emulate a different manager's provider on this temporary fixture. Real
+    // profile homes and credentials are never used by this consumer test.
+    const sourceDb=new DatabaseSync(join(source.directory,'state_5.sqlite'))
+    const sourceRow=sourceDb.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(event.thread_id) as {rollout_path:string}|undefined;assert.ok(sourceRow)
+    sourceDb.prepare('UPDATE threads SET model_provider = ? WHERE id = ?').run('cockpit_cli_proxy',event.thread_id);sourceDb.close()
+    const sourceRollout=readFileSync(sourceRow.rollout_path,'utf8'),firstNewline=sourceRollout.indexOf('\n'),metadata=JSON.parse(sourceRollout.slice(0,firstNewline));metadata.payload.model_provider='cockpit_cli_proxy'
+    writeFileSync(sourceRow.rollout_path,JSON.stringify(metadata)+'\n'+sourceRollout.slice(firstNewline+1))
+    writeFileSync(join(source.directory,'config.toml'),'model_provider="cockpit_cli_proxy"\n[model_providers.cockpit_cli_proxy]\nname="Fixture other manager"\nbase_url='+JSON.stringify(account.baseUrl)+'\nwire_api="responses"\nexperimental_bearer_token="fixture-copy-api"\n')
     const {id,revision,name:_name,...details}=store.read().instances![0]
     instances.startCopy({id,revision,details:{applicationId:details.applicationId,accountId:details.accountId,connectionMode:details.connectionMode,defaultTier:details.defaultTier,model:details.model,name:'Copy',extraArgs:[...args,'resume',event.thread_id,'Continue the earlier fixture conversation. Do not use tools.']}})
     const deadline=Date.now()+10_000
@@ -85,7 +119,7 @@ async function main(){
     const target=instances.views().find(value=>value.id===instances.copyView()!.targetId)!
     assert.equal(existsSync(join(target.directory,'auth.json')),false)
     const before=files(source.directory)
-    const resumed=await run(target.id);assert.ok(resumed.includes('fixture-resumed-turn'),resumed)
+    const resumed=await run(target.id,instances,event.thread_id);assert.ok(resumed.includes('fixture-resumed-turn'),resumed)
     assert.equal(received.length,2);assert.ok(JSON.stringify(received[1].input).includes('fixture-first-turn'),'Resumed request must carry the previous assistant reply')
     assert.equal(received[1].service_tier,'priority');assert.deepEqual(files(source.directory),before,'Resuming a copy must not alter any source session or database file')
     assert.equal(existsSync(join(target.directory,'auth.json')),false)
@@ -95,7 +129,7 @@ async function main(){
     const importDeadline=Date.now()+10_000
     while(['scanning','copying'].includes(importedInstances.copyView()!.status)){if(Date.now()>importDeadline)throw new Error('External copy timed out');await new Promise(resolve=>setTimeout(resolve,20))}
     assert.equal(importedInstances.copyView()!.status,'completed',importedInstances.copyView()!.error)
-    const imported=importedInstances.views()[0],importedOutput=await run(imported.id,importedInstances)
+    const imported=importedInstances.views()[0],importedOutput=await run(imported.id,importedInstances,event.thread_id)
     assert.ok(importedOutput.includes('fixture-resumed-turn'),importedOutput);assert.equal(received.length,3)
     assert.ok(JSON.stringify(received[2].input).includes('fixture-first-turn'));assert.equal(received[2].service_tier,'priority')
     assert.deepEqual(files(source.directory),before);assert.equal(existsSync(join(imported.directory,'auth.json')),false)
@@ -181,7 +215,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
     console.log('Real all-session sync passed: two real same-ID conversation branches merged, official indexes rebuilt, repeat preview has no rollout changes, both native CLI homes resume both branches with Fast=priority.')
     await transfers.stop();sessions.stop()
     console.log('Real archived selected copy passed: noncanonical nested source becomes the official flat archive layout; actual ID is visible in archived thread/list, source bytes unchanged.')
-    console.log('Real Codex instance copy passed: managed/external copies and directly attached existing home resume prior content; Fast=priority, source unchanged by copies/registration, login restored and every file retained on detach; only temporary profiles and loopback SSE.')
+    console.log('Real Codex instance copy passed: different-provider managed/external copies appear in official thread/list under the actual active provider and resume prior content; directly attached existing home resumes; Fast=priority, source unchanged by copies/registration, login restored and every file retained on detach; only temporary profiles and loopback SSE.')
   }finally{
     await instances.closeAll().catch(()=>{})
     await importedInstances.closeAll().catch(()=>{})

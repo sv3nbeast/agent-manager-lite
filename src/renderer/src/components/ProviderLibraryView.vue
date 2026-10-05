@@ -4,13 +4,15 @@ import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { PlusOutlined, ApiOutlined, KeyOutlined, DownOutlined } from '@ant-design/icons-vue'
 import type { Account } from '../../../shared/types'
-import { providerEndpoint, type ProviderDetails, type ProviderMutation, type ProviderSummary, type ProviderKeySummary } from '../../../shared/providerLibrary'
+import { providerEndpoint, providerDetailsSchema, providerMutationSchema, type ProviderDetails, type ProviderMutation, type ProviderSummary, type ProviderKeySummary } from '../../../shared/providerLibrary'
 import { providerPresets, providerPreset } from '../../../shared/providerPresets'
 import { useManager } from '../store'
 import ProviderProbePanel from './ProviderProbePanel.vue'
 import ProviderUsageDetails from './ProviderUsageDetails.vue'
 import ProviderModelsField from './ProviderModelsField.vue'
 import ModelContextWindowsField from './ModelContextWindowsField.vue'
+import { focusFirstInvalidField, useFormFeedback, validationErrors } from '../formFeedback'
+import FormFeedback from './FormFeedback.vue'
 
 const emit=defineEmits<{'manage-connections':[accountId?:string]}>()
 const manager = useManager()
@@ -59,6 +61,11 @@ const models = ref('')
 const modelValues = computed({get:()=>[...new Set(models.value.split(/[\n,]/).map(s=>s.trim()).filter(Boolean))],set:(value:string[])=>{models.value=value.join('\n')}})
 const draftKey = ref(''), createConnection=ref(true)
 const editorKeyId = ref<string>(), loadedEditorKey = ref(''), editorKeyLoading = ref(false), editorKeyError = ref('')
+const editorError = ref(''), editorFieldErrors = ref<Record<string, string>>({})
+useFormFeedback(() => editorKeyError.value || editorError.value, { active: editorOpen })
+watch(() => [editorOpen.value, details.name, details.baseUrl, models.value, draftKey.value, JSON.stringify(details.modelContextWindows)], () => {
+  editorError.value = ''; editorFieldErrors.value = {}
+}, { flush: 'sync' })
 let editorKeyRead = 0, operationKeyRead = 0
 const savedKeyAddress = computed(() => {
   try { return !!editing.value && providerEndpoint(details.baseUrl) === providerEndpoint(editing.value.baseUrl) }
@@ -118,8 +125,12 @@ async function mutate(input:ProviderMutation) {
   return manager.execute(() => window.manager.mutateProvider(clone(input)))
 }
 async function saveProvider() {
-  if (editorKeyLoading.value || editorKeyError.value) return
-  if (editorKeyId.value && !draftKey.value.trim()) { message.info('密钥不能为空；移除密钥请使用供应商详情中的移除操作'); return }
+  if (manager.loading || editorKeyLoading.value || editorKeyError.value) return
+  editorError.value = ''
+  if (editorKeyId.value && !draftKey.value.trim()) {
+    editorFieldErrors.value = { apiKey: '密钥不能为空；移除密钥请使用供应商详情中的移除操作' }
+    editorError.value = editorFieldErrors.value.apiKey; void focusFirstInvalidField('.provider-details-form'); return
+  }
   const values:ProviderDetails = {
     name:details.name, baseUrl:details.baseUrl,
     models:[...new Set(models.value.split(/[\n,]/).map(s=>s.trim()).filter(Boolean))],
@@ -131,6 +142,13 @@ async function saveProvider() {
     ...(details.visionRoutingModel?.trim() ? {visionRoutingModel:details.visionRoutingModel.trim()} : {}),
     ...(details.supportsWebsockets === undefined ? {} : {supportsWebsockets:details.supportsWebsockets}),
     ...(details.enableModePreference ? {enableModePreference:details.enableModePreference} : {})
+  }
+  const validation = providerDetailsSchema.safeParse(values)
+  if (!validation.success) {
+    editorFieldErrors.value = validationErrors(validation.error.issues, { name: '供应商名称', baseUrl: 'API 地址', models: '模型', modelContextWindows: '模型上下文' })
+    editorError.value = Object.values(editorFieldErrors.value)[0] || '请检查供应商配置'
+    void focusFirstInvalidField('.provider-details-form')
+    return
   }
   const provider = editing.value
   if (await mutate(provider ? {action:'update',id:provider.id,revision:provider.revision,changes:values,
@@ -146,7 +164,12 @@ type Operation = 'addKey' | 'editKey' | 'moveKey' | 'createAccount' | 'linkAccou
 const operation = ref<Operation>(), owner = ref<ProviderSummary>(), key = ref<ProviderKeySummary>()
 const keyForm = reactive({name:'',apiKey:'',createConnection:true})
 const operationKeyLoading = ref(false), operationKeyError=ref('')
+const operationError = ref(''), operationFieldErrors = ref<Record<string, string>>({})
+useFormFeedback(() => operationKeyError.value || operationError.value, { active: () => !!operation.value })
 const target = ref<ProviderSummary>(), account = ref<Account>()
+watch(() => [operation.value, keyForm.name, keyForm.apiKey, target.value?.id, account.value?.id], () => {
+  operationError.value = ''; operationFieldErrors.value = {}
+}, { flush: 'sync' })
 const operationTitle:Record<Operation,string> = {addKey:'添加密钥',editKey:'编辑密钥',moveKey:'移动密钥',createAccount:'启用 API 连接',linkAccount:'关联已有 API 连接'}
 async function openOperation(action:Operation, provider:ProviderSummary, item?:ProviderKeySummary) {
   closeOperation()
@@ -170,22 +193,30 @@ function closeOperation() { operationKeyRead++; operation.value = undefined; key
 function selectTarget(id:string) { const value=providers.value.find(p=>p.id===id); target.value=value ? clone(value) : undefined }
 function selectAccount(id:string) { const value=manager.data?.accounts.find(a=>a.id===id); account.value=value ? clone(value) : undefined }
 async function saveOperation() {
-  if (operationKeyLoading.value || operationKeyError.value) return
+  if (manager.loading || operationKeyLoading.value || operationKeyError.value || !owner.value || !operation.value) return
+  operationError.value = ''
   const provider = owner.value!, action = operation.value!
   const identity = {id:provider.id,revision:provider.revision}, keyId = key.value?.id ?? ''
   let input:ProviderMutation
   if (action === 'addKey') input = {action,...identity,name:keyForm.name,apiKey:keyForm.apiKey,createConnection:keyForm.createConnection}
   else if (action === 'editKey') {
-    if (!keyForm.apiKey.trim()) { message.info('密钥不能为空；如需删除请使用移除操作'); return }
+    if (!keyForm.apiKey.trim()) { operationFieldErrors.value = { apiKey: '密钥不能为空；如需删除请使用移除操作' }; operationError.value=operationFieldErrors.value.apiKey; void focusFirstInvalidField('.provider-key-form'); return }
     input = {action,...identity,keyId,name:keyForm.name,apiKey:keyForm.apiKey}
   }
   else if (action === 'moveKey') {
-    if (!target.value) { message.info('请选择目标供应商'); return }
+    if (!target.value) { operationFieldErrors.value = { targetId: '请选择目标供应商' }; operationError.value=operationFieldErrors.value.targetId; void focusFirstInvalidField('.provider-key-form'); return }
     input = {action,...identity,keyId,targetId:target.value.id,targetRevision:target.value.revision}
   } else if (action === 'createAccount') input = {action,...identity,keyId,name:keyForm.name}
   else {
-    if (!account.value) { message.info('请选择 API 连接'); return }
+    if (!account.value) { operationFieldErrors.value = { accountId: '请选择 API 连接' }; operationError.value=operationFieldErrors.value.accountId; void focusFirstInvalidField('.provider-key-form'); return }
     input = {action,...identity,keyId,accountId:account.value.id,accountRevision:account.value.revision ?? 0}
+  }
+  const validation=providerMutationSchema.safeParse(input)
+  if (!validation.success) {
+    operationFieldErrors.value=validationErrors(validation.error.issues, { name: action==='createAccount' ? 'API 连接名称' : '密钥名称', apiKey: 'API Key' })
+    operationError.value=Object.values(operationFieldErrors.value)[0] || '请检查密钥配置'
+    void focusFirstInvalidField('.provider-key-form')
+    return
   }
   if (await mutate(input)) { closeOperation(); message.success({key:'provider-operation',content:'已保存'}) }
 }
@@ -197,7 +228,7 @@ function remove(provider:ProviderSummary, item?:ProviderKeySummary) {
     async onOk() {
       if (!await mutate(keyId ? {action:'removeKey',id:snapshot.id,revision:snapshot.revision,keyId}
         : {action:'delete',id:snapshot.id,revision:snapshot.revision})) {
-        message.error({key:'provider-operation',content:manager.error}); throw new Error('保存失败')
+        throw new Error('保存失败')
       }
     }
   })
@@ -287,13 +318,12 @@ function usageText(key:ProviderKeySummary):string {
             <a-form-item label="离线预设" extra="只填充地址和模型，可继续修改，不会联网或发送密钥。"><a-select v-model:value="details.presetId" allow-clear placeholder="选择供应商预设" :options="presetOptions" @change="applyPreset" /></a-form-item>
           </a-collapse-panel>
         </a-collapse>
-        <a-form-item label="供应商名称" required><a-input v-model:value="details.name" aria-label="供应商名称" :maxlength="120" /></a-form-item>
-        <a-form-item label="Base URL" required><a-input v-model:value="details.baseUrl" aria-label="供应商地址" /></a-form-item>
+        <a-form-item label="供应商名称" required :validate-status="editorFieldErrors.name ? 'error' : undefined" :help="editorFieldErrors.name"><a-input v-model:value="details.name" aria-label="供应商名称" :maxlength="120" /></a-form-item>
+        <a-form-item label="Base URL" required :validate-status="editorFieldErrors.baseUrl ? 'error' : undefined" :help="editorFieldErrors.baseUrl"><a-input v-model:value="details.baseUrl" aria-label="供应商地址" /></a-form-item>
         <a-form-item v-if="editing?.keys.length && savedKeyAddress" label="选择密钥"><a-select :value="editorKeyId" allow-clear :options="editing.keys.map(item=>({label:item.name || '未命名密钥',value:item.id}))" placeholder="临时密钥（仅用于获取模型）" aria-label="编辑供应商密钥选择" @change="selectEditorKey($event as string | undefined)" /></a-form-item>
-        <a-form-item label="API Key" :extra="!editing ? '密钥加密保存在本机；可留空，稍后添加。' : editorKeyId ? '修改后随供应商保存，并同步到关联 API 连接。' : savedKeyAddress ? '临时密钥仅用于获取模型，不会替换已保存密钥。' : '地址已更改，原密钥已清空。新密钥仅用于获取模型。'"><a-input v-model:value="draftKey" :disabled="editorKeyLoading || !!editorKeyError" aria-label="供应商初始密钥" autocomplete="off" :placeholder="editorKeyLoading ? '正在读取密钥…' : ''" /></a-form-item>
-        <a-alert v-if="editorKeyError" type="error" :message="editorKeyError" />
+        <a-form-item label="API Key" :validate-status="editorFieldErrors.apiKey ? 'error' : undefined" :help="editorFieldErrors.apiKey" :extra="!editing ? '密钥加密保存在本机；可留空，稍后添加。' : editorKeyId ? '修改后随供应商保存，并同步到关联 API 连接。' : savedKeyAddress ? '临时密钥仅用于获取模型，不会替换已保存密钥。' : '地址已更改，原密钥已清空。新密钥仅用于获取模型。'"><a-input v-model:value="draftKey" :disabled="editorKeyLoading || !!editorKeyError" aria-label="供应商初始密钥" autocomplete="off" :placeholder="editorKeyLoading ? '正在读取密钥…' : ''" /></a-form-item>
         <a-form-item v-if="!editing && draftKey.trim()"><a-checkbox v-model:checked="createConnection">保存后用于 Codex 实例与本地 API</a-checkbox></a-form-item>
-        <a-form-item label="模型列表" required><ProviderModelsField v-model="modelValues" :base-url="details.baseUrl" :api-key="draftKey" :active="editorOpen" :key-managed="true" :key-loading="editorKeyLoading || !!editorKeyError" :saved-key="editing && editorKeyId && savedKeyAddress && draftKey===loadedEditorKey ? {providerId:editing.id,revision:editing.revision,keyId:editorKeyId} : undefined" /></a-form-item>
+        <a-form-item label="模型列表" required :validate-status="editorFieldErrors.models ? 'error' : undefined" :help="editorFieldErrors.models"><ProviderModelsField v-model="modelValues" :base-url="details.baseUrl" :api-key="draftKey" :active="editorOpen" :key-managed="true" :key-loading="editorKeyLoading || !!editorKeyError" :saved-key="editing && editorKeyId && savedKeyAddress && draftKey===loadedEditorKey ? {providerId:editing.id,revision:editing.revision,keyId:editorKeyId} : undefined" /></a-form-item>
         <a-form-item label="默认服务等级" extra="请求和 API 连接的明确设置优先；运行中的服务需重启后应用。"><a-select v-model:value="details.defaultTier" aria-label="供应商服务等级" :options="tierOptions" /></a-form-item>
         <a-collapse v-model:active-key="editorSections" ghost :destroy-inactive-panel="false" class="provider-advanced-settings">
           <a-collapse-panel key="context" :header="`模型上下文窗口${Object.keys(details.modelContextWindows ?? {}).length ? ` · ${Object.keys(details.modelContextWindows ?? {}).length} 个自定义` : ' · 使用默认值'}`">
@@ -310,23 +340,21 @@ function usageText(key:ProviderKeySummary):string {
             </div>
           </a-collapse-panel>
         </a-collapse>
-        <a-alert v-if="editing" type="info" show-icon message="修改会同步到关联 API 连接，无需重复配置。" />
-        <a-alert v-if="manager.error" type="error" :message="manager.error" class="error-banner" />
+        <a-alert v-if="editing" type="info" show-icon message="共享配置会同步到关联 API 连接；连接单独设置的上下文窗口会保留。" />
       </a-form>
-      <template #footer><a-space><a-button @click="editorOpen=false">取消</a-button><a-button type="primary" :loading="manager.loading" :disabled="!details.name.trim() || !modelValues.length || modelValues.length>500 || editorKeyLoading || !!editorKeyError" @click="saveProvider">保存供应商</a-button></a-space></template>
+      <template #footer><FormFeedback :error="editorKeyError || editorError || manager.error" /><a-space><a-button @click="editorOpen=false">取消</a-button><a-button type="primary" :loading="manager.loading" :disabled="manager.loading || editorKeyLoading || !!editorKeyError" @click="saveProvider">保存供应商</a-button></a-space></template>
     </a-drawer>
-    <a-modal :open="!!operation" :title="operation ? operationTitle[operation] : ''" ok-text="保存" cancel-text="取消" :confirm-loading="manager.loading" destroy-on-close @cancel="closeOperation" @ok="saveOperation">
+    <a-modal :open="!!operation" :title="operation ? operationTitle[operation] : ''" ok-text="保存" cancel-text="取消" :confirm-loading="manager.loading" :body-style="{maxHeight:'70vh',overflowY:'auto'}" destroy-on-close @cancel="closeOperation" @ok="saveOperation">
       <a-form layout="vertical" class="provider-key-form">
         <p class="muted">{{ owner?.name }} · {{ owner?.baseUrl }}</p>
-        <a-form-item v-if="['addKey','editKey','createAccount'].includes(operation ?? '')" :label="operation==='createAccount' ? 'API 连接名称' : '密钥名称'"><a-input v-model:value="keyForm.name" aria-label="密钥或账号名称" :maxlength="120" /></a-form-item>
-        <a-form-item v-if="operation==='addKey' || operation==='editKey'" label="API Key" :extra="operation==='editKey' ? '显示已保存密钥的实际内容；修改会同步到关联连接，取消不会保存。' : undefined"><a-input v-model:value="keyForm.apiKey" :disabled="operationKeyLoading || !!operationKeyError" aria-label="供应商密钥" autocomplete="off" :placeholder="operationKeyLoading ? '正在读取密钥…' : ''" /></a-form-item>
-        <a-alert v-if="operationKeyError" type="error" :message="operationKeyError" />
+        <a-form-item v-if="['addKey','editKey','createAccount'].includes(operation ?? '')" :label="operation==='createAccount' ? 'API 连接名称' : '密钥名称'" :validate-status="operationFieldErrors.name ? 'error' : undefined" :help="operationFieldErrors.name"><a-input v-model:value="keyForm.name" aria-label="密钥或账号名称" :maxlength="120" /></a-form-item>
+        <a-form-item v-if="operation==='addKey' || operation==='editKey'" label="API Key" :validate-status="operationFieldErrors.apiKey ? 'error' : undefined" :help="operationFieldErrors.apiKey" :extra="operation==='editKey' ? '显示已保存密钥的实际内容；修改会同步到关联连接，取消不会保存。' : undefined"><a-input v-model:value="keyForm.apiKey" :disabled="operationKeyLoading || !!operationKeyError" aria-label="供应商密钥" autocomplete="off" :placeholder="operationKeyLoading ? '正在读取密钥…' : ''" /></a-form-item>
         <a-form-item v-if="operation==='addKey'"><a-checkbox v-model:checked="keyForm.createConnection">同时启用 API 连接</a-checkbox></a-form-item>
-        <template v-if="operation==='moveKey'"><a-form-item label="目标供应商"><a-select :value="target?.id" placeholder="选择目标供应商" :options="providers.filter(p=>p.id!==owner?.id).map(p=>({label:p.name,value:p.id}))" @change="selectTarget" /></a-form-item><p>原 API 连接保留接口和密钥并解除关联，移动不会改变请求地址。</p></template>
-        <template v-if="operation==='linkAccount'"><a-form-item label="关联 API 连接"><a-select :value="account?.id" placeholder="选择 API 连接" :options="(manager.data?.accounts ?? []).filter(a=>a.kind==='api_key').map(a=>({label:a.name,value:a.id}))" @change="selectAccount" /></a-form-item><p>该连接将使用此供应商的地址、协议、模型和所选密钥，保留独立服务等级。</p></template>
-        <p v-if="operation==='createAccount'">API 连接继承供应商默认服务等级，可在「API 连接」页单独调整。</p>
-        <a-alert v-if="manager.error" type="error" :message="manager.error" />
+        <template v-if="operation==='moveKey'"><a-form-item label="目标供应商" :validate-status="operationFieldErrors.targetId ? 'error' : undefined" :help="operationFieldErrors.targetId"><a-select :value="target?.id" placeholder="选择目标供应商" :options="providers.filter(p=>p.id!==owner?.id).map(p=>({label:p.name,value:p.id}))" @change="selectTarget" /></a-form-item><p>原 API 连接保留接口和密钥并解除关联，移动不会改变请求地址。</p></template>
+        <template v-if="operation==='linkAccount'"><a-form-item label="关联 API 连接" :validate-status="operationFieldErrors.accountId ? 'error' : undefined" :help="operationFieldErrors.accountId"><a-select :value="account?.id" placeholder="选择 API 连接" :options="(manager.data?.accounts ?? []).filter(a=>a.kind==='api_key').map(a=>({label:a.name,value:a.id}))" @change="selectAccount" /></a-form-item><p>该连接将使用此供应商的地址、协议、模型和所选密钥，保留独立服务等级和模型上下文。</p></template>
+        <p v-if="operation==='createAccount'">API 连接继承供应商的服务等级和模型上下文，可在「API 连接」页单独调整。</p>
       </a-form>
+      <template #footer><FormFeedback :error="operationKeyError || operationError || manager.error" /><a-space><a-button @click="closeOperation">取消</a-button><a-button type="primary" :loading="manager.loading" :disabled="manager.loading || operationKeyLoading || !!operationKeyError" @click="saveOperation">保存</a-button></a-space></template>
     </a-modal>
     <ProviderProbePanel v-model:open="probeOpen" :initial="probeTarget" />
   </section>

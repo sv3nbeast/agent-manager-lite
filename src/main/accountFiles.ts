@@ -5,6 +5,7 @@ import { accountIdsSchema, type StagedImport } from '../shared/types'
 import { parseAccountImport, importParsedAccounts } from './accounts'
 import { Store, type StoredAccount } from './store'
 import { providerTierForAccount } from './providerLibrary'
+import { effectiveModelContextWindows } from './providerModelContext'
 
 const MAX_BYTES = 16 * 1024 * 1024
 
@@ -16,7 +17,7 @@ export function serializeAccounts(accounts: StoredAccount[]): string {
     ...(account.subscriptionActiveUntil !== undefined ? { subscription_active_until: account.subscriptionActiveUntil,
       subscription_source: account.subscriptionSource ?? (account.subscriptionQueryLastSuccessAt !== undefined ? 'web' : undefined) } : {}),
     api_base_url: account.baseUrl, api_wire_api: account.wireApi, models: account.models,
-    ...(account.kind === 'api_key' ? { integrationType: account.integrationType } : {}),
+    ...(account.kind === 'api_key' ? { integrationType: account.integrationType, modelContextWindows: account.modelContextWindows } : {}),
     ...(account.kind === 'agent_identity' ? { agent_identity: account.credentials.agentIdentity } : account.kind === 'api_key' ? { openai_api_key: account.credentials.apiKey } : {
       tokens: { access_token: account.credentials.accessToken, refresh_token: account.credentials.refreshToken,
         id_token: account.credentials.idToken, account_id: account.credentials.accountId }
@@ -113,6 +114,7 @@ export class AccountFiles {
     // receiving workspace has no corresponding provider library or association.
     for (const account of accounts) {
       if (account.providerId && account.defaultTier === 'inherit') account.defaultTier = providerTierForAccount(state, account) ?? 'inherit'
+      if (account.kind === 'api_key') account.modelContextWindows = effectiveModelContextWindows(state, account).windows
     }
     return writeAccountExport(this.store.directory,accounts,path)
   }

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import {computed,onUnmounted,reactive,ref,watch} from 'vue'
 import {message} from 'ant-design-vue'
+import {useFormFeedback} from '../formFeedback'
+import FormFeedback from './FormFeedback.vue'
 import type {ModelDefinition,ModelCatalogView} from '../../../shared/modelCatalog'
 import type {ClientConfigPreview} from '../../../shared/clientConfig'
 
@@ -9,6 +11,9 @@ const emit=defineEmits<{'saved':[];'loaded':[view:ModelCatalogView]}>()
 const view=ref<ModelCatalogView>(),models=ref<ModelDefinition[]>([]),enabled=ref(false),defaultModelId=ref<string>()
 const busy=ref(false),error=ref(''),preview=ref<ClientConfigPreview>(),expanded=ref<string[]>([])
 const importTicket=ref<string>(),importName=ref(''),resetBasis=ref(false),editOpen=ref(false),editing=ref<number>()
+const editError=ref('')
+useFormFeedback(()=>error.value)
+useFormFeedback(()=>editError.value,{active:()=>editOpen.value})
 const empty=():ModelDefinition=>({modelId:'',displayName:'',reasoningEfforts:null,contextWindow:null,autoCompactTokenLimit:null,supportsVision:null})
 const form=reactive(empty())
 let generation=0
@@ -41,11 +46,12 @@ watch(()=>[props.targetId,props.configRevision],(value,previous)=>{
   else error.value='客户端配置已有其他修改，目录草稿已保留；请记录草稿后重新读取，再预览改动'
 },{immediate:true})
 onUnmounted(()=>{generation++})
-function edit(index?:number) {editing.value=index;Object.assign(form,index===undefined?empty():JSON.parse(JSON.stringify(models.value[index])));editOpen.value=true}
+function edit(index?:number) {editError.value='';editing.value=index;Object.assign(form,index===undefined?empty():JSON.parse(JSON.stringify(models.value[index])));editOpen.value=true}
 function saveModel() {
   const model=JSON.parse(JSON.stringify(form)) as ModelDefinition
-  if(!model.modelId.trim() || !model.displayName.trim()){message.error('请填写模型 ID 和显示名称');return}
-  if(models.value.some((value,index)=>index!==editing.value && value.modelId.toLowerCase()===model.modelId.trim().toLowerCase())){message.error('模型 ID 已存在');return}
+  editError.value=''
+  if(!model.modelId.trim() || !model.displayName.trim()){editError.value='请填写模型 ID 和显示名称';return}
+  if(models.value.some((value,index)=>index!==editing.value && value.modelId.toLowerCase()===model.modelId.trim().toLowerCase())){editError.value='模型 ID 已存在';return}
   model.modelId=model.modelId.trim();model.displayName=model.displayName.trim()
   if(model.contextWindow===null)model.autoCompactTokenLimit=null
   if(editing.value===undefined)models.value.push(model);else models.value[editing.value]=model
@@ -108,12 +114,13 @@ async function cancelPreview(){preview.value=undefined;await window.manager.disc
       <a-form-item label="自动压缩阈值（Token）" extra="必须小于窗口；只填窗口时按 90% 派生。"><a-input-number v-model:value="form.autoCompactTokenLimit" :disabled="!form.contextWindow" :min="1" :max="100000000" :precision="0" style="width:100%" /></a-form-item>
       <a-form-item label="图片输入"><a-select v-model:value="form.supportsVision" allow-clear placeholder="继承原始目录" :options="[{value:true,label:'支持图片'},{value:false,label:'仅文本'}]" /></a-form-item>
     </a-form>
+    <template #footer><FormFeedback :error="editError" /><a-space><a-button @click="editOpen=false">取消</a-button><a-button type="primary" @click="saveModel">保存到草稿</a-button></a-space></template>
   </a-modal>
   <a-modal :open="!!preview" title="确认模型目录改动" :width="740" ok-text="应用目录" cancel-text="取消" :ok-button-props="{disabled:!preview?.changes.length}" :confirm-loading="busy" @ok="apply" @cancel="cancelPreview">
     <p class="muted model-id">{{preview?.target.directory}}/config.toml</p>
     <a-table :data-source="preview?.changes" row-key="key" size="small" table-layout="fixed" :pagination="false" :columns="[{title:'设置',dataIndex:'key',width:110},{title:'当前值',dataIndex:'before',width:200},{title:'保存后',dataIndex:'after'}]"><template #bodyCell="{column,text}"><span v-if="column.dataIndex==='key'">{{labels[text]??text}}</span><code v-else class="model-id">{{text}}</code></template></a-table>
     <p v-if="preview?.catalogModels" class="muted">将保存 {{preview.catalogModels.length}} 个可见模型：</p><div v-if="preview?.catalogModels" class="catalog-preview-models"><a-tag v-for="id in preview.catalogModels" :key="id">{{id}}</a-tag></div>
-    <a-alert v-if="error" type="error" :message="error" style="margin-top:16px" />
+    <template #footer><FormFeedback :error="error" /><a-space><a-button @click="cancelPreview">取消</a-button><a-button type="primary" :disabled="!preview?.changes.length" :loading="busy" @click="apply">应用目录</a-button></a-space></template>
   </a-modal>
 </template>
 

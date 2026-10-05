@@ -3,13 +3,14 @@ import {computed,reactive,ref,watch} from 'vue'
 import {Modal,message} from 'ant-design-vue'
 import type {LocalKeyDetails,LocalKeyView,LocalPoolSettings,CustomRoutingRule,QuotaReserveThreshold} from '../../../shared/localAccess'
 import {useManager} from '../store'
+import FormFeedback from './FormFeedback.vue'
 const manager=useManager(),state=computed(()=>manager.data?.localAccess),accounts=computed(()=>manager.data?.accounts??[])
 const busy=computed(()=>Boolean(state.value?.running||state.value?.starting)),otherService=computed(()=>state.value?.singleStarting||manager.data?.gateway?.running&&!state.value?.running)
 const settings=reactive<LocalPoolSettings>({accountIds:[],routingStrategy:'auto',customRoutingRules:[],sessionAffinity:true,sessionAffinityTtlMs:3600000,quotaReserve:{}})
 const savedPool=computed(()=>state.value?{accountIds:state.value.accountIds,routingStrategy:state.value.routingStrategy,customRoutingRules:state.value.customRoutingRules??[],sessionAffinity:state.value.sessionAffinity,sessionAffinityTtlMs:state.value.sessionAffinityTtlMs,quotaReserve:state.value.quotaReserve??{}}:undefined)
 watch(()=>JSON.stringify(savedPool.value),()=>{if(savedPool.value)Object.assign(settings,{...savedPool.value,accountIds:[...savedPool.value.accountIds],customRoutingRules:savedPool.value.customRoutingRules.map(rule=>({...rule})),quotaReserve:Object.fromEntries(Object.entries(savedPool.value.quotaReserve).map(([id,value])=>[id,{...value}]))})},{immediate:true})
 const dirty=computed(()=>JSON.stringify(settings)!==JSON.stringify(savedPool.value))
-const open=ref(false),editing=ref<LocalKeyView>(),allowed=ref(''),excluded=ref('')
+const open=ref(false),editing=ref<LocalKeyView>(),allowed=ref(''),excluded=ref(''),keyError=ref('')
 const form=reactive<LocalKeyDetails>({label:'',enabled:true,inheritAccountPool:true,accountIds:[],priorityAccountIds:[],modelPrefix:'',allowedModels:[],excludedModels:[],tokenLimit:0})
 const options=computed(()=>accounts.value.filter(account=>state.value?.accountIds.includes(account.id)).map(account=>({value:account.id,label:account.name})))
 const priorityOptions=computed(()=>options.value.filter(option=>form.inheritAccountPool||form.accountIds.includes(option.value)))
@@ -31,8 +32,8 @@ const start=()=>manager.execute(()=>window.manager.startLocalAccess())
 const stop=()=>manager.execute(()=>window.manager.stopLocalAccess())
 function changeAffinity(value:string|number|null){settings.sessionAffinityTtlMs=Number(value||60)*60000}
 async function savePool(){await manager.execute(()=>window.manager.mutateLocalAccess({action:'savePool',revision:state.value!.revision,settings:{...settings,accountIds:[...settings.accountIds],customRoutingRules:settings.customRoutingRules?.map(rule=>({...rule})),quotaReserve:Object.fromEntries(Object.entries(settings.quotaReserve).map(([id,value])=>[id,{...value}]))}}))}
-function edit(key?:LocalKeyView){editing.value=key;Object.assign(form,key?{label:key.label,enabled:key.enabled,inheritAccountPool:key.inheritAccountPool,accountIds:[...key.accountIds],priorityAccountIds:[...(key.priorityAccountIds??[])],modelPrefix:key.modelPrefix,allowedModels:key.allowedModels,excludedModels:key.excludedModels,tokenLimit:key.tokenLimit}:{label:'',enabled:true,inheritAccountPool:true,accountIds:[],priorityAccountIds:[],modelPrefix:'',allowedModels:[],excludedModels:[],tokenLimit:0});allowed.value=form.allowedModels.join('\n');excluded.value=form.excludedModels.join('\n');open.value=true}
-async function saveKey(){const lines=(text:string)=>[...new Set(text.split('\n').map(value=>value.trim()).filter(Boolean))];const details={...form,accountIds:[...form.accountIds],priorityAccountIds:[...(form.priorityAccountIds??[])],allowedModels:lines(allowed.value),excludedModels:lines(excluded.value)};if(await manager.execute(()=>window.manager.mutateLocalAccess(editing.value?{action:'updateKey',id:editing.value.id,revision:editing.value.revision,details}:{action:'createKey',details})))open.value=false}
+function edit(key?:LocalKeyView){keyError.value='';editing.value=key;Object.assign(form,key?{label:key.label,enabled:key.enabled,inheritAccountPool:key.inheritAccountPool,accountIds:[...key.accountIds],priorityAccountIds:[...(key.priorityAccountIds??[])],modelPrefix:key.modelPrefix,allowedModels:key.allowedModels,excludedModels:key.excludedModels,tokenLimit:key.tokenLimit}:{label:'',enabled:true,inheritAccountPool:true,accountIds:[],priorityAccountIds:[],modelPrefix:'',allowedModels:[],excludedModels:[],tokenLimit:0});allowed.value=form.allowedModels.join('\n');excluded.value=form.excludedModels.join('\n');open.value=true}
+async function saveKey(){keyError.value='';const lines=(text:string)=>[...new Set(text.split('\n').map(value=>value.trim()).filter(Boolean))];const details={...form,accountIds:[...form.accountIds],priorityAccountIds:[...(form.priorityAccountIds??[])],allowedModels:lines(allowed.value),excludedModels:lines(excluded.value)};if(await manager.execute(()=>window.manager.mutateLocalAccess(editing.value?{action:'updateKey',id:editing.value.id,revision:editing.value.revision,details}:{action:'createKey',details})))open.value=false;else keyError.value=manager.error||'密钥保存失败，请检查配置后重试。'}
 async function copy(key:LocalKeyView){try{await window.manager.copyLocalAccessKey(key.id);message.success({content:'本地密钥已复制',key:'local-key'})}catch(error){message.error(String(error))}}
 function change(key:LocalKeyView,action:'rotateKey'|'deleteKey'){Modal.confirm({title:action==='rotateKey'?`重置“${key.label}”的密钥？`:`删除密钥“${key.label}”？`,content:action==='rotateKey'?'原密钥将失效，Token 已用量保留。':'该密钥将无法再访问本地服务，历史调用记录保留。',okText:'确认',cancelText:'取消',async onOk(){await manager.execute(()=>window.manager.mutateLocalAccess({action,id:key.id,revision:key.revision}))}})}
 </script>
@@ -95,8 +96,8 @@ function change(key:LocalKeyView,action:'rotateKey'|'deleteKey'){Modal.confirm({
         <a-form-item label="模型前缀" extra="可选，例如 work：客户端使用 work/模型名。"><a-input v-model:value="form.modelPrefix" aria-label="本地密钥模型前缀" :maxlength="64" /></a-form-item>
         <div class="pool-options"><a-form-item label="允许的模型" extra="每行一条，支持 *；空白表示允许全部。"><a-textarea v-model:value="allowed" aria-label="本地密钥允许模型" :rows="3" /></a-form-item><a-form-item label="排除的模型" extra="每行一条，优先于允许规则。"><a-textarea v-model:value="excluded" aria-label="本地密钥排除模型" :rows="3" /></a-form-item></div>
         <a-form-item label="Token 总上限" extra="0 表示不限；重置密钥不会重置已用量。"><a-input-number v-model:value="form.tokenLimit" aria-label="本地密钥Token上限" :min="0" :max="Number.MAX_SAFE_INTEGER" :precision="0" style="width:100%" /></a-form-item>
-        <a-alert v-if="manager.error" type="error" :message="manager.error" />
       </a-form>
+      <template #footer><FormFeedback :error="keyError" /><a-space><a-button @click="open=false">取消</a-button><a-button type="primary" :loading="manager.loading" @click="saveKey">保存密钥</a-button></a-space></template>
     </a-modal>
   </section>
 </template>

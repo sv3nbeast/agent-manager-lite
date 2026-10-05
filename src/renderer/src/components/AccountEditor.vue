@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
-import type { Account, AccountInput } from '../../../shared/types'
+import { accountInputSchema, type Account, type AccountInput } from '../../../shared/types'
 import { integrationTypeOptions } from '../../../shared/providerUsage'
 import { providerEndpoint } from '../../../shared/providerLibrary'
+import ModelContextWindowsField from './ModelContextWindowsField.vue'
 import { useManager } from '../store'
+import { focusFirstInvalidField, useFormFeedback, validationErrors } from '../formFeedback'
+import FormFeedback from './FormFeedback.vue'
 
 const props = defineProps<{ open: boolean; account?: Account }>()
 const emit = defineEmits<{ 'update:open': [value: boolean]; 'edit-provider': [providerId: string] }>()
@@ -16,9 +19,15 @@ const inheritedModels = computed(() => linkedProvider.value?.models ?? props.acc
 const inheritedProtocol = computed(() => (linkedProvider.value?.wireApi ?? props.account?.wireApi) === 'chat_completions' ? 'Chat Completions' : 'Responses')
 const inheritedIntegration = computed(() => integrationTypeOptions.find(option => option.value === (linkedProvider.value?.integrationType ?? props.account?.integrationType ?? 'auto'))?.label ?? '自动识别')
 const models = ref('gpt-5.5')
+const connectionModels = computed(() => managedConnection.value ? inheritedModels.value : models.value.split(/[\n,]/).map(model => model.trim()).filter(Boolean))
 const form = reactive<AccountInput>({ name: '', apiKey: '', baseUrl: 'https://api.openai.com/v1', models: ['gpt-5.5'], wireApi: 'responses', defaultTier: 'inherit', note: '', tags: [] })
 const editingAccount = ref<Account>()
 const keyLoading = ref(false), keyError = ref(''), loadedKey = ref(''), keyNeedsEntry = ref(false)
+const formError = ref(''), fieldErrors = ref<Record<string, string>>({})
+useFormFeedback(() => keyError.value || formError.value, { active: () => props.open })
+watch(() => [props.open, form.name, form.apiKey, form.baseUrl, models.value, form.note, JSON.stringify(form.tags), JSON.stringify(form.modelContextWindows)], () => {
+  formError.value = ''; fieldErrors.value = {}
+}, { flush: 'sync' })
 let keyRead = 0, initializing = false
 function clearKey() {
   keyRead++; form.apiKey = ''; loadedKey.value = ''; keyLoading.value = false; keyError.value = ''
@@ -53,6 +62,7 @@ watch([() => props.open, () => props.account?.id], ([open]) => {
   initializing = true
   Object.assign(form, { name: account?.name ?? '', apiKey: '', baseUrl: account?.baseUrl ?? 'https://api.openai.com/v1',
     models: [...(account?.models ?? ['gpt-5.5'])], wireApi: account?.wireApi ?? 'responses',
+    modelContextWindows: account?.modelContextWindows ? { ...account.modelContextWindows } : undefined,
     defaultTier: account?.defaultTier ?? 'inherit', integrationType: account?.integrationType ?? 'auto', note: account?.note ?? '', tags: [...(account?.tags ?? [])] })
   models.value = form.models.join('\n')
   initializing = false
@@ -69,21 +79,34 @@ onBeforeUnmount(clearKey)
 async function save() {
   if (!props.open || keyLoading.value || keyError.value || manager.loading) return
   const original = editingAccount.value, request = keyRead
-  if ((!original || original.kind === 'api_key' && !original.providerId) && !form.apiKey.trim()) {
-    message.info('请输入 API Key'); return
+  const values = { ...form, tags: [...form.tags], models: [...connectionModels.value], modelContextWindows: form.modelContextWindows ? { ...form.modelContextWindows } : undefined }
+  formError.value = ''
+  const metadataOnly = original && (original.kind !== 'api_key' || original.providerId)
+  const schema = metadataOnly
+    ? accountInputSchema.pick({ name: true, note: true, tags: true, defaultTier: true, modelContextWindows: true }) : accountInputSchema
+  const validation = schema.safeParse(metadataOnly ? { name: values.name, note: values.note, tags: values.tags, defaultTier: values.defaultTier, modelContextWindows: values.modelContextWindows } : values)
+  if (!validation.success) {
+    fieldErrors.value = validationErrors(validation.error.issues, { name: managedConnection.value ? '连接名称' : '账号名称', baseUrl: 'API 地址', apiKey: 'API Key', models: '模型', modelContextWindows: '模型上下文', tags: '标签', note: '备注' })
+    formError.value = Object.values(fieldErrors.value)[0] || '请检查账号配置'
+    void focusFirstInvalidField('.account-editor-form')
+    return
   }
-  const values = { ...form, tags: [...form.tags], models: models.value.split(/[\n,]/).map(s => s.trim()).filter(Boolean) }
   const action = original ? () => {
     const changes: Partial<AccountInput> = {}
     for (const key of ['name', 'note', 'tags', 'defaultTier'] as const) {
       if (JSON.stringify(values[key]) !== JSON.stringify(original[key])) Object.assign(changes, { [key]: values[key] })
     }
     if (original.kind === 'api_key') {
-      for (const key of ['baseUrl', 'models', 'wireApi'] as const) {
-        if (JSON.stringify(values[key]) !== JSON.stringify(original[key])) Object.assign(changes, { [key]: values[key] })
+      if (JSON.stringify(values.modelContextWindows ?? {}) !== JSON.stringify(original.modelContextWindows ?? {})) {
+        changes.modelContextWindows = values.modelContextWindows ?? {}
       }
-      if (values.apiKey.trim() && values.apiKey.trim() !== loadedKey.value) changes.apiKey = values.apiKey
-      if (values.integrationType !== (original.integrationType ?? 'auto')) changes.integrationType = values.integrationType
+      if (!original.providerId) {
+        for (const key of ['baseUrl', 'models', 'wireApi'] as const) {
+          if (JSON.stringify(values[key]) !== JSON.stringify(original[key])) Object.assign(changes, { [key]: values[key] })
+        }
+        if (values.apiKey.trim() && values.apiKey.trim() !== loadedKey.value) changes.apiKey = values.apiKey
+        if (values.integrationType !== (original.integrationType ?? 'auto')) changes.integrationType = values.integrationType
+      }
     }
     return window.manager.editAccount({ id: original.id, revision: original.revision ?? 0, changes })
   } : () => window.manager.addAccount(values)
@@ -105,7 +128,7 @@ function editProvider() {
 
 <template>
   <a-drawer :open="open" :title="managedConnection ? '编辑连接' : account ? '编辑账号' : '添加 API 账号'" :width="500" destroy-on-close @close="close">
-    <a-form layout="vertical" @finish="save">
+    <a-form layout="vertical" class="account-editor-form" @finish="save">
       <section v-if="managedConnection" class="connection-shared-config" aria-label="供应商共享配置">
         <div class="connection-source-heading"><span><small>共享配置来源</small><strong>{{ linkedProvider?.name ?? '未知供应商' }}</strong></span><a-button v-if="linkedProvider" type="link" size="small" @click="editProvider">编辑供应商配置</a-button></div>
         <p v-if="linkedProvider">使用密钥「{{ linkedKey?.name || '已关联密钥' }}」· {{ inheritedModels.length }} 个模型 · {{ inheritedProtocol }}</p>
@@ -122,21 +145,22 @@ function editProvider() {
         </details>
         <div class="connection-source-footer"><small>{{ linkedProvider ? '地址、密钥和模型在供应商处统一维护。' : '解除关联后保留现有连接配置。' }}</small><a-button type="link" size="small" @click="unlink">解除关联</a-button></div>
       </section>
-      <a-form-item :label="managedConnection ? '连接名称' : '账号名称'" required><a-input v-model:value="form.name" :maxlength="120" /></a-form-item>
+      <a-form-item :label="managedConnection ? '连接名称' : '账号名称'" required :validate-status="fieldErrors.name ? 'error' : undefined" :help="fieldErrors.name"><a-input v-model:value="form.name" :maxlength="120" /></a-form-item>
       <template v-if="(!account || account.kind === 'api_key') && !managedConnection">
-        <a-form-item label="Base URL" required><a-input v-model:value="form.baseUrl" /></a-form-item>
-        <a-form-item label="API Key" required :extra="keyNeedsEntry ? '地址已更改，请填写用于此地址的 API Key' : undefined"><a-input v-model:value="form.apiKey" aria-label="账号 API Key" autocomplete="off" :disabled="keyLoading" :placeholder="keyLoading ? '正在读取已保存的 API Key…' : '请输入 API Key'" /></a-form-item>
-        <a-alert v-if="keyError" type="error" :message="keyError" class="error-banner" />
-        <a-form-item label="模型列表" extra="多个模型用逗号或换行分隔" required><a-textarea v-model:value="models" :rows="3" /></a-form-item>
+        <a-form-item label="Base URL" required :validate-status="fieldErrors.baseUrl ? 'error' : undefined" :help="fieldErrors.baseUrl"><a-input v-model:value="form.baseUrl" /></a-form-item>
+        <a-form-item label="API Key" required :validate-status="fieldErrors.apiKey ? 'error' : undefined" :help="fieldErrors.apiKey" :extra="keyNeedsEntry ? '地址已更改，请填写用于此地址的 API Key' : undefined"><a-input v-model:value="form.apiKey" aria-label="账号 API Key" autocomplete="off" :disabled="keyLoading" :placeholder="keyLoading ? '正在读取已保存的 API Key…' : '请输入 API Key'" /></a-form-item>
+        <a-form-item label="模型列表" extra="多个模型用逗号或换行分隔" required :validate-status="fieldErrors.models ? 'error' : undefined" :help="fieldErrors.models"><a-textarea v-model:value="models" :rows="3" /></a-form-item>
         <a-form-item label="上游协议"><a-select v-model:value="form.wireApi" :options="[{ label: 'Responses', value: 'responses' }, { label: 'Chat Completions', value: 'chat_completions' }]" /></a-form-item>
       </template>
+      <a-form-item v-if="!account || account.kind === 'api_key'" label="模型上下文窗口" :validate-status="fieldErrors.modelContextWindows ? 'error' : undefined" :help="fieldErrors.modelContextWindows" :extra="managedConnection ? '仅覆盖此连接；未设置的模型继承供应商配置。保存后重新启动使用此连接的实例生效。' : '按模型单独配置，仅作用于此连接。保存后重新启动使用此连接的实例生效。'">
+        <ModelContextWindowsField :key="account?.id ?? 'new-api'" v-model="form.modelContextWindows" :models="connectionModels" :inherited-windows="managedConnection ? linkedProvider?.modelContextWindows : undefined" :active="open" />
+      </a-form-item>
       <a-form-item label="服务等级" extra="服务运行期间保存的等级修改，在停止并重新启动后应用。"><a-select v-model:value="form.defaultTier" :options="[{ label: account?.providerId ? '继承供应商设置' : '继承全局设置', value: 'inherit' }, { label: '跟随请求', value: 'follow' }, { label: 'Standard', value: 'standard' }, { label: 'Fast', value: 'fast' }, {label:'Auto',value:'auto'}, {label:'Flex',value:'flex'}]" /></a-form-item>
       <a-form-item v-if="(!account || account.kind === 'api_key') && !managedConnection" label="额度查询方式" extra="仅影响自定义服务商的额度查询；官方服务商仍使用专用接口。更改后请重新刷新用量。"><a-select v-model:value="form.integrationType" aria-label="账号额度查询方式" :options="integrationTypeOptions" /></a-form-item>
       <a-form-item label="标签" extra="输入后按回车，可添加多个标签"><a-select v-model:value="form.tags" mode="tags" :token-separators="[',']" /></a-form-item>
       <a-form-item label="备注"><a-textarea v-model:value="form.note" :maxlength="2000" :rows="3" /></a-form-item>
-      <a-alert v-if="manager.error" type="error" :message="manager.error" class="error-banner" />
     </a-form>
-    <template #footer><a-space><a-button @click="close">取消</a-button><a-button type="primary" :loading="manager.loading" :disabled="keyLoading || !!keyError" @click="save">{{ managedConnection ? '保存连接' : '保存账号' }}</a-button></a-space></template>
+    <template #footer><FormFeedback :error="keyError || formError || manager.error" /><a-space><a-button @click="close">取消</a-button><a-button type="primary" :loading="manager.loading" :disabled="keyLoading || !!keyError" @click="save">{{ managedConnection ? '保存连接' : '保存账号' }}</a-button></a-space></template>
   </a-drawer>
 </template>
 

@@ -10,6 +10,7 @@ import * as library from '../src/shared/providerLibrary'
 import type { ProviderSummary } from '../src/shared/providerLibrary'
 import type { ManagerAPI } from '../src/shared/types'
 import * as presets from '../src/shared/providerPresets'
+import * as feedback from '../src/renderer/src/formFeedback'
 
 const path = new URL('../src/renderer/src/components/ProviderLibraryView.vue', import.meta.url)
 const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path.pathname })
@@ -28,7 +29,7 @@ function mount(overrides:Partial<ManagerAPI>={}) {
   const api:Partial<ManagerAPI>={readProviderKey:async input=>`fixture-${input.id}`,mutateProvider:async input=>{writes.push(structuredClone(input));return manager.data as any},...overrides}
   const exports={}
   const context={module:{exports},exports,window:{manager:api},console,
-    require:(id:string)=>id==='vue'?vue:id==='ant-design-vue'?{message:{success(){},info(){},error(){}},Modal:{confirm(){}}}:id==='../store'?{useManager:()=>manager}:id.endsWith('/providerLibrary')?library:id.endsWith('/providerPresets')?presets:id.endsWith('/providerUsage')?{integrationTypeOptions:[]}:id==='@ant-design/icons-vue'?{}:id.endsWith('.vue')?{default:{}}:(()=>{throw new Error(`Unexpected module ${id}`)})()}
+    require:(id:string)=>id==='vue'?vue:id==='ant-design-vue'?{message:{success(){},info(){},error(){}},Modal:{confirm(){}}}:id==='../store'?{useManager:()=>manager}:id==='../formFeedback'?feedback:id.endsWith('/providerLibrary')?library:id.endsWith('/providerPresets')?presets:id.endsWith('/providerUsage')?{integrationTypeOptions:[]}:id==='@ant-design/icons-vue'?{}:id.endsWith('.vue')?{default:{}}:(()=>{throw new Error(`Unexpected module ${id}`)})()}
   vm.runInNewContext(javascript,context)
   const component=(context.module.exports as {default:vue.Component}).default as vue.Component&{render?:()=>null};component.render=()=>null
   const renderer=vue.createRenderer<object,{children:object[]}>({patchProp(){},insert(node,parent){parent.children.push(node)},remove(){},createElement:()=>({children:[]}),createText:()=>({}),createComment:()=>({}),setText(){},setElementText(){},parentNode:()=>null,nextSibling:()=>null})
@@ -37,6 +38,18 @@ function mount(overrides:Partial<ManagerAPI>={}) {
   return {state:vnode.component!.setupState as Record<string,any>,providers,manager,writes,unmount:()=>renderer.render(null,container)}
 }
 const flush=async()=>{await Promise.resolve();await vue.nextTick()}
+
+test('saving incomplete supplier drafts gives field errors instead of silently disabling the action',async t=>{
+  const ui=mount();t.after(ui.unmount);ui.state.openEditor()
+  await ui.state.saveProvider()
+  assert.equal(ui.writes.length,0)
+  assert.equal(ui.state.editorError,'请填写供应商名称')
+  assert.equal(ui.state.editorFieldErrors.models,'请至少添加一个模型')
+  ui.state.details.name='Supplier';assert.equal(ui.state.editorError,'')
+  await ui.state.saveProvider();assert.equal(ui.state.editorError,'请至少添加一个模型')
+  ui.state.models='fixture-model';ui.state.details.baseUrl='bad-url'
+  await ui.state.saveProvider();assert.ok(ui.state.editorFieldErrors.baseUrl);assert.equal(ui.writes.length,0)
+})
 
 test('supplier editing reads selected saved keys; cancelling and late responses cannot fill another supplier',async t=>{
   const first=deferred<string>(),second=deferred<string>();let reads=0

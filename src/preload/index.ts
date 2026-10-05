@@ -124,6 +124,7 @@ const api: ManagerAPI = {
   listInstanceWorkingDirectories: () => ipcRenderer.invoke('manager:invoke','listInstanceWorkingDirectories'),
   removeInstance: input => ipcRenderer.invoke('manager:invoke','removeInstance',input),
   previewInstanceLaunch: input => ipcRenderer.invoke('manager:invoke','previewInstanceLaunch',input),
+  previewInstanceHistory: input => ipcRenderer.invoke('manager:invoke','previewInstanceHistory',input),
   startInstance: ticket => ipcRenderer.invoke('manager:invoke','startInstance',ticket),
   stopInstance: id => ipcRenderer.invoke('manager:invoke','stopInstance',id),
   closeAllInstances: () => ipcRenderer.invoke('manager:invoke','closeAllInstances'),

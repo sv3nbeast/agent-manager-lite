@@ -2,6 +2,7 @@ import type {ProxyResourcesView,ProxyChangePreview,ProxyResourceChange} from './
 import type {ProxyImportInput,ProxyImportPreview,ProxyAssignmentInput,ProxyAssignmentPreview} from './proxyBatch'
 import type {TrashPreviewInput,TrashActionInput,TrashPreview,TrashPage,TrashState,LegacyTrashPage,LegacyTrashImportInput} from './sessionTrash'
 import { z } from 'zod'
+import { modelContextWindowsSchema } from './modelContextWindows'
 import { integrationTypeSchema, type IntegrationType } from './providerUsage'
 import type { HistoryFilter, HistoryQuery, HistoryPage } from './history'
 import type { ClientConfigTarget, ClientConfigView, ClientConfigPreview, ClientConfigChanges } from './clientConfig'
@@ -10,7 +11,7 @@ import type {ProviderConfigInput,ProviderConfigView} from './providerConfig'
 import type { ProviderSummary, ProviderMutation } from './providerLibrary'
 import type { ProviderProbeInput, ProviderProbeState } from './providerProbe'
 import type { LocalAccessMutation,LocalAccessView } from './localAccess'
-import type { InstanceProfile, InstanceView, InstanceApplication, InstanceInput, InstanceLaunchPreview, InstanceWorkingDirectory, InstanceCopyInput, InstanceCopyView, InstanceCopySource, ExternalInstanceCopyInput, AttachInstanceInput } from './instances'
+import type { InstanceProfile, InstanceView, InstanceApplication, InstanceInput, InstanceLaunchPreview, InstanceWorkingDirectory, InstanceCopyInput, InstanceCopyView, InstanceCopySource, ExternalInstanceCopyInput, AttachInstanceInput, InstanceHistorySummary } from './instances'
 import type {ClientIdentityInput,ClientIdentityView} from './clientIdentity'
 import type {ClientSwitchView,ClientSwitchPreview} from './clientSwitch'
 import type {ClientAuthorityView} from './clientAuthority'
@@ -46,12 +47,15 @@ export const accountInputSchema = z.object({
   name: z.string().trim().min(1).max(120),
   apiKey: z.string().trim().min(1).max(10000),
   baseUrl: z.string().url().refine(value => {
-    const url = new URL(value)
-    return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash
+    try {
+      const url = new URL(value)
+      return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash
+    } catch { return false }
   }, '请输入不含账号密码、查询参数的 HTTP(S) 地址'),
   models: z.array(z.string().trim().min(1).max(200)).min(1).max(500),
   wireApi: z.enum(['responses', 'chat_completions']).default('responses'),
   integrationType: integrationTypeSchema.optional(),
+  modelContextWindows: modelContextWindowsSchema.optional(),
   defaultTier: defaultTierSchema.default('inherit'),
   note: z.string().max(2000).default(''),
   tags: z.array(z.string().trim().min(1).max(40)).max(30).default([])
@@ -97,6 +101,7 @@ export interface Account {
   id: string; name: string; email?: string; kind: 'oauth' | 'api_key' | 'agent_identity'; plan?: string
   baseUrl: string; models: string[]; wireApi: 'responses' | 'chat_completions'
   integrationType?: IntegrationType
+  modelContextWindows?: Record<string, number>
   defaultTier: DefaultTier; note: string; tags: string[]; createdAt: number
   providerId?: string; providerKeyId?: string
   quota?: Quota; error?: string; errorAt?: number
@@ -237,6 +242,7 @@ export interface ManagerAPI {
   listInstanceWorkingDirectories():Promise<InstanceWorkingDirectory[]>
   removeInstance(input:Pick<InstanceProfile,'id'|'revision'>):Promise<AppSnapshot>
   previewInstanceLaunch(input:Pick<InstanceProfile,'id'|'revision'>):Promise<InstanceLaunchPreview>
+  previewInstanceHistory(input:Pick<InstanceProfile,'id'|'revision'>):Promise<InstanceHistorySummary>
   startInstance(ticket:string):Promise<AppSnapshot>
   stopInstance(id:string):Promise<AppSnapshot>
   closeAllInstances():Promise<AppSnapshot>

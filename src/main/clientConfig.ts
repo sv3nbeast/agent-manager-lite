@@ -13,7 +13,7 @@ import {providerView,providerEdits} from './providerConfig'
 import type {ProviderConfigView} from '../shared/providerConfig'
 import {instanceHomePath,validateExternalHome} from './instancePaths'
 import {instanceProviderName} from './instanceProviderName'
-import {providerModelContextWindows} from './providerModelContext'
+import {effectiveModelContextWindows} from './providerModelContext'
 
 const managedId = 'dd0c896c-522d-4d6a-a9af-3a6a3e10e2fd'
 const hash = (text: string | null) => createHash('sha256').update(text === null ? 'missing:' : `present:${text}`).digest('hex')
@@ -264,7 +264,7 @@ export class ClientConfigs {
     const target=this.target(id),source=this.source(target),doc=new TomlDocument(source??'')
     const catalog=this.catalogSource(target,source)
     if(catalog.error)throw new Error(catalog.error)
-    const windows=providerModelContextWindows(state,account),override=windows?.[model]
+    const {windows,providerWindows,connectionWindows}=effectiveModelContextWindows(state,account),override=windows?.[model]
     const template=templateFor(model,catalog.catalog)
     const configured=doc.scalar(['model_context_window']),configuredCompact=doc.scalar(['model_auto_compact_token_limit'])
     const positive=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>1
@@ -273,7 +273,7 @@ export class ClientConfigs {
       ?typeof configuredCompact==='number'&&Number.isSafeInteger(configuredCompact)&&configuredCompact>0?configuredCompact
         :positive(configured)?undefined:typeof template.model.auto_compact_token_limit==='number'?template.model.auto_compact_token_limit:undefined
       :Math.floor(override*0.9)
-    const origin: 'provider'|'config'|'catalog'|'template'=override!==undefined?'provider':positive(configured)?'config':template.known?'catalog':'template'
+    const origin: 'connection'|'provider'|'config'|'catalog'|'template'=connectionWindows&&Object.hasOwn(connectionWindows,model)?'connection':override!==undefined?'provider':positive(configured)?'config':template.known?'catalog':'template'
     let catalogFile:CatalogFile|undefined
     // Model settings belong to the selected model, including later selections
     // inside Codex. A top-level launch override would leak to every model.
@@ -286,11 +286,11 @@ export class ClientConfigs {
       // only when preserving a pre-existing global override requires it.
       const requiredModels=globalWindow||globalCompact?account.models:account.models.filter(id=>Object.hasOwn(windows,id))
       const modelIds=[...new Set([...requiredModels,model])]
-      if(modelIds.some(id=>id.length>128))throw new Error('供应商模型名称超过 Codex 模型目录支持的 128 字符，请调整名称或清除该供应商的上下文覆盖')
+      if(modelIds.some(id=>id.length>128))throw new Error('模型名称超过 Codex 模型目录支持的 128 字符，请调整名称或清除上下文覆盖')
       if(new Set(modelIds.map(id=>id.toLowerCase())).size!==modelIds.length)throw new Error('模型名称仅大小写不同，Codex 模型目录无法区分，请统一名称后重试')
       for(const id of modelIds){
         const existing=generated.models.find(entry=>entry.slug.toLowerCase()===id.toLowerCase())
-        // Preserve the provider's actual model spelling when matching a native
+        // Preserve the connection's actual model spelling when matching a native
         // case-insensitive catalog entry; requests still use that exact ID.
         if(existing){existing.slug=id;continue}
         const entry=templateFor(id,catalog.catalog).model
@@ -320,7 +320,7 @@ export class ClientConfigs {
     }
     const supportsFast=Array.isArray(template.model.service_tiers)&&template.model.service_tiers.some(tier=>tier&&typeof tier==='object'&&tier.id==='priority')
     return {window,compact,origin,override,dependency:catalog.dependency,catalogFile,supportsFast,
-      revision:hash(JSON.stringify([model,catalog.revision,instance.accountId,account.kind,account.providerId,account.providerKeyId,windows??null,window,compact,origin,catalogFile?.name]))}
+      revision:hash(JSON.stringify([model,catalog.revision,instance.accountId,account.kind,account.providerId,account.providerKeyId,providerWindows??null,connectionWindows??null,window,compact,origin,catalogFile?.name]))}
   }
   // Native instances reuse the ordinary config journal, independently of their
   // encrypted auth transaction. This keeps later hand edits out of restoration.
@@ -334,7 +334,7 @@ export class ClientConfigs {
       {path:['model_auto_compact_token_limit'],raw:null}
     ]
     const preview=this.stage(target,source,edits.filter(edit=>doc.raw(edit.path)!==edit.raw),'apply',[],context.dependency?[context.dependency]:[],context.catalogFile)
-    this.pending!.verify=()=>{if(this.instanceModelContext(id,model).revision!==context.revision)throw new Error('实例供应商上下文或模型目录已变化，请重新预览启动')}
+    this.pending!.verify=()=>{if(this.instanceModelContext(id,model).revision!==context.revision)throw new Error('实例连接、供应商上下文或模型目录已变化，请重新预览启动')}
     return preview
   }
   previewInstanceConnection(id:string, revision:string, connection:{port:number;key:string;model:string;tier?:string;manageServiceTier?:boolean}):ClientConfigPreview {
@@ -368,7 +368,7 @@ export class ClientConfigs {
     this.pending!.verify=()=>{
       const current=this.store.read(),profile=current.instances?.find(profile=>profile.id===id),active=current.accounts.find(account=>account.id===profile?.accountId)
       if(!active||JSON.stringify([profile?.accountId,active.kind,active.providerId,active.providerKeyId,instanceProviderName(current,active)])!==attribution)throw new Error('实例供应商关联或名称已变化，请重新预览启动')
-      if(this.instanceModelContext(id,connection.model).revision!==context.revision)throw new Error('实例供应商上下文或模型目录已变化，请重新预览启动')
+      if(this.instanceModelContext(id,connection.model).revision!==context.revision)throw new Error('实例连接、供应商上下文或模型目录已变化，请重新预览启动')
     }
     return preview
   }

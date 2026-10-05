@@ -24,6 +24,7 @@ import {instanceProviderName} from './instanceProviderName'
 import {initializeDesktopLocale,previewDesktopLocale,systemDesktopLanguages} from './desktopLocale'
 import {inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuInspection} from './codexSpeedMenu'
 import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopServiceTier'
+import {readInstanceHistory} from './instanceHistory'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu}
 const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
@@ -166,7 +167,7 @@ export class Instances {
     const canonical=realpathSync(selected);directory(canonical)
     if(pathContains(this.root,canonical)||pathContains(canonical,this.root))throw new Error('所选目录不能包含本管理器数据目录或位于其中；受管实例请使用卡片入口')
     if(purpose==='copy'&&!['config.toml','auth.json','sessions','skills'].some(name=>existsSync(join(canonical,name))))throw new Error('所选目录没有 Codex 配置、登录文件、会话或技能，请选择 CODEX_HOME 目录')
-    const stat=lstatSync(canonical),view={ticket:randomUUID(),name:basename(canonical),directory:canonical}
+    const stat=lstatSync(canonical),view={ticket:randomUUID(),name:basename(canonical),directory:canonical,history:readInstanceHistory(canonical)}
     const source={view,device:stat.dev,inode:stat.ino,expires:this.now()+300_000,purpose}
     this.verifyExternalSource(source)
     this.externalCopySource=source
@@ -214,6 +215,8 @@ export class Instances {
     if(this.store.read().instances?.some(item=>item.name.toLowerCase()===details.name.toLowerCase()))throw new Error('实例名称已存在')
     if((this.store.read().instances?.length??0)>=100)throw new Error('最多管理 100 个实例')
     this.validateDetails(details,source.id)
+    const account=this.store.read().accounts.find(value=>value.id===details.accountId)!
+    const copiedSessionProvider=getInstanceClientAdapter(details.clientType).copiedSessionProvider(details,account)
     const id=randomUUID(),controller=new AbortController(),sourceHome=source.directory
     const view:InstanceCopyView={id,sourceId:source.id,sourceName:source.name,sourceDirectory:sourceHome,external:source.external,name:details.name,status:'scanning',files:0,bytes:0,totalFiles:0,totalBytes:0,skipped:0}
     const job={view,controller,accountId:details.accountId,task:undefined as Promise<void>|undefined};this.copy=job
@@ -229,7 +232,7 @@ export class Instances {
         await mkdir(staging,{mode:0o700});created=true;identity=lstatSync(staging)
         atomic(join(staging,'copy.json'),JSON.stringify({id,sourceId:source.id,...source.external?{external:true,sourceName:source.name}:{}}))
         await copyInstanceHome(manifest,join(staging,'home'),controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
-        await relocateCopiedProfile(manifest,join(staging,'home'),join(target,'home'),controller.signal)
+        await relocateCopiedProfile(manifest,join(staging,'home'),join(target,'home'),controller.signal,copiedSessionProvider)
         assertClientDaemonStopped(await probeClientDaemon(sourceHome,controller.signal));controller.signal.throwIfAborted()
         verify()
         await mkdir(join(staging,'desktop'),{mode:0o700});await mkdir(join(staging,'workspace'),{mode:0o700})
@@ -307,21 +310,36 @@ export class Instances {
     const language=plan.mode==='cli'?undefined:previewDesktopLocale(this.localeOptions(profile.id,plan))
     const tier=resolveServiceTier(undefined,state.settings.defaultTier,providerTier,profile.defaultTier,account.defaultTier)
     const clientMenu=plan.mode!=='cli'&&profile.connectionMode!=='native'?this.speedMenuServices.inspect({application:plan.application,executable:plan.executable}):undefined
-    const speedMenu=clientMenu?.supported&&!modelContext.supportsFast?{...clientMenu,supported:false,reason:'此模型未声明 Fast 能力，保留已有速度设置',fingerprint:digest([clientMenu.fingerprint,profile.model,modelContext.revision,'no-fast'])}:clientMenu
+    // The renderer compatibility hook is what exposes the Normal / Fast
+    // selector for manager-owned local providers. A model catalog can omit
+    // `service_tiers` for a newly released or provider-routed model even when
+    // the upstream accepts the tier request (for example gpt-5.6-sol-wm).
+    // Using that catalog field as a hard gate made the selector disappear.
+    // Keep the inspected client capability authoritative; the selected tier
+    // is still carried by the gateway and can be rejected upstream when it is
+    // genuinely unsupported.
+    const speedMenu=clientMenu
     const localeCandidate=plan.mode==='cli'?undefined:this.speedMenuServices.inspectLocale?.({application:plan.application,executable:plan.executable})
     const combined=speedMenu?.supported&&localeCandidate?.supported?this.speedMenuServices.inspectCombined?.({application:plan.application,executable:plan.executable}):undefined
     const localeCompatibility=localeCandidate?.supported&&speedMenu?.supported&&!combined?.supported?{...localeCandidate,supported:false,reason:combined?.reason??'当前客户端组合界面适配未就绪，保留原页面语言'}:localeCandidate
     const compatibility=combined?.supported?combined:speedMenu?.supported?speedMenu:localeCompatibility
     const speedPreference=speedMenu?.supported?previewDesktopServiceTier(this.speedPreferenceOptions(profile.id,plan,tier.tier)):undefined
     const initialTier=speedPreference?speedPreference.tier:tier.tier
+    const history=readInstanceHistory(plan.directory)
     const fingerprint=digest([profile,view.revision,plan.application,plan.executable,plan.cliPackage,lstatSync(plan.executable).mtimeMs,lstatSync(plan.executable).ino,lstatSync(plan.workingDirectory).ino,
       ...[folder,plan.directory,plan.desktopDirectory].map(path=>[lstatSync(path).dev,lstatSync(path).ino]),
       account.id,account.kind,account.baseUrl,account.models,account.wireApi,account.credentials.apiKey,account.providerId,account.providerKeyId,providerName,language?.revision,modelContext.revision,accountProxyURL(account,state),tier,
-      profile.connectionMode==='native'?readBounded(join(plan.directory,'auth.json'),2*1024*1024):null,speedMenu?.fingerprint,speedPreference?.revision,localeCandidate?.fingerprint,combined?.fingerprint,compatibility?.fingerprint])
-    return {account,configs,view,tier,plan,fingerprint,providerName,language,modelContext,speedMenu,speedPreference,initialTier,localeCompatibility,compatibility}
+      profile.connectionMode==='native'?readBounded(join(plan.directory,'auth.json'),2*1024*1024):null,speedMenu?.fingerprint,speedPreference?.revision,localeCandidate?.fingerprint,combined?.fingerprint,compatibility?.fingerprint,history])
+    return {account,configs,view,tier,plan,fingerprint,providerName,language,modelContext,speedMenu,speedPreference,initialTier,localeCompatibility,compatibility,history}
   }
   private localeOptions(id:string,plan:DesktopPlan) {return {directory:plan.directory,markerPath:join(this.folder(id),'desktop-locale.json'),systemLanguages:this.systemLanguages}}
   private speedPreferenceOptions(id:string,plan:DesktopPlan,initialTier?:string) {return {directory:plan.directory,markerPath:join(this.folder(id),'desktop-speed-preference.json'),initialTier}}
+  previewHistory(raw:unknown) {
+    const {id,revision}=instanceRevisionSchema.parse(raw),profile=this.profile(id)
+    if(profile.revision!==revision||this.inUse(id))throw new Error('实例已变化或正在运行，请停止并刷新后查看会话来源')
+    getInstanceClientAdapter(profile.clientType)
+    return readInstanceHistory(instanceHomePath(this.root,profile))
+  }
   preview(raw:unknown):InstanceLaunchPreview {
     const {id,revision}=instanceRevisionSchema.parse(raw),profile=this.profile(id)
     if(profile.revision!==revision || this.inUse(id))throw new Error('实例已变化或正在运行，请刷新后重试')
@@ -331,7 +349,8 @@ export class Instances {
       effectiveContextWindow:context.modelContext.window,effectiveAutoCompactTokenLimit:context.modelContext.compact,contextWindowSource:context.modelContext.origin,
       model:profile.model,tier:context.initialTier,tierSource:context.speedPreference?.source==='existing'?'client':context.tier.source,connectionMode:profile.connectionMode??'local_api',launchMode:context.plan.mode??'desktop',externalHome:!!profile.externalHome,
       speedMenuAvailable:context.speedMenu?.supported,speedMenuReason:context.speedMenu?.reason,speedPreferenceSource:context.speedPreference?.source,
-      desktopLocaleCompatibilityAvailable:context.localeCompatibility?.supported,desktopLocaleCompatibilityReason:context.localeCompatibility?.reason}
+      desktopLocaleCompatibilityAvailable:context.localeCompatibility?.supported,desktopLocaleCompatibilityReason:context.localeCompatibility?.reason,
+      history:context.history}
     this.previews.set(id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000})
     return structuredClone(preview)
   }
@@ -342,7 +361,7 @@ export class Instances {
     const [id,pending]=entry,profile=this.profile(id),context=this.context(profile)
     if(this.inUse(id))throw new Error('实例已有启动或运行任务')
     this.previews.delete(id)
-    if(context.fingerprint!==pending.fingerprint)throw new Error('账号、配置或应用已变化，请重新预览')
+    if(context.fingerprint!==pending.fingerprint)throw new Error('账号、配置、会话或应用已变化，请重新预览')
     const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),initialTier:context.initialTier,speedMenuInspection:context.speedMenu,localeInspection:context.localeCompatibility}
     this.notices.delete(id)
     this.active.set(id,run)

@@ -4,9 +4,13 @@ import { message, Modal } from 'ant-design-vue'
 import { PlusOutlined, CloudServerOutlined, DeleteOutlined } from '@ant-design/icons-vue'
 import type { SshServerInput } from '../../../shared/ssh'
 import { useManager } from '../store'
+import { useFormFeedback } from '../formFeedback'
+import FormFeedback from './FormFeedback.vue'
 
 const manager = useManager()
 const open = ref(false), syncOpen = ref(false), editing = ref<string>(), syncServerId = ref(''), syncAccountId = ref(''), error = ref(''), testing = ref(''), syncing = ref('')
+const saveError = ref('')
+useFormFeedback(() => error.value)
 const form = reactive<SshServerInput>({ name: '', host: '', port: 22, username: '', codexHome: '~/.codex', auth: { kind: 'agent' }, syncOnCodexSwitch: false })
 const servers = computed(() => manager.data?.sshServers?.servers ?? [])
 const accounts = computed(() => (manager.data?.accounts ?? []).filter(account => account.kind !== 'agent_identity'))
@@ -15,14 +19,15 @@ const displayError = (cause: unknown) => (cause instanceof Error ? cause.message
 
 function reset(server?: SshServerInput & { id?: string }) {
   editing.value = server?.id
-  Object.assign(form, server ? structuredClone(server) : { name: '', host: '', port: 22, username: '', codexHome: '~/.codex', auth: { kind: 'agent' }, syncOnCodexSwitch: false })
-  error.value = ''; open.value = true
+  Object.assign(form, server ? JSON.parse(JSON.stringify(server)) : { name: '', host: '', port: 22, username: '', codexHome: '~/.codex', auth: { kind: 'agent' }, syncOnCodexSwitch: false })
+  error.value = ''; saveError.value = ''; open.value = true
 }
 async function save() {
-  error.value = ''
+  error.value = ''; saveError.value = ''
   try {
     const input = { ...form, ...(editing.value ? { id: editing.value } : {}), auth: form.auth.kind === 'agent' ? { kind: 'agent' as const } : { kind: 'private_key_file' as const, path: form.auth.path }}
     if (await manager.execute(() => window.manager.saveSshServer(input))) { open.value = false; message.success('SSH 服务器已保存') }
+    else saveError.value = manager.error || 'SSH 服务器保存失败，请检查配置后重试。'
   } catch (cause) { error.value = displayError(cause) }
 }
 function remove(id: string, name: string) {
@@ -39,7 +44,7 @@ async function sync(id: string) {
 }
 async function performSync() {
   const id = syncServerId.value, accountId = syncAccountId.value
-  if (!id || !accountId) return
+  if (!id || !accountId) { error.value = '请选择要同步的服务器和账号。'; return }
   syncing.value = id; error.value = ''
   try { const result = await window.manager.syncSshAccount({ serverId: id, accountId }); await manager.refresh(); syncOpen.value = false; message.success(`已同步到 ${result.serverName}`) } catch (cause) { error.value = displayError(cause) } finally { if (syncing.value === id) syncing.value = '' }
 }
@@ -49,7 +54,7 @@ async function performSync() {
   <a-card title="SSH 远端 Codex" class="settings-card ssh-servers-panel">
     <template #extra><a-button type="primary" size="small" @click="reset()"><PlusOutlined />添加服务器</a-button></template>
     <p class="muted">配置保存在管理器加密 vault。连接使用系统 OpenSSH 的非交互模式；私钥只保存路径，不读取或上传私钥内容。</p>
-    <a-alert v-if="error" type="error" show-icon :message="error" class="ssh-error" />
+    <a-alert v-if="error && !open && !syncOpen" type="error" show-icon :message="error" class="ssh-error" />
     <a-empty v-if="!servers.length" description="尚未配置远端服务器" />
     <div v-else class="ssh-server-list">
       <a-card v-for="server in servers" :key="server.id" size="small" class="ssh-server-card">
@@ -75,10 +80,12 @@ async function performSync() {
         <a-form-item v-if="form.auth.kind==='private_key_file'" label="私钥路径"><a-input v-model:value="form.auth.path" placeholder="~/.ssh/id_ed25519" autocomplete="off" /></a-form-item>
         <a-form-item><a-checkbox v-model:checked="form.syncOnCodexSwitch">切换账号后自动同步（默认关闭）</a-checkbox></a-form-item>
       </a-form>
+      <template #footer><FormFeedback :error="saveError || error" /><a-space><a-button @click="open=false">取消</a-button><a-button type="primary" :loading="manager.loading" @click="save">保存</a-button></a-space></template>
     </a-modal>
     <a-modal v-model:open="syncOpen" title="同步账号到远端 Codex" ok-text="继续同步" cancel-text="取消" :confirm-loading="!!syncing" @ok="performSync">
       <p>将选定账号的 <code>auth.json</code> 通过非交互 SSH 传输到远端 CODEX_HOME，并在远端校验 SHA-256。请确认远端客户端已关闭或允许重新读取凭据。</p>
       <a-form-item label="账号"><a-select v-model:value="syncAccountId" :options="accounts.map(account=>({value:account.id,label:account.name+(account.email?' · '+account.email:'')}))" /></a-form-item>
+      <template #footer><FormFeedback :error="error" /><a-space><a-button @click="syncOpen=false">取消</a-button><a-button type="primary" :loading="!!syncing" @click="performSync">继续同步</a-button></a-space></template>
     </a-modal>
   </a-card>
 </template>

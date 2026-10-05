@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import {computed,onMounted,onUnmounted,ref} from 'vue'
+import {useFormFeedback} from '../formFeedback'
 import type {ClientConfigTarget} from '../../../shared/clientConfig'
 import type {InstanceApplication} from '../../../shared/instances'
 import type {SyncPreview,SyncView,SyncRecovery} from '../../../shared/sessionSync'
 const props=defineProps<{targets:ClientConfigTarget[];reading:boolean}>(),emit=defineEmits<{completed:[]}>()
 const sync=ref<SyncView>(),recoveries=ref<SyncRecovery[]>([]),applications=ref<InstanceApplication[]>([]),open=ref(false),targetIds=ref<string[]>([]),applicationId=ref<string>(),preview=ref<SyncPreview>(),retryId=ref<string>(),clientsClosed=ref(false),loading=ref(false),error=ref('')
+useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>!!sync.value&&['preparing','running'].includes(sync.value.status)),labels={preparing:'正在准备同步',ready:'同步预览已就绪',running:'正在同步',completed:'同步已完成',cancelled:'同步已取消',failed:'同步未完成'}
 const progress=computed(()=>sync.value?.totalBytes?Math.min(100,Math.floor(sync.value.bytes/sync.value.totalBytes*100)):0)
 const bytes=(value:number)=>value<1024**2?(value/1024).toFixed(1)+' KiB':value<1024**3?(value/1024**2).toFixed(1)+' MiB':(value/1024**3).toFixed(2)+' GiB'

@@ -41,18 +41,26 @@ export interface InstanceLaunchPreview {
   desktopLocaleSource?:'existing'|'legacy'|'system'|'initialized'
   effectiveContextWindow?:number
   effectiveAutoCompactTokenLimit?:number
-  contextWindowSource?:'provider'|'config'|'catalog'|'template'
+  contextWindowSource?:'connection'|'provider'|'config'|'catalog'|'template'
   speedMenuAvailable?:boolean
   speedMenuReason?:string
   speedPreferenceSource?:'existing'|'initial'|'initialized'
   desktopLocaleCompatibilityAvailable?:boolean
   desktopLocaleCompatibilityReason?:string
+  history?:InstanceHistorySummary
+}
+export interface InstanceHistorySummary {
+  sessions:number
+  archived:number
+  projects:{path:string;name:string;exists:boolean;sessions:number}[]
+  unassigned:number
+  issues:string[]
 }
 export const instanceRevisionSchema=z.object({id:z.string().uuid(),revision:z.number().int().nonnegative()}).strict()
 export const saveInstanceSchema=z.object({id:z.string().uuid().optional(),revision:z.number().int().nonnegative().optional(),details:instanceInputSchema}).strict()
 export const copyInstanceSchema=instanceRevisionSchema.extend({details:instanceInputSchema}).strict()
 export type InstanceCopyInput=z.infer<typeof copyInstanceSchema>
-export interface InstanceCopySource {ticket:string;name:string;directory:string}
+export interface InstanceCopySource {ticket:string;name:string;directory:string;history?:InstanceHistorySummary}
 export const copyExternalInstanceSchema=z.object({ticket:z.string().uuid(),sourceClosed:z.literal(true),details:instanceInputSchema}).strict()
 export type ExternalInstanceCopyInput=z.infer<typeof copyExternalInstanceSchema>
 export const attachInstanceSchema=copyExternalInstanceSchema

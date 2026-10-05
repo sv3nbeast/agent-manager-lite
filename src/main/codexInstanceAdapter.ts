@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { existsSync, lstatSync, realpathSync } from 'node:fs'
+import { createServer } from 'node:net'
 import { basename, isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
 import { accountCompatibility, getAgentClient, resolveAgentClientType } from '../shared/agentClients'
@@ -9,6 +10,7 @@ import type { DesktopPlan } from './instanceRuntime'
 import { directory } from './clientConfig'
 import { resolveCliRuntime } from './cliResolver'
 import { TomlDocument } from './tomlPatch'
+import {nativeProvider} from './nativeAccountProjection'
 
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
@@ -80,6 +82,11 @@ function validateAccount(profile:Pick<InstanceProfile,'clientType'|'connectionMo
   if(!result.compatible)throw new Error(result.reason)
 }
 
+function copiedSessionProvider(profile:Pick<InstanceProfile,'clientType'|'connectionMode'>,account:Pick<Account,'kind'>):string {
+  resolveAgentClientType(profile.clientType)
+  return profile.connectionMode==='native'?(account.kind==='api_key'?nativeProvider:'openai'):'cml_instance'
+}
+
 export function codexDesktopEnvironment(source:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
   const env={...source}
   for(const key of Object.keys(env))if(/^(?:CODEX_|CML_TEST_|CML_TEMP_LOGIN_|CML_CODEX_SPEED_MENU_|ELECTRON_|NODE_|OPENAI_|npm_config_)/.test(key)||['__CFBundleIdentifier','XPC_SERVICE_NAME'].includes(key))delete env[key]
@@ -93,17 +100,39 @@ export function codexMacLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.
   if(plan.speedMenuHook&&plan.desktopLocaleHook)throw new Error('同一实例只能加载一份组合界面兼容脚本')
   const speed=plan.speedMenuHook??plan.desktopLocaleHook
   if(speed&&[speed.script,speed.manifest,speed.statusLog,...Object.values(speed.env)].some(value=>/[\r\n\0"\\]/.test(value)))throw new Error('速度菜单兼容路径包含不支持的字符')
+  if(speed?.transport&&speed.transport!=='preload'&&speed.transport!=='cdp')throw new Error('速度菜单兼容方式无效')
+  if(speed?.transport==='cdp'&&plan.cdpPort!==undefined&&(!Number.isInteger(plan.cdpPort)||plan.cdpPort<1||plan.cdpPort>65535))throw new Error('CDP 调试端口无效')
   if(speed&&Object.keys(speed.env).some(key=>!/^CML_CODEX_SPEED_MENU_[A-Z_]+$/.test(key)))throw new Error('速度菜单启动环境无效')
-  const scripts=[...(hook?[hook.script]:[]),...(speed?[speed.script]:[])]
+  const scripts=[...(hook?[hook.script]:[]),...(speed&&speed.transport!=='cdp'?[speed.script]:[])]
+  const cdp=Boolean(speed?.transport==='cdp')
   return ['-n','-a',plan.application,'--env',`CODEX_HOME=${plan.directory}`,'--env',`CODEX_ELECTRON_USER_DATA_PATH=${plan.desktopDirectory}`,
     ...(scripts.length?['--env',`NODE_OPTIONS=${scripts.map(script=>`--require="${script}"`).join(' ')}`]:[]),
     ...(hook?['--env',`CML_TEMP_LOGIN_CAPTURE=${hook.capture}`]:[]),
     ...(speed?Object.entries(speed.env).flatMap(([key,value])=>['--env',`${key}=${value}`]):[]),
-    '--args',`--user-data-dir=${plan.desktopDirectory}`,`--cml-instance=${plan.nonce}`,...args]
+    '--args',`--user-data-dir=${plan.desktopDirectory}`,`--cml-instance=${plan.nonce}`,...(cdp?[`--remote-debugging-port=${plan.cdpPort??0}`,'--remote-debugging-address=127.0.0.1']:[]),...args]
+}
+
+/**
+ * Reserve a loopback port before LaunchServices starts Electron.  The listener
+ * is closed immediately so Electron can bind it; the fixed value still avoids
+ * the startup race caused by `--remote-debugging-port=0`, where the CDP client
+ * only learns the port after the first renderer request has already started.
+ */
+export async function reserveCodexCdpPort():Promise<number> {
+  return await new Promise((resolve,reject)=>{
+    const server=createServer()
+    const fail=(error:Error)=>{try{server.close()}catch{};reject(error)}
+    server.once('error',fail)
+    server.listen({host:'127.0.0.1',port:0},()=>{
+      const address=server.address()
+      if(!address||typeof address==='string'||!Number.isInteger(address.port)||address.port<1){fail(new Error('CDP 调试端口无效'));return}
+      server.close(error=>error?reject(error):resolve(address.port))
+    })
+  })
 }
 
 export const codexInstanceAdapter={client:getAgentClient('codex'),applications,registerApplication,executable,launchRuntime,validateApplication,validateAccount,
-  desktopEnvironment:codexDesktopEnvironment,macLaunchArgs:codexMacLaunchArgs,validateCliArgs:validateCodexCliArgs}
+  desktopEnvironment:codexDesktopEnvironment,macLaunchArgs:codexMacLaunchArgs,validateCliArgs:validateCodexCliArgs,copiedSessionProvider}
 
 /** Add verified clients here, rather than branching in each lifecycle method. */
 export function getInstanceClientAdapter(clientType:unknown) {

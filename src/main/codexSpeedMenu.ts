@@ -7,16 +7,61 @@ import {dirname,join,isAbsolute,relative,sep} from 'node:path'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
 export type CodexSpeedMenuEnhancements='speed'|'locale'|'speed-locale'
-const release={version:'26.915.31945',asset:'webview/assets/app-initial-a498f911edeb.js',url:'app://-/assets/app-initial-a498f911edeb.js',source:'34a75db63c7137eb4caecdba1f36d631c10c7912487e532fd5e9dafb175bb9be',patched:{speed:'5d8a7434e2ce686bcf359ea16d7d889bc0df9ec4c513d0222992ff7d038807a8',locale:'f76d1b5e0f1ef29951cf301d1bf31f9155fbebd79e35fcb48c8a203ade2b8754','speed-locale':'a21d5bf01e4280636727813c12f77fa45d87cb555606712f9c4fb98b9ef06b30'}}
-const speedReplacements=[
+type CodexSpeedReplacement={begin:string;end:string;before:string;after:string}
+type CodexReleaseProfile={
+  id:string
+  version:string
+  injection:'preload'|'cdp'
+  asset:string
+  url:string
+  source:string
+  patched:Record<CodexSpeedMenuEnhancements,string>
+  earlyBootstrap:string
+  bootstrap:string
+  appProtocol?:{asset:string;source:string;requirement:string}
+  fuseWireSha256?:string
+  speedReplacements:readonly CodexSpeedReplacement[]
+  ultraReplacements?:readonly CodexSpeedReplacement[]
+  localeReplacement:CodexSpeedReplacement
+}
+const legacySpeedReplacements=[
   {begin:'function TRa(e){',end:'}var ERa;',before:'a=i?.authMethod===`chatgpt`,o=',after:'a=i?.authMethod===`chatgpt`||i?.authMethod===`apikey`||r===`local`&&i?.authMethod===null&&i?.requiresAuth===!1,o='},
   {begin:'function Yqt(e,{runtime:t,storage:n},r,i){',end:'function Xqt(){',before:'let[r,i]=await Promise.all([e.getAccount({priority:`critical`}),e.getAuthMethod({priority:`critical`}).catch(()=>null)]);return i!==`personalAccessToken`&&r.account?.type===`chatgpt`',after:'let[r,i]=await Promise.all([e.getAccount({priority:`critical`}),e.getAuthMethod({priority:`critical`}).catch(()=>void 0)]);return i!==`personalAccessToken`&&(r.account?.type===`chatgpt`||r.account?.type===`apiKey`||e.getHostId()===`local`&&i===null&&r.account===null&&r.requiresOpenaiAuth===!1)'},
   {begin:'async function Qdi(e,t){',end:'async function $di(',before:'if(n!==`chatgpt`)return!1;',after:'if(n!==`chatgpt`&&n!==`apikey`){if(n!==null||t!==`local`)return!1;let a;try{a=await ep(e,t).getAccount({priority:`critical`})}catch{return!1}if(a?.account!==null||a?.requiresOpenaiAuth!==!1)return!1;}'}
 ] as const
 // Only the translation provider is adapted. All built-in language resolution,
 // message loading and explicit selections stay in the official renderer.
-const localeReplacement={begin:'function Wal(e){',end:'function Gal(){}',before:'let c=s,l=o?.get(`locale_source`,`IDE`)',after:'let c=!0,l=a?.systemLocale?`SYSTEM`:`IDE`'} as const
-const replacementsFor=(enhancements:CodexSpeedMenuEnhancements)=>enhancements==='speed'?speedReplacements:enhancements==='locale'?[localeReplacement]:[...speedReplacements,localeReplacement]
+const legacyLocaleReplacement={begin:'function Wal(e){',end:'function Gal(){}',before:'let c=s,l=o?.get(`locale_source`,`IDE`)',after:'let c=!0,l=a?.systemLocale?`SYSTEM`:`IDE`'} as const
+const currentSpeedReplacements=[
+  {begin:'function lai(e){',end:'}var uai;',before:'a=i?.authMethod===`chatgpt`||i?.authMethod===`personalAccessToken`,',after:'a=i?.authMethod===`chatgpt`||i?.authMethod===`personalAccessToken`||i?.authMethod===`apikey`||r===`local`&&i?.authMethod===null&&i?.requiresAuth===!1,'},
+  {begin:'async function Z$i(e,t){',end:'async function Q$i(',before:'if(n!==`chatgpt`&&n!==`personalAccessToken`)return!1;',after:'if(n!==`chatgpt`&&n!==`personalAccessToken`&&n!==`apikey`){if(n!==null||t!==`local`)return!1;let a;try{a=await vf(e.get(yf,t)?.rpc.getAccount({priority:`critical`}))}catch{return!1}if(a?.account!==null||a?.requiresOpenaiAuth!==!1)return!1;}' }
+] as const
+// The current renderer keeps the ultra reasoning level behind two server
+// feature gates. Manager-owned local providers already advertise this level
+// in their model catalog, so the audited renderer must keep it selectable and
+// persist it for the isolated instance.
+const currentUltraReplacements=[
+  {begin:'function cni(){',end:'function lni(e){',before:'sni=ds(W,({get:e})=>new Set([..._g(e,Rse.enabledReasoningEfforts),`persistent`]))',after:'sni=ds(W,({get:e})=>new Set([..._g(e,Rse.enabledReasoningEfforts),`persistent`,`ultra`]))'},
+  {begin:'function Kti({',end:'function qti(',before:'let u=[],d=null,f=c.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`max`)),p=o&&c.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`ultra`));',after:'let u=[],d=null,f=c.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`max`)),p=c.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`ultra`));'},
+  {begin:'function Kti({',end:'function qti(',before:'let e=o?r.supportedReasoningEfforts:r.supportedReasoningEfforts.filter(({reasoningEffort:e})=>e!==`ultra`),',after:'let e=r.supportedReasoningEfforts,'},
+  {begin:'function qDn(e,t,n){',end:'function JDn(e,t){',before:'return n===`ultra`&&!e(j,`536305374`)?void 0:n',after:'return !1?void 0:n'},
+  {begin:'function $Dn(e,t){',end:'function eOn(e,t){',before:'(t.thinkingEffort!==`ultra`||e.get(j,`536305374`))&&e.get(LDn).mutate',after:'(t.thinkingEffort!==`ultra`||!0)&&e.get(LDn).mutate'},
+  {begin:'function $Dn(e,t){',end:'function eOn(e,t){',before:'let n=e.get(yA),r=t.thinkingEffort!==`ultra`||e.get(j,`536305374`),',after:'let n=e.get(yA),r=!0,'},
+  {begin:'function eOn(e,t){',end:'var tOn,nOn,rOn,iOn;',before:'else if(!e.get(j,`536305374`)){',after:'else if(!1){'}
+] as const
+const currentLocaleReplacement={begin:'function gZs(e){',end:'function _Zs(){}',before:'let l=c,u=s?.get(`locale_source`,`IDE`)',after:'let l=!0,u=o?.systemLocale?`SYSTEM`:`IDE`'} as const
+// 26.930.51102 keeps the locale provider in a wrapper component and moves
+// the renderer body to `_Zs`.  Keep this marker separate from the audited
+// 41038 profile so an upstream bundle reshuffle cannot silently broaden the
+// patch target.
+const currentWrappedLocaleReplacement={begin:'function _Zs(e){',end:'function vZs(){}',before:'let l=c,u=s?.get(`locale_source`,`IDE`)',after:'let l=!0,u=o?.systemLocale?`SYSTEM`:`IDE`'} as const
+const releases:readonly CodexReleaseProfile[]=[
+  {id:'26.915.31945',version:'26.915.31945',injection:'preload',asset:'webview/assets/app-initial-a498f911edeb.js',url:'app://-/assets/app-initial-a498f911edeb.js',source:'34a75db63c7137eb4caecdba1f36d631c10c7912487e532fd5e9dafb175bb9be',patched:{speed:'5d8a7434e2ce686bcf359ea16d7d889bc0df9ec4c513d0222992ff7d038807a8',locale:'f76d1b5e0f1ef29951cf301d1bf31f9155fbebd79e35fcb48c8a203ade2b8754','speed-locale':'a21d5bf01e4280636727813c12f77fa45d87cb555606712f9c4fb98b9ef06b30'},earlyBootstrap:'.vite/build/early-bootstrap.js',bootstrap:'.vite/build/bootstrap-DF0QwAxC.js',speedReplacements:legacySpeedReplacements,localeReplacement:legacyLocaleReplacement},
+  {id:'26.930.41038',version:'26.930.41038',injection:'cdp',fuseWireSha256:'352dd1a2192c4570488ed05121a0a8d3f20db7de8862181b6d6cdde148996642',asset:'webview/assets/app-initial-f5551f754e43.js',url:'app://-/assets/app-initial-f5551f754e43.js',source:'be620740a6218c263b32e3692ed2e40768624d984662731b0cbb359af47ebe8e',patched:{speed:'876e96728da1a7431a33bf9494c1c260faa5bde151a1e602a13f6db6b4789929',locale:'7a7a679d1d461961d3d7d4f1fb7aadf59c759ace0fa1aa48db1c085b2aef683d','speed-locale':'4c32ffa56c3a76f9ce54ca0962ccdac366f6685fe22eaacdbf34bc8380d36d1b'},earlyBootstrap:'.vite/build/early-bootstrap.js',bootstrap:'.vite/build/bootstrap-D18rbfeM.js',appProtocol:{asset:'.vite/build/app-protocol-DC-JCzS7.js',source:'b5fb869f9d9c3b42c2b1c3de28e154c9f2597379a8122a76263da00b3771cb19',requirement:'require("./app-protocol-DC-JCzS7.js")'},speedReplacements:currentSpeedReplacements,ultraReplacements:currentUltraReplacements,localeReplacement:currentLocaleReplacement},
+  {id:'26.930.51102',version:'26.930.51102',injection:'cdp',fuseWireSha256:'352dd1a2192c4570488ed05121a0a8d3f20db7de8862181b6d6cdde148996642',asset:'webview/assets/app-initial-f9b16fbf8fc7.js',url:'app://-/assets/app-initial-f9b16fbf8fc7.js',source:'22f3ea455585cfc0508e3d3627eac161c80c849c0aace3d76d09fdebaa0aeca3',patched:{speed:'5de6f1c3edff9c936cb1e75192e28f464f731f1cede2253a54183ce49f8210a0',locale:'470630cf7208ef1e98fc07f97af6ca28b717051876f1368a57fd25609659cbca', 'speed-locale':'8349a89e0fe3a5c5159f6b437ebba8284a8242d454f9a3fc9e3b902649c856cd'},earlyBootstrap:'.vite/build/early-bootstrap.js',bootstrap:'.vite/build/bootstrap-CXJAEjVI.js',appProtocol:{asset:'.vite/build/app-protocol-DC-JCzS7.js',source:'b5fb869f9d9c3b42c2b1c3de28e154c9f2597379a8122a76263da00b3771cb19',requirement:'require("./app-protocol-DC-JCzS7.js")'},speedReplacements:currentSpeedReplacements,ultraReplacements:currentUltraReplacements,localeReplacement:currentWrappedLocaleReplacement}
+]
+const releaseByVersion=new Map(releases.map(profile=>[profile.version,profile]))
+const replacementsFor=(profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):readonly CodexSpeedReplacement[]=>{const ultra=profile.ultraReplacements??[];return enhancements==='speed'?[...profile.speedReplacements,...ultra]:enhancements==='locale'?[...ultra,profile.localeReplacement]:[...profile.speedReplacements,...ultra,profile.localeReplacement]}
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex')
 const sentinel=Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
 
@@ -29,6 +74,7 @@ export interface CodexSpeedMenuInspection {
   sourceSha256?:string
   patchedSha256?:string
   enhancements?:CodexSpeedMenuEnhancements
+  transport?:'preload'|'cdp'
 }
 export interface CodexSpeedMenuInspectOptions {application:string;executable:string;platform?:NodeJS.Platform;enhancements?:CodexSpeedMenuEnhancements}
 export interface CodexSpeedMenuReader {
@@ -40,7 +86,7 @@ export interface CodexSpeedMenuReader {
   /** Dependency injection for isolated fixtures; production always uses SHA256. */
   digest?(value:string|Buffer):string
 }
-export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>}
+export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>;transport?:'preload'|'cdp';manifestSha256?:string;patchedBody?:string}
 export interface CodexSpeedMenuPrepareOptions {
   inspection:CodexSpeedMenuInspection
   directory:string
@@ -123,12 +169,12 @@ const defaultReader:CodexSpeedMenuReader={
   identity:path=>{const s=rawFS.lstatSync(path);if(!s.isFile()||s.isSymbolicLink())throw new Error('resource type');return JSON.stringify([path,s.dev,s.ino,s.size,s.mtimeMs,s.ctimeMs])},
   file:boundedFile,archive:packedFile,fuseWires:scanFuseWires
 }
-const checked=new WeakMap<CodexSpeedMenuInspection,{options:CodexSpeedMenuInspectOptions;reader:CodexSpeedMenuReader}>()
+const checked=new WeakMap<CodexSpeedMenuInspection,{options:CodexSpeedMenuInspectOptions;reader:CodexSpeedMenuReader;profile:CodexReleaseProfile}>()
 const inspectionCache=new Map<string,CodexSpeedMenuInspection>()
 
-function patch(source:string,enhancements:CodexSpeedMenuEnhancements):string {
+function patch(source:string,profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):string {
   let result=source
-  for(const replacement of replacementsFor(enhancements)){
+  for(const replacement of replacementsFor(profile,enhancements)){
     const start=result.indexOf(replacement.begin)
     if(start<0||result.indexOf(replacement.begin,start+1)!==-1)throw new Error('patch start')
     const end=result.indexOf(replacement.end,start+replacement.begin.length)
@@ -140,16 +186,17 @@ function patch(source:string,enhancements:CodexSpeedMenuEnhancements):string {
   return result
 }
 export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reader:CodexSpeedMenuReader=defaultReader):CodexSpeedMenuInspection {
-  const enhancements=options.enhancements??'speed',patchedSha256=release.patched[enhancements]
-  const parts:unknown[]=[options.application,options.executable,options.platform??process.platform,release.source,enhancements,patchedSha256],digest=reader.digest??hash
-  let version:string|undefined,cacheKey:string|undefined
+  const enhancements=options.enhancements??'speed'
+  const parts:unknown[]=[options.application,options.executable,options.platform??process.platform,enhancements],digest=reader.digest??hash
+  let version:string|undefined,profile:CodexReleaseProfile|undefined,cacheKey:string|undefined
   const finish=(supported:boolean,reason:string):CodexSpeedMenuInspection=>{
-    const result=Object.freeze({supported,reason,fingerprint:hash(JSON.stringify(parts)),...(version?{version}:{}),...(supported?{assetURL:release.url,sourceSha256:release.source,patchedSha256,enhancements}:{})})
-    if(supported)checked.set(result,{options:{...options,enhancements},reader})
+    const patchedSha256=profile?.patched[enhancements]
+    const result=Object.freeze({supported,reason,fingerprint:hash(JSON.stringify(parts)),...(version?{version}:{}),...(supported&&profile&&patchedSha256?{assetURL:profile.url,sourceSha256:profile.source,patchedSha256,enhancements,transport:profile.injection}:{})})
+    if(supported&&profile)checked.set(result,{options:{...options,enhancements},reader,profile})
     if(cacheKey&&supported){if(inspectionCache.size>=16)inspectionCache.delete(inspectionCache.keys().next().value!);inspectionCache.set(cacheKey,result)}
     return result
   }
-  if(!Object.hasOwn(release.patched,enhancements))return finish(false,'未知的 Codex 界面适配模式，使用原界面')
+  if(!['speed','locale','speed-locale'].includes(enhancements))return finish(false,'未知的 Codex 界面适配模式，使用原界面')
   if((options.platform??process.platform)!=='darwin')return finish(false,'当前平台暂不支持 Codex 速度菜单')
   try{
     if(!isAbsolute(options.application)||!options.application.endsWith('.app')||reader.canonical(options.application)!==options.application||reader.canonical(options.executable)!==options.executable||dirname(options.executable)!==join(options.application,'Contents','MacOS'))return finish(false,'客户端路径不符合隔离启动要求')
@@ -158,19 +205,26 @@ export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reade
     parts.push(reader.identity(options.executable),reader.identity(archive),reader.identity(framework))
     if(reader===defaultReader){cacheKey=hash(JSON.stringify(parts));const cached=inspectionCache.get(cacheKey);if(cached)return cached}
     const pkgBody=reader.archive(archive,'package.json',128*1024),pkg=JSON.parse(pkgBody.toString('utf8'))
-    parts.push(digest(pkgBody));version=typeof pkg.version==='string'?pkg.version:undefined
-    if(pkg.name!=='openai-codex-electron'||pkg.main!=='.vite/build/early-bootstrap.js'||version!==release.version)return finish(false,'当前 Codex 版本尚未适配，使用原界面')
+    parts.push(digest(pkgBody));version=typeof pkg.version==='string'?pkg.version:undefined;profile=version?releaseByVersion.get(version):undefined
+    if(pkg.name!=='openai-codex-electron'||pkg.main!=='.vite/build/early-bootstrap.js'||profile===undefined)return finish(false,'当前 Codex 版本尚未适配，使用原界面')
+    parts.push(profile.id,profile.source,profile.appProtocol?.source??'legacy-bootstrap-protocol')
+    const patchedSha256=profile.patched[enhancements]
     const wires=reader.fuseWires(framework);parts.push(wires.map(w=>hash(w)))
-    if(!wires.length||wires.some(w=>w[0]!==1||w[1]<3||w.length!==w[1]+2||w[4]!==49))return finish(false,'此 Codex 禁用了启动兼容参数，使用原界面')
+    if(!wires.length||wires.some(w=>w[0]!==1||w[1]<3||w.length!==w[1]+2))return finish(false,'此 Codex 禁用了启动兼容参数，使用原界面')
+    if(profile.injection==='preload' && wires.some(w=>w[4]!==49))return finish(false,'此 Codex 禁用了启动兼容参数，使用原界面')
+    if(profile.injection==='cdp' && (wires.length!==1||digest(wires[0])!==profile.fuseWireSha256))return finish(false,'此 Codex 的启动兼容参数与已审计版本不匹配，使用原界面')
     const html=reader.archive(archive,'webview/index.html',1024*1024).toString('utf8')
-    const early=reader.archive(archive,'.vite/build/early-bootstrap.js',1024*1024).toString('utf8')
-    const bootstrap=reader.archive(archive,'.vite/build/bootstrap-DF0QwAxC.js',16*1024*1024).toString('utf8')
-    parts.push(digest(html),digest(early),digest(bootstrap))
+    const early=reader.archive(archive,profile.earlyBootstrap,1024*1024).toString('utf8')
+    const bootstrap=reader.archive(archive,profile.bootstrap,16*1024*1024).toString('utf8')
+    const appProtocol=profile.appProtocol?reader.archive(archive,profile.appProtocol.asset,4*1024*1024).toString('utf8'):undefined
+    parts.push(digest(html),digest(early),digest(bootstrap),...(appProtocol===undefined?[]:[digest(appProtocol)]))
     if(/<script\b[^>]*\bintegrity\s*=/i.test(html)||/strict-dynamic/i.test(html)||!/script-src\s+(?:&#39;|')self(?:&#39;|')/.test(html))return finish(false,'Codex 页面完整性策略不兼容，使用原界面')
-    if(!early.includes('require("./bootstrap-DF0QwAxC.js")')||!bootstrap.includes('require("electron")')||!bootstrap.includes('protocol.handle(`app`,')||!bootstrap.includes('CODEX_ELECTRON_USER_DATA_PATH'))return finish(false,'Codex 资源加载方式已变化，使用原界面')
-    const source=reader.archive(archive,release.asset,32*1024*1024).toString('utf8'),sourceDigest=digest(source)
+    if(!early.includes(`require("./${profile.bootstrap.slice(profile.bootstrap.lastIndexOf('/')+1)}")`)||!bootstrap.includes('require("electron")')||!bootstrap.includes('CODEX_ELECTRON_USER_DATA_PATH'))return finish(false,'Codex 资源加载方式已变化，使用原界面')
+    if(profile.appProtocol){if(!bootstrap.includes(profile.appProtocol.requirement)||!appProtocol?.includes('protocol.handle(`app`,')||digest(appProtocol)!==profile.appProtocol.source)return finish(false,'Codex 协议资源已变化，使用原界面')}
+    else if(!bootstrap.includes('protocol.handle(`app`,') )return finish(false,'Codex 资源加载方式已变化，使用原界面')
+    const source=reader.archive(archive,profile.asset,32*1024*1024).toString('utf8'),sourceDigest=digest(source)
     parts.push(sourceDigest)
-    if(sourceDigest!==release.source||digest(patch(source,enhancements))!==patchedSha256)return finish(false,'Codex 界面资源已变化，使用原界面')
+    if(sourceDigest!==profile.source||digest(patch(source,profile,enhancements))!==patchedSha256)return finish(false,'Codex 界面资源已变化，使用原界面')
     return finish(true,enhancements==='locale'?'可按语言偏好显示 Codex 内置翻译':enhancements==='speed-locale'?'可显示内置翻译并选择普通或 Fast':'可在 Codex 对话中选择普通或 Fast')
   }catch{return finish(false,'无法读取 Codex 兼容信息，使用原界面')}
 }
@@ -183,6 +237,12 @@ function atomicFile(path:string,body:string):void {
   const temporary=path+'.'+randomUUID()+'.tmp'
   const fd=rawFS.openSync(temporary,rawFS.constants.O_WRONLY|rawFS.constants.O_CREAT|rawFS.constants.O_EXCL|rawFS.constants.O_NOFOLLOW,0o600)
   try{rawFS.writeFileSync(fd,body,'utf8');rawFS.fsyncSync(fd)}finally{rawFS.closeSync(fd)}
+  try{rawFS.linkSync(temporary,path)}finally{rawFS.unlinkSync(temporary)}
+}
+function atomicBytes(path:string,body:Buffer):void {
+  const temporary=path+'.'+randomUUID()+'.tmp'
+  const fd=rawFS.openSync(temporary,rawFS.constants.O_WRONLY|rawFS.constants.O_CREAT|rawFS.constants.O_EXCL|rawFS.constants.O_NOFOLLOW,0o600)
+  try{rawFS.writeFileSync(fd,body);rawFS.fsyncSync(fd)}finally{rawFS.closeSync(fd)}
   try{rawFS.linkSync(temporary,path)}finally{rawFS.unlinkSync(temporary)}
 }
 // This source executes only in the selected instance's main Electron process.
@@ -268,19 +328,23 @@ export function prepareCodexSpeedMenu(options:CodexSpeedMenuPrepareOptions):Code
     privateDirectory(base)
     rawFS.mkdirSync(target,{mode:0o700});folder=target
     const manifest=join(target,'manifest.json'),script=join(target,'hook.cjs'),statusLog=join(target,'status.jsonl')
-    const enhancements=proof.options.enhancements??'speed',replacements=replacementsFor(enhancements)
-    const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,url:release.url,sourceSha256:release.source,patchedSha256:release.patched[enhancements],enhancements,replacementCount:replacements.length,replacementsSha256:hash(JSON.stringify(replacements))}
+    const enhancements=proof.options.enhancements??'speed',profile=proof.profile,replacements=replacementsFor(profile,enhancements)
+    const patchedBodyPath=profile.injection==='cdp'?join(target,'patched.js'):undefined
+    const patchedBody=patchedBodyPath?Buffer.from(patch(proof.reader.archive(join(proof.options.application,'Contents','Resources','app.asar'),profile.asset,32*1024*1024).toString('utf8'),profile,enhancements),'utf8'):undefined
+    if(patchedBody&&(hash(patchedBody)!==profile.patched[enhancements]))throw new Error('patch digest')
+    const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,url:profile.url,sourceSha256:profile.source,patchedSha256:profile.patched[enhancements],enhancements,replacementCount:replacements.length,replacementsSha256:hash(JSON.stringify(replacements)),...(patchedBodyPath&&patchedBody?{patchedBody:patchedBodyPath,patchedBodySha256:hash(patchedBody)}:{})}
     const manifestBody=JSON.stringify({version:1,...scope,fingerprint:current.fingerprint,replacements},null,2)+'\n'
+    if(patchedBodyPath&&patchedBody)atomicBytes(patchedBodyPath,patchedBody)
     atomicFile(manifest,manifestBody);atomicFile(statusLog,'')
     const source=hookSource.replace('__EXPECTED__',JSON.stringify({...scope,manifest,statusLog,hookDirectory:target})).replace('__MANIFEST_DIGEST__',JSON.stringify(hash(manifestBody)))
     atomicFile(script,source)
-    return {script,manifest,statusLog,env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
+    return {script,manifest,statusLog,transport:profile.injection,manifestSha256:hash(manifestBody),...(patchedBodyPath?{patchedBody:patchedBodyPath}:{}),env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
   }catch{
     if(folder)try{privateDirectory(folder);rawFS.rmSync(folder,{recursive:true,force:true})}catch{/* Never follow a replaced directory. */}
     return
   }
 }
-const reasons:Record<string,string>={scope:'启动参数未生效',manifest:'适配文件已变化',protocol:'当前客户端的加载方式尚未适配',response:'客户端页面加载异常',source:'客户端更新后需重新适配',patched:'适配文件校验失败',transform:'页面适配失败'}
+const reasons:Record<string,string>={scope:'启动参数未生效',manifest:'适配文件已变化',protocol:'当前客户端的加载方式尚未适配',response:'客户端页面加载异常',source:'客户端更新后需重新适配',patched:'适配文件校验失败',transform:'页面适配失败',cdp:'CDP 调试通道未建立',cdpResponse:'CDP 页面拦截失败'}
 export function readCodexSpeedMenuStatus(scope:CodexSpeedMenuStatusScope,now=Date.now()):CodexSpeedMenuStatus {
   const feature=scope.enhancements==='locale'?'页面翻译':scope.enhancements==='speed-locale'?'页面翻译和普通 / Fast 菜单':'普通 / Fast 菜单'
   const fallback=(reason?:string):CodexSpeedMenuStatus=>({state:'fallback',reason:`${feature}未加载${reason?'（'+reason+'）':''}，请重启实例后再试`})

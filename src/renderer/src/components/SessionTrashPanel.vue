@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import {computed,onMounted,onUnmounted,ref} from 'vue'
+import {useFormFeedback} from '../formFeedback'
 import type {InstanceApplication} from '../../../shared/instances'
 import type {TrashPage,TrashPreview,TrashState,TrashRecovery} from '../../../shared/sessionTrash'
 import LegacyTrashImportPanel from './LegacyTrashImportPanel.vue'
 const props=defineProps<{snapshotId?:string;selectedIds:string[];reading:boolean}>(),emit=defineEmits<{completed:[]}>()
 const state=ref<TrashState>({recoveries:[]}),list=ref<TrashPage>(),listOpen=ref(false),selected=ref<string[]>([]),editor=ref(false),preview=ref<TrashPreview>(),action=ref<'trash'|'restore'|'purge'|'recover'>('trash'),all=ref(false)
 const recovery=ref<{record:TrashRecovery;mode:'resume'|'restore'|'discard'}>(),applications=ref<InstanceApplication[]>([]),applicationId=ref<string>(),closed=ref(false),confirmed=ref(false),loading=ref(false),error=ref('')
+useFormFeedback(()=>error.value,{active:()=>editor.value||listOpen.value})
 const running=computed(()=>!!state.value.job&&['preparing','running'].includes(state.value.job.status)),needsProgram=computed(()=>action.value!=='purge'&&recovery.value?.mode!=='discard')
 const titles={trash:'移到废纸篓',restore:'恢复所选会话',purge:'永久删除',recover:'处理恢复任务',import:'导入旧废纸篓'},statuses={preparing:'正在准备预览',ready:'预览已就绪',running:'正在处理',completed:'已完成',cancelled:'已取消',failed:'未完成'}
 const bytes=(n:number)=>n<1024**2?(n/1024).toFixed(1)+' KiB':n<1024**3?(n/1024**2).toFixed(1)+' MiB':(n/1024**3).toFixed(2)+' GiB'

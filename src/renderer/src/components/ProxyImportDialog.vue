@@ -1,18 +1,20 @@
 <script setup lang="ts">
 import {ref,watch,onBeforeUnmount} from 'vue'
 import {useManager} from '../store'
+import {useFormFeedback} from '../formFeedback'
 import type {ProxyImportOptions,ProxyImportPreview} from '../../../shared/proxyBatch'
 const props=defineProps<{open:boolean}>(),emit=defineEmits<{'update:open':[boolean]}>(),manager=useManager()
 const input=ref(''),protocol=ref<ProxyImportOptions['protocol']>('socks5'),format=ref<ProxyImportOptions['format']>('auto'),skipInvalid=ref(false),skipDuplicates=ref(true)
-const preview=ref<ProxyImportPreview>(),page=ref(1),busy=ref(false),error=ref('');let generation=0
+const preview=ref<ProxyImportPreview>(),page=ref(1),busy=ref(false),error=ref(''),applyError=ref('');let generation=0
+useFormFeedback(()=>error.value,{active:()=>props.open})
 const displayError=(e:unknown)=>String(e instanceof Error?e.message:e).replace(/^(?:Error: )?Error invoking remote method 'manager:invoke': (?:Error: )?/,'')
 async function discard(){const ticket=preview.value?.ticket;preview.value=undefined;if(ticket)await window.manager.discardProxyBatch(ticket).catch(()=>{})}
-function clear(){generation++;void discard();input.value='';busy.value=false;error.value=''}
+function clear(){generation++;void discard();input.value='';busy.value=false;error.value='';applyError.value=''}
 watch(()=>props.open,()=>{clear();page.value=1})
 onBeforeUnmount(clear)
 function close(){clear();emit('update:open',false)}
 async function prepare(){
-  const version=++generation;busy.value=true;error.value='';await discard()
+  const version=++generation;busy.value=true;error.value='';applyError.value='';await discard()
   try{const result=await window.manager.previewProxyImport({input:input.value,options:{protocol:protocol.value,format:format.value,skipInvalid:skipInvalid.value,skipDuplicates:skipDuplicates.value}})
     if(version!==generation){if(result.ticket)await window.manager.discardProxyBatch(result.ticket);return}
     preview.value=result;page.value=1
@@ -20,9 +22,9 @@ async function prepare(){
 }
 async function apply(){
   const ticket=preview.value?.ticket;if(!ticket)return
-  busy.value=true;error.value=''
+  busy.value=true;error.value='';applyError.value=''
   if(await manager.execute(()=>window.manager.applyProxyBatch({ticket,confirmed:true})))close()
-  else{error.value=displayError(manager.error);busy.value=false}
+  else{applyError.value=displayError(manager.error)||'代理导入失败，请重试。';busy.value=false}
 }
 const formats=[{value:'auto',label:'自动识别（歧义时手动指定）'},{value:'host_auth',label:'主机:端口:用户:密码'},{value:'auth_at_host',label:'用户:密码@主机:端口'},{value:'host_at_auth',label:'主机:端口@用户:密码'}]
 </script>
@@ -50,7 +52,7 @@ const formats=[{value:'auto',label:'自动识别（歧义时手动指定）'},{v
         </a-table>
         <a-space><a-button type="primary" :disabled="!preview.ticket" :loading="busy" @click="apply">确认导入</a-button><a-button :disabled="busy" @click="discard">返回修改</a-button><a-button :disabled="busy" @click="close">取消</a-button></a-space>
       </template>
-      <a-alert v-if="error" type="error" :message="error" class="error-banner" />
+      <a-alert v-if="error||applyError" type="error" :message="error||applyError" class="error-banner" />
     </div>
   </a-modal>
 </template>

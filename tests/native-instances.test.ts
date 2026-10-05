@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {mkdtempSync,mkdirSync,readFileSync,writeFileSync,rmSync,existsSync,realpathSync} from 'node:fs'
 import {join,resolve} from 'node:path'
 import {tmpdir} from 'node:os'
+import {DatabaseSync} from 'node:sqlite'
 import {createCipheriv,createDecipheriv,randomBytes} from 'node:crypto'
 import {spawnSync} from 'node:child_process'
 import {Store,type VaultCodec,type StoredAccount} from '../src/main/store'
@@ -165,6 +166,36 @@ test('native API instances show the actual provider name, reject rename-stale ti
   assert.equal(doc.scalar(['model_providers','cml_native_account','name']),'新供应商名称')
   await f.instances.stop(first.id)
   assert.equal(readFileSync(join(first.directory,'config.toml'),'utf8'),original)
+})
+
+test('copied Cockpit histories follow the actual native API, OAuth and PAT launch provider',async t=>{
+  const f=fixture(t),api=createAPIAccount({name:'Copy API',apiKey:'fixture-copy-key',baseUrl:'https://copy-native.invalid/v1',models:['api-model'],wireApi:'responses',defaultTier:'standard'})
+  const pat=parseAccountImport('{"personal_access_token":"at-fixture-copied-pat"}').accounts[0];importParsedAccounts(f.store,[api,pat])
+  const home=join(f.root,'cockpit-source');mkdirSync(home);mkdirSync(join(home,'sessions'))
+  const config='model_provider="cockpit_cli_proxy"\ncustom=true\n',session='copied-session',file=join(home,'sessions','rollout-fixture.jsonl'),body='{"type":"event_msg","payload":{"text":"existing dialogue"}}\n'
+  writeFileSync(join(home,'config.toml'),config);writeFileSync(join(home,'auth.json'),auth('alpha','source-not-cloned'))
+  writeFileSync(file,JSON.stringify({type:'session_meta',payload:{id:session,model_provider:'cockpit_cli_proxy',cwd:'/user/project'}})+'\n'+body)
+  const dbPath=join(home,'state_5.sqlite'),db=new DatabaseSync(dbPath)
+  db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,title TEXT,archived INTEGER)')
+  db.prepare('INSERT INTO threads VALUES(?,?,?,?,?)').run(session,file,'cockpit_cli_proxy','kept title',0);db.close();const originalDb=readFileSync(dbPath),originalSession=readFileSync(file)
+  for(const [account,model,provider]of [[api,'api-model','cml_native_account'],[f.beta,'native-model','openai'],[pat,'native-model','openai']] as const){
+    const selected=f.instances.selectCopySource(home)
+    f.instances.startExternalCopy({ticket:selected.ticket,sourceClosed:true,details:{name:'Copied '+account.id,applicationId:f.app.id,accountId:account.id,model,connectionMode:'native',extraArgs:[]}})
+    const end=Date.now()+10000
+    while(['scanning','copying'].includes(f.instances.copyView()!.status)){if(Date.now()>end)throw new Error('Copy timeout');await new Promise(resolve=>setTimeout(resolve,10))}
+    assert.equal(f.instances.copyView()!.status,'completed',f.instances.copyView()!.error)
+    const target=f.instances.views().find(value=>value.id===f.instances.copyView()!.targetId)!
+    assert.equal(existsSync(join(target.directory,'auth.json')),false)
+    await f.start(target.id);assert.equal(f.instances.views().find(value=>value.id===target.id)?.status,'running')
+    const actualProvider=new TomlDocument(readFileSync(join(target.directory,'config.toml'),'utf8')).scalar(['model_provider']);assert.equal(actualProvider,provider)
+    const copied=new DatabaseSync(join(target.directory,'state_5.sqlite'),{readOnly:true})
+    const row=copied.prepare('SELECT * FROM threads WHERE model_provider = ?').get(actualProvider!);copied.close();assert.ok(row)
+    assert.equal(row.id,session);assert.equal(row.title,'kept title');assert.equal(row.archived,0)
+    const raw=readFileSync(row.rollout_path as string,'utf8'),newline=raw.indexOf('\n');assert.equal(JSON.parse(raw.slice(0,newline)).payload.model_provider,provider);assert.equal(raw.slice(newline+1),body)
+    await f.instances.stop(target.id)
+  }
+  assert.deepEqual(readFileSync(dbPath),originalDb);assert.deepEqual(readFileSync(file),originalSession);assert.equal(readFileSync(join(home,'config.toml'),'utf8'),config)
+  assert.equal(JSON.parse(readFileSync(join(home,'auth.json'),'utf8')).tokens.refresh_token,'fixture-native-rt-source-not-cloned')
 })
 
 test('native desktop instances default to auto detection and preserve user language changes through auth restoration',async t=>{

@@ -434,6 +434,7 @@ async function main(): Promise<void> {
       case 'cancelInstanceCopy': await instances.cancelCopy(z.string().uuid().parse(input));break
       case 'removeInstance': instances.remove(input); break
       case 'previewInstanceLaunch': return instances.preview(input)
+      case 'previewInstanceHistory': return instances.previewHistory(input)
       case 'startInstance': instances.start(z.string().uuid().parse(input)); break
       case 'stopInstance': await instances.stop(z.string().uuid().parse(input)); break
       case 'closeAllInstances': await instances.closeAll(); break

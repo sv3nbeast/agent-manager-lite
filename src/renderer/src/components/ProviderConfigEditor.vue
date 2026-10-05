@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import {onUnmounted,reactive,ref,watch} from 'vue'
 import {message} from 'ant-design-vue'
+import {useFormFeedback} from '../formFeedback'
+import FormFeedback from './FormFeedback.vue'
 import {providerIdSchema,providerChangeLabel,type ProviderConfigView,type ProviderConfigEntry,type ProviderChanges,type ProviderConfigInput} from '../../../shared/providerConfig'
 import type {ClientConfigPreview} from '../../../shared/clientConfig'
 
 const props=defineProps<{targetId:string;configRevision:string}>()
 const emit=defineEmits<{'saved':[]}>()
 const view=ref<ProviderConfigView>(),busy=ref(false),error=ref(''),open=ref(false),preview=ref<ClientConfigPreview>(),creating=ref(false)
+useFormFeedback(()=>error.value)
 const expanded=ref<string[]>([])
 const defaults=()=>({name:'',base_url:'',wire_api:'responses',supports_websockets:null as boolean|null,supports_standalone_web_search:null as boolean|null,
   request_max_retries:null as number|null,stream_max_retries:null as number|null,stream_idle_timeout_ms:null as number|null})
@@ -66,7 +69,6 @@ async function cancelPreview(){preview.value=undefined;await window.manager.disc
   </a-collapse>
   <a-modal v-model:open="open" :title="creating?'添加 Provider 连接':'编辑 Provider 连接'" :width="740" ok-text="预览连接改动" cancel-text="取消" :confirm-loading="busy" @ok="stage" @cancel="form.token=''">
     <a-form layout="vertical" :model="form" class="provider-form" :disabled="busy">
-      <a-alert v-if="error" type="error" :message="error" style="margin-bottom:16px" />
       <div class="provider-grid"><a-form-item label="Provider ID" required><a-input v-model:value="form.providerId" :disabled="!creating" :maxlength="100" placeholder="例如 my_provider" /></a-form-item><a-form-item label="显示名称" required><a-input v-model:value="form.name" :maxlength="200" /></a-form-item></div>
       <a-form-item label="Base URL" required><a-input v-model:value="form.base_url" placeholder="https://api.example.com/v1" :maxlength="2000" /></a-form-item>
       <a-form-item label="客户端协议" extra="直连使用 Responses。Chat Completions 账号应通过本地 API 转换后接入。"><a-select v-model:value="form.wire_api" :options="[{value:'responses',label:'Responses'}]" /></a-form-item>
@@ -79,12 +81,13 @@ async function cancelPreview(){preview.value=undefined;await window.manager.disc
       <a-form-item><a-checkbox v-model:checked="form.makeDefault">设为此客户端的默认 Provider</a-checkbox></a-form-item>
       <a-form-item v-if="form.makeDefault" label="默认服务等级" extra="保存到此客户端默认设置；已有会话与 Profile 可有独立覆盖。"><a-select v-model:value="form.serviceTier" :options="[{value:'keep',label:'保留当前设置'},{value:'clear',label:'清除默认设置'},{value:'fast',label:'Fast'},{value:'default',label:'Standard'},{value:'auto',label:'Auto'},{value:'flex',label:'Flex'}]" /></a-form-item>
     </a-form>
+    <template #footer><FormFeedback :error="error" /><a-space><a-button @click="open=false;form.token=''">取消</a-button><a-button type="primary" :loading="busy" @click="stage">预览连接改动</a-button></a-space></template>
   </a-modal>
   <a-modal :open="!!preview" title="确认 Provider 连接改动" :width="740" ok-text="应用连接" cancel-text="返回编辑" :confirm-loading="busy" :ok-button-props="{disabled:!preview?.changes.length}" @ok="apply" @cancel="cancelPreview">
     <p class="muted provider-value">{{preview?.target.directory}}/config.toml</p>
     <a-table :data-source="preview?.changes" row-key="key" size="small" table-layout="fixed" :pagination="false" :columns="[{title:'字段',dataIndex:'key',width:240},{title:'当前值',dataIndex:'before'},{title:'保存后',dataIndex:'after'}]"><template #bodyCell="{column,text}"><span class="provider-value">{{column.dataIndex==='key'?providerChangeLabel(text):text}}</span></template></a-table>
     <p class="muted">密钥内容不会显示在差异中。配置和备份存放在本机；应用后由客户端重新读取生效。</p>
-    <a-alert v-if="error" type="error" :message="error" />
+    <template #footer><FormFeedback :error="error" /><a-space><a-button @click="cancelPreview">返回编辑</a-button><a-button type="primary" :disabled="!preview?.changes.length" :loading="busy" @click="apply">应用连接</a-button></a-space></template>
   </a-modal>
 </template>
 

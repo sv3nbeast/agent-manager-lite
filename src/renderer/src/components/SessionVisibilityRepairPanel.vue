@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import {computed,ref,watch} from 'vue'
+import {useFormFeedback} from '../formFeedback'
 import {message} from 'ant-design-vue'
 import type {SessionVisibilityRepairInstance,SessionVisibilityRepairPreview,SessionVisibilityRepairProvider} from '../../../shared/sessionVisibility'
 
 const props=defineProps<{open:boolean;sessionIds:string[]}>()
 const emit=defineEmits<{(event:'update:open',value:boolean):void;(event:'completed'):void}>()
 const instances=ref<SessionVisibilityRepairInstance[]>([]),providers=ref<SessionVisibilityRepairProvider[]>([]),selectedInstances=ref<string[]>([]),provider=ref(''),preview=ref<SessionVisibilityRepairPreview>(),loading=ref(false),applying=ref(false),error=ref('')
+useFormFeedback(()=>error.value,{active:()=>props.open})
 const selectedSessionNote=computed(()=>props.sessionIds.length?`仅修复当前选择的 ${props.sessionIds.length} 个会话`:'修复所选目录中侧边栏可见的会话')
 const selectedTargets=computed(()=>selectedInstances.value.length?selectedInstances.value:instances.value.map(value=>value.id))
 const runningCount=computed(()=>preview.value?.runningInstanceCount??0)

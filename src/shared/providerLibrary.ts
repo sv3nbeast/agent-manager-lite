@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { accountInputSchema, defaultTierSchema } from './types'
 import type {ProviderUsageState} from './providerUsage'
+import { modelContextWindowsSchema } from './modelContextWindows'
 
 export const providerDetailsSchema = z.object({
   name: accountInputSchema.shape.name,
@@ -10,7 +11,7 @@ export const providerDetailsSchema = z.object({
   integrationType: accountInputSchema.shape.integrationType,
   defaultTier: defaultTierSchema.default('inherit'),
   presetId: z.string().trim().max(80).optional(),
-  modelContextWindows: z.record(z.string().trim().min(1).max(200), z.number().int().min(2).max(10_000_000)).optional(),
+  modelContextWindows: modelContextWindowsSchema.optional(),
   supportsVision: z.boolean().optional(),
   modelCapabilities: z.record(z.string().trim().min(1).max(200), z.object({ supportsVision: z.boolean().optional() }).strict()).optional(),
   visionRoutingModel: z.string().trim().max(200).optional(),
@@ -18,7 +19,12 @@ export const providerDetailsSchema = z.object({
   enableModePreference: z.enum(['auto', 'direct', 'gateway']).optional()
 }).strict()
 export type ProviderDetails = z.infer<typeof providerDetailsSchema>
-export interface ProviderKeySummary { id: string; name: string; createdAt: number; updatedAt: number; accountIds: string[]; usage?:ProviderUsageState }
+export interface ProviderKeySummary {
+  id: string; name: string; createdAt: number; updatedAt: number; accountIds: string[]
+  // Credential matches are reusable connections, not supplier-managed links.
+  // Optional for older snapshots; credentials never leave the encrypted store.
+  reusableAccountIds?: string[]; usage?:ProviderUsageState
+}
 export interface ProviderSummary extends ProviderDetails {
   id: string; revision: number; createdAt: number; updatedAt: number; keys: ProviderKeySummary[]
 }

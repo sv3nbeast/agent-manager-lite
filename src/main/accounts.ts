@@ -10,6 +10,7 @@ import {accountIdentity,strongIdentityConflict} from './accountIdentity'
 import {invalidateProviderUsage} from './providerUsage'
 import { parseQuota, parseSubscriptionTimestamp } from './quota'
 import { projectSubscriptionClaim } from './subscriptionClaims'
+import { providerModelContextWindows } from './providerModelContext'
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('账号必须是 JSON 对象')
@@ -69,6 +70,7 @@ function importedQuota(source: Record<string, unknown>): Quota | undefined {
 export function createAPIAccount(input: AccountInput): StoredAccount {
   const valid = accountInputSchema.parse(input)
   const { apiKey, ...metadata } = valid
+  if (!Object.keys(metadata.modelContextWindows ?? {}).length) delete metadata.modelContextWindows
   return { ...metadata, id: randomUUID(), kind: 'api_key', createdAt: Date.now(), credentials: { apiKey } }
 }
 
@@ -93,15 +95,20 @@ export function editAccount(store: Store, input: unknown, inUse: (id: string) =>
     const connectionChanged = changes.apiKey !== undefined && changes.apiKey !== account.credentials.apiKey
       || (['baseUrl', 'models', 'wireApi'] as const).some(key => changes[key] !== undefined && JSON.stringify(changes[key]) !== JSON.stringify(account[key]))
     const integrationChanged = changes.integrationType !== undefined && changes.integrationType !== (account.integrationType ?? 'auto')
-    if (account.kind !== 'api_key' && ['apiKey', 'baseUrl', 'models', 'wireApi', 'integrationType'].some(key => key in changes)) throw new Error('登录账号仅支持修改名称、标签、备注和服务等级')
+    if (account.kind !== 'api_key' && ['apiKey', 'baseUrl', 'models', 'wireApi', 'integrationType', 'modelContextWindows'].some(key => key in changes)) throw new Error('登录账号仅支持修改名称、标签、备注和服务等级')
     if ((connectionChanged || integrationChanged) && account.providerId) throw new Error('连接由供应商管理，请在供应商页修改，或先解除账号关联')
     if (connectionChanged && inUse(id)) throw new Error('请先停止使用该账号的本地服务或解除客户端凭据关联，再修改连接信息')
     if (changes.baseUrl !== undefined && changes.baseUrl !== account.baseUrl
       || changes.apiKey !== undefined && changes.apiKey !== account.credentials.apiKey || integrationChanged) invalidateProviderUsage(account)
-    const { apiKey, integrationType, ...metadata } = changes
+    const { apiKey, integrationType, modelContextWindows, ...metadata } = changes
     Object.assign(account, metadata)
     if (apiKey !== undefined) account.credentials.apiKey = apiKey
     if (integrationType !== undefined) account.integrationType = integrationType
+    // An empty declaration clears connection overrides and resumes inheritance.
+    if (modelContextWindows !== undefined) {
+      if (Object.keys(modelContextWindows).length) account.modelContextWindows = modelContextWindows
+      else delete account.modelContextWindows
+    }
     if (state.accounts.some(a => a.id !== id && sameAccount(a, account))) throw new Error('此接口和凭据的账号已存在')
     account.tags = [...new Set(account.tags)]
     account.revision = revision + 1
@@ -131,7 +138,7 @@ export function deleteAccounts(store: Store, input: unknown, inUse: (id: string)
     if((state.accountRecycle?.length??0)+selected.length>10000)throw new Error('账号回收站最多保存 1 万条，请先导出或清理已有备份')
     state.accountRecycle??=[]
     // Every backup and the live removal publish in one encrypted vault save.
-    for(const account of selected)state.accountRecycle.push({id:randomUUID(),deletedAt:Date.now(),account:structuredClone(account),groupIds:state.groups.filter(group=>group.accountIds.includes(account.id)).map(group=>group.id),providerDefault:providerTierForAccount(state,account)})
+    for(const account of selected)state.accountRecycle.push({id:randomUUID(),deletedAt:Date.now(),account:structuredClone(account),groupIds:state.groups.filter(group=>group.accountIds.includes(account.id)).map(group=>group.id),providerDefault:providerTierForAccount(state,account),providerModelContextWindows:account.providerId ? providerModelContextWindows(state,account) ?? {} : undefined})
     state.accounts = state.accounts.filter(a => !ids.has(a.id))
     removeGroupReferences(state, ids)
     if(state.localAccess){
@@ -204,7 +211,8 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
           apiKey, baseUrl: text(source.api_base_url) ?? text(source.apiBaseUrl) ?? text(source.base_url) ?? text(source.baseUrl) ?? 'https://api.openai.com/v1',
           models: source.api_model_catalog ?? source.models ?? ['gpt-5.5'],
           wireApi: source.api_wire_api ?? source.wireApi ?? 'responses',
-          integrationType: source.integrationType
+          integrationType: source.integrationType,
+          modelContextWindows: source.modelContextWindows ?? source.model_context_windows ?? source.api_model_context_windows
         })
         account = { ...connection, id: randomUUID(), kind: 'api_key', createdAt: Date.now(), credentials: { apiKey: importedKey },
           email: text(source.email), plan: text(source.plan_type) ?? text(source.plan) }

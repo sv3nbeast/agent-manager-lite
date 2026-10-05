@@ -8,6 +8,8 @@ import * as vue from 'vue'
 import { randomUUID } from 'node:crypto'
 import * as library from '../src/shared/providerLibrary'
 import type { Account, ManagerAPI } from '../src/shared/types'
+import * as accountTypes from '../src/shared/types'
+import * as feedback from '../src/renderer/src/formFeedback'
 
 const path = new URL('../src/renderer/src/components/AccountEditor.vue', import.meta.url)
 const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path.pathname })
@@ -21,12 +23,12 @@ function deferred<T>() {
   const promise = new Promise<T>(yes => { resolve = yes })
   return { promise, resolve }
 }
-function mount(overrides: Partial<ManagerAPI> = {}, selected?: Account) {
+function mount(overrides: Partial<ManagerAPI> = {}, selected?: Account, providers: library.ProviderSummary[] = []) {
   const accounts = [account('First'), account('Second')]
   if (selected) accounts[0] = selected
   const props = vue.reactive({ open: true, account: accounts[0] as Account | undefined })
   const writes: unknown[] = [], events: unknown[] = [], infos: string[] = [], reads: unknown[] = []
-  const manager = vue.reactive({ data: { accounts, providers: [] }, error: '', loading: false,
+  const manager = vue.reactive({ data: { accounts, providers }, error: '', loading: false,
     async execute(action: () => Promise<any>) { await action(); return true } })
   const api: Partial<ManagerAPI> = {
     readAccountKey: async input => { reads.push(input); return `fixture-${input.id}` },
@@ -39,7 +41,9 @@ function mount(overrides: Partial<ManagerAPI> = {}, selected?: Account) {
   const context = { module: { exports }, exports, window: { manager: api }, console,
     require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { message: { success() {}, info(value: string) { infos.push(value) } } }
       : id === '../store' ? { useManager: () => manager } : id.endsWith('/providerLibrary') ? library
-      : id.endsWith('/providerUsage') ? { integrationTypeOptions: [] } : (() => { throw new Error(`Unexpected module ${id}`) })() }
+      : id === '../formFeedback' ? feedback : id.endsWith('/shared/types') ? accountTypes
+      : id.endsWith('/providerUsage') ? { integrationTypeOptions: [] } : id.endsWith('.vue') ? { default: {} }
+      : (() => { throw new Error(`Unexpected module ${id}`) })() }
   vm.runInNewContext(javascript, context)
   const component = (context.module.exports as { default: vue.Component }).default as vue.Component & { render?: () => null }
   component.render = () => null
@@ -71,10 +75,24 @@ test('independent editor shows its saved key and metadata saves do not rotate it
 test('rotated key is submitted once; clearing a saved key blocks saving', async t => {
   const ui = mount(); t.after(ui.unmount); await flush()
   ui.state.form.apiKey = ''
-  await ui.state.save(); assert.equal(ui.writes.length, 0); assert.deepEqual(ui.infos, ['请输入 API Key'])
+  await ui.state.save(); assert.equal(ui.writes.length, 0); assert.equal(ui.state.formError, '请填写API Key'); assert.equal(ui.state.fieldErrors.apiKey, '请填写API Key')
   ui.state.form.apiKey = 'fixture-new-key'
   await ui.state.save()
   assert.deepEqual((ui.writes[0] as any).changes, { apiKey: 'fixture-new-key' })
+})
+
+test('invalid account fields stay in the editor with actionable field feedback and never call IPC', async t => {
+  const ui = mount(); t.after(ui.unmount); await flush()
+  ui.state.form.name = ''; ui.state.form.baseUrl = 'invalid-url'; ui.state.models = ''
+  await ui.state.save()
+  assert.equal(ui.writes.length, 0)
+  assert.equal(ui.state.formError, '请填写账号名称')
+  assert.ok(ui.state.fieldErrors.baseUrl); assert.equal(ui.state.fieldErrors.models, '请至少添加一个模型')
+  ui.state.form.name = 'Corrected'
+  assert.equal(ui.state.formError, '')
+  await ui.state.save()
+  assert.ok(ui.state.formError); assert.ok(ui.state.fieldErrors.baseUrl.includes('API 地址'))
+  assert.equal(ui.writes.length, 0)
 })
 
 test('cancel clears keys immediately and late reads cannot populate a different account', async t => {
@@ -167,4 +185,53 @@ test('a late unlink result cannot close another account editor', async t => {
   unlinked.resolve(ui.manager.data); await unlinking; await flush()
   assert.equal(ui.props.open, true)
   assert.equal(ui.state.form.apiKey, `fixture-${ui.accounts[1].id}`)
+})
+
+test('independent API connection edits model windows without losing unselected models or changing its key', async t => {
+  const selected = { ...account('Context'), modelContextWindows: { 'fixture-model': 333333, unselected: 262144 } }
+  const ui = mount({}, selected); t.after(ui.unmount); await flush()
+  assert.deepEqual(plain(ui.state.form.modelContextWindows), selected.modelContextWindows)
+  ui.state.form.modelContextWindows['fixture-model'] = 400000
+  ui.state.form.note = 'Window changed'
+  assert.equal(selected.modelContextWindows['fixture-model'], 333333, 'The draft must not mutate the stored account')
+  await ui.state.save()
+  assert.deepEqual(plain((ui.writes[0] as any).changes), { note: 'Window changed', modelContextWindows: { 'fixture-model': 400000, unselected: 262144 } })
+})
+
+test('clearing connection model windows sends an explicit empty map; missing windows remain unchanged', async t => {
+  const ui = mount({}, { ...account('Context'), modelContextWindows: { 'fixture-model': 512000 } }); t.after(ui.unmount); await flush()
+  ui.state.form.modelContextWindows = undefined
+  await ui.state.save()
+  assert.deepEqual(plain((ui.writes[0] as any).changes), { modelContextWindows: {} })
+  const missing = mount(); t.after(missing.unmount); await flush()
+  missing.state.form.modelContextWindows = {}
+  await missing.state.save()
+  assert.deepEqual(plain((missing.writes[0] as any).changes), {})
+})
+
+test('managed connection overrides are local and do not submit shared endpoint, key, models or integration', async t => {
+  const provider: library.ProviderSummary = { id: randomUUID(), revision: 3, name: 'Shared', baseUrl: 'https://shared.invalid/v1', models: ['shared-model'], wireApi: 'responses', defaultTier: 'inherit', modelContextWindows: { 'shared-model': 400000 }, createdAt: 1, updatedAt: 1, keys: [] }
+  const selected = { ...account('Managed'), providerId: provider.id, providerKeyId: randomUUID(), modelContextWindows: { 'shared-model': 256000 } }
+  const ui = mount({}, selected, [provider]); t.after(ui.unmount); await flush()
+  assert.deepEqual(plain(ui.state.connectionModels), ['shared-model'], 'Use the current supplier models, not a stale account snapshot')
+  assert.deepEqual(plain(ui.state.linkedProvider.modelContextWindows), { 'shared-model': 400000 })
+  ui.state.form.modelContextWindows = { 'shared-model': 512000 }
+  ui.state.form.baseUrl = 'https://must-not-save.invalid/v1'; ui.state.form.apiKey = 'fixture-must-not-save'; ui.state.form.wireApi = 'chat_completions'; ui.state.form.integrationType = 'custom'
+  ui.state.models = 'must-not-save'; ui.state.form.tags = ['local']
+  await ui.state.save()
+  assert.deepEqual(plain((ui.writes[0] as any).changes), { tags: ['local'], modelContextWindows: { 'shared-model': 512000 } })
+  assert.deepEqual(provider.modelContextWindows, { 'shared-model': 400000 }, 'A connection edit must preserve supplier defaults')
+  assert.equal(ui.reads.length, 0)
+})
+
+test('new API connection submits windows and editor switching clears the previous draft', async t => {
+  const ui = mount({}, { ...account('Context'), modelContextWindows: { 'fixture-model': 512000 } }); t.after(ui.unmount); await flush()
+  ui.props.account = undefined; await flush()
+  assert.equal(ui.state.form.modelContextWindows, undefined)
+  ui.state.form.name = 'New'; ui.state.form.apiKey = 'fixture-new-key'; ui.state.models = 'new-model,other-model'
+  ui.state.form.modelContextWindows = { 'new-model': 200000 }
+  await ui.state.save()
+  const added = ui.writes[0] as any
+  assert.deepEqual(plain(added.models), ['new-model', 'other-model'])
+  assert.deepEqual(plain(added.modelContextWindows), { 'new-model': 200000 })
 })

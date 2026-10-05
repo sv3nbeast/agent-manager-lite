@@ -18,7 +18,7 @@ const providerUsage=z.object({checkedAt:date,error:text.optional(),unavailable:z
 const proxy=z.object({mode:z.enum(['direct','custom','resource']),url:z.string().max(2*1024*1024).optional(),resourceId:id.optional()}).strict()
 const identity=z.object({agent_runtime_id:text,agent_private_key:text,task_id:text.optional(),account_id:text,chatgpt_user_id:text,email:text.optional(),plan_type:text.optional(),chatgpt_account_is_fedramp:z.boolean()}).strict()
 const account=z.object({id,name:accountInputSchema.shape.name,email:text.optional(),kind:z.enum(['oauth','api_key','agent_identity']),plan:text.optional(),baseUrl:accountInputSchema.shape.baseUrl,
-  models:z.array(z.string().max(200)).max(500),wireApi:z.enum(['responses','chat_completions']),integrationType:accountInputSchema.shape.integrationType,providerUsageRevision:integer.optional(),defaultTier:defaultTierSchema,note:z.string().max(2000),tags:accountInputSchema.shape.tags,createdAt:date,
+  models:z.array(z.string().max(200)).max(500),wireApi:z.enum(['responses','chat_completions']),integrationType:accountInputSchema.shape.integrationType,modelContextWindows:accountInputSchema.shape.modelContextWindows,providerUsageRevision:integer.optional(),defaultTier:defaultTierSchema,note:z.string().max(2000),tags:accountInputSchema.shape.tags,createdAt:date,
   credentials:z.object({apiKey:text.optional(),accessToken:text.optional(),refreshToken:text.optional(),idToken:text.optional(),accountId:text.optional(),localAPIKey:text.optional(),agentIdentity:identity.optional()}).strict(),
   generation:text.optional(),source:json.optional(),revision:integer.optional(),providerId:id.optional(),providerKeyId:id.optional(),proxy:proxy.optional(),quota:quota.optional(),providerUsage:providerUsage.optional(),subscriptionActiveUntil:date.optional(),subscriptionSource:z.enum(['token','web']).optional(),subscriptionQueryLastAttemptAt:date.optional(),subscriptionQueryNextRetryAt:date.optional(),subscriptionQueryLastSuccessAt:date.optional(),subscriptionQueryLastError:text.optional(),error:text.optional(),errorAt:date.optional(),needsTokenExchange:z.boolean().optional()
 }).strict()
@@ -35,7 +35,7 @@ const wakeupHistory=z.object({id,runId:id,timestamp:date,triggerType:z.enum(['st
 const wakeup=z.object({enabled:z.boolean(),tasks:z.array(wakeupTask).max(1000),history:z.array(wakeupHistory).max(300)}).strict()
 const sshServer=z.object({id,name:text,host:text,port:z.number().int().min(1).max(65535),username:text,codexHome:text,auth:sshAuthSchema,syncOnCodexSwitch:z.boolean(),createdAt:date,updatedAt:date,lastSync:z.object({accountId:id,accountEmail:text.optional(),tokenGeneration:text.optional(),bundleHash:z.string().regex(/^[a-f0-9]{64}$/),syncedAt:date,verified:z.boolean(),error:text.optional()}).strict().optional()}).strict()
 const portable=z.object({localDataArchives:z.array(z.object({id,fingerprint:z.string().regex(/^[a-f0-9]{64}$/),importedAt:date,sources:z.array(z.object({path:text,format:text,files:z.array(z.object({path:text,hash:z.string().regex(/^[a-f0-9]{64}$/),content:z.unknown()}).strict()).max(20040)}).strict()).max(30)}).strict()).max(100).optional(),version:z.literal(1),settings:settingsSchema,accounts:z.array(account).max(10000),groups:z.array(groupInputSchema.extend({id,sortOrder:integer,createdAt:date,accountIds:z.array(id).max(10000)}).strict()).max(10000),
-  providers:z.array(provider).max(1000).optional(),accountRecycle:z.array(z.object({id,deletedAt:date,account,groupIds:z.array(id).max(10000),providerDefault:defaultTierSchema.optional()}).strict()).max(10000).optional(),
+  providers:z.array(provider).max(1000).optional(),accountRecycle:z.array(z.object({id,deletedAt:date,account,groupIds:z.array(id).max(10000),providerDefault:defaultTierSchema.optional(),providerModelContextWindows:accountInputSchema.shape.modelContextWindows}).strict()).max(10000).optional(),
   localAccess:localPoolSchema.extend({revision:integer,keys:z.array(localKeyDetailsSchema.extend({id,revision:integer,createdAt:date,key:text,restoredUsageOffset:integer.optional()}).strict()).max(100)}).strict().optional(),
   instances:z.array(profile).max(100).optional(),instanceApplications:z.array(z.object({id:text,name:text,path:text,kind:z.enum(['desktop','cli']).optional()}).strict()).max(1000).optional(),instanceWorkingDirectories:z.array(z.object({id,path:text,device:integer,inode:integer}).strict()).max(1000).optional(),
   wakeup:wakeup.optional(),
@@ -73,6 +73,10 @@ export function validateBackup(value:unknown):DataBackupBundle{
   for(const p of s.providers??[])unique(p.keys)
   for(const source of s.proxyCatalogs??[])unique([...source.catalog.nodes,...source.catalog.groups])
   const known=new Set(s.accounts.map(a=>a.id))
+  for(const a of [...s.accounts,...(s.accountRecycle??[]).map(entry=>entry.account)]){
+    if(a.kind!=='api_key'&&a.modelContextWindows!==undefined)throw new Error('登录账号不支持 API 连接上下文配置')
+  }
+  for(const entry of s.accountRecycle??[])if(entry.account.kind!=='api_key'&&entry.providerModelContextWindows!==undefined)throw new Error('登录账号不支持供应商上下文快照')
   for(const a of s.accounts){
     if(a.kind==='api_key'&&!a.credentials.apiKey||a.kind==='oauth'&&!a.credentials.accessToken&&!a.credentials.refreshToken||a.kind==='agent_identity'&&!a.credentials.agentIdentity)throw new Error('备份账号缺少凭据')
     if(!!a.providerId!==!!a.providerKeyId)throw new Error('备份供应商关联不一致')

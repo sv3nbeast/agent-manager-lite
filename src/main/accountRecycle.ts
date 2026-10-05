@@ -6,9 +6,12 @@ import {sameAccount} from './accounts'
 import {sameNativeAccount} from './accountIdentity'
 import {providerTierForAccount} from './providerLibrary'
 import {writeAccountExport} from './accountFiles'
+import { effectiveModelContextWindows } from './providerModelContext'
 import {accountRecyclePageSchema,accountRecyclePreviewSchema,accountRecycleApplySchema,type AccountRecyclePage,type AccountRecyclePreview,type AccountRecycleResult} from '../shared/accountRecycle'
 
 const stamp=(entry:RecycledAccount)=>createHash('sha256').update(JSON.stringify(entry)).digest('hex')
+const archivedWindows=(entry:RecycledAccount)=>({...(entry.providerModelContextWindows??{}),...(entry.account.modelContextWindows??{})})
+const windowStamp=(windows:Record<string,number>|undefined)=>JSON.stringify(Object.entries(windows??{}).sort(([a],[b])=>a.localeCompare(b)))
 interface Pending {view:AccountRecyclePreview;entries:RecycledAccount[];stamps:Map<string,string>;expires:number}
 export class AccountRecycle {
   private snapshot?:{id:string;entries:RecycledAccount[];expires:number}
@@ -68,7 +71,13 @@ export class AccountRecycle {
       if(exportFirst||pending.view.action==='export'){
         const path=await choosePath();if(!path)return {count:0,exported:0,cancelled:true}
         this.validate(pending)
-        const accounts=pending.entries.map(entry=>{const account=structuredClone(entry.account);if(account.providerId&&account.defaultTier==='inherit')account.defaultTier=entry.providerDefault??'inherit';return account})
+        const accounts=pending.entries.map(entry=>{
+          const account=structuredClone(entry.account)
+          if(account.providerId&&account.defaultTier==='inherit')account.defaultTier=entry.providerDefault??'inherit'
+          const windows=archivedWindows(entry)
+          if(Object.keys(windows).length)account.modelContextWindows=windows
+          return account
+        })
         exported=await writeAccountExport(this.store.directory,accounts,path,this.controller.signal)
       }
       this.validate(pending)
@@ -77,7 +86,16 @@ export class AccountRecycle {
           const account=structuredClone(entry.account);account.generation=randomUUID();account.revision=(account.revision??0)+1
           // Keep unchanged provider links; changed or removed providers must not
           // replace the archived credential or its effective service tier.
-          if(account.providerId)try{const tier=providerTierForAccount(state,account);if(account.defaultTier==='inherit'&&tier!==entry.providerDefault)throw new Error('Provider default changed')}catch{if(account.defaultTier==='inherit')account.defaultTier=entry.providerDefault??'inherit';delete account.providerId;delete account.providerKeyId}
+          if(account.providerId)try{
+            const tier=providerTierForAccount(state,account)
+            if(account.defaultTier==='inherit'&&tier!==entry.providerDefault)throw new Error('Provider default changed')
+            if(entry.providerModelContextWindows!==undefined&&windowStamp(effectiveModelContextWindows(state,account).windows)!==windowStamp(archivedWindows(entry)))throw new Error('Provider model context changed')
+          }catch{
+            if(account.defaultTier==='inherit')account.defaultTier=entry.providerDefault??'inherit'
+            const windows=archivedWindows(entry)
+            if(Object.keys(windows).length)account.modelContextWindows=windows
+            delete account.providerId;delete account.providerKeyId
+          }
           state.accounts.push(account)
           for(const group of state.groups)if(entry.groupIds.includes(group.id)&&!group.accountIds.includes(account.id))group.accountIds.push(account.id)
         }

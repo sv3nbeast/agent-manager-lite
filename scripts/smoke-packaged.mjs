@@ -7,6 +7,7 @@ import { extractFile } from '@electron/asar'
 import assert from 'node:assert/strict'
 
 const productName = 'Agent Manager Lite'
+const sourcePackage = JSON.parse(readFileSync('package.json', 'utf8'))
 const evidenceDirectory = resolve(process.env.CML_PACKAGED_EVIDENCE_DIR || 'docs/evidence')
 mkdirSync(evidenceDirectory, { recursive: true })
 const bundle = resolve(process.env.CML_PACKAGED_APP_PATH?join(process.env.CML_PACKAGED_APP_PATH,'Contents'):'release-agent-manager/mac-arm64/Agent Manager Lite.app/Contents')
@@ -20,9 +21,12 @@ assert.ok(existsSync(binary), 'Build the macOS application before this test')
 assert.equal(plistValue('CFBundleName'), productName)
 assert.equal(plistValue('CFBundleDisplayName'), productName)
 assert.equal(plistValue('CFBundleIdentifier'), 'local.codex-manager-lite', 'Bundle identity must remain compatible with existing installs')
+assert.equal(plistValue('CFBundleShortVersionString'), sourcePackage.version, 'Bundle display version must match the release source')
+assert.equal(plistValue('CFBundleVersion'), sourcePackage.version, 'Bundle build version must match the release source')
 const archive = join(bundle, 'Resources/app.asar')
 const shippedPackage = JSON.parse(extractFile(archive, 'package.json').toString('utf8'))
 assert.equal(shippedPackage.name, 'codex-manager-lite', 'Package identity is separate from the display brand')
+assert.equal(shippedPackage.version, sourcePackage.version, 'Shipped package version must match the release source')
 const shippedMain = extractFile(archive, 'out/main/index.js').toString('utf8')
 // This verifies key addressing in the shipped code; it does not access or
 // claim integration coverage of the user's real vault or system Keychain.
@@ -59,6 +63,7 @@ try {
   }
   for (let i=0;i<100;i++) { if(await evaluate('!!window.manager && !!document.querySelector("h1")')) break; await delay(100) }
   assert.equal(await evaluate('document.title'), productName)
+  assert.equal(await evaluate('document.querySelector(".sidebar-bottom .version").textContent'), `v${sourcePackage.version} · 本地数据`, 'Visible application version must match the installer')
   assert.equal(await evaluate('document.querySelector(".brand-mark")?.getAttribute("alt")'), productName)
   assert.equal(await evaluate('document.querySelector("h1").textContent'),'实例')
   const snapshot=await evaluate('window.manager.load()')

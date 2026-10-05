@@ -25,14 +25,14 @@ These screenshots capture the running v0.1.0 application content at its default 
 
 ## Features
 
-- **Independent instances**: manage Codex desktop and CLI instances, choose an account, connection mode and project, then preview, launch, stop or archive.
+- **Independent instances**: manage Codex desktop and CLI instances with automatically suggested, editable names. Choose an account, connection mode and session source, then preview, launch, stop or archive.
 - **Accounts**: sign in to ChatGPT using a browser or device code, import accounts, and manage tags, groups, usage windows, subscription expiry and the account recycle bin. Expiry dates depend on the upstream response.
 - **Providers and keys**: manage multiple API providers and keys, discover models through their APIs, and run cancellable connection and conversation tests.
-- **Models and configuration**: choose a model, reasoning effort and preset or custom context window; preview configuration changes and restore them.
+- **Models and configuration**: choose a model, reasoning effort and preset or custom context window. Each API connection can set its own window per model and inherit provider defaults when unset; preview instance configuration changes and restore them.
 - **Standard / Fast**: choose a speed in the existing menu of supported Codex desktop instances. The local API supports service tier settings and outbound tier records. Availability depends on the client version, model and provider.
 - **Network proxies**: configure a default proxy and account overrides using HTTP, HTTPS, SOCKS5 or SOCKS5H.
 - **Local API**: use multiple accounts, scheduling strategies and separate access keys with model restrictions and Token limits.
-- **Sessions and records**: manage sessions from registered directories, import, export, copy and restore them; query request history, view statistics and export CSV files.
+- **Sessions and records**: start fresh or copy sessions from an instance or local directory. Preview session counts and project grouping, search project details and preserve the original directory. Manage session import, export, copies and restoration, and query request history, statistics and CSV exports.
 - **Data backups**: preview imports, export accounts or create encrypted portable data backups.
 
 ## Integration direction
@@ -54,7 +54,7 @@ The current release target is **macOS Apple Silicon (arm64)**, with DMG and ZIP 
 1. Install and open Agent Manager Lite, and prepare a local Codex desktop application or CLI.
 2. Sign in to ChatGPT under Accounts, or add an API URL, key and models under Providers and Keys.
 3. Create an instance, choosing Codex and a compatible account or provider.
-4. Select the project and settings, review the preview, then launch.
+4. Check the model, session source and launch preview, then launch. Choose desktop projects inside Codex; CLI instances can select a working directory beforehand.
 
 If a proxy is required, configure the default network in Settings and override it per account as needed. Proxies apply to the manager’s login exchanges, Token refreshes, usage queries and local API. External browsers and native clients use their own network settings.
 

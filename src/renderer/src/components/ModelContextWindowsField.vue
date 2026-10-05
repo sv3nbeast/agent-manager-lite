@@ -2,10 +2,10 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { formatModelContextWindow, getModelContextWindow, modelContextChoice, modelContextWindowPresets, setModelContextWindow, type ModelContextChoice, type ModelContextDefault } from '../../../shared/modelContextWindows'
 
-const props = defineProps<{ modelValue?: Record<string, number>; models: string[]; active?: boolean }>()
+const props = defineProps<{ modelValue?: Record<string, number>; models: string[]; inheritedWindows?: Record<string, number>; active?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: Record<string, number> | undefined] }>()
 const custom = ref<string[]>([])
-const bulkOptions = [{ label: '未设置 · 使用各模型默认值', value: 'default' }, ...modelContextWindowPresets]
+const bulkOptions = computed(() => [{ label: props.inheritedWindows ? '未设置 · 继承供应商或模型默认值' : '未设置 · 使用各模型默认值', value: 'default' }, ...modelContextWindowPresets])
 const defaults = ref<Record<string, ModelContextDefault>>({}), defaultsLoading = ref(false), defaultsError = ref(false)
 let defaultsRequest = 0
 watch(() => [props.active !== false, ...props.models] as const, async () => {
@@ -23,8 +23,10 @@ watch(() => [props.active !== false, ...props.models] as const, async () => {
 }, { immediate: true })
 onBeforeUnmount(() => { defaultsRequest++ })
 function optionsFor(model: string) {
+  const inherited = getModelContextWindow(props.inheritedWindows, model)
   const value = Object.hasOwn(defaults.value, model) ? defaults.value[model] : undefined
-  const label = value ? `未设置 · 使用默认值 ${formatModelContextWindow(value.contextWindow)}${value.source === 'template' ? '（模板）' : ''}`
+  const label = inherited !== undefined ? `未设置 · 使用供应商默认值 ${formatModelContextWindow(inherited)}`
+    : value ? `未设置 · 使用默认值 ${formatModelContextWindow(value.contextWindow)}${value.source === 'template' ? '（模板）' : ''}`
     : defaultsLoading.value ? '未设置 · 正在读取默认值…' : '未设置 · 默认值暂不可用'
   return [{ label, value: 'default' }, ...modelContextWindowPresets, { label: '自定义', value: 'custom' }]
 }
@@ -62,7 +64,7 @@ function clearAll() { custom.value=[]; emit('update:modelValue', undefined) }
         <a-input-number v-if="choice(model) === 'custom'" :value="getModelContextWindow(modelValue, model)" :min="2" :max="10000000" :precision="0" :aria-label="`自定义上下文窗口 · ${model}`" placeholder="tokens" @change="input(model, $event as number | null)" />
       </div>
     </div>
-    <p class="muted">未设置时显示 Codex 内置目录默认值；未知模型使用模板值，不代表上游支持该窗口。配置值以十进制 tokens 计算，例如 1M = 1,000,000。</p>
+    <p class="muted">{{ inheritedWindows ? '未设置时优先继承供应商配置，其余模型使用 Codex 内置目录默认值。' : '未设置时显示 Codex 内置目录默认值。' }}未知模型使用模板值，不代表上游支持该窗口。配置值以十进制 tokens 计算，例如 1M = 1,000,000。</p>
     <p v-if="defaultsError" class="muted">默认值读取失败，可重新打开编辑窗口。已有配置不受影响。</p>
     <p v-if="extraModels.length" class="muted">已保留 {{ extraModels.length }} 个未在当前模型列表中的配置。</p>
     <a-button v-if="Object.keys(modelValue ?? {}).length" size="small" class="context-window-clear" @click="clearAll">清空所有配置</a-button>

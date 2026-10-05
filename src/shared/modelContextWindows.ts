@@ -1,3 +1,7 @@
+import { z } from 'zod'
+
+export const modelContextWindowsSchema = z.record(z.string().trim().min(1).max(200), z.number().int().min(2).max(10_000_000))
+
 export const modelContextWindowPresets = [
   { label: '32K · 32,000 tokens', value: 32_000 },
   { label: '64K · 64,000 tokens', value: 64_000 },

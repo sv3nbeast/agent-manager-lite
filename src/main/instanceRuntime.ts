@@ -4,11 +4,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type {CliPackage} from './cliResolver'
 import {desktopNetworkArgs,macSystemProxyEnabled} from './desktopNetwork'
 import type {CodexSpeedMenuHook} from './codexSpeedMenu'
+import {CodexSpeedMenuCdpSession,markCodexSpeedMenuCdpFailure} from './codexSpeedMenuCdp'
 import type {AgentClientType} from '../shared/agentClients'
-import {getInstanceClientAdapter,codexDesktopEnvironment} from './codexInstanceAdapter'
+import {getInstanceClientAdapter,codexDesktopEnvironment,reserveCodexCdpPort} from './codexInstanceAdapter'
 
 const exec=promisify(execFile)
-export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';cliPackage?:CliPackage;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook }
+export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';cliPackage?:CliPackage;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
 export interface DesktopProcess { pid:number; started:string }
 export interface DesktopRuntime {
   find(plan:DesktopPlan):Promise<DesktopProcess|undefined>
@@ -25,6 +26,7 @@ export function macLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.args)
 // LaunchServices owns the launcher PID. Only an exact executable + private nonce
 // match proves that a discovered PID belongs to this managed desktop instance.
 export class MacDesktopRuntime implements DesktopRuntime {
+  private readonly cdpSessions=new Map<string,CodexSpeedMenuCdpSession>()
   private supported() {if(process.platform!=='darwin')throw new Error('桌面实例当前仅在 macOS 接入，其他平台仍在迁移')}
   async find(plan:DesktopPlan):Promise<DesktopProcess|undefined> {
     getInstanceClientAdapter(plan.clientType)
@@ -49,19 +51,55 @@ export class MacDesktopRuntime implements DesktopRuntime {
     this.supported();signal.throwIfAborted()
     const env=desktopEnvironment(process.env)
     const args=desktopNetworkArgs(plan.args,env,macSystemProxyEnabled())
+    const hook=plan.speedMenuHook??plan.desktopLocaleHook
+    let cdpSession:CodexSpeedMenuCdpSession|undefined
+    let cdpStart:Promise<void>|undefined
+    if(hook?.transport==='cdp'){
+      // The port must be known before LaunchServices starts Electron. Starting
+      // the CDP handshake concurrently with `open` lets the browser-level
+      // auto-attach catch the first renderer request.
+      plan.cdpPort=plan.cdpPort??await reserveCodexCdpPort()
+      cdpSession=new CodexSpeedMenuCdpSession({hook,directory:plan.directory,desktopDirectory:plan.desktopDirectory,executable:plan.executable,nonce:plan.nonce,pid:undefined,cdpPort:plan.cdpPort})
+      cdpStart=cdpSession.start()
+      // The promise is intentionally awaited only after LaunchServices has
+      // produced the owned PID; attach a rejection handler now so a failed
+      // optional CDP enhancement never becomes an unhandled rejection while
+      // the process is still being discovered.
+      void cdpStart.catch(()=>{})
+    }
     try {await exec('/usr/bin/open',macLaunchArgs(plan,args),{cwd:plan.workingDirectory,env,timeout:15_000,maxBuffer:64*1024})}
-    catch {throw new Error('启动桌面应用失败，请检查应用路径和系统启动权限')}
+    catch {cdpSession?.close();throw new Error('启动桌面应用失败，请检查应用路径和系统启动权限')}
     // Do not abort the LaunchServices command halfway: first identify its child,
     // then cancellation can terminate only that owned process.
     const deadline=Date.now()+10_000
     while(Date.now()<deadline) {
       const child=await this.find(plan)
-      if(child){if(signal.aborted){await this.stop(plan);throw new Error('实例启动已取消')}return child}
+      if(child){
+        if(signal.aborted){await this.stop(plan);throw new Error('实例启动已取消')}
+        if(cdpSession){
+          cdpSession.setPid(child.pid)
+          try {
+            await cdpStart
+            if(this.cdpSessions.has(plan.nonce))this.cdpSessions.get(plan.nonce)!.close()
+            this.cdpSessions.set(plan.nonce,cdpSession)
+          } catch {
+            cdpSession.close()
+            if(hook)markCodexSpeedMenuCdpFailure({hook,directory:plan.directory,desktopDirectory:plan.desktopDirectory,executable:plan.executable,nonce:plan.nonce,pid:child.pid,cdpPort:plan.cdpPort})
+            // CDP is an optional compatibility enhancement. The official
+            // client remains usable when the debug endpoint is unavailable.
+          }
+        }
+        if(signal.aborted){await this.stop(plan);throw new Error('实例启动已取消')}
+        return child
+      }
       await delay(100)
     }
+    cdpSession?.close()
     throw new Error('未找到实例主进程，请检查应用是否支持独立启动后重试')
   }
   async stop(plan:DesktopPlan):Promise<void> {
+    const cdp=this.cdpSessions.get(plan.nonce)
+    if(cdp){cdp.close();this.cdpSessions.delete(plan.nonce)}
     const child=await this.find(plan)
     if(!child)return
     const signal=async(value:NodeJS.Signals)=>{

@@ -25,7 +25,9 @@ function mount(overrides: Partial<ManagerAPI> = {}) {
     applyLocalData: async () => { throw new Error('unexpected automatic apply') }, ...overrides
   }
   const exports = {}
-  const context = { module: { exports }, exports, require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { message: { success: () => {} } } : (() => { throw new Error(`Unexpected module: ${id}`) })(), window: { manager: api }, crypto: webcrypto, setInterval, clearInterval, Date, console }
+  const context = { module: { exports }, exports, require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { message: { success: () => {} } }
+    : id === '../formFeedback' ? { useFormFeedback: () => {} } : id.endsWith('.vue') ? { default: {} }
+    : (() => { throw new Error(`Unexpected module: ${id}`) })(), window: { manager: api }, crypto: webcrypto, setInterval, clearInterval, Date, console }
   vm.runInNewContext(javascript, context)
   const component = (context.module.exports as { default: vue.Component }).default as vue.Component & { render?: () => null }
   component.render = () => null

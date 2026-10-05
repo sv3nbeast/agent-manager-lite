@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
+import {useFormFeedback} from '../formFeedback'
 import type {ClientConfigTarget} from '../../../shared/clientConfig'
 import type {InstanceApplication} from '../../../shared/instances'
 import type {SessionCopyPreview,SessionTransferView,SessionTransferRecovery} from '../../../shared/sessions'
@@ -8,6 +9,7 @@ const props=defineProps<{targets:ClientConfigTarget[];snapshotId?:string;selecte
 const emit=defineEmits<{completed:[]}>()
 const transfer=ref<SessionTransferView>(),recoveries=ref<SessionTransferRecovery[]>([]),applications=ref<InstanceApplication[]>([])
 const open=ref(false),targetId=ref<string>(),applicationId=ref<string>(),preview=ref<SessionCopyPreview>(),retryId=ref<string>(),clientsClosed=ref(false),loading=ref(false),error=ref('')
+useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>!!transfer.value&&['copying','committing','indexing'].includes(transfer.value.status))
 const labels={copying:'正在复制',committing:'正在保存文件',indexing:'正在更新 Codex 会话列表',completed:'复制已完成',cancelled:'操作已取消',failed:'复制失败',recovery_required:'需要处理恢复记录'}
 const bytes=(value:number)=>value<1024?value+' B':value<1024**2?(value/1024).toFixed(1)+' KiB':value<1024**3?(value/1024**2).toFixed(1)+' MiB':(value/1024**3).toFixed(2)+' GiB'

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
+import { useFormFeedback } from '../formFeedback'
+import FormFeedback from './FormFeedback.vue'
 import type { AppSnapshot } from '../../../shared/types'
 import type { LocalDataPreview, LocalDataScan } from '../../../shared/localDataMigration'
 
@@ -11,6 +13,7 @@ const selected = ref<string[]>([])
 const preview = ref<LocalDataPreview>()
 const phase = ref<'scan' | 'preview' | 'apply' | ''>('')
 const error = ref('')
+useFormFeedback(() => error.value, { active: () => props.open })
 const now = ref(Date.now())
 let generation = 0
 let requestId: string | undefined
@@ -136,6 +139,7 @@ async function apply() {
 <template>
   <a-modal :open="open" title="扫描本机数据" :width="820" :closable="!applying" :mask-closable="!applying" :keyboard="!applying" destroy-on-close @cancel="close">
     <template #footer>
+      <FormFeedback :error="error || preview?.errors[0]" />
       <div v-if="preview" class="modal-actions local-data-actions"><a-button :disabled="applying" @click="close">取消</a-button><a-button :disabled="applying" @click="back">返回选择</a-button><a-button type="primary" :disabled="!canApply" :loading="applying" @click="apply">确认迁移</a-button></div>
       <div v-else-if="scan" class="modal-actions local-data-actions"><a-button :disabled="busy" @click="close">取消</a-button><a-button type="primary" :disabled="!selected.length || busy" :loading="phase === 'preview'" @click="prepare">预览迁移</a-button></div>
       <a-button v-else @click="close">取消</a-button>
@@ -193,7 +197,6 @@ async function apply() {
         <a-alert v-if="expired" type="warning" message="此预览已过期，请返回重新预览。" />
         <a-alert v-else-if="!hasChanges && !preview.errors.length" type="info" message="所选数据均已存在，无需重复导入。" />
       </template>
-      <a-alert v-if="error" type="error" :message="error" class="error-banner" />
     </div>
   </a-modal>
 </template>

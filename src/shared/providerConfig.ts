@@ -3,8 +3,10 @@ import { z } from 'zod'
 export const providerIdSchema = z.string().trim().min(1).max(100).regex(/^[A-Za-z0-9_.-]+$/)
 const text = z.string().trim().min(1).max(200).refine(value => !/[\u0000-\u001f\u007f]/.test(value))
 export const providerURLSchema = z.string().trim().max(2000).url().refine(value => {
-  const url = new URL(value)
-  return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash
+  try {
+    const url = new URL(value)
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash
+  } catch { return false }
 })
 export const providerFields = ['name', 'base_url', 'wire_api', 'requires_openai_auth', 'supports_websockets', 'supports_standalone_web_search',
   'env_key', 'env_key_instructions', 'experimental_bearer_token', 'request_max_retries', 'stream_max_retries', 'stream_idle_timeout_ms'] as const

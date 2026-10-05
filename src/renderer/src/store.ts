@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { AppSnapshot } from '../../shared/types'
+import { useFormFeedback } from './formFeedback'
 
 function displayError(cause: unknown): string {
   const message = cause instanceof Error ? cause.message : String(cause)
@@ -11,6 +12,7 @@ export const useManager = defineStore('manager', () => {
   const data = ref<AppSnapshot>()
   const loading = ref(false)
   const error = ref('')
+  useFormFeedback(error)
   let mutation = 0, refreshRequest = 0
   async function execute(action: () => Promise<AppSnapshot>): Promise<boolean> {
     const current = ++mutation

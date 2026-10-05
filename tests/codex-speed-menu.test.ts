@@ -7,6 +7,7 @@ import {join,resolve} from 'node:path'
 import {runInNewContext} from 'node:vm'
 import {execFileSync} from 'node:child_process'
 import {inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuReader,type CodexSpeedMenuHook,type CodexSpeedMenuEnhancements} from '../src/main/codexSpeedMenu'
+import {codexStartupNavigationSource} from '../src/main/codexSpeedMenuCdp'
 
 const originalHash='34a75db63c7137eb4caecdba1f36d631c10c7912487e532fd5e9dafb175bb9be',patchedHash='5d8a7434e2ce686bcf359ea16d7d889bc0df9ec4c513d0222992ff7d038807a8'
 const localePatchedHash='f76d1b5e0f1ef29951cf301d1bf31f9155fbebd79e35fcb48c8a203ade2b8754',combinedPatchedHash='a21d5bf01e4280636727813c12f77fa45d87cb555606712f9c4fb98b9ef06b30'
@@ -68,6 +69,43 @@ test('inspection recognizes only the audited API UI release and fingerprints all
   f.entries.set('.vite/build/bootstrap-DF0QwAxC.js',Buffer.from(f.entries.get('.vite/build/bootstrap-DF0QwAxC.js')!.toString()+'\n// changed'))
   assert.equal(f.inspect().supported,true);assert.notEqual(f.inspect().fingerprint,before)
 })
+
+function startupNavigationFixture(href='app://-/index.html',metaRoute?:string) {
+  const listeners=new Map<string,Set<(event:unknown)=>void>>(),messages:unknown[]=[],microtasks:Array<()=>void>=[]
+  let failDispatch=false
+  const window={
+    addEventListener(type:string,handler:(event:unknown)=>void){const handlers=listeners.get(type)??new Set();handlers.add(handler);listeners.set(type,handlers)},
+    removeEventListener(type:string,handler:(event:unknown)=>void){listeners.get(type)?.delete(handler)},
+    dispatchEvent(event:{type:string;data?:unknown}){if(failDispatch){failDispatch=false;throw new Error('dispatch fixture')};if(event.type==='message')messages.push(JSON.parse(JSON.stringify(event.data)));for(const listener of listeners.get(event.type)??[])listener(event);return true}
+  }
+  const location=new URL(href)
+  class MessageEvent {constructor(public type:string,init:{data?:unknown}){this.data=init.data}data?:unknown}
+  runInNewContext(codexStartupNavigationSource,{window,location,URL,MessageEvent,document:{querySelector:()=>metaRoute===undefined?null:{content:metaRoute}},queueMicrotask:(task:()=>void)=>{microtasks.push(task)}})
+  const emit=(detail:unknown)=>{for(const listener of listeners.get('codex-message-from-view')??[])listener({detail})}
+  return {messages,emit,flush:()=>{while(microtasks.length)microtasks.shift()!()},registered:()=>listeners.get('codex-message-from-view')?.size??0,failNextDispatch:()=>{failDispatch=true}}
+}
+test('CDP startup navigation waits for official app readiness and navigates through the memory-router host event once',()=>{
+  const f=startupNavigationFixture()
+  assert.equal(f.registered(),1);assert.deepEqual(f.messages,[])
+  f.emit({type:'unrelated',mode:'app'});f.emit({type:'electron-set-window-mode',mode:'onboarding'});f.flush();assert.deepEqual(f.messages,[])
+  f.emit({type:'electron-set-window-mode',mode:'app'});f.emit({type:'electron-set-window-mode',mode:'app'})
+  assert.deepEqual(f.messages,[]);f.flush()
+  assert.deepEqual(f.messages,[{type:'navigate-to-route',path:'/',replace:true,state:{codexAppMode:'codex',prefillComposerMode:'local'}}])
+  assert.equal(f.registered(),0)
+  f.emit({type:'electron-set-window-mode',mode:'app'});f.flush();assert.equal(f.messages.length,1)
+})
+test('CDP startup navigation preserves explicit URL and meta initial routes',()=>{
+  for(const [href,metaRoute] of [['app://-/codex/thread',undefined],['app://-/index.html?initialRoute=%2Flocal%2Fthread',undefined],['app://-/index.html','/settings']] as const){
+    const f=startupNavigationFixture(href,metaRoute);f.emit({type:'electron-set-window-mode',mode:'app'});f.flush()
+    assert.deepEqual(f.messages,[]);assert.equal(f.registered(),0)
+  }
+  const f=startupNavigationFixture('app://-/index.html?initialRoute=%2F',' / ');f.emit({type:'electron-set-window-mode',mode:'app'});f.flush();assert.equal(f.messages.length,1)
+})
+test('CDP startup navigation retries a failed dispatch but never sends twice after success',()=>{
+  const f=startupNavigationFixture();f.failNextDispatch();f.emit({type:'electron-set-window-mode',mode:'app'});f.flush()
+  assert.deepEqual(f.messages,[]);assert.equal(f.registered(),1)
+  f.emit({type:'electron-set-window-mode',mode:'app'});f.flush();assert.equal(f.messages.length,1);assert.equal(f.registered(),0)
+})
 test('locale, speed and combined inspections pin distinct checksums and manifest replacement sets',t=>{
   const f=fixture(t),states=new Map<string,string>()
   for(const [enhancements,expectedHash,count] of [['speed',patchedHash,3],['locale',localePatchedHash,1],['speed-locale',combinedPatchedHash,4]] as const){
@@ -115,6 +153,46 @@ test('unsupported platforms, wrong package versions and drifted JS use the origi
   f.entries.set('package.json',Buffer.from('{"name":"openai-codex-electron","version":"26.915.31945","main":".vite/build/early-bootstrap.js"}'))
   f.entries.set('webview/assets/app-initial-a498f911edeb.js',Buffer.from(source+'\n// updated'))
   assert.match(f.inspect().reason,/资源已变化/)
+})
+test('the installed ChatGPT renderer uses the audited CDP compatibility path',t=>{
+  if(process.platform!=='darwin'||!existsSync('/Applications/ChatGPT.app/Contents/Resources/app.asar')){t.skip('macOS ChatGPT installation unavailable');return}
+  const inspection=inspectCodexSpeedMenu({application:'/Applications/ChatGPT.app',executable:'/Applications/ChatGPT.app/Contents/MacOS/ChatGPT',platform:'darwin',enhancements:'speed-locale'})
+  const expected={
+    '26.930.41038':{source:'be620740a6218c263b32e3692ed2e40768624d984662731b0cbb359af47ebe8e',patched:'4c32ffa56c3a76f9ce54ca0962ccdac366f6685fe22eaacdbf34bc8380d36d1b'},
+    '26.930.51102':{source:'22f3ea455585cfc0508e3d3627eac161c80c849c0aace3d76d09fdebaa0aeca3',patched:'8349a89e0fe3a5c5159f6b437ebba8284a8242d454f9a3fc9e3b902649c856cd'}
+  }[inspection.version??'']
+  if(!expected){t.skip('installed client is not an audited current release');return}
+  assert.equal(inspection.supported,true)
+  assert.equal(inspection.transport,'cdp')
+  assert.equal(inspection.sourceSha256,expected.source)
+  assert.equal(inspection.patchedSha256,expected.patched)
+})
+test('the installed CDP follow-up speed patch uses account RPC outside React and respects no-auth and Fast requirements',async t=>{
+  const application='/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
+  if(process.platform!=='darwin'||!existsSync(join(application,'Contents/Resources/app.asar'))){t.skip('macOS ChatGPT installation unavailable');return}
+  const inspection=inspectCodexSpeedMenu({application,executable,platform:'darwin',enhancements:'speed-locale'})
+  if(!['26.930.41038','26.930.51102'].includes(inspection.version??'')){t.skip('installed client is not an audited current release');return}
+  assert.equal(inspection.supported,true,inspection.reason)
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-cdp-follow-up-'))),directory=join(root,'home'),desktopDirectory=join(root,'desktop')
+  t.after(()=>rmSync(root,{recursive:true,force:true}));mkdirSync(directory,{mode:0o700});mkdirSync(desktopDirectory,{mode:0o700})
+  const hook=prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce:randomUUID()})
+  assert.ok(hook?.patchedBody)
+  const body=readFileSync(hook.patchedBody,'utf8'),begin=body.indexOf('async function Z$i(e,t){'),end=body.indexOf('async function Q$i(',begin)
+  assert.ok(begin>=0&&end>begin)
+  const create=new Function('q$i','vf','yf','XMe','yd',body.slice(begin,end)+';return Z$i;')
+  async function run(options:{method?:unknown;account?:unknown;host?:string;accountFailure?:boolean;missingRpc?:boolean;requirements?:unknown}={}) {
+    let accountReads=0,requirementReads=0,queryWrites=0
+    const host=options.host??'local',rpcKey=Symbol('auth-rpc'),requirementsKey=Symbol('requirements')
+    const scope={get(key:unknown,target:unknown){assert.equal(key,rpcKey);assert.equal(target,host);return options.missingRpc?undefined:{rpc:{getAccount:async(priority:unknown)=>{assert.deepEqual(priority,{priority:'critical'});accountReads++;if(options.accountFailure)throw new Error('account failed');return options.account??{account:null,requiresOpenaiAuth:false}}}}},query:{setData(key:unknown,_target:unknown,_data:unknown){assert.equal(key,requirementsKey);queryWrites++}}}
+    const follow=create(async()=>options.method===undefined?null:options.method,(value:unknown)=>value,rpcKey,async(_scope:unknown,target:unknown,priority:unknown)=>{assert.equal(_scope,scope);assert.equal(target,host);assert.deepEqual(priority,{priority:'critical'});requirementReads++;return {requirements:options.requirements??null}},requirementsKey)
+    return {allowed:await follow(scope,host),accountReads,requirementReads,queryWrites}
+  }
+  assert.deepEqual(await run(),{allowed:true,accountReads:1,requirementReads:1,queryWrites:1})
+  for(const options of [{accountFailure:true},{account:{account:null}},{account:{requiresOpenaiAuth:false}},{account:{account:{},requiresOpenaiAuth:false}},{account:{account:null,requiresOpenaiAuth:true}}])assert.deepEqual(await run(options),{allowed:false,accountReads:1,requirementReads:0,queryWrites:0})
+  assert.deepEqual(await run({missingRpc:true}),{allowed:false,accountReads:0,requirementReads:0,queryWrites:0})
+  assert.deepEqual(await run({host:'remote'}),{allowed:false,accountReads:0,requirementReads:0,queryWrites:0})
+  assert.deepEqual(await run({requirements:{featureRequirements:{fast_mode:false}}}),{allowed:false,accountReads:1,requirementReads:1,queryWrites:1})
+  for(const method of ['chatgpt','apikey','personalAccessToken'])assert.deepEqual(await run({method}),{allowed:true,accountReads:0,requirementReads:1,queryWrites:1})
 })
 test('disabled, missing, truncated and disagreeing universal fuse wires disable enhancement',t=>{
   const f=fixture(t)
@@ -215,7 +293,9 @@ test('follow-up speed confirms account/read before allowing a null custom-provid
 test('audited locale provider loads built-in messages without experiments and follows live manual or system choices',async t=>{
   const archive='/Applications/ChatGPT.app/Contents/Resources/app.asar'
   if(!existsSync(archive)){t.skip('audited local language resources unavailable');return}
-  const asar=require('@electron/asar'),whole=asar.extractFile(archive,'webview/assets/app-initial-a498f911edeb.js').toString()
+  const asar=require('@electron/asar'),auditedEntry='webview/assets/app-initial-a498f911edeb.js'
+  if(!asar.listPackage(archive).includes('/'+auditedEntry)){t.skip('installed renderer is no longer the audited release');return}
+  const whole=asar.extractFile(archive,auditedEntry).toString()
   if(hash(whole)!==originalHash){t.skip('installed renderer is no longer the audited release');return}
   assert.equal(whole.slice(whole.indexOf('function Wal(e){'),whole.indexOf('function Gal(){}',whole.indexOf('function Wal(e){'))),localeSource)
   const localeFns=whole.slice(whole.indexOf('function n2(e){'),whole.indexOf('var mvs,hvs,gvs,_vs;',whole.indexOf('function n2(e){')))
@@ -389,10 +469,12 @@ test('aborted requests and upstream handler failures retain the original protoco
 
 test('all enhancement modes run in project Electron against audited JS without running the official UI',{timeout:45000},t=>{
   const application='/Applications/ChatGPT.app',executable=join(application,'Contents','MacOS','ChatGPT'),inspection=inspectCodexSpeedMenu({application,executable,platform:'darwin'})
-  if(process.platform!=='darwin'||!inspection.supported){t.skip('audited local client / macOS fixture unavailable');return}
+  if(process.platform!=='darwin'||!inspection.supported||inspection.version!=='26.915.31945'){t.skip('legacy preload fixture unavailable on the installed client');return}
   const ownElectron=resolve('node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')
   const asar=require('@electron/asar')
-  const actualSource=asar.extractFile(join(application,'Contents','Resources','app.asar'),'webview/assets/app-initial-a498f911edeb.js')
+  const actualAsset='webview/assets/app-initial-a498f911edeb.js'
+  if(!asar.listPackage(join(application,'Contents','Resources','app.asar')).includes('/'+actualAsset)){t.skip('legacy renderer asset unavailable');return}
+  const actualSource=asar.extractFile(join(application,'Contents','Resources','app.asar'),actualAsset)
   for(const [enhancements,expectedHash] of [['speed',patchedHash],['locale',localePatchedHash],['speed-locale',combinedPatchedHash]] as const){
   const f=fixture(t,enhancements)
   f.entries.set('webview/assets/app-initial-a498f911edeb.js',actualSource)

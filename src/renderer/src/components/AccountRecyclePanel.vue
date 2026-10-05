@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import {onUnmounted,ref} from 'vue'
 import {useManager} from '../store'
+import {useFormFeedback} from '../formFeedback'
 import type {AccountRecyclePage,AccountRecyclePreview,AccountRecycleInput} from '../../../shared/accountRecycle'
 const manager=useManager(),open=ref(false),loading=ref(false),busy=ref(false),error=ref(''),notice=ref(''),page=ref<AccountRecyclePage>(),selected=ref<string[]>([]),preview=ref<AccountRecyclePreview>()
+useFormFeedback(()=>error.value,{active:()=>open.value})
 let alive=true,request=0
 const labels={restore:'恢复账号',export:'导出账号',purge:'永久删除'}
 async function reload(){const current=++request;loading.value=true;error.value='';try{const result=await window.manager.listAccountRecycle();if(alive&&current===request){page.value=result;selected.value=[]}}catch(cause){if(alive&&current===request)error.value=String(cause)}finally{if(alive&&current===request)loading.value=false}}

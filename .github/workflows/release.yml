@@ -84,7 +84,7 @@ jobs:
             release-ci/*.dmg
             release-ci/*.zip
             release-ci/SHA256SUMS.txt
-      - name: Create or update draft release
+      - name: Prepare release and upload verified installers
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -100,6 +100,26 @@ jobs:
             if [[ "$RELEASE_TAG" == *-* ]]; then
               release_flags+=(--prerelease)
             fi
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${release_flags[@]}" --title "Agent Manager Lite $RELEASE_TAG" --notes-file .github/RELEASE_TEMPLATE.md
+            notes_file=".github/releases/$RELEASE_TAG.md"
+            if [ ! -f "$notes_file" ]; then
+              echo 'Version-specific release notes are required.' >&2
+              exit 1
+            fi
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${release_flags[@]}" --title "Agent Manager Lite $RELEASE_TAG" --notes-file "$notes_file"
           fi
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber release-ci/*.dmg release-ci/*.zip release-ci/SHA256SUMS.txt
+      - name: Verify uploaded assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_dir="$RUNNER_TEMP/agent-manager-release-assets"
+          mkdir -p "$asset_dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$asset_dir" --pattern '*.dmg' --pattern '*.zip' --pattern 'SHA256SUMS.txt'
+          test -n "$(find "$asset_dir" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$(find "$asset_dir" -maxdepth 1 -name '*.zip' -print -quit)"
+          (cd "$asset_dir" && shasum -a 256 --check SHA256SUMS.txt)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

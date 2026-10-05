@@ -1,22 +1,24 @@
 <script setup lang="ts">
 import {computed,ref,watch,onBeforeUnmount} from 'vue'
 import {useManager} from '../store'
+import {useFormFeedback} from '../formFeedback'
 import type {AccountProxyView} from '../../../shared/accountProxy'
 import type {ProxyAssignmentInput,ProxyAssignmentPreview} from '../../../shared/proxyBatch'
 const props=defineProps<{open:boolean;accountIds:string[]}>(),emit=defineEmits<{'update:open':[boolean]}>(),manager=useManager()
-const mode=ref<ProxyAssignmentInput['mode']>('resource'),resourceId=ref(''),preview=ref<ProxyAssignmentPreview>(),page=ref(1),busy=ref(false),error=ref('')
+const mode=ref<ProxyAssignmentInput['mode']>('resource'),resourceId=ref(''),preview=ref<ProxyAssignmentPreview>(),page=ref(1),busy=ref(false),error=ref(''),applyError=ref('')
+useFormFeedback(()=>error.value,{active:()=>props.open})
 const resources=computed(()=>manager.data?.proxyResources?.resources??[]),resource=computed(()=>resources.value.find(r=>r.id===resourceId.value))
 let generation=0
 const displayError=(e:unknown)=>String(e instanceof Error?e.message:e).replace(/^(?:Error: )?Error invoking remote method 'manager:invoke': (?:Error: )?/,'')
 const route=(view?:AccountProxyView)=>!view?'—':view.invalid?'代理失效':view.mode==='direct'?'直连':view.name??(view.server?`${view.protocol} · ${view.server}:${view.port}`:'默认网络')
 async function discard(){const ticket=preview.value?.ticket;preview.value=undefined;if(ticket)await window.manager.discardProxyBatch(ticket).catch(()=>{})}
-function clear(){generation++;void discard();busy.value=false;error.value=''}
+function clear(){generation++;void discard();busy.value=false;error.value='';applyError.value=''}
 watch(()=>props.open,()=>{clear();page.value=1;mode.value='resource';resourceId.value=''})
 watch(()=>props.accountIds.join(','),()=>{clear()})
 onBeforeUnmount(clear)
 function close(){clear();emit('update:open',false)}
 async function prepare(){
-  const version=++generation;busy.value=true;error.value='';await discard()
+  const version=++generation;busy.value=true;error.value='';applyError.value='';await discard()
   try{const result=await window.manager.previewProxyAssignment({accountIds:[...props.accountIds],mode:mode.value,...mode.value==='resource'?{resourceId:resource.value?.id,resourceRevision:resource.value?.revision}:{}})
     if(version!==generation){if(result.ticket)await window.manager.discardProxyBatch(result.ticket);return}
     preview.value=result;page.value=1
@@ -24,9 +26,9 @@ async function prepare(){
 }
 async function apply(){
   const ticket=preview.value?.ticket;if(!ticket)return
-  busy.value=true;error.value=''
+  busy.value=true;error.value='';applyError.value=''
   if(await manager.execute(()=>window.manager.applyProxyBatch({ticket,confirmed:true})))close()
-  else{error.value=displayError(manager.error);busy.value=false}
+  else{applyError.value=displayError(manager.error)||'代理分配失败，请重试。';busy.value=false}
 }
 </script>
 <template>
@@ -50,7 +52,7 @@ async function apply(){
         <p class="muted">确认后整批保存。账号或资源变化会使预览失效；保存失败保留原设置。</p>
         <a-space><a-button type="primary" :disabled="!preview.ticket||!!preview.busy" :loading="busy" @click="apply">确认分配</a-button><a-button :disabled="busy" @click="discard">返回修改</a-button><a-button :disabled="busy" @click="close">取消</a-button></a-space>
       </template>
-      <a-alert v-if="error" type="error" :message="error" class="error-banner" />
+      <a-alert v-if="error||applyError" type="error" :message="error||applyError" class="error-banner" />
     </div>
   </a-modal>
 </template>

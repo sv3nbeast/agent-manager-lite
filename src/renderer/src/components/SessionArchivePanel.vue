@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
+import {useFormFeedback} from '../formFeedback'
 import type {ClientConfigTarget} from '../../../shared/clientConfig'
 import type {InstanceApplication} from '../../../shared/instances'
 import type {ArchivePreview,ArchiveImportPreview,ArchiveProgress} from '../../../shared/sessionArchives'
@@ -7,6 +8,7 @@ const props=defineProps<{targets:ClientConfigTarget[];snapshotId?:string;selecte
 const emit=defineEmits<{completed:[]}>()
 const open=ref(false),mode=ref<'export'|'import'>('export'),preview=ref<ArchivePreview>(),importPreview=ref<ArchiveImportPreview>(),state=ref<ArchiveProgress>(),applications=ref<InstanceApplication[]>([])
 const targetId=ref<string>(),applicationId=ref<string>(),importIds=ref<string[]>([]),closed=ref(false),loading=ref(false),error=ref('')
+useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>state.value&&['preparing','running'].includes(state.value.status)),percent=computed(()=>state.value?.totalBytes?Math.min(100,Math.floor(state.value.bytes/state.value.totalBytes*100)):0)
 const labels={preparing:'正在准备',ready:'预览已就绪',running:'正在处理',completed:'已完成',failed:'操作失败',cancelled:'已取消'}
 const bytes=(n:number)=>n<1024**2?(n/1024).toFixed(1)+' KiB':n<1024**3?(n/1024**2).toFixed(1)+' MiB':(n/1024**3).toFixed(2)+' GiB'

@@ -5,8 +5,10 @@ import zhCN from 'ant-design-vue/es/locale/zh_CN'
 import { AppstoreOutlined, UserOutlined, DesktopOutlined, ApiOutlined, FileTextOutlined, SettingOutlined, PlusOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined, SearchOutlined, DeleteOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import { settingsSchema, type Account, type AppSnapshot, type Settings, type TierMode } from '../../shared/types'
 import { useManager } from './store'
+import { useFormFeedback, validationErrors } from './formFeedback'
 import type { InstanceLoginRequest, InstanceLoginResult } from './instanceOnboarding'
 import brandUrl from '../../../resources/brand.svg'
+import { version as applicationVersion } from '../../../package.json'
 import LoginDialog from './components/LoginDialog.vue'
 import LocalDataMigrationDialog from './components/LocalDataMigrationDialog.vue'
 import AccountCard from './components/AccountCard.vue'
@@ -81,9 +83,15 @@ watch(() => JSON.stringify(manager.data?.settings), (value, previous) => {
 })
 const settingsSaving = ref(false)
 const settingsDirty = computed(() => !!manager.data && (Object.keys(settings) as (keyof Settings)[]).some(key => !Object.is(settings[key], manager.data!.settings[key])))
-const settingsValid = computed(() => settingsSchema.safeParse({...settings}).success)
+const settingsError = ref(''), settingsErrors = reactive<Record<string,string>>({})
+useFormFeedback(settingsError, { active: () => page.value === 'settings' })
+const settingsLabels: Record<string,string> = { theme:'主题',defaultTier:'默认服务等级',port:'本地 API 端口',refreshMinutes:'自动刷新间隔',streamOpenTimeoutSeconds:'等待上游响应',streamIdleTimeoutSeconds:'流式空闲',imageStreamOpenTimeoutSeconds:'图片请求等待响应',imageStreamIdleTimeoutSeconds:'图片流式空闲' }
+function clearSettingsErrors(){settingsError.value='';for(const key of Object.keys(settingsErrors))delete settingsErrors[key]}
+watch(()=>({...settings}),(values,previous)=>{
+  for(const key of Object.keys(settingsErrors))if(values[key as keyof Settings]!==previous[key as keyof Settings]){if(settingsError.value===settingsErrors[key])settingsError.value='';delete settingsErrors[key]}
+},{flush:'sync'})
 const activeConnections = computed(() => !!manager.data?.gateway?.running || !!manager.data?.localAccess?.starting || !!manager.data?.localAccess?.singleStarting || manager.data?.instances?.some(instance => ['preparing','starting','running','stopping'].includes(instance.status)))
-function discardSettings() { if (manager.data) Object.assign(settings, manager.data.settings) }
+function discardSettings() { if (manager.data) Object.assign(settings, manager.data.settings);clearSettingsErrors() }
 const systemDark = ref(window.matchMedia('(prefers-color-scheme: dark)').matches)
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', event => { systemDark.value = event.matches })
 const dark = computed(() => settings.theme === 'dark' || settings.theme === 'system' && systemDark.value)
@@ -137,8 +145,17 @@ async function persistSettings(next: Settings): Promise<boolean> {
   } finally { settingsSaving.value = false }
 }
 async function saveSettings() {
-  if (!settingsValid.value) return
-  if (await persistSettings({ ...settings })) discardSettings()
+  clearSettingsErrors()
+  const parsed=settingsSchema.safeParse({...settings})
+  if(!parsed.success){
+    Object.assign(settingsErrors,validationErrors(parsed.error.issues,settingsLabels))
+    const key=Object.keys(settingsErrors)[0];settingsError.value=settingsErrors[key]
+    await nextTick()
+    const item=document.querySelector<HTMLElement>(`[data-settings-field="${key}"]`)
+    item?.scrollIntoView({block:'center',behavior:'smooth'});item?.querySelector<HTMLElement>('input,[tabindex="0"]')?.focus({preventScroll:true})
+    return
+  }
+  if (await persistSettings(parsed.data)) discardSettings()
 }
 async function saveDefaultTier(value: string | number) {
   if (!manager.data || !['follow','standard','fast'].includes(String(value))) return
@@ -238,7 +255,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
           <a-menu-item key="wakeup"><span class="nav-item-content"><ThunderboltOutlined />唤醒任务</span></a-menu-item>
           <a-menu-item key="history"><span class="nav-item-content"><FileTextOutlined />调用记录</span></a-menu-item>
         </a-menu>
-        <div class="sidebar-bottom"><a-button type="text" block @click="page = 'settings'"><span class="nav-item-content"><SettingOutlined /><span>设置</span></span></a-button><div class="version">v0.1.0 · 本地数据</div></div>
+        <div class="sidebar-bottom"><a-button type="text" block @click="page = 'settings'"><span class="nav-item-content"><SettingOutlined /><span>设置</span></span></a-button><div class="version">v{{applicationVersion}} · 本地数据</div></div>
       </aside>
       <section class="body">
         <header class="titlebar"><span>{{ names[page] }}</span><div class="status"><span class="status-dot" :style="{ background: manager.data?.gateway?.running ? '#52c41a' : undefined }" />{{ manager.data?.gateway?.running ? `本地 API · ${manager.data.gateway.port}` : '本地 API 未启动' }}</div></header>
@@ -316,15 +333,16 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
                 <a-space class="settings-actions">
                   <span v-if="settingsDirty" class="muted settings-unsaved">有未保存的更改</span>
                   <a-button :disabled="!settingsDirty || settingsSaving" @click="discardSettings">放弃更改</a-button>
-                  <a-button type="primary" :loading="settingsSaving" :disabled="!settingsDirty || !settingsValid || manager.loading" @click="saveSettings">保存设置</a-button>
+                  <a-button type="primary" :loading="settingsSaving" :disabled="!settingsDirty || manager.loading" @click="saveSettings">保存设置</a-button>
                 </a-space>
               </div>
+              <a-alert v-if="settingsError" class="error-banner" type="error" show-icon :message="settingsError" role="alert" />
               <a-card title="外观与请求" class="settings-card settings-draft">
                 <a-form layout="vertical">
                   <a-form-item label="主题"><a-segmented v-model:value="settings.theme" :options="[{ label: '跟随系统', value: 'system' }, { label: '浅色', value: 'light' }, { label: '深色', value: 'dark' }]" /></a-form-item>
                   <a-form-item label="默认服务等级" extra="保存后使用。仅补充未指定的请求等级；Fast 对应 priority。运行中的服务或实例需重启后应用。"><a-segmented v-model:value="settings.defaultTier" :options="tiers" /></a-form-item>
-                  <a-form-item label="本地 API 端口"><a-input-number v-model:value="settings.port" :min="1024" :max="65535" /></a-form-item>
-                  <a-form-item label="自动刷新间隔（分钟）" extra="0 表示关闭。应用运行期间自动刷新登录账号及已手动查询成功的 API 账号，最多同时查询 3 个账号。"><a-input-number v-model:value="settings.refreshMinutes" :min="0" :max="1440" /></a-form-item>
+                  <a-form-item data-settings-field="port" :validate-status="settingsErrors.port?'error':undefined" :help="settingsErrors.port" label="本地 API 端口"><a-input-number v-model:value="settings.port" :min="1024" :max="65535" /></a-form-item>
+                  <a-form-item data-settings-field="refreshMinutes" :validate-status="settingsErrors.refreshMinutes?'error':undefined" :help="settingsErrors.refreshMinutes" label="自动刷新间隔（分钟）" extra="0 表示关闭。应用运行期间自动刷新登录账号及已手动查询成功的 API 账号，最多同时查询 3 个账号。"><a-input-number v-model:value="settings.refreshMinutes" :min="0" :max="1440" /></a-form-item>
                   <a-form-item label="开机启动" extra="保存后由系统登录项生效；桌面系统不支持时会保留设置并提示错误。"><a-checkbox v-model:checked="settings.launchAtLogin">登录系统后自动启动 Agent Manager Lite</a-checkbox></a-form-item>
                   <a-form-item label="关闭窗口行为" extra="启用后点击窗口关闭按钮只隐藏到系统托盘；从托盘选择“退出”才会结束应用。"><a-checkbox v-model:checked="settings.closeToTray">关闭主窗口时隐藏到系统托盘</a-checkbox></a-form-item>
                 </a-form>
@@ -333,10 +351,10 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
               <a-card title="流式请求超时" class="settings-card stream-timeouts">
                 <p class="muted">适用于 HTTP 和 WebSocket。按秒设置等待响应与流式空闲时限；WebSocket 每轮等待首个事件也受此限制。已经返回内容的请求不会重新发送。保存后需重启本地服务或实例。</p>
                 <a-form layout="vertical">
-                  <a-form-item label="等待上游响应（秒）"><a-input-number v-model:value="settings.streamOpenTimeoutSeconds" :min="1" :max="600" /></a-form-item>
-                  <a-form-item label="流式空闲（秒）"><a-input-number v-model:value="settings.streamIdleTimeoutSeconds" :min="1" :max="600" /></a-form-item>
-                  <a-form-item label="图片请求等待响应（秒）"><a-input-number v-model:value="settings.imageStreamOpenTimeoutSeconds" :min="1" :max="600" /></a-form-item>
-                  <a-form-item label="图片流式空闲（秒）"><a-input-number v-model:value="settings.imageStreamIdleTimeoutSeconds" :min="1" :max="600" /></a-form-item>
+                  <a-form-item data-settings-field="streamOpenTimeoutSeconds" :validate-status="settingsErrors.streamOpenTimeoutSeconds?'error':undefined" :help="settingsErrors.streamOpenTimeoutSeconds" label="等待上游响应（秒）"><a-input-number v-model:value="settings.streamOpenTimeoutSeconds" :min="1" :max="600" /></a-form-item>
+                  <a-form-item data-settings-field="streamIdleTimeoutSeconds" :validate-status="settingsErrors.streamIdleTimeoutSeconds?'error':undefined" :help="settingsErrors.streamIdleTimeoutSeconds" label="流式空闲（秒）"><a-input-number v-model:value="settings.streamIdleTimeoutSeconds" :min="1" :max="600" /></a-form-item>
+                  <a-form-item data-settings-field="imageStreamOpenTimeoutSeconds" :validate-status="settingsErrors.imageStreamOpenTimeoutSeconds?'error':undefined" :help="settingsErrors.imageStreamOpenTimeoutSeconds" label="图片请求等待响应（秒）"><a-input-number v-model:value="settings.imageStreamOpenTimeoutSeconds" :min="1" :max="600" /></a-form-item>
+                  <a-form-item data-settings-field="imageStreamIdleTimeoutSeconds" :validate-status="settingsErrors.imageStreamIdleTimeoutSeconds?'error':undefined" :help="settingsErrors.imageStreamIdleTimeoutSeconds" label="图片流式空闲（秒）"><a-input-number v-model:value="settings.imageStreamIdleTimeoutSeconds" :min="1" :max="600" /></a-form-item>
                 </a-form>
               </a-card>
               <a-card title="数据" class="settings-card"><p class="muted">凭据由操作系统加密；编辑窗口按需读取已保存的 API Key。</p><code>{{ manager.data?.dataDirectory }}</code><DataBackupPanel /></a-card>

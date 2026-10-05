@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
+import {DatabaseSync} from 'node:sqlite'
 import {createServer as createSocketServer} from 'node:net'
 import { Store } from '../src/main/store'
 import { Instances, type InstanceSpeedMenuServices } from '../src/main/instances'
@@ -76,6 +77,26 @@ function speedMenuFixture(includeLocale=false) {
   return {service,prepared,observedScopes,changeClient:()=>{fingerprint='fixture-speed-v2'}}
 }
 
+test('history previews are scoped to a stopped instance and included in launch review without changing files',async t=>{
+  const f=fixture(t),instance=f.add(f.account().id)
+  const statePath=join(instance.directory,'.codex-global-state.json')
+  const state=JSON.stringify({'local-projects':{},unrelated:{secret:'fixture-only'}})
+  writeFileSync(statePath,state)
+  const summary=f.instances.previewHistory({id:instance.id,revision:instance.revision})
+  assert.equal(summary.sessions,0);assert.equal(summary.projects.length,0)
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.deepEqual(preview.history,summary);assert.equal(readFileSync(statePath,'utf8'),state)
+  assert.throws(()=>f.instances.previewHistory({id:instance.id,revision:instance.revision+1}),/变化/)
+  assert.throws(()=>f.instances.previewHistory({id:randomUUID(),revision:0}),/不存在/)
+  assert.throws(()=>f.instances.previewHistory({id:instance.id,revision:0,path:f.root}),/Unrecognized|unrecognized/)
+  const projectId=randomUUID()
+  writeFileSync(statePath,JSON.stringify({'local-projects':{[projectId]:{id:projectId,name:'New project',rootPaths:[f.root]}}}))
+  assert.throws(()=>f.instances.start(preview.ticket),/会话.*变化/)
+  writeFileSync(statePath,state)
+  f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket);await f.instances.settled(instance.id)
+  assert.throws(()=>f.instances.previewHistory({id:instance.id,revision:instance.revision}),/运行/)
+})
+
 test('locale and speed compatibility share one hook while new desktops keep native auto detection',async t=>{
   const menus=speedMenuFixture(true),f=fixture(t,['zh-Hans-CN'],menus.service),account=f.account('http://127.0.0.1:9','fixture-upstream',['gpt-5.5']),instance=f.add(account.id,'Combined','fast','gpt-5.5')
   const preview=f.instances.preview({id:instance.id,revision:instance.revision})
@@ -97,15 +118,15 @@ test('locale and speed compatibility share one hook while new desktops keep nati
 test('locale compatibility works without Fast capability and leaves gateway tier semantics intact',async t=>{
   const menus=speedMenuFixture(true),f=fixture(t,['zh-Hans-CN'],menus.service),instance=f.add(f.account().id)
   const preview=f.instances.preview({id:instance.id,revision:instance.revision})
-  assert.equal(preview.speedMenuAvailable,false);assert.equal(preview.desktopLocaleCompatibilityAvailable,true)
+  assert.equal(preview.speedMenuAvailable,true);assert.equal(preview.desktopLocaleCompatibilityAvailable,true)
   f.instances.start(preview.ticket);await f.instances.settled(instance.id)
   assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
-  assert.deepEqual(menus.prepared,['locale'])
-  assert.equal(f.runtime.plans[0].speedMenuHook,undefined);assert.ok(f.runtime.plans[0].desktopLocaleHook)
+  assert.deepEqual(menus.prepared,['speed-locale'])
+  assert.ok(f.runtime.plans[0].speedMenuHook);assert.equal(f.runtime.plans[0].desktopLocaleHook,undefined)
   assert.equal(f.instances.views()[0].desktopLocaleCompatibility,'active')
-  assert.equal(f.gateways[0].current().defaultTier,'priority')
+  assert.equal(f.gateways[0].current().defaultTier,'default')
   assert.equal(connection(instance.directory).doc.scalar(['service_tier']),'fast')
-  const hook=f.runtime.plans[0].desktopLocaleHook!
+  const hook=f.runtime.plans[0].speedMenuHook!
   assert.ok(macLaunchArgs(f.runtime.plans[0]).includes(`NODE_OPTIONS=--require="${hook.script}"`))
   await f.instances.stop(instance.id)
   assert.equal(existsSync(join(instance.desktopDirectory,'cml-speed-menu',f.runtime.plans[0].nonce)),false)
@@ -172,15 +193,27 @@ test('speed-menu client changes invalidate launch and unsupported clients retain
   assert.equal(normal.gateways[0].current().defaultTier,'priority')
 })
 
-test('a model without declared Fast capability retains existing Fast fallback without a misleading menu adaptation',async t=>{
+test('a model without a local Fast catalog declaration still gets the Normal / Fast selector',async t=>{
   const menus=speedMenuFixture(),f=fixture(t,['en-US'],menus.service),account=f.account(),instance=f.add(account.id)
   const preview=f.instances.preview({id:instance.id,revision:instance.revision})
-  assert.equal(preview.speedMenuAvailable,false)
-  assert.match(preview.speedMenuReason!,/未声明 Fast/)
+  assert.equal(preview.speedMenuAvailable,true)
   f.instances.start(preview.ticket);await f.instances.settled(instance.id)
   assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
-  assert.equal(f.runtime.plans[0].speedMenuHook,undefined)
-  assert.equal(f.gateways[0].current().defaultTier,'priority')
+  assert.ok(f.runtime.plans[0].speedMenuHook)
+  assert.equal(f.gateways[0].current().defaultTier,'default')
+})
+
+test('ChatGPT OAuth accounts keep the Normal / Fast selector for newly released model IDs',t=>{
+  const menus=speedMenuFixture(),f=fixture(t,['en-US'],menus.service)
+  const oauth=f.account()
+  f.store.transaction(state=>{
+    const saved=state.accounts.find(account=>account.id===oauth.id)!
+    saved.kind='oauth';saved.credentials={accessToken:'fixture-chatgpt-token'}
+  })
+  const instance=f.add(oauth.id,'ChatGPT OAuth','fast','new-chatgpt-model')
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.speedMenuAvailable,true)
+  assert.equal(preview.speedMenuReason,'')
 })
 
 test('speed menu launch environment is instance scoped and composes with temporary login without inheriting flags',()=>{
@@ -193,6 +226,14 @@ test('speed menu launch environment is instance scoped and composes with tempora
   assert.throws(()=>macLaunchArgs({...base,speedMenuHook:{...hook,env:{OPENAI_API_KEY:'fixture'}}}),/环境无效/)
   assert.deepEqual(macLaunchArgs({...base,desktopLocaleHook:hook}),macLaunchArgs({...base,speedMenuHook:hook}))
   assert.throws(()=>macLaunchArgs({...base,speedMenuHook:hook,desktopLocaleHook:hook}),/一份组合/)
+  const cdpHook={...hook,transport:'cdp' as const}
+  const cdpArgs=macLaunchArgs({...base,speedMenuHook:cdpHook})
+  assert.ok(cdpArgs.includes('--remote-debugging-port=0'))
+  assert.ok(cdpArgs.includes('--remote-debugging-address=127.0.0.1'))
+  const fixedArgs=macLaunchArgs({...base,speedMenuHook:cdpHook,cdpPort:43127})
+  assert.ok(fixedArgs.includes('--remote-debugging-port=43127'))
+  assert.throws(()=>macLaunchArgs({...base,speedMenuHook:cdpHook,cdpPort:65536}),/CDP 调试端口无效/)
+  assert.equal(cdpArgs.some(value=>value.startsWith('NODE_OPTIONS=')),false)
 })
 async function fixtureEvidence(directory:string){
   const deadline=Date.now()+3000
@@ -555,6 +596,52 @@ test('instance copy preserves complete profile files and launches independently 
   assert.equal(response.status,200);await response.text();assert.deepEqual(received,[{key:'Bearer fixture-copy-selected',tier:'priority'}])
   await f.instances.stop(target.id);assert.equal(readFileSync(join(target.directory,'config.toml'),'utf8').trimStart(),config)
   assert.equal(readFileSync(join(source.directory,'auth.json'),'utf8').includes('do-not-clone-rotation'),true)
+})
+
+test('external Cockpit history copy is visible under the launched local API provider without rewriting its source',async t=>{
+  const f=fixture(t),account=f.account(),source=join(realpathSync(f.root),'cockpit-history')
+  mkdirSync(source);mkdirSync(join(source,'sessions'));mkdirSync(join(source,'archived_sessions'))
+  const config='model_provider="cockpit_cli_proxy"\nmodel="fixture-model"\n',auth='fixture-existing-login-token'
+  writeFileSync(join(source,'config.toml'),config);writeFileSync(join(source,'auth.json'),auth)
+  const dbPath=join(source,'state_5.sqlite'),db=new DatabaseSync(dbPath)
+  db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,cwd TEXT,title TEXT,archived INTEGER)')
+  const sessionIds=[randomUUID(),randomUUID()],bodies=new Map<string,string>()
+  for(const [i,id]of sessionIds.entries()){
+    const folder=i?'archived_sessions':'sessions',file=join(source,folder,'rollout-'+id+'.jsonl')
+    const body='{"type":"event_msg","payload":{"text":"remember previous reply '+id+'"}}\n';bodies.set(id,body)
+    writeFileSync(file,JSON.stringify({type:'session_meta',payload:{id,model_provider:'cockpit_cli_proxy',cwd:'/shared/user-project'}})+'\n'+body)
+    db.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?)').run(id,file,'cockpit_cli_proxy','/shared/user-project','History '+i,i)
+  }
+  db.close();const originalDb=readFileSync(dbPath)
+  const selected=f.instances.selectCopySource(source)
+  f.instances.startExternalCopy({ticket:selected.ticket,sourceClosed:true,details:{name:'Copied Cockpit',applicationId:f.app.id,accountId:account.id,model:'fixture-model',connectionMode:'local_api',extraArgs:[]}})
+  const done=await copyFinished(f.instances);assert.equal(done.status,'completed',done.error)
+  const target=f.instances.views().find(value=>value.id===done.targetId)!
+  assert.equal(existsSync(join(target.directory,'auth.json')),false)
+  f.instances.start(f.instances.preview({id:target.id,revision:0}).ticket);await f.instances.settled(target.id)
+  assert.equal(f.instances.views().find(value=>value.id===target.id)?.status,'running')
+  const provider=connection(target.directory).doc.scalar(['model_provider']);assert.equal(provider,'cml_instance')
+  const copied=new DatabaseSync(join(target.directory,'state_5.sqlite'),{readOnly:true})
+  const rows=copied.prepare('SELECT * FROM threads WHERE model_provider = ? ORDER BY archived').all(provider!);copied.close()
+  assert.deepEqual(rows.map(row=>row.id),sessionIds)
+  for(const [i,row]of rows.entries()){
+    assert.equal(row.cwd,'/shared/user-project');assert.equal(row.archived,i);assert.equal(row.title,'History '+i)
+    assert.ok(typeof row.rollout_path==='string'&&row.rollout_path.startsWith(target.directory+'/'))
+    const raw=readFileSync(row.rollout_path as string,'utf8'),newline=raw.indexOf('\n')
+    assert.equal(JSON.parse(raw.slice(0,newline)).payload.model_provider,provider);assert.equal(raw.slice(newline+1),bodies.get(row.id as string))
+  }
+  await f.instances.stop(target.id)
+  assert.deepEqual(readFileSync(dbPath),originalDb);assert.equal(readFileSync(join(source,'config.toml'),'utf8'),config);assert.equal(readFileSync(join(source,'auth.json'),'utf8'),auth)
+})
+
+test('unrecognized copied history never publishes an incomplete instance and leaves source data unchanged',async t=>{
+  const f=fixture(t),source=f.add(f.account().id),dbPath=join(source.directory,'state_5.sqlite')
+  const db=new DatabaseSync(dbPath);db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)');db.close()
+  const before=readFileSync(dbPath)
+  f.instances.startCopy(copyInput(source,'Rejected copy'));const done=await copyFinished(f.instances)
+  assert.equal(done.status,'failed');assert.match(done.error!,/数据库/);assert.equal(f.instances.views().length,1)
+  assert.equal(existsSync(join(f.store.directory,'instances',done.id)),false);assert.equal(existsSync(join(f.store.directory,'instance-copies',done.id)),false)
+  assert.deepEqual(readFileSync(dbPath),before)
 })
 
 test('copy cancellation, stale inputs and running sources never publish partial instances',async t=>{

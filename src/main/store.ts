@@ -23,7 +23,7 @@ export interface StoredAccount extends Omit<Account, 'credentialConfigured'|'egr
   credentials: { apiKey?: string; accessToken?: string; refreshToken?: string; idToken?: string; accountId?: string; localAPIKey?: string; agentIdentity?: AgentIdentity }
   source?: Record<string, unknown>
 }
-export interface RecycledAccount {id:string;deletedAt:number;account:StoredAccount;groupIds:string[];providerDefault?:StoredAccount['defaultTier']}
+export interface RecycledAccount {id:string;deletedAt:number;account:StoredAccount;groupIds:string[];providerDefault?:StoredAccount['defaultTier'];providerModelContextWindows?:Record<string,number>}
 export interface LocalDataArchive { id:string; fingerprint:string; importedAt:number; sources:{path:string;format:string;files:{path:string;hash:string;content:unknown}[]}[] }
 export interface State extends ProxyState { localDataArchives?:LocalDataArchive[]; proxyCatalogs?:StoredCatalogSource[]; version: 1; settings: Settings; accounts: StoredAccount[]; groups: AccountGroup[]; accountRecycle?:RecycledAccount[]; configTargets?: StoredConfigTarget[]; providers?: StoredProvider[]; instances?:InstanceProfile[]; instanceApplications?:InstanceApplication[];instanceWorkingDirectories?:InstanceWorkingDirectory[]; localAccess?:StoredLocalAccess;clientAuthorities?:StoredClientAuthority[];clientSwitches?:StoredClientSwitch[];wakeup?:StoredWakeupState; sshServers?:SshServersView }
 export interface VaultCodec { encrypt(text: string): Buffer; decrypt(data: Buffer): string }
