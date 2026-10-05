@@ -31,7 +31,8 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},project:(account:Stor
   const service=new ClientAuthority(store,configs,identities,tokens,project)
   const file=join(client,'auth.json'),config=join(client,'config.toml')
   writeFileSync(config,'# preserve this\ncli_auth_credentials_store="file"\nservice_tier="fast"\n')
-  writeFileSync(file,auth());importParsedAccounts(store,parseAccountImport(auth()).accounts)
+  const initialAuth=auth()
+  writeFileSync(file,initialAuth);importParsedAccounts(store,parseAccountImport(initialAuth).accounts)
   const accountId=store.read().accounts[0].id
   const bind=async()=>service.bind({ticket:(await identities.read({id:target.id})).ticket!,accountId})
   t.after(async()=>{await tokens.stop();await service.stop();identities.stop();rmSync(root,{recursive:true,force:true})})
@@ -52,13 +53,14 @@ test('file authority adopts client rotations, projects after save, coalesces cal
   f=fixture(t,account=>{projects++;assert.equal(f.store.read().accounts[0].credentials.accessToken,account.credentials.accessToken)})
   const originalConfig=readFileSync(f.config,'utf8');await f.bind()
   const first=f.store.read().accounts[0].credentials.accessToken!
-  writeFileSync(f.file,auth('second',7200))
+  const rotatedAuth=auth('second',7200)
+  writeFileSync(f.file,rotatedAuth)
   const a=f.tokens.ensure(f.accountId),b=f.tokens.ensure(f.accountId);assert.equal(a,b)
   const updated=await a;assert.equal(updated.credentials.refreshToken,'fixture-rt-second')
   assert.equal((await f.tokens.ensure(f.accountId,{force:true,rejectedToken:first})).credentials.accessToken,updated.credentials.accessToken)
   await assert.rejects(f.tokens.ensure(f.accountId,{force:true,rejectedToken:updated.credentials.accessToken}),/客户端凭据被上游拒绝/)
   assert.equal(f.refreshes(),0);assert.ok(projects>=3)
-  assert.equal(readFileSync(f.file,'utf8'),auth('second',7200));assert.equal(readFileSync(f.config,'utf8'),originalConfig)
+  assert.equal(readFileSync(f.file,'utf8'),rotatedAuth);assert.equal(readFileSync(f.config,'utf8'),originalConfig)
   const view=JSON.stringify(f.service.views());assert.equal(view.includes('fixture-rt-'),false);assert.equal(view.includes(updated.credentials.accessToken!),false)
   const reopened=new Store(f.store.directory,{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()})
   const restarted=new TokenAuthority(reopened,async()=>{assert.fail('Must not refresh before external resolver is ready')})
@@ -84,8 +86,8 @@ test('logout, stale snapshots, mismatched workspaces and storage changes fail cl
 })
 
 test('an expired client-owned token waits for the client and cannot use the manager refresh path',async t=>{
-  const f=fixture(t);writeFileSync(f.file,auth('expired',-100))
-  f.store.transaction(state=>{state.accounts[0].credentials=parseAccountImport(auth('expired',-100)).accounts[0].credentials})
+  const f=fixture(t),expiredAuth=auth('expired',-100);writeFileSync(f.file,expiredAuth)
+  f.store.transaction(state=>{state.accounts[0].credentials=parseAccountImport(expiredAuth).accounts[0].credentials})
   await f.bind();await assert.rejects(f.tokens.ensure(f.accountId),/等待客户端刷新/)
   assert.match(f.service.views()[0].error!,/等待客户端刷新/)
   writeFileSync(f.file,auth('recovered',7200));assert.equal((await f.tokens.ensure(f.accountId)).credentials.refreshToken,'fixture-rt-recovered')
