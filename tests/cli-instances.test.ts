@@ -25,6 +25,7 @@ const build=realpathSync(mkdtempSync(join(tmpdir(),'cml-cli-build-'))),binary=jo
 if(supported)execFileSync('go',['build','-o',binary,'tests/fixtures/desktop-client.go'],{cwd:resolve('.'),timeout:30000,stdio:'pipe'})
 after(()=>rmSync(build,{recursive:true,force:true}))
 async function waitFor<T>(read:()=>T|undefined):Promise<T>{const end=Date.now()+5000;for(;;){const result=read();if(result!==undefined)return result;if(Date.now()>end)throw new Error('Fixture evidence timeout');await new Promise(resolve=>setTimeout(resolve,30))}}
+function oauthInput(generation:string){const jwt='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+7200,generation,'https://api.openai.com/auth':{chatgpt_account_id:'cli-workspace',chatgpt_user_id:'cli-user'}})).toString('base64url')+'.sig';return JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:jwt,id_token:jwt,refresh_token:'fixture-cli-rt-'+generation,account_id:'cli-workspace'}})}
 function fixture(t:{after(fn:()=>void|Promise<void>):void}){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-cli-instance-'))),store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()})
   const children:ChildProcess[]=[],gateways:Gateway[]=[]
@@ -58,11 +59,11 @@ test('CLI native and local API instances launch real isolated native processes, 
 })
 
 test('CLI stop saves the final OAuth rotation and manager restart finds the recorded live native PID',{skip:!supported},async t=>{
-  const f=fixture(t),auth=(generation:string)=>{const jwt='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+7200,generation,'https://api.openai.com/auth':{chatgpt_account_id:'cli-workspace',chatgpt_user_id:'cli-user'}})).toString('base64url')+'.sig';return JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:jwt,id_token:jwt,refresh_token:'fixture-cli-rt-'+generation,account_id:'cli-workspace'}})}
-  importParsedAccounts(f.store,parseAccountImport(auth('before')).accounts)
+  const f=fixture(t)
+  importParsedAccounts(f.store,parseAccountImport(oauthInput('before')).accounts)
   const account=f.store.read().accounts.find(item=>item.kind==='oauth')!,instance=f.add('OAuth CLI','native',undefined,account.id)
   await f.start(instance.id);const evidence=await f.evidence(instance.directory)
-  writeFileSync(join(instance.directory,'fixture-rotate-auth.json'),auth('at-exit'))
+  writeFileSync(join(instance.directory,'fixture-rotate-auth.json'),oauthInput('at-exit'))
   const reopened=f.create();await reopened.recover();assert.equal(reopened.views()[0].status,'error');assert.equal(reopened.views()[0].pid,evidence.pid)
   await reopened.stop(instance.id)
   assert.equal(f.store.read().accounts.find(item=>item.id===account.id)?.credentials.refreshToken,'fixture-cli-rt-at-exit')
@@ -159,6 +160,28 @@ test('CLI mapping probe failure preserves a live owner but accepts a verified co
   })
   assert.equal(await exited.find(plan),undefined)
   await f.instances.refresh();assert.equal(f.instances.views()[0].status,'stopped');assert.equal(existsSync(join(instance.directory,'auth.json')),false)
+})
+
+test('CLI successful mapping snapshot refuses a live mismatched owner but accepts its concurrent exit and final OAuth rotation',{skip:!supported},async t=>{
+  const f=fixture(t)
+  importParsedAccounts(f.store,parseAccountImport(oauthInput('mapping-before')).accounts)
+  const account=f.store.read().accounts.find(item=>item.kind==='oauth')!,instance=f.add('Mapping OAuth CLI','native',undefined,account.id)
+  await f.start(instance.id);const evidence=await f.evidence(instance.directory)
+  const launch=JSON.parse(readFileSync(join(f.store.directory,'instances',instance.id,'launch.json'),'utf8'))
+  const plan={application:binary,executable:binary,directory:instance.directory,desktopDirectory:instance.desktopDirectory,workingDirectory:join(f.store.directory,'instances',instance.id,'workspace'),args:[],nonce:launch.nonce,mode:'cli' as const}
+  const live=new MacCliRuntime(undefined,async pid=>{assert.equal(pid,evidence.pid);return `p${pid}\n`})
+  await assert.rejects(live.stop(plan),/不一致/)
+  assert.doesNotThrow(()=>process.kill(evidence.pid,0));assert.equal(existsSync(join(instance.directory,'auth.json')),true)
+  writeFileSync(join(instance.directory,'fixture-rotate-auth.json'),oauthInput('mapping-at-exit'))
+  const exited=new MacCliRuntime(undefined,async pid=>{
+    assert.equal(pid,evidence.pid);process.kill(pid,'SIGTERM')
+    await waitFor(()=>{try{process.kill(pid,0);return undefined}catch{return true}})
+    return `p${pid}\n`
+  })
+  assert.equal(await exited.find(plan),undefined)
+  await f.instances.refresh();assert.equal(f.instances.views()[0].status,'stopped')
+  assert.equal(f.store.read().accounts.find(item=>item.id===account.id)?.credentials.refreshToken,'fixture-cli-rt-mapping-at-exit')
+  assert.equal(existsSync(join(instance.directory,'auth.json')),false);assert.equal(f.store.read().clientSwitches?.length,0)
 })
 
 test('npm package-manager ownership follows installation metadata without inheriting unrelated shell flags',{skip:!supported},t=>{

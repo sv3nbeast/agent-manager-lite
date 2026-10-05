@@ -69,6 +69,10 @@ export class MacCliRuntime implements DesktopRuntime {
       try{files=await this.textFiles(record.pid)}
       catch{const next=await processIdentity(record.pid);if(!next||next.started!==record.started)return;throw new Error('无法核对 CLI 程序，尚未恢复登录配置')}
       if(files.split('\n').includes('n'+plan.executable))return record
+      // A successful mapping snapshot can lose its text files during exit.
+      // Restore only after rechecking that this recorded owner is gone.
+      const next=await processIdentity(record.pid)
+      if(!next||next.started!==record.started)return
       throw new Error('CLI 进程与登记的程序不一致，已保留实例文件')
     }
     if(allowShell&&current.args===`/bin/bash ${cliLaunchFiles(plan).script}`)return record

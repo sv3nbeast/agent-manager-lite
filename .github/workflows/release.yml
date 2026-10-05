@@ -117,6 +117,7 @@ jobs:
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$asset_dir" --pattern '*.dmg' --pattern '*.zip' --pattern 'SHA256SUMS.txt'
           test -n "$(find "$asset_dir" -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$(find "$asset_dir" -maxdepth 1 -name '*.zip' -print -quit)"
+          cmp release-ci/SHA256SUMS.txt "$asset_dir/SHA256SUMS.txt"
           (cd "$asset_dir" && shasum -a 256 --check SHA256SUMS.txt)
           if [[ "$RELEASE_TAG" == *-* ]]; then
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
