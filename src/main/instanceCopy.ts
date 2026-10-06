@@ -13,7 +13,8 @@ import {TomlDocument,patchToml,scalarRaw,type TomlEdit} from './tomlPatch'
 import {copiedProjectStateFile,copiedProjectStateLimit,projectCopiedProjectState} from './copiedProjectState'
 import {excludedInstanceCopyTree} from './instanceCopyScope'
 
-interface Entry {relative:string;directory:boolean;dev:number;ino:number;size:number;mtime:number;ctime:number;mode:number}
+export interface CopyEntry {relative:string;directory:boolean;dev:number;ino:number;size:number;mtime:number;ctime:number;mode:number}
+type Entry=CopyEntry
 export interface CopyManifest {root:string;entries:Entry[];files:number;bytes:number;skipped:number;digest:string}
 const signature=(relative:string,stat:Stats):Entry=>({relative,directory:stat.isDirectory(),dev:stat.dev,ino:stat.ino,size:stat.size,mtime:stat.mtimeMs,ctime:stat.ctimeMs,mode:stat.mode})
 const matches=(entry:Entry,stat:Stats)=>JSON.stringify(signature(entry.relative,stat))===JSON.stringify(entry)
@@ -22,7 +23,7 @@ async function checkedDirectory(path:string):Promise<Stats>{
   if(!stat.isDirectory()||stat.isSymbolicLink()||await realpath(path)!==path)throw new Error('复制来源目录已改变，请重新复制')
   return stat
 }
-export async function scanInstanceHome(root:string,signal:AbortSignal):Promise<CopyManifest>{
+export async function scanInstanceHome(root:string,signal:AbortSignal,snapshot=false):Promise<CopyManifest>{
   const entries:Entry[]=[],skippedEntries:Entry[]=[]
   let files=0,bytes=0,skipped=0,count=0
   async function walk(relative:string,depth:number):Promise<void>{
@@ -37,10 +38,12 @@ export async function scanInstanceHome(root:string,signal:AbortSignal):Promise<C
     }
     for(const name of names.sort()){
       signal.throwIfAborted()
-      const child=join(relative,name),stat=await lstat(join(root,child))
+      const child=join(relative,name)
+      let stat:Stats
+      try{stat=await lstat(join(root,child))}catch(error){if(snapshot&&(error as NodeJS.ErrnoException).code==='ENOENT')continue;throw error}
       // A second copy of a refresh-token chain must never become a login owner.
       // Live daemon state is regenerated; do not carry stale PID/control files.
-      if(excludedInstanceCopyTree(child)||!relative&&name.toLowerCase()==='auth.json'||!stat.isFile()&&!stat.isDirectory()){
+      if(excludedInstanceCopyTree(child)||!relative&&name.toLowerCase()==='auth.json'||snapshot&&/\.sqlite-(?:wal|shm|journal)$/i.test(child)||!stat.isFile()&&!stat.isDirectory()){
         skipped++;skippedEntries.push(signature(child,stat));continue
       }
       if(stat.isDirectory())await walk(child,depth+1)
@@ -50,7 +53,8 @@ export async function scanInstanceHome(root:string,signal:AbortSignal):Promise<C
         entries.push(signature(child,stat))
       }
     }
-    if(!matches(signature(relative,before),await checkedDirectory(folder)))throw new Error('复制来源目录正在变化，请停止使用后重试')
+    const after=await checkedDirectory(folder)
+    if(snapshot?before.dev!==after.dev||before.ino!==after.ino:!matches(signature(relative,before),after))throw new Error('复制来源目录正在变化，请停止使用后重试')
   }
   await walk('',0)
   return {root,entries,files,bytes,skipped,digest:createHash('sha256').update(JSON.stringify([entries,skippedEntries])).digest('hex')}

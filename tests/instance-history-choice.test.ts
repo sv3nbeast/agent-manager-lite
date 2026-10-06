@@ -61,7 +61,7 @@ function mount() {
   return { state, manager, calls, api, source, sourceId, targetId, jobId, draft, selectCopy, complete, unmount: () => renderer.render(null, container) }
 }
 
-test('discovered external instances are selectable without registration and require closure before independent copying',async t=>{
+test('discovered running external instances can copy saved history without registering or closing the source',async t=>{
   const ui=mount();t.after(ui.unmount);ui.manager.data.instances=[];ui.draft()
   const id=randomUUID(),ticket=randomUUID()
   ui.api.discoverExternalInstanceSources=async()=>({sources:[{id,name:'Other workspace',directory:'/fixture/external',sourceName:'兼容工具',clientType:'codex',launchMode:'desktop',runtimeState:'running'}],issues:[]})
@@ -71,9 +71,8 @@ test('discovered external instances are selectable without registration and requ
   assert.equal(ui.state.instanceSourceOptions[0].options[0].disabled,undefined,'Discovery remains available while the source runs')
   await ui.state.chooseInstanceSource('external:'+id)
   assert.equal(ui.state.externalSource.name,'Other workspace');assert.equal(ui.state.chosenHistory.sessions,5)
-  await ui.state.nextStep();assert.equal(ui.state.step,2);assert.match(ui.state.error,/关闭/);assert.equal(ui.calls.length,0)
-  ui.state.sourceClosed=true;await ui.state.nextStep();assert.equal(ui.state.step,3);await ui.state.save()
-  assert.equal(ui.calls[0].method,'external');assert.equal(ui.calls[0].input.ticket,ticket);assert.equal(ui.calls[0].input.sourceClosed,true)
+  await ui.state.nextStep();assert.equal(ui.state.step,3);assert.equal(ui.calls.length,0);await ui.state.save()
+  assert.equal(ui.calls[0].method,'external');assert.equal(ui.calls[0].input.ticket,ticket);assert.equal('sourceClosed' in ui.calls[0].input,false)
   assert.equal('directory' in ui.calls[0].input,false);assert.equal(ui.calls.some(call=>call.method==='start'),false)
 })
 
@@ -166,16 +165,14 @@ test('copy selection preserves the draft and wizard; only its successful job tar
   assert.equal(ui.calls.some(call => call.method === 'start'), false)
 })
 
-test('external source selection retains configuration and requires an explicit source-closed confirmation', async t => {
+test('external snapshot source selection retains configuration and can preview an independent copy while the source stays open', async t => {
   const ui = mount(); t.after(ui.unmount); ui.draft(); ui.state.historyMode = 'copy'; ui.state.historySourceKind = 'directory'
   await ui.state.chooseHistoryDirectory()
   assert.equal(ui.state.wizard, true); assert.equal(ui.state.form.name, 'Chosen history'); assert.equal(ui.state.sourceClosed, false)
   await ui.state.nextStep(); await settle()
-  assert.equal(ui.state.step, 2); assert.equal(ui.calls.length, 0); assert.match(ui.state.error, /关闭/)
-  await ui.state.save(true); assert.equal(ui.calls.length, 0); assert.match(ui.state.error, /关闭/)
-  ui.state.sourceClosed = true; await ui.state.nextStep(); assert.equal(ui.state.step, 3)
+  assert.equal(ui.state.step, 3); assert.equal(ui.calls.length, 0)
   await ui.state.save(true)
-  assert.equal(ui.calls[0].method, 'external'); assert.equal(ui.calls[0].input.sourceClosed, true)
+  assert.equal(ui.calls[0].method, 'external'); assert.equal('sourceClosed' in ui.calls[0].input, false)
   ui.complete(); await settle()
   assert.equal(ui.calls.at(-1)!.method, 'preview'); assert.equal(ui.calls.at(-1)!.input.id, ui.targetId)
 })

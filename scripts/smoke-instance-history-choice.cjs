@@ -47,6 +47,9 @@ function seedHistory(home) {
   return ids
 }
 const external = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'aml-history-source-'))); seedHistory(external)
+const externalIndex=new DatabaseSync(join(external,'state_5.sqlite'))
+externalIndex.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(),join(external,'sessions','rollout-missing.jsonl'),external,'fixture_original_provider','cli',0,0,null)
+externalIndex.close()
 const cleanupExternal = () => fs.rmSync(external, { recursive: true, force: true })
 process.on('exit', cleanupExternal)
 app.on('will-quit', cleanupExternal)
@@ -250,14 +253,8 @@ app.on('browser-window-created', (_event, window) => {
       await wait('!document.querySelector("[aria-label=启动会话概况]")')
       await beginWizard('外部目录会话副本', 'Codex 2'); await historyChoice('directory')
       await click('.instance-history-choice button', '选择目录')
-      await wait('!!document.querySelector("[aria-label=来源客户端已关闭]")')
-      const checkbox = '[aria-label="来源客户端已关闭"]'
-      assert.equal(await run(`document.querySelector(${JSON.stringify(checkbox)}).checked`), false)
-      assert.equal(await run(`${visible('.instance-editor-dialog .ant-modal-footer button')}.find(el=>el.textContent.trim()==='下一步').disabled`), false, 'Missing closure permits an explanatory validation click')
-      await click('.instance-editor-dialog .ant-modal-footer button', '下一步')
-      await verifyValidation('source-not-closed-1280x800', '关闭')
-      assert.equal(await run('(async()=>{const s=await window.manager.load();return s.instances.length})()'), 2, 'Unconfirmed source closure cannot create or copy an instance')
-      await run(`document.querySelector(${JSON.stringify(checkbox)}).click()`)
+      await wait('document.querySelector(".instance-history-choice").innerText.includes("独立快照")')
+      assert.equal(await run('!!document.querySelector("[aria-label=来源客户端已关闭]")'), false, 'Copying a snapshot does not require closing its source')
       await verifyLayout('directory-1280x800')
       await resize(940, 680); await verifyLayout('directory-940x680'); await resize(1280, 800)
       await next(3); await capture('external-history-confirmation.png')
@@ -266,6 +263,9 @@ app.on('browser-window-created', (_event, window) => {
       await wait('(async()=>{const s=await window.manager.load();return s.instanceCopy?.status==="completed"&&s.instances.length===3})()')
       snapshot = await run('window.manager.load()')
       assert.equal(snapshot.instances.length, 3); assert.ok(snapshot.instances.every(instance => instance.status === 'stopped'))
+      assert.equal(snapshot.instanceCopy.omittedSessions,1)
+      await wait('document.querySelector(".instance-copy-job .ant-alert-warning")?.innerText.includes("已跳过 1 条")')
+      await capture('snapshot-stale-index-notice.png')
       assert.deepEqual(snapshotFiles(source.directory), originalSourceFiles, 'Both copies preserve the original managed source')
       assert.deepEqual(snapshotFiles(external), originalExternalFiles, 'External source files are unchanged')
       const registryRoot=join(directory,'external-source-home','.antigravity_cockpit')
@@ -276,12 +276,9 @@ app.on('browser-window-created', (_event, window) => {
       await beginWizard('扫描来源副本','Codex 2');await historyChoice('instance')
       await wait('!document.querySelector(".instance-history-choice").innerText.includes("正在查找")')
       await selectSource('本机外部工作空间')
-      await wait('document.querySelector(".instance-history-choice").innerText.includes("105")&&!!document.querySelector("[aria-label=来源客户端已关闭]")')
-      assert.equal(await run(`document.querySelector(${JSON.stringify(checkbox)}).checked`),false)
+      await wait('document.querySelector(".instance-history-choice").innerText.includes("105")&&document.querySelector(".instance-history-choice").innerText.includes("独立快照")')
+      assert.equal(await run('!!document.querySelector("[aria-label=来源客户端已关闭]")'),false)
       await resize(940,680);await verifyLayout('discovered-source-940x680');await capture('discovered-source-940x680.png')
-      await click('.instance-editor-dialog .ant-modal-footer button','下一步')
-      await verifyValidation('discovered-source-not-closed-940x680','关闭')
-      await run(`document.querySelector(${JSON.stringify(checkbox)}).click()`)
       await next(3);await click('.ant-modal-footer button','仅创建')
       await wait('(async()=>{const s=await window.manager.load();return s.instanceCopy?.status==="completed"&&s.instances.length===4})()')
       assert.equal(fs.readFileSync(registry,'utf8'),registryText,'Metadata discovery preserves the other tool registry')
@@ -332,12 +329,12 @@ app.on('browser-window-created', (_event, window) => {
       await click('.settings-actions button', '放弃更改')
       await wait(`document.querySelector('[data-settings-field="port"] input').value===${JSON.stringify(String(settingsBeforeValidation.port))}`)
       fs.writeFileSync(join(output, 'validation.json'), JSON.stringify({ passed: true, blankDefault: true, managedSourceReadOnlyPreview: true, projectCounts: { sessions: 105, archived: 32, projects: 12, projectSessions: 67, unassigned: 38 },
-        fourStepWizardPreserved: true, sourceClosedExplicit: true, copiedTargetPreviewOnly: true, originalStateUnchanged: true, allSourceFilesUnchanged: true, instanceCount: 4, accountCount: 1,
-        externalMetadataDiscovery:true,externalSourceSelection:true,externalRegistryUnchanged:true,discoveredClosureValidation:true,
+        fourStepWizardPreserved: true, liveSnapshotWithoutClosure: true, staleIndexNotice:true, copiedTargetPreviewOnly: true, originalStateUnchanged: true, allSourceFilesUnchanged: true, instanceCount: 4, accountCount: 1,
+        externalMetadataDiscovery:true,externalSourceSelection:true,externalRegistryUnchanged:true,discoveredLiveSnapshot:true,
         keyboardOptionsReachable: true, switchingClearsSource: true, projectSearch: true, detailEscapePreservesParent: true, lightAndDarkTheme: true,
         automaticName: true, automaticNameCollisionAvoided: true, clearedNameRestored: true, customNamePreserved: true, missingModelPreventsAdvance: true,
         validationChecks, providerValidation, settingsValidation, layoutChecks, realAccountsTouched: false, externalRequests: 0, officialClientLaunched: false }, null, 2))
-      console.log('Instance history UI passed: blank/default wizard, source project/session summary, managed and external copies, explicit closure, completed target launch preview; no real accounts, upstream calls or official client launch.')
+      console.log('Instance history UI passed: blank/default wizard, source project/session summary, managed and live external snapshots, completed target launch preview; no real accounts, upstream calls or official client launch.')
       clearTimeout(timer); cleanupExternal(); app.exit(0)
     } catch (error) {
       console.error(error)

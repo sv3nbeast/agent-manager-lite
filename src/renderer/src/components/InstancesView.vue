@@ -117,7 +117,7 @@ function validHistorySource():boolean{
   if(wizard.value&&historyMode.value==='copy'&&!copySource.value&&!externalSource.value){error.value='请选择要复制的会话来源。';return false}
   if(copySource.value){const current=instances.value.find(item=>item.id===copySource.value!.id);if(!current||current.status!=='stopped'||current.copying||current.revision!==copySource.value.revision){error.value='来源实例已变化或正在运行，请重新选择已停止的实例。';return false}}
   if((copySource.value||externalSource.value)&&!attachingForm.value&&!chosenHistory.value){error.value='无法核对来源会话，请重新选择来源。';return false}
-  if(externalSource.value&&!sourceClosed.value){error.value='请先关闭使用来源目录的客户端，并确认已关闭。';return false}
+  if(attachingForm.value&&!sourceClosed.value){error.value='请先关闭使用来源目录的客户端，并确认已关闭。';return false}
   if((copySource.value||externalSource.value)&&!attachingForm.value&&copyRunning.value){error.value='请等待当前复制完成，或先取消当前复制。';return false}
   return true
 }
@@ -366,12 +366,12 @@ async function save(previewAfter=false) {
   if(!parsed?.success)return
   const details=parsed.data
   const source=copySource.value,external=externalSource.value
-  if(external&&!sourceClosed.value)return
+  if(external&&attachingForm.value&&!sourceClosed.value)return
   const previousJobId=copyJob.value?.id
   const attach=attachingForm.value,previousIds=new Set(instances.value.map(instance=>instance.id)),editingId=editing.value?.id
   committing.value=true
   let savedOk=false
-  try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,sourceClosed:true,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
+  try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
   finally{committing.value=false}
   if(savedOk&&open.value&&generation===draftGeneration) {
     closeEditor();message.success(attach?'已有目录已登记':source||external?'正在复制实例':'实例已保存')
@@ -409,7 +409,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
   <section class="instances-panel">
     <div class="page-heading"><div><h1>实例</h1><p>选择客户端和兼容资源，从一个入口启动独立工作空间。</p></div><a-space wrap><a-button v-if="instances.some(value=>value.status!=='stopped')" @click="stopAll">停止全部</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('copy')">从已有目录复制</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('attach')">使用已有目录</a-button><a-button type="primary" @click="edit()"><PlusOutlined />创建实例</a-button></a-space></div>
     <a-alert v-if="error&&!open&&!preview" type="error" :message="error" class="error-banner" />
-    <a-card v-if="copyJob" class="instance-copy-job" size="small"><strong>{{copyJob.sourceName}} → {{copyJob.name}}</strong><p>{{copyJob.status==='scanning'?'正在检查来源':copyJob.status==='copying'?'正在复制文件':copyJob.status==='completed'?'副本已创建':copyJob.status==='cancelled'?'复制已取消':'复制未完成'}} · {{copyJob.files}} / {{copyJob.totalFiles}} 个文件 · {{size(copyJob.bytes)}} / {{size(copyJob.totalBytes)}}</p><a-progress v-if="copyRunning" :percent="copyJob.totalBytes?Math.min(99,Math.floor(copyJob.bytes/copyJob.totalBytes*100)):0" :show-info="false" /><p v-if="copyJob.skipped" class="muted">已排除 {{copyJob.skipped}} 项登录文件、临时或缓存目录、工作树、后台状态及链接。</p><a-alert v-if="copyJob.error" :message="copyJob.error" type="error" /><a-space><a-button v-if="copyRunning" @click="cancelCopy">取消复制</a-button><template v-if="pendingCopyPreview===copyJob.id"><span class="muted">完成后打开启动预览</span><a-button type="link" @click="cancelCopyPreview">取消自动预览</a-button></template></a-space></a-card>
+    <a-card v-if="copyJob" class="instance-copy-job" size="small"><strong>{{copyJob.sourceName}} → {{copyJob.name}}</strong><p>{{copyJob.status==='scanning'?'正在检查来源':copyJob.status==='copying'?'正在创建独立快照':copyJob.status==='completed'?'副本已创建':copyJob.status==='cancelled'?'复制已取消':'复制未完成'}} · {{copyJob.files}} / {{copyJob.totalFiles}} 个文件 · {{size(copyJob.bytes)}} / {{size(copyJob.totalBytes)}}</p><a-progress v-if="copyRunning" :percent="copyJob.totalBytes?Math.min(99,Math.floor(copyJob.bytes/copyJob.totalBytes*100)):0" :show-info="false" /><p v-if="copyJob.skipped" class="muted">已排除 {{copyJob.skipped}} 项登录文件、临时或缓存目录、工作树、后台状态及链接。</p><a-alert v-if="copyJob.omittedSessions" :message="`已跳过 ${copyJob.omittedSessions} 条文件已缺失的会话索引，来源数据未修改。`" type="warning" show-icon /><a-alert v-if="copyJob.error" :message="copyJob.error" type="error" /><a-space><a-button v-if="copyRunning" @click="cancelCopy">取消复制</a-button><template v-if="pendingCopyPreview===copyJob.id"><span class="muted">完成后打开启动预览</span><a-button type="link" @click="cancelCopyPreview">取消自动预览</a-button></template></a-space></a-card>
     <div class="toolbar"><a-input v-model:value="search" allow-clear placeholder="搜索实例、账号或模型" style="max-width:360px" @change="page=1" /><span class="toolbar-spacer" /><span class="muted">{{ instances.length }} 个实例</span><a-button @click="manager.load">刷新状态</a-button></div>
     <div v-if="!instances.length" class="empty-panel"><div class="empty-icon"><DesktopOutlined /></div><h2>创建你的第一个实例</h2><p>选择客户端 → 选择账号或供应商 → 配置项目 → 启动。<br>配置与会话独立保存，供应商密钥可供兼容实例复用。</p><a-button type="primary" @click="edit()">创建实例</a-button></div>
     <a-empty v-else-if="!filtered.length" description="没有匹配的实例" />
@@ -445,7 +445,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <a-form layout="vertical" class="instance-editor" :class="{'instance-wizard':wizard}">
         <a-alert v-if="copyingForm&&!wizard" type="info" :message="'从“'+copySourceName+'”复制配置、会话和技能，并将副本内部的会话与模型目录路径指向新目录。文件登录令牌不复制，启动时使用下方绑定账号。项目分组与会话会复制，项目文件不会复制。'" class="instance-copy-explanation error-banner" />
         <a-alert v-if="attachingForm" class="instance-attach-explanation error-banner" type="info" message="直接使用所选目录，不复制文件。登记不会改写配置；启动时应用绑定账号和设置，停止后回收登录状态并恢复配置。移除实例会保留此目录。" />
-        <div v-if="externalSource&&!wizard" class="external-copy-source"><p class="instance-path">{{attachingForm?'已有目录':'来源'}}：{{externalSource.directory}}</p><p class="muted">{{attachingForm?'请先关闭使用此目录的客户端；此实例运行时，不要再由其他客户端同时使用该目录。':'请先关闭使用此目录的客户端。来源保持不变；配置中的其他 API 密钥会随配置复制，链接会跳过。'}}</p><a-checkbox v-model:checked="sourceClosed" aria-label="来源客户端已关闭">我已关闭使用此目录的客户端</a-checkbox></div>
+        <div v-if="externalSource&&!wizard" class="external-copy-source"><p class="instance-path">{{attachingForm?'已有目录':'来源'}}：{{externalSource.directory}}</p><p class="muted">{{attachingForm?'请先关闭使用此目录的客户端；此实例运行时，不要再由其他客户端同时使用该目录。':'复制已保存历史的独立快照，来源可以继续使用。复制完成后的新消息不会同步；配置中的其他 API 密钥会随配置复制，链接会跳过。'}}</p><a-checkbox v-if="attachingForm" v-model:checked="sourceClosed" aria-label="来源客户端已关闭">我已关闭使用此目录的客户端</a-checkbox></div>
         <template v-if="copyingForm&&!wizard"><p v-if="historyLoading" class="muted">正在读取项目与会话概况…</p><a-alert v-if="historyError" type="error" :message="historyError" /><InstanceHistoryOverview v-if="chosenHistory" :history="chosenHistory" aria-label="所选会话概况" /></template>
         <section v-show="!wizard||step===0" class="instance-step" data-step="0">
           <a-form-item label="客户端"><a-select v-model:value="form.clientType" aria-label="实例客户端" :disabled="!!editing||copyingForm||attachingForm" :options="implementedAgentClients.map(item=>({value:item.id,label:item.name}))" /></a-form-item>
@@ -491,10 +491,10 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
                 <a-select id="instance-history-source" :value="copySource?'managed:'+copySource.id:discoveredSourceId?'external:'+discoveredSourceId:undefined" aria-label="来源实例" class="instance-source-select" placeholder="选择本应用或本机其他实例" :disabled="committing||historyLoading" :loading="discoveryLoading" :options="instanceSourceOptions" @change="chooseInstanceSource(String($event))" />
                 <p v-if="discoveryLoading" class="instance-source-note" role="status">正在查找本机的 Codex 配置和兼容工具实例…</p>
                 <p v-else-if="!compatibleSources.length&&!discoveredSources.length" class="instance-source-note">未找到可用来源，可以改选「从目录复制」手动选择配置目录。</p>
-                <p v-else-if="!copySource&&!externalSource" class="instance-source-note">可识别正在运行的外部实例；选择后查看历史，复制前请先关闭来源客户端。</p>
+                <p v-else-if="!copySource&&!externalSource" class="instance-source-note">可识别正在运行的外部实例；选择后查看历史，复制独立快照，来源可以继续使用。</p>
                 <a-alert v-if="discoveryError" type="warning" :message="discoveryError" :show-icon="true" />
                 <p v-for="issue in discoveryIssues" :key="issue" class="instance-source-note">{{issue}}</p>
-                <div v-if="discoveredSourceId&&externalSource" class="instance-source-closure"><p class="instance-path">{{externalSource.directory}}</p><a-checkbox v-model:checked="sourceClosed" aria-label="来源客户端已关闭">来源客户端已关闭，可以复制</a-checkbox><span>只复制已保存的历史。来源保留；复制时会重新检查目录和后台状态。</span></div>
+                <div v-if="discoveredSourceId&&externalSource" class="instance-source-closure"><p class="instance-path">{{externalSource.directory}}</p><span>复制已保存历史的独立快照，来源可以继续使用；后续新消息不会同步到副本。</span></div>
               </template>
               <template v-else>
                 <div class="instance-directory-picker">
@@ -502,7 +502,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
                   <div><strong>{{externalSource?.name??'选择会话目录'}}</strong><p :title="externalSource?.directory">{{externalSource?.directory??'从其他工具的 Codex 会话目录导入'}}</p></div>
                   <a-button :loading="busy" :disabled="committing" @click="chooseHistoryDirectory">{{externalSource?'更换':'选择目录'}}</a-button>
                 </div>
-                <div v-if="externalSource" class="instance-source-closure"><a-checkbox v-model:checked="sourceClosed" aria-label="来源客户端已关闭">来源客户端已关闭，可以复制</a-checkbox><span>目录选择 5 分钟内有效，过期后需重新选择。</span></div>
+                <div v-if="externalSource" class="instance-source-closure"><span>复制已保存历史的独立快照，来源可以继续使用。目录选择 5 分钟内有效，过期后需重新选择。</span></div>
               </template>
               <div v-if="historyLoading" class="instance-history-loading" role="status"><LoadingOutlined />正在读取项目与会话概况…</div>
               <a-alert v-if="historyError" type="error" :message="historyError" :show-icon="true" />

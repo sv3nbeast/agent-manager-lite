@@ -6,11 +6,20 @@ import {createConnection,type Socket} from 'node:net'
 
 export type ClientDaemonState='not_detected'|'running'|'unavailable'|'unsupported'|'cancelled'
 export async function probeClientDaemon(directory:string,signal?:AbortSignal):Promise<ClientDaemonState> {
+  const states:ClientDaemonState[]=[]
+  for(const [folder,name]of [['app-server-control','app-server-control.sock'],['ipc','ipc.sock']]){
+    const state=await probeClientSocket(directory,folder,name,signal)
+    if(['running','cancelled','unsupported'].includes(state))return state
+    states.push(state)
+  }
+  return states.includes('unavailable')?'unavailable':'not_detected'
+}
+async function probeClientSocket(directory:string,folderName:string,socketName:string,signal?:AbortSignal):Promise<ClientDaemonState> {
   if(signal?.aborted)return 'cancelled'
   if(process.platform!=='darwin'&&process.platform!=='linux')return 'unsupported'
   // The caller supplies an already registered directory capability, not a raw
   // renderer path. Do not follow a substituted control directory or socket.
-  const control=join(directory,'app-server-control'),path=join(control,'app-server-control.sock')
+  const control=join(directory,folderName),path=join(control,socketName)
   try{
     if(!isAbsolute(directory)||realpathSync(directory)!==directory||!lstatSync(directory).isDirectory())return 'unavailable'
     const folder=lstatSync(control)

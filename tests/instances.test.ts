@@ -692,9 +692,8 @@ test('explicit external home copy is read-only, uses a single-use capability and
   const before=configs.view(registered.id),edit=configs.preview({id:registered.id,revision:before.revision,changes:{model:'changed'}})
   const choice=f.instances.selectCopySource(source),details={name:'External copy',applicationId:f.app.id,accountId:account.id,model:'fixture-model',defaultTier:'fast',extraArgs:[]}
   assert.equal(readFileSync(join(source,'config.toml'),'utf8'),config)
-  assert.throws(()=>f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:false,details}))
   assert.throws(()=>f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:true,details,directory:source}))
-  f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:true,details})
+  f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:false,details})
   assert.equal(f.instances.inUse(registered.id),true)
   assert.throws(()=>configs.apply(edit.ticket),/停止实例/)
   assert.throws(()=>f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:true,details}),/过期/)
@@ -724,7 +723,7 @@ test('external copy rejects unselected, stale, replaced, overlapping and authori
   assert.equal(f.instances.views().length,0)
 })
 
-test('external live daemon prevents copy; interrupted external copy is archived and visible after restart',{skip:!['darwin','linux'].includes(process.platform)},async t=>{
+test('external live daemon can retain its source while snapshot copying; interrupted copies are archived after restart',{skip:!['darwin','linux'].includes(process.platform)},async t=>{
   const f=fixture(t),source=realpathSync(mkdtempSync('/tmp/cml-copy-daemon-'))
   t.after(()=>rmSync(source,{recursive:true,force:true}))
   writeFileSync(join(source,'config.toml'),'model="fixture"\n');mkdirSync(join(source,'app-server-control'))
@@ -732,9 +731,10 @@ test('external live daemon prevents copy; interrupted external copy is archived 
   t.after(()=>server.close())
   await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(join(source,'app-server-control','app-server-control.sock'),resolve)})
   const choice=f.instances.selectCopySource(source)
-  f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:true,details:{name:'No live copy',applicationId:f.app.id,accountId:f.account().id,model:'fixture-model',extraArgs:[]}})
-  const done=await copyFinished(f.instances);assert.equal(done.status,'failed');assert.match(done.error!,/后台进程仍在运行/)
-  assert.equal(f.instances.views().length,0);assert.equal(server.listening,true)
+  f.instances.startExternalCopy({ticket:choice.ticket,details:{name:'Saved history copy',applicationId:f.app.id,accountId:f.account().id,model:'fixture-model',extraArgs:[]}})
+  const done=await copyFinished(f.instances);assert.equal(done.status,'completed',done.error)
+  assert.equal(f.instances.views().length,1);assert.equal(server.listening,true)
+  assert.equal(readFileSync(join(source,'config.toml'),'utf8'),'model="fixture"\n')
   const id=randomUUID(),folder=join(f.store.directory,'instance-copies',id);mkdirSync(folder,{recursive:true})
   writeFileSync(join(folder,'copy.json'),JSON.stringify({id,sourceId:choice.ticket,external:true,sourceName:'external'}));writeFileSync(join(folder,'partial'),'preserved')
   const reopened=f.create();await reopened.recover()

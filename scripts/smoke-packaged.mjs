@@ -1,5 +1,5 @@
-import { spawn, execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { spawn, spawnSync, execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync, openSync, closeSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -34,6 +34,19 @@ assert.match(shippedMain, /\.setName\(isolatedTest\s*\?\s*["']Codex Manager Lite
 assert.match(shippedMain, /\.setPath\(["']userData["'],[^;\n]*\.getPath\(["']appData["']\),\s*["']codex-manager-lite["']\)\)/)
 const help = execFileSync(join(bundle,'Resources/bin/codex-proxy'),['-help'],{encoding:'utf8',stdio:['ignore','pipe','pipe']})
 assert.ok(typeof help === 'string')
+const snapshotHelper=join(bundle,'Resources/bin/codex-profile-snapshot')
+assert.ok(existsSync(snapshotHelper),'The installed application includes its profile snapshot helper')
+const profileProbe=mkdtempSync(join(tmpdir(),'aml-packaged-snapshot-'))
+let sourceFd,parentFd
+try{
+  const source=join(profileProbe,'source'),copy=join(profileProbe,'saved')
+  writeFileSync(source,'saved history\n');sourceFd=openSync(source,'r');parentFd=openSync(profileProbe,'r')
+  const result=spawnSync(snapshotHelper,['saved'],{stdio:['ignore','pipe','pipe',sourceFd,parentFd],timeout:10_000})
+  assert.ifError(result.error);assert.equal(result.status,0,'The shipped helper creates an APFS snapshot from verified descriptors')
+  writeFileSync(source,'later source write\n')
+  assert.equal(readFileSync(copy,'utf8'),'saved history\n');assert.notEqual(statSync(copy).ino,statSync(source).ino)
+  assert.equal(spawnSync(snapshotHelper,['../outside'],{stdio:['ignore','pipe','pipe',sourceFd,parentFd],timeout:10_000}).status,1)
+}finally{if(sourceFd!==undefined)closeSync(sourceFd);if(parentFd!==undefined)closeSync(parentFd);rmSync(profileProbe,{recursive:true,force:true})}
 const directory = mkdtempSync(join(tmpdir(),'cml-packaged-'))
 const env = { ...process.env,CML_TEST_DATA_DIR:directory }
 delete env.ELECTRON_RUN_AS_NODE

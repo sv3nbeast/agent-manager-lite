@@ -15,7 +15,8 @@ import { NativeInstanceAccounts } from './nativeInstanceAccounts'
 import { MacInstanceRuntime } from './cliInstanceRuntime'
 import {codexInstanceAdapter,getInstanceClientAdapter} from './codexInstanceAdapter'
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
-import {copyInstanceHome,scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
+import {scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
+import {copySavedInstanceHome} from './instanceCopySnapshot'
 import {assertClientDaemonStopped,probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,validateExternalHome,pathContains} from './instancePaths'
 import {TomlDocument} from './tomlPatch'
@@ -197,7 +198,8 @@ export class Instances {
     this.verifyExternalSource(source)
     const controller=new AbortController();this.attaching.add(controller)
     try{
-      assertClientDaemonStopped(await probeClientDaemon(source.view.directory,controller.signal));controller.signal.throwIfAborted()
+      const daemon=await probeClientDaemon(source.view.directory,controller.signal)
+      controller.signal.throwIfAborted();assertClientDaemonStopped(daemon)
       if(this.externalCopySource!==source||source.expires<this.now())throw new Error('所选目录已改变、过期或已使用，请重新选择')
       this.verifyExternalSource(source)
       const state=this.store.read(),path=source.view.directory
@@ -225,15 +227,16 @@ export class Instances {
       let promoted=false,published=false,created=false,identity:{dev:number;ino:number}|undefined
       try{
         verify()
-        assertClientDaemonStopped(await probeClientDaemon(sourceHome,controller.signal));controller.signal.throwIfAborted()
-        const manifest=await scanInstanceHome(sourceHome,controller.signal)
+        controller.signal.throwIfAborted()
+        const manifest=await scanInstanceHome(sourceHome,controller.signal,true)
         Object.assign(view,{status:'copying',totalFiles:manifest.files,totalBytes:manifest.bytes,skipped:manifest.skipped})
         directory(join(this.root,'instance-copies'),true)
         await mkdir(staging,{mode:0o700});created=true;identity=lstatSync(staging)
         atomic(join(staging,'copy.json'),JSON.stringify({id,sourceId:source.id,...source.external?{external:true,sourceName:source.name}:{}}))
-        await copyInstanceHome(manifest,join(staging,'home'),controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
-        await relocateCopiedProfile(manifest,join(staging,'home'),join(target,'home'),controller.signal,copiedSessionProvider)
-        assertClientDaemonStopped(await probeClientDaemon(sourceHome,controller.signal));controller.signal.throwIfAborted()
+        const saved=await copySavedInstanceHome(manifest,join(staging,'home'),controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
+        Object.assign(view,{totalFiles:saved.files,totalBytes:saved.bytes,skipped:saved.skipped,omittedSessions:saved.omittedSessions})
+        await relocateCopiedProfile(saved,join(staging,'home'),join(target,'home'),controller.signal,copiedSessionProvider)
+        controller.signal.throwIfAborted()
         verify()
         await mkdir(join(staging,'desktop'),{mode:0o700});await mkdir(join(staging,'workspace'),{mode:0o700})
         // Publish only a complete independent directory. A durable marker lets

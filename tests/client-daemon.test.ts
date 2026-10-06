@@ -52,3 +52,12 @@ test('daemon status blocks live, failed and cancelled probes without treating ab
   assert.doesNotThrow(()=>assertClientDaemonStopped('not_detected'))
   assert.doesNotThrow(()=>assertClientDaemonStopped('unsupported'))
 })
+test('current Codex ipc socket blocks reuse of a profile even without the older app-server-control socket',{skip:!unix},async t=>{
+  const f=fixture(t);mkdirSync(join(f.client,'ipc'))
+  const path=join(f.client,'ipc','ipc.sock'),server=createServer(socket=>socket.end())
+  t.after(()=>server.close())
+  await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(path,resolve)})
+  assert.equal(await probeClientDaemon(f.client),'running')
+  assert.throws(()=>assertClientDaemonStopped('running'),/仍在运行/)
+  assert.equal(server.listening,true)
+})
