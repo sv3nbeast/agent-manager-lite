@@ -226,6 +226,40 @@ test('CLI successful mapping snapshot refuses a live mismatched owner but accept
   assert.equal(existsSync(join(instance.directory,'auth.json')),false);assert.equal(f.store.read().clientSwitches?.length,0)
 })
 
+test('CLI argv snapshot refuses a live unknown owner but recovers a concurrent exit and final OAuth rotation',{skip:!supported},async t=>{
+  const f=fixture(t)
+  importParsedAccounts(f.store,parseAccountImport(oauthInput('argv-before')).accounts)
+  const account=f.store.read().accounts.find(item=>item.kind==='oauth')!,instance=f.add('Argv OAuth CLI','native',undefined,account.id)
+  await f.start(instance.id);const evidence=await f.evidence(instance.directory)
+  const launch=JSON.parse(readFileSync(join(f.store.directory,'instances',instance.id,'launch.json'),'utf8'))
+  const plan={application:binary,executable:binary,directory:instance.directory,desktopDirectory:instance.desktopDirectory,workingDirectory:join(f.store.directory,'instances',instance.id,'workspace'),args:[],nonce:launch.nonce,mode:'cli' as const}
+  const files=cliLaunchFiles(plan),record=readFileSync(files.record,'utf8'),started=record.trim().split('\n')[1].trim()
+  const live=new MacCliRuntime(undefined,undefined,async pid=>{
+    assert.equal(pid,evidence.pid)
+    return {started,args:'unrecognized live argv'}
+  })
+  await assert.rejects(live.stop(plan),/状态不明确/)
+  assert.doesNotThrow(()=>process.kill(evidence.pid,0))
+  assert.equal(readFileSync(files.record,'utf8'),record);assert.equal(existsSync(join(instance.directory,'auth.json')),true)
+  writeFileSync(join(instance.directory,'fixture-rotate-auth.json'),oauthInput('argv-at-exit'))
+  let exitedSnapshots=0
+  const exited=new MacCliRuntime(undefined,undefined,async pid=>{
+    assert.equal(pid,evidence.pid)
+    if(exitedSnapshots++===0){
+      process.kill(pid,'SIGTERM')
+      await waitFor(()=>{try{process.kill(pid,0);return undefined}catch{return true}})
+      // An earlier ps snapshot lost argv while this real owner was exiting.
+      return {started,args:'(exiting client)'}
+    }
+    assert.throws(()=>process.kill(pid,0));return undefined
+  })
+  await exited.stop(plan)
+  await f.instances.refresh();assert.equal(f.instances.views()[0].status,'stopped')
+  assert.equal(f.store.read().accounts.find(item=>item.id===account.id)?.credentials.refreshToken,'fixture-cli-rt-argv-at-exit')
+  assert.equal(existsSync(join(instance.directory,'auth.json')),false);assert.equal(f.store.read().clientSwitches?.length,0)
+  assert.equal(existsSync(files.record),false)
+})
+
 test('npm package-manager ownership follows installation metadata without inheriting unrelated shell flags',{skip:!supported},t=>{
   const f=fixture(t),pnpm=npmCliPackage(join(f.root,'pnpm'),binary)
   writeFileSync(join(f.root,'pnpm','node_modules','.modules.yaml'),'fixture')

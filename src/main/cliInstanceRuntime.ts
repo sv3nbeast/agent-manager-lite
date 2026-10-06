@@ -62,7 +62,7 @@ async function processIdentity(pid:number):Promise<{started:string;args:string}|
   }
 }
 export class MacCliRuntime implements DesktopRuntime {
-  constructor(private readonly open:(script:string)=>Promise<void>=openCliTerminal,private readonly textFiles:(pid:number)=>Promise<string>=processTextFiles){}
+  constructor(private readonly open:(script:string)=>Promise<void>=openCliTerminal,private readonly textFiles:(pid:number)=>Promise<string>=processTextFiles,private readonly identity:typeof processIdentity=processIdentity){}
   private supported(){if(process.platform!=='darwin')throw new Error('CLI 终端实例当前仅在 macOS 接入')}
   private record(plan:DesktopPlan):DesktopProcess|undefined {
     const raw=readBounded(cliLaunchFiles(plan).record,512)
@@ -73,21 +73,25 @@ export class MacCliRuntime implements DesktopRuntime {
   }
   private async owned(plan:DesktopPlan,allowShell=false):Promise<DesktopProcess|undefined> {
     const record=this.record(plan);if(!record)return
-    const current=await processIdentity(record.pid)
+    const current=await this.identity(record.pid)
     if(!current||current.started!==record.started)return
     if(current.args.startsWith(marker(plan)+' ')||current.args===marker(plan)){
       // argv[0] is deliberately the nonce, so ps comm cannot prove the binary.
       let files:string
       try{files=await this.textFiles(record.pid)}
-      catch{const next=await processIdentity(record.pid);if(!next||next.started!==record.started)return;throw new Error('无法核对 CLI 程序，尚未恢复登录配置')}
+      catch{const next=await this.identity(record.pid);if(!next||next.started!==record.started)return;throw new Error('无法核对 CLI 程序，尚未恢复登录配置')}
       if(files.split('\n').includes('n'+plan.executable))return record
       // A successful mapping snapshot can lose its text files during exit.
       // Restore only after rechecking that this recorded owner is gone.
-      const next=await processIdentity(record.pid)
+      const next=await this.identity(record.pid)
       if(!next||next.started!==record.started)return
       throw new Error('CLI 进程与登记的程序不一致，已保留实例文件')
     }
     if(allowShell&&current.args===`/bin/bash ${cliLaunchFiles(plan).script}`)return record
+    // ps can lose argv while the recorded process exits. Recheck its identity
+    // before reporting an unknown live owner; never signal a mismatched process.
+    const next=await this.identity(record.pid)
+    if(!next||next.started!==record.started)return
     throw new Error('CLI 启动进程状态不明确，已保留实例文件')
   }
   async find(plan:DesktopPlan):Promise<DesktopProcess|undefined>{getInstanceClientAdapter(plan.clientType);this.supported();return this.owned(plan)}
