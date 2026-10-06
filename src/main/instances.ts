@@ -4,7 +4,7 @@ import { existsSync, lstatSync, realpathSync, renameSync, rmSync, readdirSync } 
 import {mkdir,rename,rm} from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { z } from 'zod'
-import { instanceRevisionSchema, saveInstanceSchema, copyInstanceSchema, copyExternalInstanceSchema, attachInstanceSchema, type ExternalInstanceHome, type InstanceCopySource, type InstanceInput, type InstanceCopyView, type InstanceApplication, type InstanceProfile, type InstanceView, type InstanceLaunchPreview, type InstanceWorkingDirectory } from '../shared/instances'
+import { instanceRevisionSchema, saveInstanceSchema, copyInstanceSchema, copyExternalInstanceSchema, attachInstanceSchema, type ExternalInstanceHome, type InstanceCopySource, type InstanceInput, type InstanceCopyView, type InstanceApplication, type InstanceProfile, type InstanceView, type InstanceLaunchPreview, type InstanceWorkingDirectory, type InstanceCopyMode } from '../shared/instances'
 import { resolveServiceTier } from '../shared/serviceTier'
 import { Store, type StoredAccount } from './store'
 import { Gateway } from './gateway'
@@ -17,6 +17,7 @@ import {codexInstanceAdapter,getInstanceClientAdapter} from './codexInstanceAdap
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
 import {scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
 import {copySavedInstanceHome} from './instanceCopySnapshot'
+import {scanSessionHome} from './instanceSessionCopy'
 import {assertClientDaemonStopped,probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,validateExternalHome,pathContains} from './instancePaths'
 import {TomlDocument} from './tomlPatch'
@@ -156,7 +157,7 @@ export class Instances {
     if(this.store.read().clientSwitches?.some(item=>item.targetId===source.id)||this.store.read().clientAuthorities?.some(item=>item.targetId===source.id))throw new Error('来源实例仍有登录恢复或凭据关联，请先处理')
     if(existsSync(join(this.folder(source.id),'launch.json')))throw new Error('来源实例仍有启动恢复记录，请先重开管理器处理')
     const sourceHome=source.externalHome?validateExternalHome(this.root,source.externalHome):join(this.folder(source.id),'home')
-    this.beginCopy({id:source.id,name:source.name,directory:sourceHome},input.details,()=>{
+    this.beginCopy({id:source.id,name:source.name,directory:sourceHome},input.details,input.copyMode,()=>{
       if(this.profile(source.id).revision!==input.revision)throw new Error('来源实例已变化，请重新复制')
       if(source.externalHome)validateExternalHome(this.root,source.externalHome)
     })
@@ -188,7 +189,7 @@ export class Instances {
     const input=copyExternalInstanceSchema.parse(raw),source=this.externalCopySource
     if(!source||source.purpose!=='copy'||source.view.ticket!==input.ticket||source.expires<this.now())throw new Error('复制来源选择已过期，请重新选择目录')
     this.verifyExternalSource(source)
-    this.beginCopy({id:source.view.ticket,name:source.view.name,directory:source.view.directory,external:true},input.details,()=>this.verifyExternalSource(source))
+    this.beginCopy({id:source.view.ticket,name:source.view.name,directory:source.view.directory,external:true},input.details,input.copyMode,()=>this.verifyExternalSource(source))
     this.externalCopySource=undefined
   }
   async attachExisting(raw:unknown):Promise<void> {
@@ -212,7 +213,7 @@ export class Instances {
       this.externalCopySource=undefined
     }finally{this.attaching.delete(controller)}
   }
-  private beginCopy(source:{id:string;name:string;directory:string;external?:boolean},details:InstanceInput,verify:()=>void):void {
+  private beginCopy(source:{id:string;name:string;directory:string;external?:boolean},details:InstanceInput,copyMode:InstanceCopyMode,verify:()=>void):void {
     if(this.copying())throw new Error('已有实例正在复制，请完成或取消后重试')
     if(this.store.read().instances?.some(item=>item.name.toLowerCase()===details.name.toLowerCase()))throw new Error('实例名称已存在')
     if((this.store.read().instances?.length??0)>=100)throw new Error('最多管理 100 个实例')
@@ -220,7 +221,7 @@ export class Instances {
     const account=this.store.read().accounts.find(value=>value.id===details.accountId)!
     const copiedSessionProvider=getInstanceClientAdapter(details.clientType).copiedSessionProvider(details,account)
     const id=randomUUID(),controller=new AbortController(),sourceHome=source.directory
-    const view:InstanceCopyView={id,sourceId:source.id,sourceName:source.name,sourceDirectory:sourceHome,external:source.external,name:details.name,status:'scanning',files:0,bytes:0,totalFiles:0,totalBytes:0,skipped:0}
+    const view:InstanceCopyView={id,sourceId:source.id,sourceName:source.name,sourceDirectory:sourceHome,external:source.external,name:details.name,copyMode,status:'scanning',files:0,bytes:0,totalFiles:0,totalBytes:0,skipped:0}
     const job={view,controller,accountId:details.accountId,task:undefined as Promise<void>|undefined};this.copy=job
     job.task=(async()=>{
       const staging=join(this.root,'instance-copies',id),target=join(this.root,'instances',id)
@@ -228,7 +229,9 @@ export class Instances {
       try{
         verify()
         controller.signal.throwIfAborted()
-        const manifest=await scanInstanceHome(sourceHome,controller.signal,true)
+        const manifest=copyMode==='sessions'
+          ?await scanSessionHome(sourceHome,controller.signal)
+          :await scanInstanceHome(sourceHome,controller.signal,true)
         Object.assign(view,{status:'copying',totalFiles:manifest.files,totalBytes:manifest.bytes,skipped:manifest.skipped})
         directory(join(this.root,'instance-copies'),true)
         await mkdir(staging,{mode:0o700});created=true;identity=lstatSync(staging)

@@ -16,7 +16,7 @@ import { createAPIAccount, editAccount, deleteAccounts } from '../src/main/accou
 import { TomlDocument,patchToml } from '../src/main/tomlPatch'
 import {mutateProvider} from '../src/main/providerLibrary'
 import {instanceProviderName} from '../src/main/instanceProviderName'
-import {builtInCatalog} from '../src/main/modelCatalog'
+import {builtInCatalog,parseNativeCatalog} from '../src/main/modelCatalog'
 import { MacDesktopRuntime, desktopEnvironment, macLaunchArgs, type DesktopRuntime, type DesktopPlan, type DesktopProcess } from '../src/main/instanceRuntime'
 
 class FixtureDesktop implements DesktopRuntime {
@@ -564,8 +564,8 @@ async function copyFinished(instances:Instances){
   const end=Date.now()+10000
   for(;;){const state=instances.copyView();if(state&&!['scanning','copying'].includes(state.status))return state;if(Date.now()>end)throw new Error('Copy timeout');await new Promise(resolve=>setTimeout(resolve,10))}
 }
-function copyInput(source:ReturnType<Instances['views']>[number],name:string,accountId=source.accountId){
-  return {id:source.id,revision:source.revision,details:{name,applicationId:source.applicationId,accountId,connectionMode:source.connectionMode,defaultTier:source.defaultTier,model:source.model,extraArgs:source.extraArgs,workingDirectoryId:source.workingDirectoryId}}
+function copyInput(source:ReturnType<Instances['views']>[number],name:string,accountId=source.accountId,copyMode:'sessions'|'full'='sessions'){
+  return {id:source.id,revision:source.revision,copyMode,details:{name,applicationId:source.applicationId,accountId,connectionMode:source.connectionMode,defaultTier:source.defaultTier,model:source.model,extraArgs:source.extraArgs,workingDirectoryId:source.workingDirectoryId}}
 }
 test('instance copy preserves complete profile files and launches independently with the selected API account',async t=>{
   const received:{key:string|undefined;tier:unknown}[]=[]
@@ -580,7 +580,7 @@ test('instance copy preserves complete profile files and launches independently 
   const state=Buffer.alloc(3*1024*1024,42);writeFileSync(join(source.directory,'opaque-state.bin'),state)
   symlinkSync('/does-not-exist',join(source.directory,'external-skill'))
   writeFileSync(join(source.desktopDirectory,'window-state'),'not a Codex home file')
-  f.instances.startCopy(copyInput(source,'Independent',selected.id))
+  f.instances.startCopy(copyInput(source,'Independent',selected.id,'full'))
   assert.equal(f.instances.inUse(source.id),true);assert.equal(f.instances.usesAccount(selected.id),true)
   assert.throws(()=>f.instances.save({id:source.id,revision:source.revision,details:copyInput(source,'Edited').details}),/停止/)
   const done=await copyFinished(f.instances);assert.equal(done.status,'completed',done.error);assert.equal(done.files,4);assert.equal(done.skipped,2)
@@ -596,6 +596,35 @@ test('instance copy preserves complete profile files and launches independently 
   assert.equal(response.status,200);await response.text();assert.deepEqual(received,[{key:'Bearer fixture-copy-selected',tier:'priority'}])
   await f.instances.stop(target.id);assert.equal(readFileSync(join(target.directory,'config.toml'),'utf8').trimStart(),config)
   assert.equal(readFileSync(join(source.directory,'auth.json'),'utf8').includes('do-not-clone-rotation'),true)
+})
+
+test('default instance copy migrates sessions only and reinitializes Chinese locale and ultra catalog',async t=>{
+  const menus=speedMenuFixture(),f=fixture(t,['zh-Hans-CN'],menus.service),account=f.account('http://127.0.0.1:9','fixture-copy-sessions',['gpt-5.6-sol'])
+  f.store.transaction(state=>{state.accounts.find(value=>value.id===account.id)!.modelContextWindows={'gpt-5.6-sol':500000}})
+  const source=f.add(account.id,'Session source','fast','gpt-5.6-sol')
+  const meta=JSON.stringify({type:'session_meta',payload:{id:'thread',model_provider:'original'}})+'\n',line=JSON.stringify({type:'response_item',payload:{text:'中文会话'}})+'\n'
+  writeFileSync(join(source.directory,'config.toml'),'model="source-model"\n[desktop]\nlocaleOverride="en-US"\n')
+  writeFileSync(join(source.directory,'auth.json'),'source-auth')
+  mkdirSync(join(source.directory,'skills'));writeFileSync(join(source.directory,'skills','tool.js'),'source-skill')
+  mkdirSync(join(source.directory,'sessions'))
+  writeFileSync(join(source.directory,'sessions','rollout-thread.jsonl'),meta+line)
+  f.instances.startCopy(copyInput(source,'Session only copy'))
+  const done=await copyFinished(f.instances)
+  assert.equal(done.status,'completed',done.error);assert.equal(done.copyMode,'sessions');assert.equal(done.files,1)
+  const target=f.instances.views().find(value=>value.id===done.targetId)!
+  assert.equal(existsSync(join(target.directory,'config.toml')),false)
+  assert.equal(existsSync(join(target.directory,'auth.json')),false)
+  assert.equal(existsSync(join(target.directory,'skills')),false)
+  const copiedSession=readFileSync(join(target.directory,'sessions','rollout-thread.jsonl'),'utf8')
+  assert.equal(copiedSession,meta.replace('"original"','"cml_instance"')+line)
+  const preview=f.instances.preview({id:target.id,revision:target.revision})
+  assert.equal(preview.desktopLocale,undefined);assert.equal(preview.desktopEffectiveLocale,'zh-CN');assert.equal(preview.speedMenuAvailable,true);assert.equal(preview.tier,'priority')
+  f.instances.start(preview.ticket);await f.instances.settled(target.id)
+  const config=connection(target.directory).doc, catalogPath=config.scalar(['model_catalog_json']) as string
+  assert.ok(catalogPath)
+  const catalog=parseNativeCatalog(readFileSync(catalogPath,'utf8')),model=catalog.models.find(entry=>entry.slug==='gpt-5.6-sol')!
+  assert.ok(model.supported_reasoning_levels.some(level=>level.effort==='ultra'))
+  await f.instances.stop(target.id)
 })
 
 test('external Cockpit history copy is visible under the launched local API provider without rewriting its source',async t=>{
@@ -614,7 +643,7 @@ test('external Cockpit history copy is visible under the launched local API prov
   }
   db.close();const originalDb=readFileSync(dbPath)
   const selected=f.instances.selectCopySource(source)
-  f.instances.startExternalCopy({ticket:selected.ticket,sourceClosed:true,details:{name:'Copied Cockpit',applicationId:f.app.id,accountId:account.id,model:'fixture-model',connectionMode:'local_api',extraArgs:[]}})
+  f.instances.startExternalCopy({ticket:selected.ticket,sourceClosed:true,copyMode:'sessions',details:{name:'Copied Cockpit',applicationId:f.app.id,accountId:account.id,model:'fixture-model',connectionMode:'local_api',extraArgs:[]}})
   const done=await copyFinished(f.instances);assert.equal(done.status,'completed',done.error)
   const target=f.instances.views().find(value=>value.id===done.targetId)!
   assert.equal(existsSync(join(target.directory,'auth.json')),false)
@@ -693,7 +722,7 @@ test('explicit external home copy is read-only, uses a single-use capability and
   const choice=f.instances.selectCopySource(source),details={name:'External copy',applicationId:f.app.id,accountId:account.id,model:'fixture-model',defaultTier:'fast',extraArgs:[]}
   assert.equal(readFileSync(join(source,'config.toml'),'utf8'),config)
   assert.throws(()=>f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:true,details,directory:source}))
-  f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:false,details})
+  f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:false,copyMode:'full',details})
   assert.equal(f.instances.inUse(registered.id),true)
   assert.throws(()=>configs.apply(edit.ticket),/停止实例/)
   assert.throws(()=>f.instances.startExternalCopy({ticket:choice.ticket,sourceClosed:true,details}),/过期/)

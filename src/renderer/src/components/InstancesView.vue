@@ -29,6 +29,7 @@ const discoveredSources=ref<ExternalInstanceSource[]>([]),discoveredSourceId=ref
 let discoveryRequest=0
 const sourceMode=ref<'copy'|'attach'>('copy'),editorFlow=ref<'wizard'|'direct'>('wizard')
 const historyMode=ref<'empty'|'copy'>('empty'),historySourceKind=ref<'instance'|'directory'>('instance')
+const copyMode=ref<'sessions'|'full'>('sessions')
 const sourceHistory=ref<InstanceHistorySummary>(),historyLoading=ref(false),historyError=ref('')
 const pendingCopyPreview=ref<string>()
 let historyRequest=0,launchRequest=0
@@ -317,6 +318,7 @@ function edit(instance?:InstanceView) {
   clearHistorySource();historyMode.value='empty';historySourceKind.value='instance';editorFlow.value='wizard'
   discoveredSources.value=[];discoveryError.value='';discoveryIssues.value=[]
   sourceMode.value='copy'
+  copyMode.value='sessions'
   editing.value=instance;clearValidation();manager.error='';generatedName='';launchMode.value=instance?.launchMode??'desktop'
   Object.assign(form,instance ? {clientType,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
     {clientType,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:accounts.value[0]?.id ?? '',connectionMode:'local_api',workingDirectoryId:undefined,defaultTier:'inherit',model:accounts.value[0]?.models[0] ?? '',extraArgs:[]})
@@ -328,6 +330,7 @@ function edit(instance?:InstanceView) {
 }
 async function duplicate(instance:InstanceView){
   edit(instance);editing.value=undefined;editorFlow.value='direct';historyMode.value='copy'
+  copyMode.value='sessions'
   form.name=copyName(instance.name);generatedName=''
   await chooseHistoryInstance(instance.id)
 }
@@ -341,7 +344,7 @@ async function chooseExternal(mode:'copy'|'attach'){
   busy.value=true;error.value=''
   try{
     const source=await (mode==='attach'?window.manager.chooseExistingInstanceDirectory():window.manager.chooseInstanceCopySource())
-    if(source&&generation===draftGeneration){edit();editorFlow.value='direct';historyMode.value='copy';historySourceKind.value='directory';externalSource.value=source;sourceMode.value=mode;form.name=mode==='attach'?source.name.slice(0,120):copyName(source.name);generatedName=''}
+    if(source&&generation===draftGeneration){edit();editorFlow.value='direct';historyMode.value='copy';historySourceKind.value='directory';externalSource.value=source;sourceMode.value=mode;copyMode.value='sessions';form.name=mode==='attach'?source.name.slice(0,120):copyName(source.name);generatedName=''}
   }catch(cause){error.value=String(cause)}finally{busy.value=false}
 }
 async function cancelCopy(){cancelCopyPreview();if(copyJob.value)await manager.execute(()=>window.manager.cancelInstanceCopy(copyJob.value!.id))}
@@ -371,7 +374,7 @@ async function save(previewAfter=false) {
   const attach=attachingForm.value,previousIds=new Set(instances.value.map(instance=>instance.id)),editingId=editing.value?.id
   committing.value=true
   let savedOk=false
-  try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
+  try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,copyMode:copyMode.value,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,copyMode:copyMode.value,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
   finally{committing.value=false}
   if(savedOk&&open.value&&generation===draftGeneration) {
     closeEditor();message.success(attach?'已有目录已登记':source||external?'正在复制实例':'实例已保存')
@@ -409,7 +412,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
   <section class="instances-panel">
     <div class="page-heading"><div><h1>实例</h1><p>选择客户端和兼容资源，从一个入口启动独立工作空间。</p></div><a-space wrap><a-button v-if="instances.some(value=>value.status!=='stopped')" @click="stopAll">停止全部</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('copy')">从已有目录复制</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('attach')">使用已有目录</a-button><a-button type="primary" @click="edit()"><PlusOutlined />创建实例</a-button></a-space></div>
     <a-alert v-if="error&&!open&&!preview" type="error" :message="error" class="error-banner" />
-    <a-card v-if="copyJob" class="instance-copy-job" size="small"><strong>{{copyJob.sourceName}} → {{copyJob.name}}</strong><p>{{copyJob.status==='scanning'?'正在检查来源':copyJob.status==='copying'?'正在创建独立快照':copyJob.status==='completed'?'副本已创建':copyJob.status==='cancelled'?'复制已取消':'复制未完成'}} · {{copyJob.files}} / {{copyJob.totalFiles}} 个文件 · {{size(copyJob.bytes)}} / {{size(copyJob.totalBytes)}}</p><a-progress v-if="copyRunning" :percent="copyJob.totalBytes?Math.min(99,Math.floor(copyJob.bytes/copyJob.totalBytes*100)):0" :show-info="false" /><p v-if="copyJob.skipped" class="muted">已排除 {{copyJob.skipped}} 项登录文件、临时或缓存目录、工作树、后台状态及链接。</p><a-alert v-if="copyJob.omittedSessions" :message="`已跳过 ${copyJob.omittedSessions} 条文件已缺失的会话索引，来源数据未修改。`" type="warning" show-icon /><a-alert v-if="copyJob.error" :message="copyJob.error" type="error" /><a-space><a-button v-if="copyRunning" @click="cancelCopy">取消复制</a-button><template v-if="pendingCopyPreview===copyJob.id"><span class="muted">完成后打开启动预览</span><a-button type="link" @click="cancelCopyPreview">取消自动预览</a-button></template></a-space></a-card>
+    <a-card v-if="copyJob" class="instance-copy-job" size="small"><strong>{{copyJob.sourceName}} → {{copyJob.name}}</strong><p>{{copyJob.status==='scanning'?'正在检查来源':copyJob.status==='copying'?'正在创建会话快照':copyJob.status==='completed'?'副本已创建':copyJob.status==='cancelled'?'复制已取消':'复制未完成'}} · {{copyJob.copyMode==='full'?'完整复制':'仅迁移会话'}} · {{copyJob.files}} / {{copyJob.totalFiles}} 个文件 · {{size(copyJob.bytes)}} / {{size(copyJob.totalBytes)}}</p><a-progress v-if="copyRunning" :percent="copyJob.totalBytes?Math.min(99,Math.floor(copyJob.bytes/copyJob.totalBytes*100)):0" :show-info="false" /><p v-if="copyJob.copyMode==='sessions'" class="muted">只迁移会话 JSONL、会话索引数据库和项目分组状态；账号、配置、技能、缓存与桌面状态由新实例重新生成。</p><p v-else-if="copyJob.skipped" class="muted">已排除 {{copyJob.skipped}} 项登录文件、临时或缓存目录、工作树、后台状态及链接。</p><a-alert v-if="copyJob.omittedSessions" :message="`已跳过 ${copyJob.omittedSessions} 条文件已缺失的会话索引，来源数据未修改。`" type="warning" show-icon /><a-alert v-if="copyJob.error" :message="copyJob.error" type="error" /><a-space><a-button v-if="copyRunning" @click="cancelCopy">取消复制</a-button><template v-if="pendingCopyPreview===copyJob.id"><span class="muted">完成后打开启动预览</span><a-button type="link" @click="cancelCopyPreview">取消自动预览</a-button></template></a-space></a-card>
     <div class="toolbar"><a-input v-model:value="search" allow-clear placeholder="搜索实例、账号或模型" style="max-width:360px" @change="page=1" /><span class="toolbar-spacer" /><span class="muted">{{ instances.length }} 个实例</span><a-button @click="manager.load">刷新状态</a-button></div>
     <div v-if="!instances.length" class="empty-panel"><div class="empty-icon"><DesktopOutlined /></div><h2>创建你的第一个实例</h2><p>选择客户端 → 选择账号或供应商 → 配置项目 → 启动。<br>配置与会话独立保存，供应商密钥可供兼容实例复用。</p><a-button type="primary" @click="edit()">创建实例</a-button></div>
     <a-empty v-else-if="!filtered.length" description="没有匹配的实例" />
@@ -443,7 +446,8 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
         </div>
       </template>
       <a-form layout="vertical" class="instance-editor" :class="{'instance-wizard':wizard}">
-        <a-alert v-if="copyingForm&&!wizard" type="info" :message="'从“'+copySourceName+'”复制配置、会话和技能，并将副本内部的会话与模型目录路径指向新目录。文件登录令牌不复制，启动时使用下方绑定账号。项目分组与会话会复制，项目文件不会复制。'" class="instance-copy-explanation error-banner" />
+        <a-alert v-if="copyingForm&&!wizard" type="info" :message="copyMode==='sessions'?'从“'+copySourceName+'”仅迁移会话与项目分组；新实例的语言、模型目录、推理档位和连接配置按当前设置重新生成。':'从“'+copySourceName+'”复制配置、会话和技能，并将副本内部的会话与模型目录路径指向新目录。文件登录令牌不复制，启动时使用下方绑定账号。项目文件不会复制。'" class="instance-copy-explanation error-banner" />
+        <a-form-item v-if="copyingForm&&!attachingForm" label="迁移内容" class="instance-copy-mode"><a-radio-group v-model:value="copyMode" aria-label="实例复制内容"><a-radio value="sessions">仅迁移会话（推荐）</a-radio><a-radio value="full">完整复制（高级）</a-radio></a-radio-group><p class="muted">仅迁移会话通常只有几 MB；完整复制会带上来源配置、技能和其他普通文件，可能很大。</p></a-form-item>
         <a-alert v-if="attachingForm" class="instance-attach-explanation error-banner" type="info" message="直接使用所选目录，不复制文件。登记不会改写配置；启动时应用绑定账号和设置，停止后回收登录状态并恢复配置。移除实例会保留此目录。" />
         <div v-if="externalSource&&!wizard" class="external-copy-source"><p class="instance-path">{{attachingForm?'已有目录':'来源'}}：{{externalSource.directory}}</p><p class="muted">{{attachingForm?'请先关闭使用此目录的客户端；此实例运行时，不要再由其他客户端同时使用该目录。':'复制已保存历史的独立快照，来源可以继续使用。复制完成后的新消息不会同步；配置中的其他 API 密钥会随配置复制，链接会跳过。'}}</p><a-checkbox v-if="attachingForm" v-model:checked="sourceClosed" aria-label="来源客户端已关闭">我已关闭使用此目录的客户端</a-checkbox></div>
         <template v-if="copyingForm&&!wizard"><p v-if="historyLoading" class="muted">正在读取项目与会话概况…</p><a-alert v-if="historyError" type="error" :message="historyError" /><InstanceHistoryOverview v-if="chosenHistory" :history="chosenHistory" aria-label="所选会话概况" /></template>
@@ -522,7 +526,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
           </a-collapse-panel></a-collapse>
         </section>
         <section v-if="wizard&&step===3" class="instance-step instance-confirm" data-step="3">
-          <a-descriptions :column="1" bordered size="small"><a-descriptions-item label="客户端">{{client.name}} · {{launchMode==='cli'?'CLI 终端':'桌面应用'}}</a-descriptions-item><a-descriptions-item label="资源">{{resourceLabel}}</a-descriptions-item><a-descriptions-item label="实例">{{form.name}}</a-descriptions-item><a-descriptions-item label="会话来源">{{historyMode==='copy'?'复制 · '+historySourceLabel:'空白会话'}}</a-descriptions-item><a-descriptions-item label="项目">{{launchMode==='cli'?(workingDirectories.find(item=>item.id===form.workingDirectoryId)?.path??'独立工作目录'):'启动后在 Codex 中选择'}}</a-descriptions-item><a-descriptions-item label="模型">{{form.model}}</a-descriptions-item><a-descriptions-item v-if="client.capabilities.contextWindow" label="上下文默认值">{{contextLabel}}</a-descriptions-item><a-descriptions-item label="接入方式">{{modeName(form.connectionMode)}}</a-descriptions-item></a-descriptions>
+          <a-descriptions :column="1" bordered size="small"><a-descriptions-item label="客户端">{{client.name}} · {{launchMode==='cli'?'CLI 终端':'桌面应用'}}</a-descriptions-item><a-descriptions-item label="资源">{{resourceLabel}}</a-descriptions-item><a-descriptions-item label="实例">{{form.name}}</a-descriptions-item><a-descriptions-item label="会话来源">{{historyMode==='copy'?'复制 · '+historySourceLabel:'空白会话'}}</a-descriptions-item><a-descriptions-item v-if="historyMode==='copy'" label="迁移内容">{{copyMode==='sessions'?'仅迁移会话':'完整复制'}}</a-descriptions-item><a-descriptions-item label="项目">{{launchMode==='cli'?(workingDirectories.find(item=>item.id===form.workingDirectoryId)?.path??'独立工作目录'):'启动后在 Codex 中选择'}}</a-descriptions-item><a-descriptions-item label="模型">{{form.model}}</a-descriptions-item><a-descriptions-item v-if="client.capabilities.contextWindow" label="上下文默认值">{{contextLabel}}</a-descriptions-item><a-descriptions-item label="接入方式">{{modeName(form.connectionMode)}}</a-descriptions-item></a-descriptions>
 <InstanceHistoryOverview v-if="chosenHistory" :history="chosenHistory" aria-label="所选会话概况" />
           <p class="muted">{{historyMode==='copy'?'复制完成后查看项目分组与实际启动预览，确认后才启动客户端。':'创建后查看实际启动预览，确认后才启动客户端。'}}</p>
         </section>

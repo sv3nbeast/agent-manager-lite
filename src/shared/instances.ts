@@ -3,6 +3,8 @@ import { defaultTierSchema } from './types'
 import { agentClientTypeSchema, type AgentClientType } from './agentClients'
 
 const text = z.string().trim().min(1).max(120).refine(value=>!/[\x00-\x1f\x7f]/.test(value))
+export const instanceCopyModeSchema=z.enum(['sessions','full']).default('sessions')
+export type InstanceCopyMode=z.infer<typeof instanceCopyModeSchema>
 export const instanceInputSchema = z.object({
   clientType:agentClientTypeSchema.default('codex'),
   name:text, applicationId:z.string().min(1).max(100), accountId:z.string().uuid(),
@@ -58,7 +60,7 @@ export interface InstanceHistorySummary {
 }
 export const instanceRevisionSchema=z.object({id:z.string().uuid(),revision:z.number().int().nonnegative()}).strict()
 export const saveInstanceSchema=z.object({id:z.string().uuid().optional(),revision:z.number().int().nonnegative().optional(),details:instanceInputSchema}).strict()
-export const copyInstanceSchema=instanceRevisionSchema.extend({details:instanceInputSchema}).strict()
+export const copyInstanceSchema=instanceRevisionSchema.extend({copyMode:instanceCopyModeSchema,details:instanceInputSchema}).strict()
 export type InstanceCopyInput=z.infer<typeof copyInstanceSchema>
 export interface InstanceCopySource {ticket:string;name:string;directory:string;history?:InstanceHistorySummary}
 export interface ExternalInstanceSource {
@@ -66,12 +68,12 @@ export interface ExternalInstanceSource {
   launchMode:'desktop'|'cli';runtimeState:'running'|'not_detected'|'unknown'
 }
 export interface ExternalInstanceDiscovery {sources:ExternalInstanceSource[];issues:string[]}
-export const copyExternalInstanceSchema=z.object({ticket:z.string().uuid(),sourceClosed:z.boolean().optional(),details:instanceInputSchema}).strict()
+export const copyExternalInstanceSchema=z.object({ticket:z.string().uuid(),sourceClosed:z.boolean().optional(),copyMode:instanceCopyModeSchema,details:instanceInputSchema}).strict()
 export type ExternalInstanceCopyInput=z.infer<typeof copyExternalInstanceSchema>
-export const attachInstanceSchema=copyExternalInstanceSchema.extend({sourceClosed:z.literal(true)})
+export const attachInstanceSchema=copyExternalInstanceSchema.omit({copyMode:true}).extend({sourceClosed:z.literal(true)})
 export type AttachInstanceInput=z.infer<typeof attachInstanceSchema>
 export interface InstanceCopyView {
   id:string;sourceId:string;sourceName:string;name:string;targetId?:string
-  sourceDirectory?:string;external?:boolean;omittedSessions?:number
+  sourceDirectory?:string;external?:boolean;omittedSessions?:number;copyMode?:InstanceCopyMode
   status:'scanning'|'copying'|'completed'|'cancelled'|'failed';files:number;bytes:number;totalFiles:number;totalBytes:number;skipped:number;error?:string
 }

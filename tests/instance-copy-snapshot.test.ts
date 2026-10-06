@@ -5,6 +5,7 @@ import {join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {DatabaseSync} from 'node:sqlite'
 import {scanInstanceHome,copyInstanceHome,relocateCopiedProfile} from '../src/main/instanceCopy'
+import {scanSessionHome} from '../src/main/instanceSessionCopy'
 import {copySavedInstanceHome} from '../src/main/instanceCopySnapshot'
 
 const supported=process.platform==='darwin'
@@ -15,6 +16,34 @@ function fixture(t:{after(fn:()=>void):void}){
 }
 const meta=JSON.stringify({type:'session_meta',payload:{id:'thread',model_provider:'original'}})+'\n'
 const line=JSON.stringify({type:'response_item',payload:{text:'完整内容 汉字 😀'}})+'\n'
+
+test('session-only inventory ignores large configuration, skills, caches and desktop state',async t=>{
+  const f=fixture(t)
+  mkdirSync(join(f.source,'skills'));mkdirSync(join(f.source,'cache'));mkdirSync(join(f.source,'desktop-state'))
+  writeFileSync(join(f.source,'config.toml'),'model="source"\n[desktop]\nlocaleOverride="en-US"\n')
+  writeFileSync(join(f.source,'skills','tool.js'),'x'.repeat(2*1024*1024))
+  writeFileSync(join(f.source,'cache','large.bin'),'x'.repeat(3*1024*1024))
+  writeFileSync(join(f.source,'desktop-state','window.json'),'x'.repeat(1024))
+  writeFileSync(join(f.source,'.codex-global-state.json'),JSON.stringify({'local-projects':{project:{id:'project',name:'中文项目',rootPaths:['/fixture/project']}},unrelated:'drop'}))
+  writeFileSync(join(f.source,'sessions','rollout-thread.jsonl'),meta+line)
+  const manifest=await scanSessionHome(f.source,f.signal)
+  assert.equal(manifest.files,2)
+  assert.ok(manifest.bytes<1024*1024)
+  assert.deepEqual(manifest.entries.filter(entry=>!entry.directory).map(entry=>entry.relative).sort(),['.codex-global-state.json','sessions/rollout-thread.jsonl'])
+  const saved=await copySavedInstanceHome(manifest,f.target,f.signal,()=>{})
+  assert.equal(existsSync(join(f.target,'config.toml')),false)
+  assert.equal(existsSync(join(f.target,'skills')),false)
+  assert.equal(existsSync(join(f.target,'cache')),false)
+  assert.equal(readFileSync(join(f.target,'sessions','rollout-thread.jsonl'),'utf8'),meta+line)
+  assert.deepEqual(JSON.parse(readFileSync(join(f.target,'.codex-global-state.json'),'utf8')),{'local-projects':{project:{id:'project',name:'中文项目',rootPaths:['/fixture/project']}}})
+  assert.equal(saved.files,2)
+})
+
+test('session-only inventory refuses a database configured outside the selected home',async t=>{
+  const f=fixture(t),outside=join(f.root,'outside-db')
+  mkdirSync(outside);writeFileSync(join(f.source,'config.toml'),`sqlite_home = ${JSON.stringify(outside)}\n`)
+  await assert.rejects(scanSessionHome(f.source,f.signal),/目录外/)
+})
 
 test('snapshot copies an appended active rollout that the old frozen metadata copier rejects, without sharing writes',{skip:!supported},async t=>{
   const f=fixture(t),file=join(f.source,'sessions','rollout-thread.jsonl')
