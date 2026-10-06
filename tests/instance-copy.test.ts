@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,renameSync,symlinkSync,readdirSync} from 'node:fs'
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,renameSync,symlinkSync,readdirSync,existsSync} from 'node:fs'
 import {join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {copyInstanceHome,scanInstanceHome,relocateCopiedProfile} from '../src/main/instanceCopy'
@@ -31,6 +31,48 @@ test('file login exclusion is case insensitive on case-insensitive filesystems',
   const f=fixture(t),signal=new AbortController().signal;writeFileSync(join(f.source,'AUTH.JSON'),'fixture-sensitive-login')
   const manifest=await scanInstanceHome(f.source,signal);assert.equal(manifest.files,0);assert.equal(manifest.skipped,1)
   await copyInstanceHome(manifest,f.target,signal,()=>{});assert.throws(()=>readFileSync(join(f.target,'AUTH.JSON')),/ENOENT/)
+})
+
+test('profile copy prunes top-level runtime trees before walking them and retains nested user data with the same names',async t=>{
+  const f=fixture(t),signal=new AbortController().signal
+  // These trees exceed the depth budget if visited. Skipping them must prune
+  // traversal, rather than simply hide their files after a full inventory.
+  for(const name of ['.TMP','tmp','cache','log','ipc','app-server-control','worktrees']){
+    const deep=join(f.source,name,...Array.from({length:65},()=> 'nested'))
+    mkdirSync(deep,{recursive:true});writeFileSync(join(deep,'runtime'),'not history')
+  }
+  for(const path of ['sessions/tmp/rollout.jsonl','archived_sessions/cache/rollout.jsonl','skills/worktrees/tool.txt','attachments/tmp/image.txt','worktrees-extra/source.ts']){
+    mkdirSync(join(f.source,path,'..'),{recursive:true});writeFileSync(join(f.source,path),'retained '+path)
+  }
+  writeFileSync(join(f.source,'config.toml'),'model="fixture-model"\n')
+  const manifest=await scanInstanceHome(f.source,signal)
+  assert.equal(manifest.files,6);assert.equal(manifest.skipped,7)
+  await copyInstanceHome(manifest,f.target,signal,()=>{})
+  for(const path of ['sessions/tmp/rollout.jsonl','archived_sessions/cache/rollout.jsonl','skills/worktrees/tool.txt','attachments/tmp/image.txt','worktrees-extra/source.ts'])assert.equal(readFileSync(join(f.target,path),'utf8'),'retained '+path)
+  for(const name of ['.TMP','tmp','cache','log','ipc','app-server-control','worktrees'])assert.equal(existsSync(join(f.target,name)),false)
+})
+
+test('changing an existing excluded cache file does not invalidate a copy of saved history',async t=>{
+  const f=fixture(t),signal=new AbortController().signal
+  mkdirSync(join(f.source,'cache'));writeFileSync(join(f.source,'cache','runtime'),'before')
+  mkdirSync(join(f.source,'sessions'));writeFileSync(join(f.source,'sessions','rollout.jsonl'),'saved history')
+  const manifest=await scanInstanceHome(f.source,signal)
+  await copyInstanceHome(manifest,f.target,signal,files=>{if(files===1)writeFileSync(join(f.source,'cache','runtime'),'after')})
+  assert.equal(readFileSync(join(f.target,'sessions','rollout.jsonl'),'utf8'),'saved history');assert.equal(existsSync(join(f.target,'cache')),false)
+})
+
+test('configured databases and catalogues inside excluded trees fail explicitly while log paths regenerate independently',async t=>{
+  const f=fixture(t),signal=new AbortController().signal,finalHome=join(f.root,'final')
+  for(const field of ['sqlite_home','model_catalog_json'])for(const value of ['tmp/custom',join(f.source,'cache','custom')]){
+    writeFileSync(join(f.source,'config.toml'),field+'='+JSON.stringify(value)+'\n')
+    const manifest=await scanInstanceHome(f.source,signal);await copyInstanceHome(manifest,f.target,signal,()=>{})
+    await assert.rejects(relocateCopiedProfile(manifest,f.target,finalHome,signal),/依赖未复制/)
+    rmSync(f.target,{recursive:true,force:true})
+  }
+  writeFileSync(join(f.source,'config.toml'),'log_dir='+JSON.stringify(join(f.source,'log'))+'\n')
+  const manifest=await scanInstanceHome(f.source,signal);await copyInstanceHome(manifest,f.target,signal,()=>{})
+  await relocateCopiedProfile(manifest,f.target,finalHome,signal)
+  assert.equal(new TomlDocument(readFileSync(join(f.target,'config.toml'),'utf8')).scalar(['log_dir']),join(finalHome,'log'))
 })
 
 test('copy relocates actual SQLite rollout references and managed catalogs without changing source or conversation content',async t=>{

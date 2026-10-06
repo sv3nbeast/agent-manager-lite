@@ -23,14 +23,14 @@ function source(){return {
 test('project state projection preserves project membership, names and order without desktop identity or permissions',()=>{
   const input=source(),raw=JSON.stringify(input),state=projectCopiedProjectState(raw,{sourceHome:'/source/home',targetHome:'/target/home',threadIds:new Set(['thread','projectless'])})
   assert.deepEqual(state,{
-    'local-projects':{legacy:{id:'legacy',name:'中文项目',rootPaths:['/external/project','/target/home/worktrees/a'],createdAt:123,updatedAt:456}},
-    'electron-saved-workspace-roots':['/external/project','/target/home/worktrees/a','/source/home-other'],
-    'electron-workspace-root-labels':{'/external/project':'外部项目','/target/home/worktrees/a':'实例工作树'},
-    'project-order':['legacy','/target/home/worktrees/a'],
+    'local-projects':{legacy:{id:'legacy',name:'中文项目',rootPaths:['/external/project','/source/home/worktrees/a'],createdAt:123,updatedAt:456}},
+    'electron-saved-workspace-roots':['/external/project','/source/home/worktrees/a','/source/home-other'],
+    'electron-workspace-root-labels':{'/external/project':'外部项目','/source/home/worktrees/a':'实例工作树'},
+    'project-order':['legacy','/source/home/worktrees/a'],
     'thread-project-assignments':{thread:{projectId:'legacy',projectKind:'local'}},
     'projectless-thread-ids':['projectless'],'pinned-thread-ids':['thread'],'pinned-project-ids':['legacy'],
     'thread-workspace-root-hints':{thread:'/external/project'},
-    'thread-projectless-output-directories':{projectless:'/target/home/worktrees/a'},
+    'thread-projectless-output-directories':{projectless:'/source/home/worktrees/a'},
     'sidebar-project-thread-orders':{legacy:{threadIds:['thread'],sortKey:'updated_at'}},
     'app-server-project-id-by-legacy-project-id-by-host':{'local:/target/home':{legacy:'server-uuid'}},
     'app-server-projects-migration-by-host':{'local:/target/home':{version:1,projectsMigrated:true,threadAssignmentsMigrated:false,threadAssignmentsReadMigrated:false,pendingThreadAssignmentIds:['thread']}}

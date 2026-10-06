@@ -11,6 +11,7 @@ import {homedir} from 'node:os'
 import {atomic,readBounded} from './clientConfig'
 import {TomlDocument,patchToml,scalarRaw,type TomlEdit} from './tomlPatch'
 import {copiedProjectStateFile,copiedProjectStateLimit,projectCopiedProjectState} from './copiedProjectState'
+import {excludedInstanceCopyTree} from './instanceCopyScope'
 
 interface Entry {relative:string;directory:boolean;dev:number;ino:number;size:number;mtime:number;ctime:number;mode:number}
 export interface CopyManifest {root:string;entries:Entry[];files:number;bytes:number;skipped:number;digest:string}
@@ -39,7 +40,7 @@ export async function scanInstanceHome(root:string,signal:AbortSignal):Promise<C
       const child=join(relative,name),stat=await lstat(join(root,child))
       // A second copy of a refresh-token chain must never become a login owner.
       // Live daemon state is regenerated; do not carry stale PID/control files.
-      if(!relative&&['auth.json','app-server-control'].includes(name.toLowerCase())||!stat.isFile()&&!stat.isDirectory()){
+      if(excludedInstanceCopyTree(child)||!relative&&name.toLowerCase()==='auth.json'||!stat.isFile()&&!stat.isDirectory()){
         skipped++;skippedEntries.push(signature(child,stat));continue
       }
       if(stat.isDirectory())await walk(child,depth+1)
@@ -144,6 +145,8 @@ export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:str
         const expanded=value.startsWith('~/')?join(homedir(),value.slice(2)):value
         const next=localPath(expanded)
         const suffix=relative(manifest.root,join(manifest.root,expanded))
+        const localSuffix=isAbsolute(expanded)?relative(manifest.root,expanded):suffix
+        if(key!=='log_dir'&&excludedInstanceCopyTree(localSuffix))throw new Error('来源配置依赖未复制的临时或工作树目录，请将模型目录和会话数据库移入配置目录后再复制')
         if(key==='sqlite_home'&&!next&&(isAbsolute(expanded)||suffix==='..'||suffix.startsWith('..'+sep)))throw new Error('来源使用了目录外的会话数据库，请先将会话库迁入实例目录后复制')
         if(next)edits.push({path,raw:scalarRaw(next)})
       }
@@ -192,7 +195,10 @@ export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:str
           }
           await setImmediate()
         }
-        await relocateCopiedProjectRoots(db,localPath,signal)
+        await relocateCopiedProjectRoots(db,value=>{
+          const suffix=relative(manifest.root,value)
+          return excludedInstanceCopyTree(suffix)?undefined:localPath(value)
+        },signal)
         db.exec('COMMIT')
       }catch(error){db.exec('ROLLBACK');throw error}
     }catch(error){

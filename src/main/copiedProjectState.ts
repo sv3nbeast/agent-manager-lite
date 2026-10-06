@@ -1,4 +1,5 @@
 import {isAbsolute,join,relative,sep} from 'node:path'
+import {excludedInstanceCopyTree} from './instanceCopyScope'
 
 export const copiedProjectStateFile='.codex-global-state.json'
 export const copiedProjectStateLimit=16*1024*1024
@@ -24,7 +25,9 @@ export function projectCopiedProjectState(raw:string,options:ProjectCopyOptions=
   const path=(value:string):string=>{
     if(!options.sourceHome||!options.targetHome||!isAbsolute(value))return value
     const suffix=relative(options.sourceHome,value)
-    return suffix==='..'||suffix.startsWith('..'+sep)||isAbsolute(suffix)?value:join(options.targetHome,suffix)
+    // Project checkouts remain at their original paths. Only copied profile
+    // data is relocated, avoiding project roots pointing at absent worktrees.
+    return suffix==='..'||suffix.startsWith('..'+sep)||isAbsolute(suffix)||excludedInstanceCopyTree(suffix)?value:join(options.targetHome,suffix)
   }
   const included=(id:string)=>!options.threadIds||options.threadIds.has(id)
   for(const key of ['electron-saved-workspace-roots','project-order'])if(own(source,key))state[key]=list(source[key],key).map(path)
