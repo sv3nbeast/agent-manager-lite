@@ -44,6 +44,8 @@ function seedHistory(home) {
   db.close()
   fs.writeFileSync(join(home, '.codex-global-state.json'), JSON.stringify({ 'local-projects': Object.fromEntries(projects.map(project => [project.id, { id: project.id, name: project.name, rootPaths: [project.path], createdAt: now, updatedAt: now }])),
     'project-order': projects.map(project => project.id), 'thread-project-assignments': assignments, 'projectless-thread-ids': projectless }))
+  fs.writeFileSync(join(home, '.codex-global-state.json.bak'), JSON.stringify({ 'project-order': ['obsolete-project'], 'source-login-state': 'fixture-excluded' }))
+  fs.writeFileSync(join(home, '..codex-global-state.json.tmp-fixture'), '{"project-order":[')
   return ids
 }
 const external = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'aml-history-source-'))); seedHistory(external)
@@ -263,6 +265,11 @@ app.on('browser-window-created', (_event, window) => {
       await wait('(async()=>{const s=await window.manager.load();return s.instanceCopy?.status==="completed"&&s.instances.length===3})()')
       snapshot = await run('window.manager.load()')
       assert.equal(snapshot.instances.length, 3); assert.ok(snapshot.instances.every(instance => instance.status === 'stopped'))
+      const copiedExternal = snapshot.instances.find(instance => instance.id === snapshot.instanceCopy.targetId)
+      assert.ok(copiedExternal)
+      assert.equal(fs.existsSync(join(copiedExternal.directory, '.codex-global-state.json.bak')), false)
+      assert.equal(fs.existsSync(join(copiedExternal.directory, '..codex-global-state.json.tmp-fixture')), false)
+      assert.equal(Object.keys(JSON.parse(fs.readFileSync(join(copiedExternal.directory, '.codex-global-state.json'), 'utf8'))['local-projects']).length, 12)
       assert.equal(snapshot.instanceCopy.omittedSessions,1)
       await wait('document.querySelector(".instance-copy-job .ant-alert-warning")?.innerText.includes("已跳过 1 条")')
       await capture('snapshot-stale-index-notice.png')

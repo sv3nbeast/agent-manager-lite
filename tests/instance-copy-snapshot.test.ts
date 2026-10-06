@@ -107,6 +107,38 @@ test('atomic desktop project-state replacement can be snapshotted while symlink 
   await assert.rejects(copySavedInstanceHome(again,join(f.root,'rejected'),f.signal,()=>{}))
 })
 
+test('desktop backup rotation and disappearing write temporaries cannot interrupt a history copy or replace project grouping',{skip:!supported},async t=>{
+  for(const disappearTemporaries of [false,true]){
+    const f=fixture(t),state=join(f.source,'.codex-global-state.json')
+    const project={'local-projects':{project:{id:'project',name:'中文项目',rootPaths:['/external/project']}},'project-order':['project']}
+    writeFileSync(state,JSON.stringify({...project,'source-login-state':'fixture-excluded'}))
+    writeFileSync(join(f.source,'sessions','rollout-thread.jsonl'),meta+line)
+    const artifacts=['.codex-global-state.json.bak','.codex-global-state.json.bak.bak','..codex-global-state.json.tmp-123-fixture','..codex-global-state.json.bak.tmp-123-fixture']
+    for(const name of artifacts)writeFileSync(join(f.source,name),'original backup or unfinished write')
+    mkdirSync(join(f.source,'attachments'))
+    writeFileSync(join(f.source,'attachments','.codex-global-state.json.bak'),'user attachment retained')
+    const manifest=await scanInstanceHome(f.source,f.signal,true)
+    writeFileSync(join(f.source,artifacts[0]),'rotated while copying')
+    if(disappearTemporaries)for(const name of artifacts.slice(1))rmSync(join(f.source,name))
+    const saved=await copySavedInstanceHome(manifest,f.target,f.signal,()=>{})
+    await relocateCopiedProfile(saved,f.target,join(f.root,'final'),f.signal,'cml_instance')
+    assert.deepEqual(JSON.parse(readFileSync(join(f.target,'.codex-global-state.json'),'utf8')),project)
+    assert.equal(readFileSync(join(f.target,'sessions','rollout-thread.jsonl'),'utf8').includes('完整内容 汉字 😀'),true)
+    assert.equal(readFileSync(join(f.target,'attachments','.codex-global-state.json.bak'),'utf8'),'user attachment retained')
+    for(const name of artifacts)assert.equal(existsSync(join(f.target,name)),false)
+    assert.equal(readFileSync(join(f.source,artifacts[0]),'utf8'),'rotated while copying')
+    assert.equal(JSON.parse(readFileSync(state,'utf8'))['source-login-state'],'fixture-excluded')
+  }
+})
+
+test('a valid desktop backup cannot mask an incomplete primary project state',{skip:!supported},async t=>{
+  const f=fixture(t)
+  writeFileSync(join(f.source,'.codex-global-state.json'),'{"project-order":[')
+  writeFileSync(join(f.source,'.codex-global-state.json.bak'),JSON.stringify({'project-order':['old']}))
+  const manifest=await scanInstanceHome(f.source,f.signal,true)
+  await assert.rejects(copySavedInstanceHome(manifest,f.target,f.signal,()=>{}),/项目分组状态格式不兼容/)
+})
+
 test('snapshot refuses unsafe SQLite companions and never writes through a source link',{skip:!supported},async t=>{
   const f=fixture(t),path=join(f.source,'state_5.sqlite'),db=new DatabaseSync(path)
   db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)');db.close()

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -26,11 +27,15 @@ func TestManagedCredentialReloadAppliesOnlyScopedExistingIdentity(t *testing.T) 
 		t.Fatal(err)
 	}
 	path := filepath.Join(authDir, "test-auth.json")
-	write := func(token, identity string) {
+	write := func(token, identity string) []byte {
 		t.Helper()
-		if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"type":"codex","access_token":%q,"account_id":%q}`, token, identity)), 0600); err != nil {
+		// Match the parent application's projection: generic background refresh
+		// must not write over a desktop-owned credential file.
+		data := []byte(fmt.Sprintf(`{"type":"codex","access_token":%q,"account_id":%q,"refresh_owner":"codex_manager_lite"}`, token, identity))
+		if err := os.WriteFile(path, data, 0600); err != nil {
 			t.Fatal(err)
 		}
+		return data
 	}
 	write("old-token-fixture", "chat-account")
 	account := &accountSpec{ID: "account-one", AuthID: "test-auth.json", AuthKind: "oauth", ChatGPTAccountID: "chat-account"}
@@ -52,7 +57,7 @@ func TestManagedCredentialReloadAppliesOnlyScopedExistingIdentity(t *testing.T) 
 		router.ServeHTTP(res, req)
 		return res.Code
 	}
-	write("new-token-fixture", "chat-account")
+	projection := write("new-token-fixture", "chat-account")
 	if status := call(public.Key, `{"accountIds":["account-one"]}`); status != 403 {
 		t.Fatalf("public key status=%d", status)
 	}
@@ -70,12 +75,18 @@ func TestManagedCredentialReloadAppliesOnlyScopedExistingIdentity(t *testing.T) 
 	if auth.Metadata["access_token"] != "new-token-fixture" {
 		t.Fatal("new token was not applied to runtime")
 	}
-	write("wrong-identity-token", "another-chat-account")
+	if disk, err := os.ReadFile(path); err != nil || !bytes.Equal(disk, projection) {
+		t.Fatal("runtime changed the desktop-owned projection")
+	}
+	projection = write("wrong-identity-token", "another-chat-account")
 	if status := call(internal.Key, `{"accountIds":["account-one"]}`); status != 409 {
 		t.Fatalf("identity status=%d", status)
 	}
 	auth, _ = manager.GetByID(account.AuthID)
 	if auth.Metadata["access_token"] != "new-token-fixture" {
 		t.Fatal("identity mismatch replaced token")
+	}
+	if disk, err := os.ReadFile(path); err != nil || !bytes.Equal(disk, projection) {
+		t.Fatal("rejected reload changed the desktop-owned projection")
 	}
 }
