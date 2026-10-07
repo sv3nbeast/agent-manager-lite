@@ -1,13 +1,15 @@
-// Version-pinned renderer compatibility for manager-owned desktop instances.
+// Capability-based renderer compatibility for manager-owned desktop instances.
+// Exact historical profiles remain as regression-tested compatibility paths.
 // The installed application, credentials and Codex configuration are read-only.
 import {createHash,randomUUID} from 'node:crypto'
 import * as nodeFS from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
+import {applyCodexUiReplacements,codexUiFeatures,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
 export type CodexSpeedMenuEnhancements='speed'|'locale'|'speed-locale'
-type CodexSpeedReplacement={begin:string;end:string;before:string;after:string}
+type CodexSpeedReplacement=CodexUiReplacement
 type CodexReleaseProfile={
   id:string
   version:string
@@ -22,7 +24,8 @@ type CodexReleaseProfile={
   fuseWireSha256?:string
   speedReplacements:readonly CodexSpeedReplacement[]
   ultraReplacements?:readonly CodexSpeedReplacement[]
-  localeReplacement:CodexSpeedReplacement
+  localeReplacement?:CodexSpeedReplacement
+  replacements?:readonly CodexSpeedReplacement[]
 }
 const legacySpeedReplacements=[
   {begin:'function TRa(e){',end:'}var ERa;',before:'a=i?.authMethod===`chatgpt`,o=',after:'a=i?.authMethod===`chatgpt`||i?.authMethod===`apikey`||r===`local`&&i?.authMethod===null&&i?.requiresAuth===!1,o='},
@@ -61,7 +64,7 @@ const releases:readonly CodexReleaseProfile[]=[
   {id:'26.930.51102',version:'26.930.51102',injection:'cdp',fuseWireSha256:'352dd1a2192c4570488ed05121a0a8d3f20db7de8862181b6d6cdde148996642',asset:'webview/assets/app-initial-f9b16fbf8fc7.js',url:'app://-/assets/app-initial-f9b16fbf8fc7.js',source:'22f3ea455585cfc0508e3d3627eac161c80c849c0aace3d76d09fdebaa0aeca3',patched:{speed:'5de6f1c3edff9c936cb1e75192e28f464f731f1cede2253a54183ce49f8210a0',locale:'470630cf7208ef1e98fc07f97af6ca28b717051876f1368a57fd25609659cbca', 'speed-locale':'8349a89e0fe3a5c5159f6b437ebba8284a8242d454f9a3fc9e3b902649c856cd'},earlyBootstrap:'.vite/build/early-bootstrap.js',bootstrap:'.vite/build/bootstrap-CXJAEjVI.js',appProtocol:{asset:'.vite/build/app-protocol-DC-JCzS7.js',source:'b5fb869f9d9c3b42c2b1c3de28e154c9f2597379a8122a76263da00b3771cb19',requirement:'require("./app-protocol-DC-JCzS7.js")'},speedReplacements:currentSpeedReplacements,ultraReplacements:currentUltraReplacements,localeReplacement:currentWrappedLocaleReplacement}
 ]
 const releaseByVersion=new Map(releases.map(profile=>[profile.version,profile]))
-const replacementsFor=(profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):readonly CodexSpeedReplacement[]=>{const ultra=profile.ultraReplacements??[];return enhancements==='speed'?[...profile.speedReplacements,...ultra]:enhancements==='locale'?[...ultra,profile.localeReplacement]:[...profile.speedReplacements,...ultra,profile.localeReplacement]}
+const replacementsFor=(profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):readonly CodexSpeedReplacement[]=>{if(profile.replacements)return profile.replacements;const ultra=profile.ultraReplacements??[],locale=profile.localeReplacement?[profile.localeReplacement]:[];return enhancements==='speed'?[...profile.speedReplacements,...ultra]:enhancements==='locale'?[...ultra,...locale]:[...profile.speedReplacements,...ultra,...locale]}
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex')
 const sentinel=Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
 
@@ -75,8 +78,10 @@ export interface CodexSpeedMenuInspection {
   patchedSha256?:string
   enhancements?:CodexSpeedMenuEnhancements
   transport?:'preload'|'cdp'
+  features?:readonly CodexUiFeature[]
+  featureSupport?:CodexUiFeatureSupports
 }
-export interface CodexSpeedMenuInspectOptions {application:string;executable:string;platform?:NodeJS.Platform;enhancements?:CodexSpeedMenuEnhancements}
+export interface CodexSpeedMenuInspectOptions {application:string;executable:string;platform?:NodeJS.Platform;enhancements?:CodexSpeedMenuEnhancements;features?:readonly CodexUiFeature[]}
 export interface CodexSpeedMenuReader {
   canonical(path:string):string
   identity(path:string):string
@@ -86,7 +91,7 @@ export interface CodexSpeedMenuReader {
   /** Dependency injection for isolated fixtures; production always uses SHA256. */
   digest?(value:string|Buffer):string
 }
-export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>;transport?:'preload'|'cdp';manifestSha256?:string;patchedBody?:string}
+export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>;transport?:'preload'|'cdp';manifestSha256?:string;patchedBody?:string;features?:readonly CodexUiFeature[]}
 export interface CodexSpeedMenuPrepareOptions {
   inspection:CodexSpeedMenuInspection
   directory:string
@@ -95,7 +100,7 @@ export interface CodexSpeedMenuPrepareOptions {
   nonce:string
   hookDirectory?:string
 }
-export interface CodexSpeedMenuStatusScope {statusLog:string;nonce:string;executable:string;directory:string;pid?:number;enhancements?:CodexSpeedMenuEnhancements}
+export interface CodexSpeedMenuStatusScope {statusLog:string;nonce:string;executable:string;directory:string;pid?:number;enhancements?:CodexSpeedMenuEnhancements;feature?:CodexUiFeature}
 export interface CodexSpeedMenuStatus {state:'pending'|'active'|'fallback';reason?:string}
 
 function boundedFile(path:string,limit:number):Buffer {
@@ -173,6 +178,7 @@ const checked=new WeakMap<CodexSpeedMenuInspection,{options:CodexSpeedMenuInspec
 const inspectionCache=new Map<string,CodexSpeedMenuInspection>()
 
 function patch(source:string,profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):string {
+  if(profile.replacements?.every(r=>r.offset!==undefined))return applyCodexUiReplacements(source,profile.replacements)
   let result=source
   for(const replacement of replacementsFor(profile,enhancements)){
     const start=result.indexOf(replacement.begin)
@@ -186,6 +192,7 @@ function patch(source:string,profile:CodexReleaseProfile,enhancements:CodexSpeed
   return result
 }
 export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reader:CodexSpeedMenuReader=defaultReader):CodexSpeedMenuInspection {
+  if(options.features)return inspectCodexDesktopUi(options,reader)
   const enhancements=options.enhancements??'speed'
   const parts:unknown[]=[options.application,options.executable,options.platform??process.platform,enhancements],digest=reader.digest??hash
   let version:string|undefined,profile:CodexReleaseProfile|undefined,cacheKey:string|undefined
@@ -227,6 +234,74 @@ export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reade
     if(sourceDigest!==profile.source||digest(patch(source,profile,enhancements))!==patchedSha256)return finish(false,'Codex 界面资源已变化，使用原界面')
     return finish(true,enhancements==='locale'?'可按语言偏好显示 Codex 内置翻译':enhancements==='speed-locale'?'可显示内置翻译并选择普通或 Fast':'可在 Codex 对话中选择普通或 Fast')
   }catch{return finish(false,'无法读取 Codex 兼容信息，使用原界面')}
+}
+
+const capabilityCache=new Map<string,ReturnType<typeof detectCodexUiCapabilities>>()
+/** Inspect each requested enhancement independently on the actual installed
+ * bytes. Package versions are diagnostic metadata, not admission criteria. */
+export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reader:CodexSpeedMenuReader=defaultReader):CodexSpeedMenuInspection {
+  const requested=codexUiFeatures.filter(feature=>(options.features??codexUiFeatures).includes(feature))
+  const parts:unknown[]=[options.application,options.executable,options.platform??process.platform,requested]
+  const digest=reader.digest??hash
+  let version:string|undefined,cacheKey:string|undefined
+  const fail=(reason:string):CodexSpeedMenuInspection=>Object.freeze({supported:false,reason,fingerprint:hash(JSON.stringify(parts)),version,features:[],featureSupport:Object.fromEntries(codexUiFeatures.map(f=>[f,{supported:false,reason}])) as CodexUiFeatureSupports})
+  if((options.platform??process.platform)!=='darwin')return fail('当前平台尚未接入 Codex 桌面适配')
+  if(!requested.length)return fail('未请求桌面适配功能')
+  try{
+    if(!isAbsolute(options.application)||!options.application.endsWith('.app')||reader.canonical(options.application)!==options.application||reader.canonical(options.executable)!==options.executable||dirname(options.executable)!==join(options.application,'Contents','MacOS'))return fail('客户端路径不符合隔离启动要求')
+    const archive=join(options.application,'Contents','Resources','app.asar'),framework=reader.canonical(join(options.application,'Contents','Frameworks','Codex Framework.framework','Codex Framework'))
+    if(relative(options.application,framework).startsWith('..'+sep)||isAbsolute(relative(options.application,framework)))return fail('客户端框架路径不符合兼容要求')
+    parts.push(reader.identity(options.executable),reader.identity(archive),reader.identity(framework))
+    if(reader===defaultReader){cacheKey=hash(JSON.stringify(parts));const cached=inspectionCache.get(cacheKey);if(cached)return cached}
+    const pkgBody=reader.archive(archive,'package.json',128*1024),pkg=JSON.parse(pkgBody.toString('utf8'))
+    parts.push(digest(pkgBody));version=typeof pkg.version==='string'&&pkg.version.length<100?pkg.version:undefined
+    if(pkg.name!=='openai-codex-electron'||pkg.main!=='.vite/build/early-bootstrap.js')return fail('所选客户端未使用兼容的 Codex 桌面入口')
+    const wires=reader.fuseWires(framework)
+    parts.push(wires.map(w=>hash(w)))
+    if(!wires.length||wires.some(w=>w[0]!==1||w[1]<8||w.length!==w[1]+2||[...w.subarray(2)].some(bit=>![48,49].includes(bit)))||wires.some(w=>!w.equals(wires[0])))return fail('客户端启动兼容参数尚未识别')
+    const html=reader.archive(archive,'webview/index.html',1024*1024).toString('utf8')
+    if(/<script\b[^>]*\bintegrity\s*=/i.test(html)||/strict-dynamic/i.test(html)||!/script-src\s+(?:&#39;|')self(?:&#39;|')/.test(html))return fail('Codex 页面完整性策略不兼容')
+    const early=reader.archive(archive,pkg.main,1024*1024).toString('utf8')
+    const bootstrapNames=[...early.matchAll(/require\(["']\.\/(bootstrap-[\w-]+\.js)["']\)/g)].map(m=>m[1])
+    if(bootstrapNames.length!==1)return fail('Codex 桌面启动入口已变化')
+    const bootstrap='.vite/build/'+bootstrapNames[0],boot=reader.archive(archive,bootstrap,16*1024*1024).toString('utf8')
+    if(!boot.includes('require("electron")')||!boot.includes('CODEX_ELECTRON_USER_DATA_PATH'))return fail('Codex 桌面隔离接口已变化')
+    parts.push(digest(html),digest(early),digest(boot))
+    const audited=version?releaseByVersion.get(version):undefined
+    let asset=audited?.asset,source:string|undefined
+    if(asset)try{source=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{asset=undefined}
+    if(!asset){
+      const scripts=[...html.matchAll(/<script\b[^>]*\bsrc=["'](?:\.\/|\/)?assets\/([\w.-]+\.js)["'][^>]*>/g)].map(m=>m[1])
+      if(scripts.length!==1)return fail('Codex 页面入口无法唯一识别')
+      const loader=reader.archive(archive,'webview/assets/'+scripts[0],2*1024*1024).toString('utf8')
+      parts.push(digest(loader))
+      const initial=[...new Set(loader.match(/app-initial-[\w-]+\.js/g)??[])]
+      if(initial.length!==1)return fail('Codex 功能页面无法唯一识别')
+      asset='webview/assets/'+initial[0];source=reader.archive(archive,asset,32*1024*1024).toString('utf8')
+    }
+    const sourceDigest=digest(source!)
+    parts.push(asset,sourceDigest)
+    let detected:ReturnType<typeof detectCodexUiCapabilities>
+    if(audited&&sourceDigest===audited.source){
+      const replacements={locale:audited.localeReplacement?[audited.localeReplacement]:[],speed:[...audited.speedReplacements],ultra:[...(audited.ultraReplacements??[])]}
+      detected={replacements,features:Object.fromEntries(codexUiFeatures.map(f=>[f,{supported:replacements[f].length>0,reason:replacements[f].length?'已验证的功能结构':'此客户端未包含该功能的兼容结构'}])) as CodexUiFeatureSupports}
+    }else{
+      detected=capabilityCache.get(sourceDigest)??detectCodexUiCapabilities(source!)
+      if(capabilityCache.size>=4)capabilityCache.delete(capabilityCache.keys().next().value!)
+      capabilityCache.set(sourceDigest,detected)
+    }
+    const featureSupport=structuredClone(detected.features),features=requested.filter(f=>featureSupport[f].supported)
+    const replacements=features.flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
+    parts.push(featureSupport,features,replacements)
+    if(!features.length)return {...fail('客户端页面功能结构尚未兼容'),featureSupport}
+    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:'app://-/assets/'+asset.split('/').pop(),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements}
+    const patchedDigest=digest(patch(source!,profile,'speed-locale'))
+    profile.patched={speed:patchedDigest,locale:patchedDigest,'speed-locale':patchedDigest}
+    const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:'speed-locale',transport:profile.injection})
+    checked.set(result,{options:{...options,features:requested},reader,profile})
+    if(cacheKey){if(inspectionCache.size>=16)inspectionCache.delete(inspectionCache.keys().next().value!);inspectionCache.set(cacheKey,result)}
+    return result
+  }catch{return fail('无法验证 Codex 桌面兼容资源')}
 }
 
 function privateDirectory(path:string):void {
@@ -292,6 +367,10 @@ const hookSource=String.raw`'use strict';
             let body=await response.clone().text();
             if(digest(body)!==manifest.sourceSha256){log('original','source');return response;}
             for(const replacement of manifest.replacements){
+              if(replacement.offset!==undefined){
+                const at=replacement.offset;if(!Number.isSafeInteger(at)||at<0||body.slice(at,at+replacement.before.length)!==replacement.before)throw Error();
+                body=body.slice(0,at)+replacement.after+body.slice(at+replacement.before.length);continue;
+              }
               const start=body.indexOf(replacement.begin);
               if(start<0||body.indexOf(replacement.begin,start+1)!==-1)throw Error();
               const end=body.indexOf(replacement.end,start+replacement.begin.length);
@@ -332,13 +411,13 @@ export function prepareCodexSpeedMenu(options:CodexSpeedMenuPrepareOptions):Code
     const patchedBodyPath=profile.injection==='cdp'?join(target,'patched.js'):undefined
     const patchedBody=patchedBodyPath?Buffer.from(patch(proof.reader.archive(join(proof.options.application,'Contents','Resources','app.asar'),profile.asset,32*1024*1024).toString('utf8'),profile,enhancements),'utf8'):undefined
     if(patchedBody&&(hash(patchedBody)!==profile.patched[enhancements]))throw new Error('patch digest')
-    const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,url:profile.url,sourceSha256:profile.source,patchedSha256:profile.patched[enhancements],enhancements,replacementCount:replacements.length,replacementsSha256:hash(JSON.stringify(replacements)),...(patchedBodyPath&&patchedBody?{patchedBody:patchedBodyPath,patchedBodySha256:hash(patchedBody)}:{})}
+    const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,url:profile.url,sourceSha256:profile.source,patchedSha256:profile.patched[enhancements],enhancements,features:options.inspection.features,replacementCount:replacements.length,replacementsSha256:hash(JSON.stringify(replacements)),...(patchedBodyPath&&patchedBody?{patchedBody:patchedBodyPath,patchedBodySha256:hash(patchedBody)}:{})}
     const manifestBody=JSON.stringify({version:1,...scope,fingerprint:current.fingerprint,replacements},null,2)+'\n'
     if(patchedBodyPath&&patchedBody)atomicBytes(patchedBodyPath,patchedBody)
     atomicFile(manifest,manifestBody);atomicFile(statusLog,'')
     const source=hookSource.replace('__EXPECTED__',JSON.stringify({...scope,manifest,statusLog,hookDirectory:target})).replace('__MANIFEST_DIGEST__',JSON.stringify(hash(manifestBody)))
     atomicFile(script,source)
-    return {script,manifest,statusLog,transport:profile.injection,manifestSha256:hash(manifestBody),...(patchedBodyPath?{patchedBody:patchedBodyPath}:{}),env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
+    return {script,manifest,statusLog,transport:profile.injection,features:options.inspection.features,manifestSha256:hash(manifestBody),...(patchedBodyPath?{patchedBody:patchedBodyPath}:{}),env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
   }catch{
     if(folder)try{privateDirectory(folder);rawFS.rmSync(folder,{recursive:true,force:true})}catch{/* Never follow a replaced directory. */}
     return
@@ -346,7 +425,7 @@ export function prepareCodexSpeedMenu(options:CodexSpeedMenuPrepareOptions):Code
 }
 const reasons:Record<string,string>={scope:'启动参数未生效',manifest:'适配文件已变化',protocol:'当前客户端的加载方式尚未适配',response:'客户端页面加载异常',source:'客户端更新后需重新适配',patched:'适配文件校验失败',transform:'页面适配失败',cdp:'CDP 调试通道未建立',cdpResponse:'CDP 页面拦截失败'}
 export function readCodexSpeedMenuStatus(scope:CodexSpeedMenuStatusScope,now=Date.now()):CodexSpeedMenuStatus {
-  const feature=scope.enhancements==='locale'?'页面翻译':scope.enhancements==='speed-locale'?'页面翻译和普通 / Fast 菜单':'普通 / Fast 菜单'
+  const feature=scope.feature==='ultra'?'Ultra 推理菜单':scope.feature==='locale'||scope.enhancements==='locale'?'页面翻译':scope.enhancements==='speed-locale'?'页面翻译和普通 / Fast 菜单':'普通 / Fast 菜单'
   const fallback=(reason?:string):CodexSpeedMenuStatus=>({state:'fallback',reason:`${feature}未加载${reason?'（'+reason+'）':''}，请重启实例后再试`})
   try{
     const lines=boundedFile(scope.statusLog,128*1024).toString('utf8').trim().split('\n')

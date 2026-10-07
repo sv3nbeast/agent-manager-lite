@@ -57,7 +57,7 @@ function linkProvider(f:ReturnType<typeof fixture>,account:ReturnType<ReturnType
 function speedMenuFixture(includeLocale=false) {
   let fingerprint='fixture-speed-v1'
   const prepared: string[]=[]
-  const observedScopes:Array<{pid?:number;enhancements?:string}>=[]
+  const observedScopes:Array<{pid?:number;enhancements?:string;feature?:string}>=[]
   const service:InstanceSpeedMenuServices={
     inspect:()=>({supported:true,reason:'',fingerprint,enhancements:'speed'}),
     prepare:options=>{
@@ -108,11 +108,38 @@ test('locale and speed compatibility share one hook while new desktops keep nati
   assert.ok(f.runtime.plans[0].speedMenuHook);assert.equal(f.runtime.plans[0].desktopLocaleHook,undefined)
   assert.equal(f.instances.views()[0].desktopLocaleCompatibility,'active');assert.equal(f.instances.views()[0].speedMenu,'active')
   assert.equal(menus.observedScopes.at(-1)!.pid,f.instances.views()[0].pid)
-  assert.equal(menus.observedScopes.at(-1)!.enhancements,'speed-locale')
+  assert.equal(menus.observedScopes.at(-1)!.feature,'locale')
+  assert.ok(menus.observedScopes.some(scope=>scope.feature==='speed'))
   assert.equal(f.gateways[0].current().defaultTier,'default')
   assert.equal(connection(instance.directory).doc.raw(['desktop','localeOverride']),null)
   await f.instances.stop(instance.id)
   assert.equal(existsSync(join(instance.desktopDirectory,'cml-speed-menu',f.runtime.plans[0].nonce)),false)
+})
+
+test('desktop features launch and report independently when any other feature is incompatible',async t=>{
+  for(const missing of ['locale','speed','ultra'] as const){
+    const menus=speedMenuFixture(),all=['locale','speed','ultra'] as const
+    menus.service.inspectFeatures=()=>({supported:true,reason:'partial',fingerprint:'feature-fixture-'+missing,version:'99.123.456',enhancements:'speed-locale',features:all.filter(f=>f!==missing),featureSupport:{
+      locale:{supported:missing!=='locale',reason:'locale fixture'},speed:{supported:missing!=='speed',reason:'speed fixture'},ultra:{supported:missing!=='ultra',reason:'ultra fixture'}
+    }})
+    const f=fixture(t,['zh-Hans-CN'],menus.service),instance=f.add(f.account().id)
+    const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+    assert.equal(preview.clientVersion,'99.123.456')
+    assert.equal(preview.desktopLocaleCompatibilityAvailable,missing!=='locale')
+    assert.equal(preview.speedMenuAvailable,missing!=='speed')
+    assert.equal(preview.ultraAvailable,missing!=='ultra')
+    f.instances.start(preview.ticket);await f.instances.settled(instance.id)
+    const view=f.instances.views()[0]
+    assert.equal(view.status,'running',view.error)
+    assert.equal(view.desktopLocaleCompatibility,missing==='locale'?'unavailable':'active')
+    assert.equal(view.speedMenu,missing==='speed'?'unavailable':'active')
+    assert.equal(view.ultraCompatibility,missing==='ultra'?'unavailable':'active')
+    assert.equal(view.notice,missing+' fixture')
+    assert.deepEqual(menus.prepared,['speed-locale'])
+    if(missing==='speed')assert.ok(f.runtime.plans[0].desktopLocaleHook)
+    else assert.ok(f.runtime.plans[0].speedMenuHook)
+    await f.instances.stop(instance.id)
+  }
 })
 
 test('locale compatibility works without Fast capability and leaves gateway tier semantics intact',async t=>{

@@ -9,14 +9,14 @@ const asar=require('@electron/asar')
 // This keeps the probe independent of Rollup chunk names while exercising the
 // exact source used by the build.
 require('tsx/cjs')
-const {inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus}=require('../src/main/codexSpeedMenu.ts')
+const {inspectCodexDesktopUi,prepareCodexSpeedMenu,readCodexSpeedMenuStatus}=require('../src/main/codexSpeedMenu.ts')
 const {CodexSpeedMenuCdpSession}=require('../src/main/codexSpeedMenuCdp.ts')
 const {reserveCodexCdpPort}=require('../src/main/codexInstanceAdapter.ts')
 
 async function main(){
 if(process.platform!=='darwin') { console.log('Codex CDP smoke skipped: macOS only'); return }
 const application='/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT'),archive=join(application,'Contents/Resources/app.asar')
-const inspection=inspectCodexSpeedMenu({application,executable,platform:'darwin',enhancements:'speed-locale'})
+const inspection=inspectCodexDesktopUi({application,executable,platform:'darwin'})
 if(!inspection.supported)throw new Error(`Installed ChatGPT is not compatible: ${inspection.reason}`)
 // macOS exposes /var/folders through /private; the runtime deliberately
 // requires canonical private directories, so create the fixture below the

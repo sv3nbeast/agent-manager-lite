@@ -71,6 +71,7 @@ an explicit user operation. Its license does not replace other components' licen
 
 | Component | Version | Source | License |
 | --- | --- | --- | --- |
+| acorn | 8.15.0 | <https://github.com/acornjs/acorn> | MIT |
 | toml-eslint-parser | 1.0.3 | <https://github.com/ota-meshi/toml-eslint-parser> | MIT |
 | eslint-visitor-keys | Locked transitive version | <https://github.com/eslint/js> | MIT |
 | yaml | 2.9.1 | <https://github.com/eemeli/yaml> | ISC |

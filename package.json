@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -55,11 +55,13 @@
     "test:desktop:local-onboarding": "node scripts/run-desktop-smoke.cjs --local-onboarding",
     "preview:isolated": "electron scripts/preview-product.cjs",
     "test:desktop:agent-manager": "node scripts/run-desktop-smoke.cjs --agent-manager",
+    "test:desktop:codex-ui": "node scripts/smoke-codex-ui.cjs",
     "test:desktop:upstream-proxy": "node scripts/run-desktop-smoke.cjs --upstream-proxy",
     "check:public": "node scripts/check-public-repository.mjs",
     "release:check": "node scripts/check-release-version.mjs"
   },
   "dependencies": {
+    "acorn": "8.15.0",
     "toml-eslint-parser": "1.0.3",
     "undici": "7.30.0",
     "yaml": "2.9.1",
@@ -96,6 +98,10 @@
       "package.json"
     ],
     "extraResources": [
+      {
+        "from": "node_modules/acorn/LICENSE",
+        "to": "licenses/acorn-LICENSE"
+      },
       {
         "from": "node_modules/yaml/LICENSE",
         "to": "licenses/yaml-LICENSE"

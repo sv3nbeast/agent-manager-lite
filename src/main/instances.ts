@@ -24,13 +24,13 @@ import {TomlDocument} from './tomlPatch'
 import {supportsOfficialTempLogin} from './tempLogin'
 import {instanceProviderName} from './instanceProviderName'
 import {initializeDesktopLocale,previewDesktopLocale,systemDesktopLanguages} from './desktopLocale'
-import {inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuInspection} from './codexSpeedMenu'
+import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuInspection} from './codexSpeedMenu'
 import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopServiceTier'
 import {readInstanceHistory} from './instanceHistory'
 
-export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu}
-const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
-type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection}
+export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
+const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspectCodexDesktopUi,inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
+type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const resolveCompatibleApplication=(application:InstanceApplication)=>{try {resolveAgentClientType(application.clientType);return true}catch{return false}}
 const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native']).optional(),nativeTier:z.string().optional()}).strict()
@@ -106,17 +106,19 @@ export class Instances {
       try {clientType=resolveAgentClientType(profile.clientType)}catch(error){clientError=error instanceof Error?error.message:'客户端尚未接入'}
       const run=this.active.get(profile.id),gateway=run?.gateway?.current()
       const hook=run?.plan.speedMenuHook??run?.plan.desktopLocaleHook
-      const compatibility=run&&hook?this.speedMenuServices.readStatus({statusLog:hook.statusLog,nonce:run.plan.nonce,executable:run.plan.executable,directory:run.plan.directory,pid:run.child?.pid,enhancements:run.plan.speedMenuHook?run.localeInspection?.supported?'speed-locale':'speed':'locale'}):undefined
-      const menu=run?.plan.speedMenuHook?compatibility:undefined
+      const featureStatus=(feature:'speed'|'locale'|'ultra',inspection?:CodexSpeedMenuInspection)=>run&&hook&&inspection?.supported?this.speedMenuServices.readStatus({statusLog:hook.statusLog,nonce:run.plan.nonce,executable:run.plan.executable,directory:run.plan.directory,pid:run.child?.pid,feature}):undefined
+      const menu=featureStatus('speed',run?.speedMenuInspection),locale=featureStatus('locale',run?.localeInspection),ultra=featureStatus('ultra',run?.ultraInspection)
       const speedMenu:InstanceView['speedMenu']=menu?.state??(run?.speedMenuInspection?'unavailable':undefined)
       const menuNotice=menu?.state==='fallback'?menu.reason:run?.speedMenuInspection&&!run.speedMenuInspection.supported?run.speedMenuInspection.reason:undefined
-      const localeState=run?.localeInspection?.supported?compatibility?.state:run?.localeInspection?'unavailable':undefined
-      const localeNotice=localeState==='fallback'?compatibility?.reason:run?.localeInspection&&!run.localeInspection.supported?run.localeInspection.reason:undefined
+      const localeState=locale?.state??(run?.localeInspection?'unavailable':undefined)
+      const localeNotice=localeState==='fallback'?locale?.reason:run?.localeInspection&&!run.localeInspection.supported?run.localeInspection.reason:undefined
+      const ultraState=ultra?.state??(run?.ultraInspection?'unavailable':undefined)
+      const ultraNotice=ultraState==='fallback'?ultra?.reason:run?.ultraInspection&&!run.ultraInspection.supported?run.ultraInspection.reason:undefined
       return {...profile,clientType,copying:this.copyingTarget(profile.id),connectionMode:profile.connectionMode??'local_api',directory:instanceHomePath(this.root,profile),desktopDirectory:join(this.root,'instances',profile.id,'desktop'),
         launchMode:applications.find(app=>app.id===profile.applicationId)?.kind??'desktop',workingDirectory:profile.workingDirectoryId?this.workingDirectories().find(value=>value.id===profile.workingDirectoryId)?.path:join(this.root,'instances',profile.id,'workspace'),
         accountName:state.accounts.find(account=>account.id===profile.accountId)?.name,applicationName:applications.find(app=>app.id===profile.applicationId)?.name,
-        status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),menuNotice,localeNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
-        speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState}
+        status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),menuNotice,localeNotice,ultraNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
+        speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState,ultraCompatibility:ultraState,clientVersion:run?.clientVersion}
     })
   }
   private validateDetails(details:InstanceInput,id:string):void {
@@ -315,7 +317,9 @@ export class Instances {
     const providerName=instanceProviderName(state,account)
     const language=plan.mode==='cli'?undefined:previewDesktopLocale(this.localeOptions(profile.id,plan))
     const tier=resolveServiceTier(undefined,state.settings.defaultTier,providerTier,profile.defaultTier,account.defaultTier)
-    const clientMenu=plan.mode!=='cli'&&profile.connectionMode!=='native'?this.speedMenuServices.inspect({application:plan.application,executable:plan.executable}):undefined
+    const desktopUi=plan.mode==='cli'?undefined:this.speedMenuServices.inspectFeatures?.({application:plan.application,executable:plan.executable,features:profile.connectionMode==='native'?['locale']:['locale','speed','ultra']})
+    const feature=(name:'speed'|'locale'|'ultra'):CodexSpeedMenuInspection|undefined=>desktopUi?{...desktopUi,supported:desktopUi.featureSupport?.[name].supported===true,reason:desktopUi.featureSupport?.[name].reason??desktopUi.reason}:undefined
+    const clientMenu=plan.mode!=='cli'&&profile.connectionMode!=='native'?(desktopUi?feature('speed'):this.speedMenuServices.inspect({application:plan.application,executable:plan.executable})):undefined
     // The renderer compatibility hook is what exposes the Normal / Fast
     // selector for manager-owned local providers. A model catalog can omit
     // `service_tiers` for a newly released or provider-routed model even when
@@ -325,10 +329,11 @@ export class Instances {
     // is still carried by the gateway and can be rejected upstream when it is
     // genuinely unsupported.
     const speedMenu=clientMenu
-    const localeCandidate=plan.mode==='cli'?undefined:this.speedMenuServices.inspectLocale?.({application:plan.application,executable:plan.executable})
-    const combined=speedMenu?.supported&&localeCandidate?.supported?this.speedMenuServices.inspectCombined?.({application:plan.application,executable:plan.executable}):undefined
-    const localeCompatibility=localeCandidate?.supported&&speedMenu?.supported&&!combined?.supported?{...localeCandidate,supported:false,reason:combined?.reason??'当前客户端组合界面适配未就绪，保留原页面语言'}:localeCandidate
-    const compatibility=combined?.supported?combined:speedMenu?.supported?speedMenu:localeCompatibility
+    const localeCandidate=plan.mode==='cli'?undefined:desktopUi?feature('locale'):this.speedMenuServices.inspectLocale?.({application:plan.application,executable:plan.executable})
+    const ultraCompatibility=plan.mode!=='cli'&&profile.connectionMode!=='native'?feature('ultra'):undefined
+    const combined=!desktopUi&&speedMenu?.supported&&localeCandidate?.supported?this.speedMenuServices.inspectCombined?.({application:plan.application,executable:plan.executable}):undefined
+    const localeCompatibility=!desktopUi&&localeCandidate?.supported&&speedMenu?.supported&&!combined?.supported?{...localeCandidate,supported:false,reason:combined?.reason??'当前客户端组合界面适配未就绪，保留原页面语言'}:localeCandidate
+    const compatibility=desktopUi??(combined?.supported?combined:speedMenu?.supported?speedMenu:localeCompatibility)
     const speedPreference=speedMenu?.supported?previewDesktopServiceTier(this.speedPreferenceOptions(profile.id,plan,tier.tier)):undefined
     const initialTier=speedPreference?speedPreference.tier:tier.tier
     const history=readInstanceHistory(plan.directory)
@@ -336,7 +341,7 @@ export class Instances {
       ...[folder,plan.directory,plan.desktopDirectory].map(path=>[lstatSync(path).dev,lstatSync(path).ino]),
       account.id,account.kind,account.baseUrl,account.models,account.wireApi,account.credentials.apiKey,account.providerId,account.providerKeyId,providerName,language?.revision,modelContext.revision,accountProxyURL(account,state),tier,
       profile.connectionMode==='native'?readBounded(join(plan.directory,'auth.json'),2*1024*1024):null,speedMenu?.fingerprint,speedPreference?.revision,localeCandidate?.fingerprint,combined?.fingerprint,compatibility?.fingerprint,history])
-    return {account,configs,view,tier,plan,fingerprint,providerName,language,modelContext,speedMenu,speedPreference,initialTier,localeCompatibility,compatibility,history}
+    return {account,configs,view,tier,plan,fingerprint,providerName,language,modelContext,speedMenu,speedPreference,initialTier,localeCompatibility,ultraCompatibility,compatibility,history}
   }
   private localeOptions(id:string,plan:DesktopPlan) {return {directory:plan.directory,markerPath:join(this.folder(id),'desktop-locale.json'),systemLanguages:this.systemLanguages}}
   private speedPreferenceOptions(id:string,plan:DesktopPlan,initialTier?:string) {return {directory:plan.directory,markerPath:join(this.folder(id),'desktop-speed-preference.json'),initialTier}}
@@ -356,6 +361,7 @@ export class Instances {
       model:profile.model,tier:context.initialTier,tierSource:context.speedPreference?.source==='existing'?'client':context.tier.source,connectionMode:profile.connectionMode??'local_api',launchMode:context.plan.mode??'desktop',externalHome:!!profile.externalHome,
       speedMenuAvailable:context.speedMenu?.supported,speedMenuReason:context.speedMenu?.reason,speedPreferenceSource:context.speedPreference?.source,
       desktopLocaleCompatibilityAvailable:context.localeCompatibility?.supported,desktopLocaleCompatibilityReason:context.localeCompatibility?.reason,
+      ultraAvailable:context.ultraCompatibility?.supported,ultraReason:context.ultraCompatibility?.reason,clientVersion:context.compatibility?.version,
       history:context.history}
     this.previews.set(id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000})
     return structuredClone(preview)
@@ -368,7 +374,7 @@ export class Instances {
     if(this.inUse(id))throw new Error('实例已有启动或运行任务')
     this.previews.delete(id)
     if(context.fingerprint!==pending.fingerprint)throw new Error('账号、配置、会话或应用已变化，请重新预览')
-    const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),initialTier:context.initialTier,speedMenuInspection:context.speedMenu,localeInspection:context.localeCompatibility}
+    const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),initialTier:context.initialTier,speedMenuInspection:context.speedMenu,localeInspection:context.localeCompatibility,ultraInspection:context.ultraCompatibility,clientVersion:context.compatibility?.version}
     this.notices.delete(id)
     this.active.set(id,run)
     run.task=this.launch(run,context.view.revision,pending.fingerprint).finally(()=>{run.task=undefined})

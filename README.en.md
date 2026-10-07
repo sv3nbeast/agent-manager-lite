@@ -95,7 +95,7 @@ npm run build
 npx electron-builder --mac --arm64 --publish never
 ```
 
-Install the Codex client separately; this project does not bundle the official client. Desktop menu and language integration depend on the client version. Passing source tests does not establish compatibility with every client version or live account environment.
+Install the Codex client separately; this project does not bundle the official client. Desktop language, Standard/Fast and Ultra are detected independently from the installed client's resources and shown in the launch preview. Compatible resource structures can survive client updates without adding a version entry; changed interfaces still require adaptation. Passing source tests does not establish compatibility with every client version or live account environment.
 
 ## License and attribution
 

@@ -29,6 +29,8 @@ export interface InstanceView extends Omit<InstanceProfile,'clientType'> {
   speedMenu?:'pending'|'active'|'fallback'|'unavailable'
   initialTier?:string
   desktopLocaleCompatibility?:'pending'|'active'|'fallback'|'unavailable'
+  ultraCompatibility?:'pending'|'active'|'fallback'|'unavailable'
+  clientVersion?:string
 }
 export interface InstanceLaunchPreview {
   clientType:AgentClientType
@@ -49,6 +51,9 @@ export interface InstanceLaunchPreview {
   speedPreferenceSource?:'existing'|'initial'|'initialized'
   desktopLocaleCompatibilityAvailable?:boolean
   desktopLocaleCompatibilityReason?:string
+  ultraAvailable?:boolean
+  ultraReason?:string
+  clientVersion?:string
   history?:InstanceHistorySummary
 }
 export interface InstanceHistorySummary {
