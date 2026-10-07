@@ -89,7 +89,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
       </a-table>
     </a-spin>
     <a-pagination v-if="result&&result.total>25" :current="result.page" :total="result.total" :page-size="25" :show-size-changer="false" :disabled="busy" class="pagination" @change="page" />
-    <p class="muted session-note">仅访问已登记目录。相同会话 ID 合并展示，打开文件时选择具体目录；复制与 ZIP 导入均保留目标已有会话。Token 来自会话文件累计记录；未记录时显示未知。可跨页选择会话后读取所选用量，并按会话或项目汇总；未知副本不会被猜算为零。全目录同步会合并分叉内容并保留原文件备份；废纸篓支持备份删除与恢复。可用“修复可见性”检查并修复 Provider 不一致导致的历史会话不显示问题。</p>
+    <p class="muted session-note">仅访问已登记目录。相同会话 ID 合并展示；同一目录中内容完全相同的副本会按活动文件优先自动合并，内容不同才标记为“同 ID 文件冲突”，跨目录副本可选择具体目录。复制与 ZIP 导入均保留目标已有会话。Token 来自会话文件累计记录；未记录时显示未知。可跨页选择会话后读取所选用量，并按会话或项目汇总；未知副本不会被猜算为零。全目录同步会合并分叉内容并保留原文件备份；废纸篓支持备份删除与恢复。可用“修复可见性”检查并修复 Provider 不一致导致的历史会话不显示问题。</p>
     <a-modal :open="!!choosing" title="选择会话所在目录" ok-text="继续" cancel-text="取消" :ok-button-props="{disabled:!selectedTarget||choosing?.record.locations.find(value=>value.targetId===selectedTarget)?.ambiguous}" @ok="confirmOpen" @cancel="choosing=undefined">
       <p>{{choosing?.record.title}}</p><a-radio-group v-model:value="selectedTarget" class="session-location-picker"><a-radio v-for="location in choosing?.record.locations??[]" :key="location.targetId" :value="location.targetId" :disabled="location.ambiguous">{{location.name}}<div class="muted session-meta">{{location.directory}}</div><small v-if="location.ambiguous">此目录存在多个同 ID 文件，请先核对。</small></a-radio></a-radio-group>
     </a-modal>

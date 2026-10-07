@@ -6,11 +6,11 @@ import {z} from 'zod'
 import {Store} from './store'
 import {ClientConfigs} from './clientConfig'
 import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,sessionStatsSchema,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult} from '../shared/sessions'
-import {openSessionFile,rolloutFiles,firstSessionEvent,sessionActivity,sessionTokens,sessionContains,cleanText,sessionIdentifier,safeSessionPath} from './sessionFiles'
+import {openSessionFile,rolloutFiles,firstSessionEvent,sessionActivity,sessionTokens,sessionContains,sessionDigest,cleanText,sessionIdentifier,safeSessionPath} from './sessionFiles'
 import {readSessionDisplay,displayTitle,displayProject} from './sessionDisplay'
 import {probeClientDaemon} from './clientDaemon'
 
-interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;record:SessionRecord}
+interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;record:SessionRecord;duplicateOf?:string}
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
 interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;warnings:string[]}
 class SessionLimitError extends Error {}
@@ -34,7 +34,26 @@ export class SessionCatalog {
     if(input.targetId&&!targets.length)throw new Error('会话来源目录不存在')
     this.stop();this.snapshot=undefined
     const controller=new AbortController(),signal=controller.signal,run={id:input.runId,controller};this.scanning=run
-    const warnings=new Set<string>(),files=new Map<string,SourceFile[]>(),records=new Map<string,SessionRecord>(),matches=new Set<string>()
+    const warnings=new Set<string>(),files=new Map<string,SourceFile[]>(),records=new Map<string,SessionRecord>(),matches=new Set<string>(),digests=new Map<string,Promise<string>>()
+    const digest=async(source:SourceFile,signal:AbortSignal):Promise<string>=>{
+      const cached=digests.get(source.path);if(cached)return cached
+      const pending=(async()=>{
+        const opened=await openSessionFile(source.root,source.path)
+        try{
+          if(opened.stat.dev!==source.device||opened.stat.ino!==source.inode||opened.stat.size!==source.size)throw new Error('会话文件已被替换')
+          const value=await sessionDigest(opened.file,opened.stat.size,signal)
+          await this.unchanged(source,opened.stat)
+          return value
+        }finally{await opened.file.close()}
+      })()
+      digests.set(source.path,pending);return pending
+    }
+    const canonical=(source:SourceFile):string=>{
+      const path=relative(source.root,source.path),archived=path.startsWith('archived_sessions'+sep)
+      // Prefer the live sessions tree.  A lexical path tie-breaker keeps the
+      // choice independent of directory enumeration order.
+      return `${archived?'1':'0'}\0${path}`
+    }
     let fileCount=0
     try{
       for(const selected of targets){
@@ -59,23 +78,45 @@ export class SessionCatalog {
                 const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false}
                 const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location]}
                 const matched=title.toLowerCase().includes(input.titleQuery.toLowerCase())&&(!input.contentQuery||await sessionContains(file,stat.size,input.contentQuery,signal))
-                sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,record:structuredClone(record)}})
+                sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,size:stat.size,record:structuredClone(record)}})
               }finally{await file.close()}
             }catch(error){signal.throwIfAborted();warn(`部分会话文件无法读取（${basename(path)}），请刷新或检查文件`)}
           }
           // Do not publish rows read through a replaced/deregistered home.
           this.configs.identityTarget(target.id);signal.throwIfAborted()
           const finalRoot=await lstat(root);if(finalRoot.dev!==rootStat.dev||finalRoot.ino!==rootStat.ino)throw new Error('会话目录已被替换')
-          for(const {record,file,matched} of sourceRows){
-            if(matched)matches.add(record.id)
-            files.set(record.id,[...files.get(record.id)??[],file])
-            const existing=records.get(record.id)
-            if(existing){
-              const location=existing.locations.find(value=>value.targetId===target.id)
+          const grouped=new Map<string,typeof sourceRows>()
+          for(const row of sourceRows)grouped.set(row.record.id,[...(grouped.get(row.record.id)??[]),row])
+          for(const [id,rows] of grouped){
+            if(rows.some(row=>row.matched))matches.add(id)
+            const ordered=rows.slice().sort((a,b)=>canonical(a.file).localeCompare(canonical(b.file)))
+            let identical=rows.length<2
+            if(!identical&&rows.every(row=>row.file.size===ordered[0].file.size)){
+              try{
+                const first=await digest(ordered[0].file,signal);identical=true
+                for(const row of ordered.slice(1))if(await digest(row.file,signal)!==first){identical=false;break}
+              }catch{identical=false}
+            }
+            // Identical copies are one logical session. Keep one stable path;
+            // distinct bodies remain ambiguous and must be chosen explicitly.
+            const selected=identical?[ordered[0]]:ordered
+            if(identical)for(const row of ordered.slice(1))row.file.duplicateOf=ordered[0].file.path
+            // Keep every physical file for full-directory sync/trash.  Actions
+            // that need one source filter duplicateOf and use the canonical row.
+            for(const {record,file} of selected){
+              files.set(id,[...files.get(id)??[],file,...(identical?ordered.slice(1).map(row=>row.file):[])])
+              const existing=records.get(id)
+              if(existing){
+                const location=existing.locations.find(value=>value.targetId===target.id)
+                if(location)location.ambiguous=true
+                else existing.locations.push(record.locations[0])
+                if((record.updatedAt??0)>(existing.updatedAt??0)){const locations=existing.locations;records.set(id,{...record,locations})}
+              }else records.set(id,record)
+            }
+            if(!identical&&rows.length>1){
+              const location=records.get(id)?.locations.find(value=>value.targetId===target.id)
               if(location)location.ambiguous=true
-              else existing.locations.push(record.locations[0])
-              if((record.updatedAt??0)>(existing.updatedAt??0)){const locations=existing.locations;records.set(record.id,{...record,locations})}
-            }else records.set(record.id,record)
+            }
           }
         }catch(error){signal.throwIfAborted();if(error instanceof SessionLimitError)throw error;warn(error instanceof Error&&error.message.includes('超过')?error.message:'目录已变化或无法读取，请在客户端配置中核对')}
       }
@@ -111,7 +152,7 @@ export class SessionCatalog {
     }catch(error){await opened.file.close();throw error}
   }
   async location(raw:unknown):Promise<string>{
-    const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),sources=snapshot.files.get(input.sessionId)?.filter(value=>value.targetId===input.targetId)??[]
+    const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),sources=snapshot.files.get(input.sessionId)?.filter(value=>value.targetId===input.targetId&&!value.duplicateOf)??[]
     if(sources.length!==1)throw new Error(sources.length?'所选目录存在多个同 ID 会话，无法确定文件':'会话不属于所选目录')
     const opened=await this.verified(sources[0],input.sessionId,new AbortController().signal);await opened.file.close();this.current(input.snapshotId);return sources[0].path
   }
@@ -124,7 +165,7 @@ export class SessionCatalog {
     for(const id of new Set(input.sessionIds)){
       const record=snapshot.records.find(row=>row.id===id)
       if(!record)throw new Error('所选会话不在当前筛选列表中，请重新选择')
-      const sources=(snapshot.files.get(id)??[]).filter(source=>!record.locations.find(location=>location.targetId===source.targetId)?.ambiguous).sort((a,b)=>(b.record.updatedAt??0)-(a.record.updatedAt??0))
+      const sources=(snapshot.files.get(id)??[]).filter(source=>!source.duplicateOf&&!record.locations.find(location=>location.targetId===source.targetId)?.ambiguous).sort((a,b)=>(b.record.updatedAt??0)-(a.record.updatedAt??0))
       if(!sources.length)throw new Error('所选会话存在同 ID 文件冲突，请先核对')
       const source=sources[0],opened=await this.verified(source,id,signal)
       try{result.push({path:source.path,root:source.root,targetId:source.targetId,rootDevice:source.rootDevice,rootInode:source.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(source.record)})}finally{await opened.file.close()}
@@ -152,7 +193,7 @@ export class SessionCatalog {
         const record=snapshot.records.find(record=>record.id===id)!
         for(const location of record.locations){
           if(location.ambiguous){failed=true;continue}
-          const source=snapshot.files.get(id)!.find(value=>value.targetId===location.targetId)!
+          const source=snapshot.files.get(id)!.find(value=>value.targetId===location.targetId&&!value.duplicateOf)!
           try{const {file,stat}=await this.verified(source,id,controller.signal);try{const tokens=await sessionTokens(file,stat.size,controller.signal);await this.unchanged(source,stat);controller.signal.throwIfAborted();if(tokens){found={id,tokens,targetId:source.targetId};break}}finally{await file.close()}}
           catch{controller.signal.throwIfAborted();failed=true}
         }

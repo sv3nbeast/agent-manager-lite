@@ -14,7 +14,12 @@ const runningCount=computed(()=>preview.value?.runningInstanceCount??0)
 async function load(){loading.value=true;error.value='';try{const [instanceList,providerList]=await Promise.all([window.manager.listSessionVisibilityRepairInstances(),window.manager.listSessionVisibilityRepairProviders()]);instances.value=instanceList.instances;providers.value=providerList.providers;provider.value=providerList.defaultProvider}catch(cause){error.value=String(cause)}finally{loading.value=false}}
 async function discard(){const ticket=preview.value?.ticket;preview.value=undefined;if(ticket)await window.manager.discardSessionVisibilityRepair(ticket).catch(()=>{})}
 async function close(){if(applying.value)return;await discard();emit('update:open',false)}
-async function makePreview(){loading.value=true;error.value='';try{await discard();preview.value=await window.manager.previewSessionVisibilityRepair({targetIds:selectedTargets.value,sessionIds:props.sessionIds,targetProvider:provider.value||undefined})}catch(cause){error.value=String(cause)}finally{loading.value=false}}
+async function makePreview(){loading.value=true;error.value='';try{await discard();preview.value=await window.manager.previewSessionVisibilityRepair({
+  // `selectedTargets` and `props.sessionIds` can be Vue reactive proxies.
+  // Electron's IPC boundary uses structured clone, which rejects proxies;
+  // copy both arrays before handing the request to the main process.
+  targetIds:[...selectedTargets.value],sessionIds:[...props.sessionIds],targetProvider:provider.value||undefined
+})}catch(cause){error.value=String(cause)}finally{loading.value=false}}
 async function apply(){const value=preview.value;if(!value)return;applying.value=true;error.value='';try{const result=await window.manager.applySessionVisibilityRepair({ticket:value.ticket,confirmed:true});message.success(result.message);preview.value=undefined;emit('completed');emit('update:open',false)}catch(cause){error.value=String(cause)}finally{applying.value=false}}
 function reset(){preview.value=undefined;error.value='';selectedInstances.value=[]}
 watch(()=>props.open,open=>{if(open){reset();void load()}else void discard()})

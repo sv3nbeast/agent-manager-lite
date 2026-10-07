@@ -8,7 +8,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {Store} from '../src/main/store'
 import {ClientConfigs} from '../src/main/clientConfig'
 import {SessionCatalog,classifySession} from '../src/main/sessions'
-import {openSessionFile,reverseSessionLines,sessionContains,sessionTokens} from '../src/main/sessionFiles'
+import {openSessionFile,reverseSessionLines,sessionContains,sessionTokens,sessionDigest} from '../src/main/sessionFiles'
 
 const when='2026-10-01T08:00:00.000Z'
 function fixture(t:{after(fn:()=>void):void}){
@@ -53,6 +53,32 @@ test('catalog merges duplicate sessions, preserves archived locations and applie
   assert.deepEqual(hashes(a.home),before)
 })
 
+test('identical same-directory copies are de-duplicated while different bodies remain ambiguous and cross-directory copies stay selectable',async t=>{
+  const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID()
+  const active=rollout(a.home,id,[usage()])
+  // Copying a profile preserves both trees.  The archived copy has the same
+  // bytes and therefore represents one logical session, not an ambiguity.
+  const archived=rollout(a.home,id,[usage()],'archived_sessions','same')
+  const cross=rollout(b.home,id,[usage()])
+  let page=await f.scan(),record=page.items.find(value=>value.id===id)!
+  assert.equal(record.locations.length,2)
+  assert.ok(record.locations.every(value=>value.ambiguous===false))
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),active)
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:b.target.id}),cross)
+  const sources=await f.catalog.transferSources(page.snapshotId,[id])
+  assert.equal(sources.length,1)
+  assert.equal(sources[0].path,active)
+  assert.notEqual(sources[0].path,archived)
+
+  // A same-ID file with a different body is still unsafe to open implicitly.
+  rmSync(archived)
+  rollout(a.home,id,[{type:'event_msg',timestamp:when,payload:{type:'user_message',message:'different body'}}],'archived_sessions','different')
+  page=await f.scan({targetId:a.target.id});record=page.items.find(value=>value.id===id)!
+  assert.equal(record.locations.find(value=>value.targetId===a.target.id)?.ambiguous,true)
+  await assert.rejects(f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),/多个同 ID/)
+  await assert.rejects(f.catalog.transferSources(page.snapshotId,[id]),/冲突/)
+})
+
 test('filters combine title and raw content in one location, retain every copy and correct stale activity timestamps',async t=>{
   const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID(),other=randomUUID()
   rollout(a.home,id,[{type:'event_msg',timestamp:when,payload:{text:'MixedCASE 中文检索'}}]);rollout(b.home,id)
@@ -79,6 +105,23 @@ test('stream readers handle UTF-8 split across chunks, giant lines, partial fina
   }finally{await opened.file.close()}
   const missing=rollout(a.home,randomUUID(),[{type:'event_msg',payload:{type:'token_count',info:{total_token_usage:{input_tokens:30}}}}])
   const second=await openSessionFile(a.home,missing);try{assert.equal(await sessionTokens(second.file,second.stat.size,signal),undefined)}finally{await second.file.close()}
+})
+
+test('duplicate-content digest refuses a rollout that changes while it is being read',async t=>{
+  const f=fixture(t),a=f.source('changing'),id=randomUUID(),path=rollout(a.home,id)
+  appendFileSync(path,Buffer.alloc(256*1024,120))
+  const opened=await openSessionFile(a.home,path)
+  try{
+    const prototype=Object.getPrototypeOf(opened.file),original=prototype.read
+    let reads=0
+    const mock=t.mock.method(prototype,'read',async function(this:unknown,...args:unknown[]){
+      const result=await original.apply(this,args as never)
+      if(++reads===1)appendFileSync(path,'changed while hashing')
+      return result
+    })
+    await assert.rejects(sessionDigest(opened.file,opened.stat.size,new AbortController().signal),/变化/)
+    mock.mock.restore()
+  }finally{await opened.file.close()}
 })
 
 test('file operations reject replaced homes/files, symlinks, foreign targets, stale snapshots and ambiguous IDs',async t=>{

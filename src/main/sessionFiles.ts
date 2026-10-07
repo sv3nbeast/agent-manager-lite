@@ -1,5 +1,6 @@
 // Read-only rollout/index traversal adapted from Cockpit codex_session_manager.
 import {constants,type Stats} from 'node:fs'
+import {createHash} from 'node:crypto'
 import {lstat,open,opendir,realpath,type FileHandle} from 'node:fs/promises'
 import {join,relative,isAbsolute,sep} from 'node:path'
 import {setImmediate} from 'node:timers/promises'
@@ -47,6 +48,23 @@ export async function* sessionLines(file:FileHandle,size:number,signal:AbortSign
 }
 export async function firstSessionEvent(file:FileHandle,size:number,signal:AbortSignal):Promise<Record<string,any>|undefined>{
   for await(const line of sessionLines(file,Math.min(size,maxLine+1),signal))if(line.toString().trim())return jsonLine(line)
+}
+// Rollouts with the same ID can legitimately be present in both the active and
+// archived trees after a profile copy.  Only callers that already found an ID
+// duplicate should pay the cost of hashing the complete file.
+export async function sessionDigest(file:FileHandle,size:number,signal:AbortSignal):Promise<string>{
+  const before=await file.stat()
+  if(!before.isFile()||before.nlink!==1||before.size!==size)throw new Error('会话文件正在变化，请刷新')
+  const digest=createHash('sha256'),buffer=Buffer.alloc(chunkSize);let offset=0
+  while(offset<size){
+    signal.throwIfAborted()
+    const {bytesRead}=await file.read(buffer,0,Math.min(buffer.length,size-offset),offset)
+    if(!bytesRead)throw new Error('会话文件正在变化，请刷新')
+    digest.update(buffer.subarray(0,bytesRead));offset+=bytesRead
+  }
+  const after=await file.stat()
+  if(!after.isFile()||after.nlink!==1||after.dev!==before.dev||after.ino!==before.ino||after.size!==before.size||after.mtimeMs!==before.mtimeMs||after.ctimeMs!==before.ctimeMs)throw new Error('会话文件正在变化，请刷新')
+  return digest.digest('hex')
 }
 export async function* reverseSessionLines(file:FileHandle,size:number,signal:AbortSignal,maxBytes=Infinity):AsyncGenerator<Buffer>{
   let offset=size,read=0,prefix=Buffer.alloc(0),oversized=false
