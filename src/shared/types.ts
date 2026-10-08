@@ -226,6 +226,8 @@ export interface ManagerAPI {
   readProviderKey(input: { id: string; revision: number; keyId: string }): Promise<string>
   readModelContextDefaults(models:string[]):Promise<import('./modelContextWindows').ModelContextDefault[]>
   readInstanceModelDefaults(clientType:import('./agentClients').AgentClientType):Promise<import('./instances').InstanceModelDefaults>
+  fetchChatGPTModels(input:import('./instances').ChatGPTModelsInput):Promise<import('./instances').ChatGPTModelsResult>
+  cancelChatGPTModels(requestId:string):Promise<void>
   fetchProviderModels(input:import('./providerModels').ProviderModelsInput):Promise<import('./providerModels').ProviderModelsResult>
   cancelProviderModels(requestId:string):Promise<void>
   startProviderProbe(input:ProviderProbeInput):Promise<AppSnapshot>

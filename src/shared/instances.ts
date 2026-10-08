@@ -17,6 +17,10 @@ export const instanceInputSchema = z.object({
 })
 export type InstanceInput = z.infer<typeof instanceInputSchema>
 export interface InstanceModelDefaults { models:string[]; defaultModelId:string|null }
+export interface ChatGPTModelsInput { accountId:string; applicationId:string; requestId:string; force?:boolean }
+export interface ChatGPTModelsResult extends InstanceModelDefaults {
+  accountId:string; requestId:string; source:'official'|'cache'; fetchedAt:number
+}
 export interface ExternalInstanceHome {directory:string;device:number;inode:number;previousTargetName?:string}
 export interface InstanceProfile extends Omit<InstanceInput,'clientType'> { clientType?:AgentClientType; id:string; revision:number; createdAt:number; externalHome?:ExternalInstanceHome }
 export interface InstanceApplication { clientType?:AgentClientType; id:string; name:string; path:string; kind?:'desktop'|'cli'; supportsTempLogin?:boolean }

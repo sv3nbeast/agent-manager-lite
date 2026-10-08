@@ -101,7 +101,7 @@ export function defaultModelDefinitions(): ModelDefinition[] {
 // the client catalog; generated routing templates such as Reserve are not
 // native account recommendations.
 export function nativeModelDefinitions(): ModelDefinition[] {
-  const catalog = { ...builtInCatalog, models: [...builtInCatalog.models].sort((a,b) => Number(a.priority) - Number(b.priority)) }
+  const catalog = { ...builtInCatalog, models: builtInCatalog.models.filter(model=>model.visibility==='list').sort((a,b) => Number(a.priority) - Number(b.priority)) }
   return summarizeCatalog(catalog)
 }
 export function buildModelCatalog(input: ModelDefinition[], base: NativeCatalog, previousModel: string | null, managedModel: string | null): NativeCatalog {

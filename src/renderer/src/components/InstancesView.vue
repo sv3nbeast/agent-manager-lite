@@ -2,7 +2,7 @@
 import { computed, reactive, ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 import { PlusOutlined, DesktopOutlined, CopyOutlined, FolderOpenOutlined, CheckCircleFilled, LoadingOutlined } from '@ant-design/icons-vue'
-import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource, InstanceModelDefaults } from '../../../shared/instances'
+import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource, InstanceModelDefaults, ChatGPTModelsResult } from '../../../shared/instances'
 import { accountCompatibility, getAgentClient, implementedAgentClients, resolveAgentClientType } from '../../../shared/agentClients'
 import { instanceInputSchema } from '../../../shared/instances'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
@@ -229,11 +229,59 @@ const selectedAccount=computed(()=>availableAccounts.value.find(account=>account
 const resourceLabel=computed(()=>resourceKind.value==='provider'?selectedSupplier.value?.label:selectedAccount.value?.name)
 const nativeModelDefaults=ref<InstanceModelDefaults>(),nativeModelsLoading=ref(false),nativeModelsError=ref('')
 let modelDefaultsRequest=0
-const usesNativeModels=computed(()=>form.clientType==='codex'&&resourceKind.value==='account'&&!!selectedAccount.value&&selectedAccount.value.kind!=='api_key'&&!selectedAccount.value.models.length)
+const officialModels=ref<ChatGPTModelsResult>(),officialModelsLoading=ref(false),officialModelsError=ref('')
+const automaticModel=ref<string|null>(null)
+let officialModelsRequest=0,pendingOfficialModelsId:string|undefined,officialApplicationId=''
+let officialModelsCancellation:Promise<void>=Promise.resolve()
+const usesNativeModels=computed(()=>form.clientType==='codex'&&resourceKind.value==='account'&&!!selectedAccount.value&&selectedAccount.value.kind!=='api_key')
+const currentOfficialModels=computed(()=>officialModels.value?.accountId===form.accountId&&officialApplicationId===form.applicationId?officialModels.value:undefined)
 const modelChoices=computed(()=>{
   const account=selectedAccount.value
-  if(account)return usesNativeModels.value?nativeModelDefaults.value?.models??[]:account.models
+  if(account){
+    if(!usesNativeModels.value)return account.models
+    if(currentOfficialModels.value)return currentOfficialModels.value.models
+    return officialModelsError.value?nativeModelDefaults.value?.models??[]:[]
+  }
   return resourceKind.value==='provider'?selectedSupplier.value?.provider?.models??[]:[]
+})
+const modelSourceLabel=computed(()=>{
+  if(officialModelsLoading.value)return '正在获取此账号的官方模型列表…'
+  if(officialModelsError.value)return currentOfficialModels.value?'官方列表刷新失败，暂用上次获取的列表。':nativeModelsError.value?'官方列表与备用目录均读取失败，可刷新或手动填写模型 ID。':'官方列表获取失败，暂用内置备用目录；可刷新或手动填写模型 ID。'
+  if(currentOfficialModels.value)return currentOfficialModels.value.source==='cache'?'此账号的官方模型列表 · 最近缓存':'此账号的官方模型列表'
+  return nativeModelsError.value||'选择账号与客户端后获取官方模型列表。'
+})
+function setAutomaticModel(model:string){automaticModel.value=model;form.model=model}
+function modelEdited(){automaticModel.value=null}
+watch(()=>form.model,model=>{if(automaticModel.value!==null&&model!==automaticModel.value)automaticModel.value=null},{flush:'sync'})
+function cancelOfficialModelRequest(){
+  officialModelsRequest++
+  if(pendingOfficialModelsId)officialModelsCancellation=Promise.allSettled([officialModelsCancellation,window.manager.cancelChatGPTModels(pendingOfficialModelsId)]).then(()=>{})
+  pendingOfficialModelsId=undefined;officialModelsLoading.value=false
+  return officialModelsCancellation
+}
+async function refreshChatGPTModels(force=false){
+  const cancelled=cancelOfficialModelRequest()
+  if(!open.value||!usesNativeModels.value||!form.applicationId)return
+  const accountId=form.accountId,applicationId=form.applicationId,generation=draftGeneration,request=officialModelsRequest,requestId=crypto.randomUUID()
+  officialModelsLoading.value=true;officialModelsError.value=''
+  try{
+    await cancelled
+    if(request!==officialModelsRequest||generation!==draftGeneration||!open.value||!usesNativeModels.value||form.accountId!==accountId||form.applicationId!==applicationId)return
+    pendingOfficialModelsId=requestId
+    const models=await window.manager.fetchChatGPTModels({accountId,applicationId,requestId,force})
+    if(request!==officialModelsRequest||generation!==draftGeneration||!open.value||!usesNativeModels.value||form.accountId!==accountId||form.applicationId!==applicationId)return
+    if(models.accountId!==accountId||models.requestId!==requestId||!models.models.length)throw new Error('官方模型列表无效')
+    officialApplicationId=applicationId;officialModels.value=models
+  }catch{
+    if(request===officialModelsRequest&&generation===draftGeneration&&open.value&&usesNativeModels.value)officialModelsError.value='获取官方模型列表失败'
+  }finally{
+    if(request===officialModelsRequest){pendingOfficialModelsId=undefined;officialModelsLoading.value=false}
+  }
+}
+watch(()=>[open.value,form.accountId,form.applicationId,form.clientType,resourceKind.value],()=>{
+  cancelOfficialModelRequest();officialModels.value=undefined;officialApplicationId='';officialModelsError.value=''
+  if(form.model===automaticModel.value)setAutomaticModel('')
+  if(open.value&&usesNativeModels.value)void refreshChatGPTModels()
 })
 watch(()=>form.clientType,async clientType=>{
   const request=++modelDefaultsRequest
@@ -242,12 +290,12 @@ watch(()=>form.clientType,async clientType=>{
   catch{if(request===modelDefaultsRequest)nativeModelsError.value='模型目录读取失败，可手动填写模型 ID。'}
   finally{if(request===modelDefaultsRequest)nativeModelsLoading.value=false}
 },{immediate:true})
-// A late catalog result may fill an empty identity draft, but must not replace
-// a typed/saved model or leak into a provider selection or a closed dialog.
-watch(()=>[open.value,usesNativeModels.value,modelChoices.value],()=>{
-  if(open.value&&usesNativeModels.value&&!form.model.trim())form.model=nativeModelDefaults.value?.defaultModelId??''
+// Only generated defaults may follow a refreshed official directory. Typed,
+// saved or copied models must survive a late response and account switching.
+watch(()=>[open.value,usesNativeModels.value,modelChoices.value,officialModelsLoading.value],()=>{
+  if(open.value&&usesNativeModels.value&&!officialModelsLoading.value&&(!form.model.trim()||form.model===automaticModel.value))setAutomaticModel(currentOfficialModels.value?.defaultModelId??modelChoices.value[0]??'')
 })
-function selectAccount(){form.model=modelChoices.value[0]??''}
+function selectAccount(){setAutomaticModel(usesNativeModels.value?(currentOfficialModels.value?.defaultModelId??''):modelChoices.value[0]??'')}
 function selectSupplier(value:string){
   supplierSelection.value=value
   form.accountId=selectedSupplier.value?.account?.id??''
@@ -271,7 +319,7 @@ function providerCreated(accountId:string){
   if(choice)selectSupplier(choice.value)
   else error.value='供应商已保存，请刷新资源后选择密钥。'
 }
-function closeEditor(){if(committing.value)return;draftGeneration++;historyRequest++;discoveryRequest++;discoveryLoading.value=false;historyLoading.value=false;busy.value=false;open.value=false;pendingLogin=undefined;providerOpen.value=false;cancelCopyPreview()}
+function closeEditor(){if(committing.value)return;cancelOfficialModelRequest();draftGeneration++;historyRequest++;discoveryRequest++;discoveryLoading.value=false;historyLoading.value=false;busy.value=false;open.value=false;pendingLogin=undefined;providerOpen.value=false;cancelCopyPreview()}
 async function ensureResource(generation=draftGeneration):Promise<boolean>{
   const selection=supplierSelection.value,mode=form.connectionMode,clientType=form.clientType,kind=resourceKind.value
   if(!open.value||generation!==draftGeneration)return false
@@ -294,6 +342,7 @@ async function ensureResource(generation=draftGeneration):Promise<boolean>{
 }
 async function nextStep(){
   if(manager.loading||busy.value||savingDraft.value)return
+  if(step.value===2&&usesNativeModels.value&&officialModelsLoading.value&&!form.model.trim())return
   const generation=draftGeneration,currentStep=step.value
   clearValidation()
   if(step.value===0&&!availableApplications.value.some(app=>app.id===form.applicationId)){rejectField('applicationId','请先选择已安装的客户端程序。');return}
@@ -318,7 +367,7 @@ watch(()=>[open.value,form.model,form.clientType],async()=>{
   try{const values=await window.manager.readModelContextDefaults([form.model.trim()]);if(request===contextRequest)contextDefault.value=values[0]}catch{/* Preview remains the authority if catalog lookup fails. */}
   finally{if(request===contextRequest)contextLoading.value=false}
 })
-onBeforeUnmount(()=>{modelDefaultsRequest++;contextRequest++;historyRequest++;discoveryRequest++;draftGeneration++;launchRequest++;pendingCopyPreview.value=undefined;pendingLogin=undefined})
+onBeforeUnmount(()=>{cancelOfficialModelRequest();modelDefaultsRequest++;contextRequest++;historyRequest++;discoveryRequest++;draftGeneration++;launchRequest++;pendingCopyPreview.value=undefined;pendingLogin=undefined})
 const contextLabel=computed(()=>{
   const connectionValue=getModelContextWindow(selectedAccount.value?.modelContextWindows,form.model)
   if(connectionValue!==undefined)return formatModelContextWindow(connectionValue)+' · API 连接设置'
@@ -332,7 +381,7 @@ const tierName=(value?:string)=>value==='priority' || value==='fast' ? 'Fast' : 
 const initialSpeedName=(value?:string)=>value===undefined?'普通':tierName(value)==='Standard'?'普通':tierName(value)
 const contextSourceName=(value?:string)=>value==='connection'?'API 连接设置':value==='provider'?'供应商设置':value==='config'?'实例配置':value==='catalog'?'模型目录':'默认模板'
 function edit(instance?:InstanceView) {
-  draftGeneration++;cancelCopyPreview();closePreview()
+  cancelOfficialModelRequest();automaticModel.value=null;draftGeneration++;cancelCopyPreview();closePreview()
   let clientType:'codex'
   try{clientType=resolveAgentClientType(instance?.clientType)}catch(cause){error.value=String(cause);return}
   step.value=0;advanced.value=[];pendingLogin=undefined
@@ -460,7 +509,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
         <a-button :disabled="committing" @click="closeEditor">取消</a-button>
         <template v-if="wizard">
           <a-button v-if="step>0" :disabled="manager.loading||busy||historyLoading" @click="step--;clearValidation()">返回</a-button>
-          <a-button v-if="step<3" type="primary" :loading="manager.loading||historyLoading" :disabled="busy||savingDraft" @click="nextStep">下一步</a-button>
+          <a-button v-if="step<3" type="primary" :loading="manager.loading||historyLoading||(step===2&&usesNativeModels&&officialModelsLoading&&!form.model.trim())" :disabled="busy||savingDraft||(step===2&&usesNativeModels&&officialModelsLoading&&!form.model.trim())" @click="nextStep">下一步</a-button>
           <template v-else><a-button :loading="manager.loading||savingDraft" :disabled="busy||copyingForm&&copyRunning" @click="save()">仅创建</a-button><a-button type="primary" :loading="manager.loading||savingDraft" :disabled="busy||copyingForm&&copyRunning" @click="save(true)">创建并预览</a-button></template>
         </template>
         <a-button v-else type="primary" :loading="manager.loading||savingDraft" :disabled="busy" @click="save()">{{editing?'保存':attachingForm?'登记实例':'创建副本'}}</a-button>
@@ -497,7 +546,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
         <section v-show="!wizard||step===2" class="instance-step" data-step="2">
           <div class="instance-basics-grid">
             <a-form-item data-field="name" :validate-status="fieldErrors.name?'error':undefined" :help="fieldErrors.name" label="实例名称"><a-input v-model:value="form.name" aria-label="实例名称" :maxlength="120" placeholder="自动生成，也可自行修改" /></a-form-item>
-            <a-form-item v-if="client.capabilities.models" data-field="model" :validate-status="fieldErrors.model?'error':undefined" :help="fieldErrors.model" label="默认模型"><a-auto-complete v-model:value="form.model" :options="modelChoices.map(value=>({value}))"><a-input aria-label="实例模型" :maxlength="200" placeholder="选择模型或填写模型 ID" /></a-auto-complete><p v-if="usesNativeModels" class="muted instance-model-source">{{nativeModelsLoading?'正在读取客户端模型目录…':nativeModelsError||'来自客户端模型目录，也可填写模型 ID；实际可用性取决于账号。'}}</p></a-form-item>
+            <a-form-item v-if="client.capabilities.models&&(!wizard||step===2)" data-field="model" :validate-status="fieldErrors.model?'error':undefined" :help="fieldErrors.model" label="默认模型"><a-auto-complete v-model:value="form.model" style="width:100%" :options="modelChoices.map(value=>({value}))" @change="modelEdited"><a-input aria-label="实例模型" :maxlength="200" placeholder="选择模型或填写模型 ID" /></a-auto-complete><div v-if="usesNativeModels" class="instance-model-source"><span class="muted">{{modelSourceLabel}}</span><a-button type="link" size="small" aria-label="刷新官方模型列表" :loading="officialModelsLoading" @click="refreshChatGPTModels(true)">刷新</a-button></div></a-form-item>
           </div>
           <a-form-item v-if="client.capabilities.projectDirectoryModes.some(mode=>mode===launchMode)" label="项目目录"><a-select v-model:value="form.workingDirectoryId" aria-label="实例工作目录" allow-clear placeholder="使用实例的独立工作目录" :options="workingDirectories.map(item=>({value:item.id,label:item.path}))" /><a-button type="link" @click="chooseWorkingDirectory">选择工作目录</a-button></a-form-item>
           <section v-if="wizard" data-field="history" class="instance-history-choice" aria-label="会话来源选择">
@@ -575,6 +624,9 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
  .instance-editor-title{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-right:28px;font-size:19px;font-weight:650;letter-spacing:-.02em}
 .instance-step-count{font-size:12px;font-weight:500;letter-spacing:0;opacity:.5}
 .instance-basics-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.instance-model-source{display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.6}
+.instance-model-source .muted{flex:1;min-width:0}
+.instance-model-source .ant-btn{flex-shrink:0;padding:0;height:auto;font-size:12px}
 .instance-section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:10px;font-size:14px}
 .instance-section-heading>span{font-size:12px;opacity:.55}
 .instance-history-choice{margin:2px 0 16px}

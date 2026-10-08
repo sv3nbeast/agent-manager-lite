@@ -15,8 +15,9 @@ const now = Date.now()
 const jwt = 'fixture.' + Buffer.from(JSON.stringify({ exp: Math.floor(now / 1000) + 7200, email: 'fixture-native@example.invalid', 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-native-workspace', chatgpt_user_id: 'fixture-native-user' } })).toString('base64url') + '.signature'
 const common = { generation: randomUUID(), revision: 0, defaultTier: 'inherit', wireApi: 'responses', note: '', tags: [], createdAt: now }
 const identity = { ...common, id: randomUUID(), kind: 'oauth', name: '示例 ChatGPT 账号', email: 'fixture-native@example.invalid', baseUrl: 'https://fixture-native.invalid', models: [], credentials: { accessToken: jwt, refreshToken: 'fixture-native-refresh', idToken: jwt, accountId: 'fixture-native-workspace' } }
+const secondIdentity = { ...identity, id: randomUUID(), name: '第二个 ChatGPT 账号', email: 'fixture-second@example.invalid', models: ['fixture-obsolete-account-model'], credentials: { accessToken: jwt, refreshToken: 'fixture-second-refresh', idToken: jwt, accountId: 'fixture-second-workspace' } }
 const connection = { ...common, id: randomUUID(), kind: 'api_key', name: '示例供应商连接', baseUrl: 'https://fixture-provider.invalid/v1', models: ['fixture-provider-model'], credentials: { apiKey: 'fixture-provider-secret' } }
-fs.writeFileSync(join(directory, 'state.vault'), safeStorage.encryptString(JSON.stringify({ version: 1, settings: { refreshMinutes: 0, theme: 'light' }, groups: [], providers: [], accounts: [identity, connection] })), { mode: 0o600 })
+fs.writeFileSync(join(directory, 'state.vault'), safeStorage.encryptString(JSON.stringify({ version: 1, settings: { refreshMinutes: 0, theme: 'light' }, groups: [], providers: [], accounts: [identity, secondIdentity, connection] })), { mode: 0o600 })
 
 const application = join(fs.realpathSync(directory), 'Fixture.app')
 fs.mkdirSync(join(application, 'Contents', 'MacOS'), { recursive: true })
@@ -25,15 +26,42 @@ fs.writeFileSync(join(application, 'Contents', 'Info.plist'), `<?xml version="1.
 dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [application] })
 globalThis.fetch = async () => { throw new Error('Instance model smoke forbids upstream requests') }
 
-// Hold the actual first catalog request across user input. This catches a
-// delayed result replacing a custom model, using the production IPC handler.
-let releaseDefaults, defaultsCompleted = false, delayDefaults = true
+// The actual renderer/preload contract receives synthetic official catalogs.
+// HTTP/authentication behavior is covered separately by the service tests.
+// Builtin-default IPC still runs its production handler; no real token is used.
+const officialModels = ['fixture-official-first', 'fixture-official-second']
+const secondOfficialModels = ['fixture-second-official-first', 'fixture-second-official-other']
+const requests = [], cancelled = [], pending = [], cachedScopes = new Set()
+let delayNextOfficial = true, failNextOfficial = false
 const nativeHandle = ipcMain.handle.bind(ipcMain)
 ipcMain.handle = (channel, listener) => nativeHandle(channel, async (event, ...args) => {
-  if (channel === 'manager:invoke' && args[0] === 'readInstanceModelDefaults' && delayDefaults) {
-    delayDefaults = false
-    await new Promise(resolve => { releaseDefaults = resolve })
-    try { return await listener(event, ...args) } finally { defaultsCompleted = true }
+  if (channel === 'manager:invoke' && args[0] === 'fetchChatGPTModels') {
+    const input = args[1]
+    assert.ok(input && [identity.id, secondIdentity.id].includes(input.accountId), 'Only the selected fixture ChatGPT account can request its official catalog')
+    assert.match(input.requestId, /^[0-9a-f-]{36}$/i)
+    assert.equal(typeof input.applicationId, 'string')
+    requests.push({ ...input })
+    const fixtureSelected = JSON.parse(safeStorage.decryptString(fs.readFileSync(join(directory, 'state.vault')))).instanceApplications?.some(item => item.id === input.applicationId && item.path === application)
+    if (failNextOfficial && fixtureSelected) { failNextOfficial = false; throw new Error('fixture official models unavailable') }
+    let delayed
+    if (delayNextOfficial && fixtureSelected) {
+      delayNextOfficial = false
+      delayed = { input: { ...input }, completed: false }
+      pending.push(delayed)
+      await new Promise(resolve => { delayed.release = resolve })
+    }
+    const models = input.accountId === identity.id ? officialModels : secondOfficialModels
+    const scope = input.accountId + ':' + input.applicationId
+    const result = { requestId: input.requestId, accountId: input.accountId, models, defaultModelId: models[0], source: cachedScopes.has(scope) && !input.force ? 'cache' : 'official', fetchedAt: Date.now() }
+    cachedScopes.add(scope)
+    if (delayed) delayed.completed = true
+    return result
+  }
+  if (channel === 'manager:invoke' && args[0] === 'cancelChatGPTModels') {
+    cancelled.push(args[1])
+    // Deliberately allow an already-in-flight response to arrive after cancel,
+    // exercising the renderer's generation/account check as well as cancel IPC.
+    return
   }
   return listener(event, ...args)
 })
@@ -85,29 +113,42 @@ app.on('browser-window-created', (_event, window) => {
       await click('.ant-select-dropdown .ant-select-item-option', text)
     }
     const modelValue = () => run('document.querySelector("[aria-label=实例模型]").value')
+    const modelSource = () => run('document.querySelector(".instance-model-source")?.textContent??""')
+    const waitPending = async index => {
+      const until = Date.now() + 10_000
+      while (!pending[index]?.release) { assert.ok(Date.now() < until, 'Delayed official catalog request was not received'); await new Promise(resolve => setTimeout(resolve, 25)) }
+      return pending[index]
+    }
+    const release = async delayed => {
+      delayed.release()
+      const until = Date.now() + 10_000
+      while (!delayed.completed) { assert.ok(Date.now() < until, 'Delayed official catalog did not complete'); await new Promise(resolve => setTimeout(resolve, 25)) }
+      await settle()
+    }
     const modelOptions = async () => {
       await fill('[aria-label="实例模型"]', '')
       await run('(()=>{const input=document.querySelector("[aria-label=实例模型]");input.focus();input.closest(".ant-select").querySelector(".ant-select-selector").dispatchEvent(new MouseEvent("mousedown",{bubbles:true}))})()')
       await wait(`(${visible('.ant-select-dropdown .ant-select-item-option')}).length>0`)
+      await settle()
+      const layout = await run(`(()=>{const input=document.querySelector('[aria-label="实例模型"]'),select=input.closest('.ant-select'),popup=(${visible('.ant-select-dropdown')})[0],options=Array.from(popup.querySelectorAll('.ant-select-item-option'));return {input:input.getBoundingClientRect().width,select:select.getBoundingClientRect().width,popup:popup.getBoundingClientRect().width,popupOffset:popup.offsetWidth,popupStyle:popup.getAttribute('style'),options:options.map(el=>el.getBoundingClientRect().width),text:options.map(el=>el.querySelector('.ant-select-item-option-content')?.getBoundingClientRect().width??0)}})()`)
+      fs.writeFileSync(join(output, 'dropdown-layout.json'), JSON.stringify(layout, null, 2))
+      assert.ok(layout.popup >= layout.input - 2, 'Model dropdown must match the input width: ' + JSON.stringify(layout))
+      assert.ok(layout.text.every(width => width >= Math.min(160, layout.input * 0.7)), 'Model option text must have readable width: ' + JSON.stringify(layout))
       return run(`(${visible('.ant-select-dropdown .ant-select-item-option')}).map(el=>el.getAttribute('title')??el.textContent.trim())`)
     }
 
     try {
       await wait('!!document.querySelector(".instances-panel")')
-      const deadline = Date.now() + 10_000
-      while (!releaseDefaults) { assert.ok(Date.now() < deadline, 'Initial native catalog request was not received'); await new Promise(resolve => setTimeout(resolve, 25)) }
-
       await openWizard()
       await next(1)
       assert.match(await run('document.querySelector("[aria-label=实例账号]").closest(".ant-select").innerText'), /示例 ChatGPT 账号/)
       await next(2)
-      assert.equal(await modelValue(), '', 'Delayed native catalog has not arrived')
+      const firstPending = await waitPending(0)
+      assert.equal(firstPending.input.accountId, identity.id)
+      assert.match(await modelSource(), /正在获取.*官方/, 'The selected fixture application still awaits its account catalog')
       await fill('[aria-label="实例模型"]', 'fixture-custom-while-loading')
-      releaseDefaults()
-      const completionDeadline = Date.now() + 10_000
-      while (!defaultsCompleted) { assert.ok(Date.now() < completionDeadline, 'Delayed native catalog did not complete'); await new Promise(resolve => setTimeout(resolve, 25)) }
-      await settle()
-      assert.equal(await modelValue(), 'fixture-custom-while-loading', 'Late native defaults must preserve user input')
+      await release(firstPending)
+      assert.equal(await modelValue(), 'fixture-custom-while-loading', 'Late official defaults must preserve user input')
       await next(3)
       await close()
 
@@ -118,30 +159,35 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(defaults.models.includes('fixture-provider-model'), false)
 
       await openWizard(); await next(1); await next(2)
-      assert.equal(await modelValue(), defaults.defaultModelId, 'OAuth accounts with models:[] receive the native default automatically')
+      await wait(`document.querySelector('[aria-label="实例模型"]').value===${JSON.stringify(officialModels[0])}`)
+      assert.equal(await modelValue(), officialModels[0], 'OAuth accounts receive the official account default ahead of builtin candidates')
+      assert.match(await modelSource(), /官方|缓存/)
+      await click('[aria-label="刷新官方模型列表"]', '刷新')
+      await wait(`document.querySelector('.instance-model-source').textContent.includes('官方模型列表')&&!document.querySelector('[aria-label="刷新官方模型列表"]').classList.contains('ant-btn-loading')`)
+      assert.equal(requests.at(-1).force, true, 'The visible refresh action requests fresh official models')
       await next(3)
-      assert.equal(await run(`document.querySelector('.instance-step[data-step="3"]').innerText.includes(${JSON.stringify(defaults.defaultModelId)})`), true, 'Automatically filled model advances to confirmation without typing')
+      assert.equal(await run(`document.querySelector('.instance-step[data-step="3"]').innerText.includes(${JSON.stringify(officialModels[0])})`), true, 'Official default advances to confirmation without typing')
       await click('.ant-modal-footer button', '返回'); await step(2)
       const nativeOptions = await modelOptions()
       assert.ok(nativeOptions.length > 0)
-      assert.ok(nativeOptions.every(model => defaults.models.includes(model)), 'OAuth dropdown comes only from the native client catalog')
-      assert.ok(nativeOptions.includes(defaults.defaultModelId))
-      await fill('[aria-label="实例模型"]', defaults.defaultModelId)
+      assert.deepEqual(nativeOptions, officialModels, 'OAuth dropdown comes from the official account catalog')
+      assert.equal(nativeOptions.some(model => defaults.models.includes(model)), false)
+      await fill('[aria-label="实例模型"]', officialModels[0])
       await capture('oauth-default-model.png')
       await next(3)
-      assert.equal(await run(`document.querySelector('.instance-step[data-step="3"]').innerText.includes(${JSON.stringify(defaults.defaultModelId)})`), true)
+      assert.equal(await run(`document.querySelector('.instance-step[data-step="3"]').innerText.includes(${JSON.stringify(officialModels[0])})`), true)
       await click('.ant-modal-footer button', '仅创建')
       await wait(`!(${visible('.instance-editor')}).length`)
       let snapshot = await run('window.manager.load()')
       assert.equal(snapshot.instances.length, 1)
-      assert.equal(snapshot.instances[0].model, defaults.defaultModelId)
+      assert.equal(snapshot.instances[0].model, officialModels[0])
       assert.equal(snapshot.instances[0].accountId, identity.id)
       assert.equal(snapshot.instanceApplications.find(item => item.id === snapshot.instances[0].applicationId).path, application)
       assert.deepEqual(snapshot.accounts.find(item => item.id === identity.id).models, [], 'Selecting a default must not rewrite the OAuth account catalog')
 
       await click('.instance-card button', '编辑')
       await wait(`(${visible('.instance-editor')}).length>0`)
-      assert.equal(await modelValue(), defaults.defaultModelId)
+      assert.equal(await modelValue(), officialModels[0])
       await fill('[aria-label="实例模型"]', 'fixture-saved-custom-model')
       await click('.ant-modal-footer button', '保存')
       await wait(`!(${visible('.instance-editor')}).length`)
@@ -159,6 +205,8 @@ app.on('browser-window-created', (_event, window) => {
       await openWizard(); await next(1)
       await click('.instance-step[data-step="1"] .ant-radio-wrapper', '供应商密钥')
       await select('实例供应商密钥', '示例供应商连接 · 独立连接')
+      await settle()
+      const beforeProvider = requests.length
       await next(2)
       assert.equal(await modelValue(), 'fixture-provider-model', 'API connections retain their own first model')
       const providerOptions = await modelOptions()
@@ -166,18 +214,54 @@ app.on('browser-window-created', (_event, window) => {
       await fill('[aria-label="实例模型"]', 'fixture-provider-custom-model')
       await settle()
       assert.equal(await modelValue(), 'fixture-provider-custom-model')
+      assert.equal(requests.length, beforeProvider, 'Provider selection must not request an official ChatGPT catalog')
       await next(3); await capture('provider-model-boundary.png'); await close()
 
+      // Account B resolves first; A's delayed response is still delivered even
+      // after cancellation and must not contaminate B's model list or default.
+      delayNextOfficial = true
+      await openWizard(); await next(1)
+      const slowFirst = await waitPending(1)
+      await select('实例账号', secondIdentity.name)
+      await next(2)
+      await wait(`document.querySelector('[aria-label="实例模型"]').value===${JSON.stringify(secondOfficialModels[0])}`)
+      assert.match(await modelSource(), /官方|缓存/)
+      await release(slowFirst)
+      assert.equal(await modelValue(), secondOfficialModels[0], 'A slow old account response must not replace the new account default')
+      const secondOptions = await modelOptions()
+      assert.deepEqual(secondOptions, secondOfficialModels)
+      assert.ok(cancelled.includes(slowFirst.input.requestId), 'Switching identities cancels the old catalog request')
+      await fill('[aria-label="实例模型"]', secondOfficialModels[0])
+      await capture('official-account-switch.png')
+      await next(3); await close()
+
+      // A failed official lookup exposes the fallback source instead of
+      // representing bundled models as verified account availability.
+      failNextOfficial = true
       await openWizard(); await next(1); await next(2)
-      assert.equal(await modelValue(), defaults.defaultModelId, 'A reopened draft has fresh identity defaults')
+      await wait('!!document.querySelector(".instance-model-source")?.textContent.match(/备用|回退/)')
+      assert.match(await modelSource(), /官方/)
+      assert.equal(await modelValue(), defaults.defaultModelId)
+      const backupOptions = await modelOptions()
+      assert.ok(backupOptions.every(model => defaults.models.includes(model)))
+      assert.equal(backupOptions.some(model => officialModels.includes(model)), false)
+      await fill('[aria-label="实例模型"]', defaults.defaultModelId)
+      await capture('official-failure-builtin-backup.png')
+      await next(3); await close()
+
+      await openWizard(); await next(1); await next(2)
+      await wait(`document.querySelector('[aria-label="实例模型"]').value===${JSON.stringify(officialModels[0])}`)
+      assert.equal(await modelValue(), officialModels[0], 'A reopened draft loads its account official catalog')
       await next(3); await close()
       snapshot = await run('window.manager.load()')
       assert.equal(snapshot.instances[0].model, 'fixture-saved-custom-model')
       assert.deepEqual(snapshot.accounts.find(item => item.id === identity.id).models, [])
+      assert.deepEqual(snapshot.accounts.find(item => item.id === secondIdentity.id).models, ['fixture-obsolete-account-model'])
       assert.deepEqual(snapshot.accounts.find(item => item.id === connection.id).models, ['fixture-provider-model'])
-      const validation = { oauthEmptyCatalog: true, automaticNativeDefault: defaults.defaultModelId, nativeDropdown: nativeOptions, noManualInputRequired: true, delayedCatalogPreservesTyping: true, providerDropdown: providerOptions, providerModelsIsolated: true, editingPreservesModel: true, copyingPreservesModel: true, reopenedDraftUsesDefaults: true, accountCatalogsUnchanged: true, actualClientLaunched: false, upstreamRequests: false }
+      assert.equal(requests.some(request => request.accountId === connection.id), false)
+      const validation = { oauthEmptyCatalog: true, officialDefault: officialModels[0], officialDropdown: nativeOptions, officialOverridesBuiltin: true, forceRefreshRequestsFreshCatalog: true, noManualInputRequired: true, delayedCatalogPreservesTyping: true, secondAccountDropdown: secondOptions, slowAccountResponseIsolated: true, cancelledRequests: cancelled.length, officialFailureLabelsBuiltinBackup: true, backupDropdown: backupOptions, providerDropdown: providerOptions, providerModelsIsolated: true, apiOfficialRequests: 0, editingPreservesModel: true, copyingPreservesModel: true, reopenedDraftUsesDefaults: true, accountCatalogsUnchanged: true, actualClientLaunched: false, upstreamRequests: false }
       fs.writeFileSync(join(output, 'validation.json'), JSON.stringify(validation, null, 2))
-      console.log('Instance model UI passed: empty OAuth catalogs receive native defaults and options; next succeeds without typing; delayed IPC preserves manual input; API catalogs stay isolated; edit/copy preserve saved models; cancel/reopen resets the draft. Temporary encrypted vault and fixture app; no upstream request or actual client launch.')
+      console.log('Instance model UI passed: official account catalogs override builtin and stale account candidates; next succeeds without typing; delayed IPC preserves manual input; slow account A cannot overwrite account B; failure explicitly labels builtin backup; API catalogs stay isolated; edit/copy preserve saved models. Temporary encrypted vault, fixture official IPC and app; no upstream request or actual client launch.')
       clearTimeout(timer); app.quit()
     } catch (error) {
       console.error(error)

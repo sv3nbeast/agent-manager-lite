@@ -38,6 +38,8 @@ import { historyFilterSchema, historyQuerySchema } from '../shared/history'
 import { mutateProvider, readProviderKey } from './providerLibrary'
 import {readModelContextDefaults} from './modelContextDefaults'
 import {readInstanceModelDefaults} from './instanceModelDefaults'
+import {ChatGPTModels} from './chatgptModels'
+import {readCodexModelClientVersion} from './codexModelClientVersion'
 import { ProviderProbes } from './providerProbe'
 import { ProviderModels } from './providerModels'
 import {ProviderUsageQueries} from './providerUsageRefresh'
@@ -157,8 +159,13 @@ async function main(): Promise<void> {
   await sessionTransfers.recover()
   await sessionSync.recover()
   const quotas = new QuotaService(store, tokens, accountNetwork.request, agents,projectRouting,maintenance)
-  const accountProxies=new AccountProxies(store,accountNetwork,id=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||quotas.busy()||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||wakeups.usesAccount(id)||[...commands.values()].includes('fetchProviderModels'))
-  const accountBusy=(id:string)=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||accountProxies.busy(id)||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||[...commands.values()].includes('fetchProviderModels')
+  const chatgptModels=new ChatGPTModels(store,tokens,accountNetwork.request,agents,{resolveClientVersion:async(applicationId,signal)=>{
+    const application=instances.applications().find(value=>value.id===applicationId)
+    if(!application)throw new Error('所选客户端程序已变化，请重新选择')
+    return readCodexModelClientVersion(application,signal)
+  }})
+  const accountProxies=new AccountProxies(store,accountNetwork,id=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||chatgptModels.busy(id)||quotas.busy()||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||wakeups.usesAccount(id)||[...commands.values()].includes('fetchProviderModels'))
+  const accountBusy=(id:string)=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.usesAccount(id)||clientSwitches.usesAccount(id)||tokens.busy(id)||agents.busy(id)||chatgptModels.busy(id)||accountProxies.busy(id)||providerUsageQueries.snapshot().running||providerProbes.snapshot().running||[...commands.values()].includes('fetchProviderModels')
   const proxyResources=new ProxyResources(store,id=>accountBusy(id)||quotas.busy())
   const proxyBatch=new ProxyBatch(store,id=>accountBusy(id)||quotas.busy())
   const proxyCatalog=new ProxyCatalog(store,id=>accountBusy(id)||quotas.busy())
@@ -246,7 +253,7 @@ async function main(): Promise<void> {
     proxyCatalog.stop()
     login.cancel()
     historyExport?.abort()
-    Promise.allSettled([localDataMigration.stop(),dataBackups.stop(),providerModels.stop(),upstreamProxies.stop(),subscriptionStop,wakeups.stop(),proxyEngine.stop(),accountProxies.stop(),accountNetwork.stop(),tempLogin.stop(),quotas.stop(), tokens.stop(), clientAuthority.stop(), agents.stop(), localAccess.stop(), instances.closeAll(),providerProbes.stop(),providerUsageQueries.stop(), accountFiles.stop(), accountRecycle.stop(), sessionArchives.stop(), sessionTransfers.stop(), sessionSync.stop(), sessionTrash.stop(), exportTask]).finally(async () => {await proxyTunnels.stop();history.close();app.quit()})
+    Promise.allSettled([localDataMigration.stop(),dataBackups.stop(),chatgptModels.stop(),providerModels.stop(),upstreamProxies.stop(),subscriptionStop,wakeups.stop(),proxyEngine.stop(),accountProxies.stop(),accountNetwork.stop(),tempLogin.stop(),quotas.stop(), tokens.stop(), clientAuthority.stop(), agents.stop(), localAccess.stop(), instances.closeAll(),providerProbes.stop(),providerUsageQueries.stop(), accountFiles.stop(), accountRecycle.stop(), sessionArchives.stop(), sessionTransfers.stop(), sessionSync.stop(), sessionTrash.stop(), exportTask]).finally(async () => {await proxyTunnels.stop();history.close();app.quit()})
   })
   app.on('second-instance', () => { if (window.isMinimized()) window.restore(); window.show(); window.focus() })
   if (process.platform === 'darwin') {
@@ -452,6 +459,8 @@ async function main(): Promise<void> {
       case 'readProviderKey': return readProviderKey(store, input)
       case 'readModelContextDefaults': return readModelContextDefaults(input)
       case 'readInstanceModelDefaults': return readInstanceModelDefaults(input)
+      case 'fetchChatGPTModels': return await chatgptModels.fetch(input)
+      case 'cancelChatGPTModels': await chatgptModels.cancel(input);return
       case 'saveInstance': instances.save(input); break
       case 'copyInstance': instances.startCopy(input);break
       case 'copyExternalInstance': instances.startExternalCopy(input);break

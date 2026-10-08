@@ -6,7 +6,7 @@ import { builtInCatalog } from '../src/main/modelCatalog'
 test('native instance defaults use visible client models in catalog priority order without routing templates', () => {
   const before = JSON.stringify(builtInCatalog)
   const defaults = readInstanceModelDefaults('codex')
-  const visible = builtInCatalog.models.filter(model => model.visibility !== 'hide')
+  const visible = builtInCatalog.models.filter(model => model.visibility === 'list')
   assert.equal(defaults.models.length, visible.length)
   assert.equal(defaults.defaultModelId, visible.reduce((best, model) => Number(model.priority) < Number(best.priority) ? model : best).slug)
   assert.deepEqual(new Set(defaults.models), new Set(visible.map(model => model.slug)))
