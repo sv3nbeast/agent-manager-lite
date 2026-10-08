@@ -17,7 +17,8 @@ const busy = ref(false), error = ref(''), backup = ref<string>()
 useFormFeedback(error)
 const form = reactive<Record<QuickConfigKey, string | number | null>>({ model: null, model_provider: null, model_reasoning_effort: null, service_tier: null, model_context_window: null, model_auto_compact_token_limit: null })
 let initial = { ...form }
-const labels: Record<ConfigKey, string> = { model: '默认模型', model_provider: 'Provider', model_reasoning_effort: '推理档位', service_tier: '服务等级', model_context_window: '上下文窗口', model_auto_compact_token_limit: '压缩阈值', model_catalog_json: '模型目录文件',cli_auth_credentials_store:'凭据存储',forced_login_method:'登录方式' }
+const labels: Record<ConfigKey, string> = { model: '默认模型', model_provider: 'Provider', model_reasoning_effort: '推理档位', service_tier: '服务等级', model_context_window: '上下文窗口', model_auto_compact_token_limit: '压缩阈值', model_catalog_json: '模型目录文件',cli_auth_credentials_store:'凭据存储',forced_login_method:'登录方式',sqlite_home:'会话数据库目录' }
+const changeLabel=(key:ConfigKey):string=>labels[key]??(key.startsWith('profiles.')?'Profile 会话数据库目录':providerChangeLabel(key))
 const tierOptions = [{ label: 'Fast', value: 'fast' }, { label: 'Standard', value: 'default' }, { label: 'Auto', value: 'auto' }, { label: 'Flex', value: 'flex' }, { label: 'Priority（保留已有值）', value: 'priority' }]
 async function run(action: () => Promise<void>) {
   if (busy.value) return
@@ -106,9 +107,9 @@ onMounted(() => run(async () => { targets.value = await window.manager.listClien
     </a-card>
     <a-modal :open="!!preview" :title="preview?.kind === 'restore' ? '确认恢复配置' : '确认配置改动'" :width="720" ok-text="应用改动" cancel-text="取消" :confirm-loading="busy" :ok-button-props="{disabled:!preview?.changes.length}" :body-style="{maxHeight:'70vh',overflowY:'auto'}" @ok="apply" @cancel="cancelPreview">
       <p class="config-path"><code>{{ preview?.target.directory }}/config.toml</code></p>
-      <a-alert v-if="preview?.conflicts.length" type="warning" show-icon :message="`以下字段已有其他修改，将保留：${preview.conflicts.map(key => labels[key]??providerChangeLabel(key)).join('、')}`" style="margin-bottom: 16px" />
+      <a-alert v-if="preview?.conflicts.length" type="warning" show-icon :message="`以下字段已有其他修改，将保留：${preview.conflicts.map(changeLabel).join('、')}`" style="margin-bottom: 16px" />
       <a-table :data-source="preview?.changes" :pagination="false" row-key="key" size="small" table-layout="fixed" :columns="[{title:'设置',dataIndex:'key',width:200},{title:'当前值',dataIndex:'before'},{title:'保存后',dataIndex:'after'}]">
-        <template #bodyCell="{column,record,text}"><span v-if="column.dataIndex === 'key'" class="config-value">{{ labels[record.key as ConfigKey]??providerChangeLabel(record.key) }}</span><code v-else class="config-value">{{ text }}</code></template>
+        <template #bodyCell="{column,record,text}"><span v-if="column.dataIndex === 'key'" class="config-value">{{ changeLabel(record.key as ConfigKey) }}</span><code v-else class="config-value">{{ text }}</code></template>
         <template #emptyText>没有需要修改的配置</template>
       </a-table>
       <template #footer><FormFeedback :error="error" /><a-space><a-button :disabled="busy" @click="cancelPreview">取消</a-button><a-button type="primary" :loading="busy" :disabled="busy || !preview?.changes.length" @click="apply">应用改动</a-button></a-space></template>

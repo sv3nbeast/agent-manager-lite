@@ -14,6 +14,7 @@ import type {ProviderConfigView} from '../shared/providerConfig'
 import {instanceHomePath,validateExternalHome} from './instancePaths'
 import {instanceProviderName} from './instanceProviderName'
 import {effectiveModelContextWindows} from './providerModelContext'
+import {chooseSessionDatabase,sessionDatabaseConfigPath} from './sessionDatabase'
 
 const managedId = 'dd0c896c-522d-4d6a-a9af-3a6a3e10e2fd'
 const hash = (text: string | null) => createHash('sha256').update(text === null ? 'missing:' : `present:${text}`).digest('hex')
@@ -328,10 +329,14 @@ export class ClientConfigs {
     const target=this.target(id),source=this.source(target),doc=new TomlDocument(source??'')
     if(hash(source)!==revision)throw new Error('实例配置已变化，请重新预览启动')
     const context=this.instanceModelContext(id,model)
-    const edits:TomlEdit[]=context.catalogFile===undefined?[]:[
-      {path:['model_catalog_json'],raw:scalarRaw(join(this.catalogFolder(target),context.catalogFile.name))},
-      {path:['model_context_window'],raw:null},
-      {path:['model_auto_compact_token_limit'],raw:null}
+    const sessionDatabase=chooseSessionDatabase(target.directory,source)
+    const edits:TomlEdit[]=[
+      ...(sessionDatabase.value===undefined?[]:[{path:sessionDatabaseConfigPath(source),raw:scalarRaw(sessionDatabase.value)}]),
+      ...(context.catalogFile===undefined?[]:[
+        {path:['model_catalog_json'],raw:scalarRaw(join(this.catalogFolder(target),context.catalogFile.name))},
+        {path:['model_context_window'],raw:null},
+        {path:['model_auto_compact_token_limit'],raw:null}
+      ])
     ]
     const preview=this.stage(target,source,edits.filter(edit=>doc.raw(edit.path)!==edit.raw),'apply',[],context.dependency?[context.dependency]:[],context.catalogFile)
     this.pending!.verify=()=>{if(this.instanceModelContext(id,model).revision!==context.revision)throw new Error('实例连接、供应商上下文或模型目录已变化，请重新预览启动')}
@@ -351,6 +356,7 @@ export class ClientConfigs {
     // Refuse hidden custom headers/query parameters on the reserved connection.
     if(doc.children(['model_providers',provider]).some(key=>!['name','base_url','wire_api','requires_openai_auth','supports_websockets','experimental_bearer_token'].includes(key)))throw new Error('实例专用 Provider 含额外字段，请先移除自定义覆盖')
     const context=this.instanceModelContext(id,connection.model)
+    const sessionDatabase=chooseSessionDatabase(target.directory,source)
     const values:[string[],string|number|boolean|null][]=[
       [['model'],connection.model],[['model_provider'],provider],
       [['cli_auth_credentials_store'],'file'],[['forced_login_method'],'api'],
@@ -358,6 +364,7 @@ export class ClientConfigs {
       [['model_providers',provider,'wire_api'],'responses'],[['model_providers',provider,'requires_openai_auth'],false],
       [['model_providers',provider,'supports_websockets'],false],[['model_providers',provider,'experimental_bearer_token'],connection.key]
     ]
+    if(sessionDatabase.value!==undefined)values.push([['sqlite_home'],sessionDatabase.value])
     // Compatible native speed menus own this persistent preference. Omit it
     // from the temporary connection journal so stopping restores the reserved
     // provider/key independently of later speed choices. Other callers retain

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
+import { createServer, get, type IncomingMessage, type ServerResponse } from 'node:http'
 import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
@@ -9,6 +9,30 @@ import { createAPIAccount, parseAccountImport } from '../src/main/accounts'
 import { settingsSchema } from '../src/shared/types'
 import { emptyLocalAccess } from '../src/shared/localAccess'
 import { setTimeout as delay } from 'node:timers/promises'
+
+// Host service discovery can touch a fresh loopback port before the sidecar.
+// Reject its exact bodyless GET / signature without relaxing the upstream
+// method, path, JSON, timeout or request-count assertions below.
+function rejectHostProbe(req:IncomingMessage,res:ServerResponse):boolean {
+  if(req.method!=='GET'||req.url!=='/'||req.headers['user-agent']!==undefined||req.headers['content-length']!==undefined||req.headers['transfer-encoding']!==undefined)return false
+  res.writeHead(404,{Connection:'close'});res.end();return true
+}
+
+// Send protocol failures back to the test caller. An uncaught async listener
+// rejection would otherwise leave fetch waiting on an unanswered socket.
+function responseFixture(handler:(req:IncomingMessage,res:ServerResponse)=>Promise<void>):(req:IncomingMessage,res:ServerResponse)=>void {
+  return (req,res)=>{
+    if(rejectHostProbe(req,res))return
+    void (async()=>{
+      assert.equal(req.method,'POST');assert.equal(req.url,'/v1/responses')
+      await handler(req,res)
+    })().catch(error=>{
+      console.error('Upstream fixture request failed',error)
+      if(!res.headersSent)res.writeHead(500,{Connection:'close'})
+      res.end('Upstream fixture request failed')
+    })
+  }
+}
 
 test('imported personal access token starts the source-built OAuth runtime without token refresh', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cml-pat-gateway-'))
@@ -23,7 +47,7 @@ test('imported personal access token starts the source-built OAuth runtime witho
     const auth = JSON.parse(readFileSync(join(directory, 'auth', `${account.id}.json`), 'utf8'))
     assert.equal(auth.auth_mode, 'personal_access_token')
     assert.equal(auth.refresh_owner, 'codex_manager_lite')
-    const response = await fetch(`http://127.0.0.1:${status.port}/v1/models`, { headers: { Authorization: 'Bearer fixture-local-key' } })
+    const response = await fetch(`http://127.0.0.1:${status.port}/v1/models`, { signal:AbortSignal.timeout(8000), headers: { Authorization: 'Bearer fixture-local-key' } })
     assert.equal(response.status, 200)
     assert.ok(Array.isArray((await response.json()).data))
   } finally { await gateway.stop(); assert.deepEqual(readdirSync(root), []); rmSync(root, { recursive: true, force: true }) }
@@ -33,7 +57,7 @@ test('saved stream timeouts reach the source-built sidecar, close upstream and n
   const root = mkdtempSync(join(tmpdir(), 'cml-stream-timeouts-'))
   const seen: unknown[] = [], events: Record<string, unknown>[] = []
   let mode = 'before_headers', closed = 0
-  const upstream = createServer(async (req, res) => {
+  const upstream = createServer(responseFixture(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk
     const body = JSON.parse(raw); seen.push(body.service_tier)
     res.once('close', () => { closed++ })
@@ -43,9 +67,13 @@ test('saved stream timeouts reach the source-built sidecar, close upstream and n
     if (mode === 'headers_only') return
     if (mode === 'after_delta') { res.write('data: {"type":"response.output_text.delta","delta":"中文🧪"}\n\n'); return }
     res.end('data: {"type":"response.completed","response":{"id":"fixture","status":"completed","output":[],"service_tier":"default"}}\n\n')
-  })
+  }))
   await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
   const address = upstream.address(); assert.ok(address && typeof address === 'object')
+  await new Promise<void>((resolve,reject)=>{
+    get(`http://127.0.0.1:${address.port}/`,response=>{assert.equal(response.statusCode,404);response.once('end',resolve);response.resume()}).once('error',reject)
+  })
+  assert.deepEqual(seen,[]);assert.equal(closed,0)
   const account = createAPIAccount({ name:'Timeout fixture', apiKey:'fixture-only', baseUrl:`http://127.0.0.1:${address.port}/v1`, models:['fixture-model'], wireApi:'responses', defaultTier:'inherit', note:'', tags:[] })
   const gateway = new Gateway(resolve('resources/bin/codex-proxy'), root, event => { if (event.type === 'usage') events.push(event) })
   t.after(async () => { await gateway.stop(); upstream.closeAllConnections(); await new Promise<void>(resolve => upstream.close(() => resolve())); rmSync(root, {recursive:true,force:true}) })
@@ -112,13 +140,13 @@ test('source-built sidecar: projected Fast reaches HTTP upstream, explicit Stand
   assert.ok(existsSync(binary), 'Run npm run build:proxy before gateway tests')
   const root = mkdtempSync(join(tmpdir(), 'codex-manager-gateway-'))
   const received: Record<string, unknown>[] = []
-  const upstream = createServer(async (req,res) => {
+  const upstream = createServer(responseFixture(async (req,res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
     received.push(JSON.parse(Buffer.concat(chunks).toString()))
     res.setHeader('Content-Type','application/json')
     res.end(JSON.stringify({ id: 'resp_local_only', object: 'response', status: 'completed', service_tier: 'default', output: [], usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } }))
-  })
+  }))
   await new Promise<void>(resolve => upstream.listen(0,'127.0.0.1',resolve))
   const address = upstream.address()
   assert.ok(address && typeof address !== 'string')
@@ -130,7 +158,7 @@ test('source-built sidecar: projected Fast reaches HTTP upstream, explicit Stand
     assert.equal(status.running,true)
     const url = `http://127.0.0.1:${status.port}/v1/responses`
     for (const tier of [undefined,'default','flex']) {
-      const response = await fetch(url,{ method:'POST', headers:{ Authorization:'Bearer fake-client','Content-Type':'application/json' }, body:JSON.stringify({ model:'gpt-5.5',input:'Local 🧪\nprobe', service_tier:tier }) })
+      const response = await fetch(url,{ signal:AbortSignal.timeout(8000), method:'POST', headers:{ Authorization:'Bearer fake-client','Content-Type':'application/json' }, body:JSON.stringify({ model:'gpt-5.5',input:'Local 🧪\nprobe', service_tier:tier }) })
       assert.equal(response.status,200,await response.text())
       assert.equal(received.at(-1)?.service_tier,tier ?? 'priority')
       const deadline = Date.now() + 2000
@@ -142,13 +170,13 @@ test('source-built sidecar: projected Fast reaches HTTP upstream, explicit Stand
       assert.equal(entry.serviceTier,'standard')
       assert.equal(entry.tierSource,tier ? 'request' : 'global')
     }
-    const invalid = await fetch(url,{ method:'POST',headers:{Authorization:'Bearer wrong-key'},body:JSON.stringify({model:'gpt-5.5',input:'denied'}) })
+    const invalid = await fetch(url,{ signal:AbortSignal.timeout(8000),method:'POST',headers:{Authorization:'Bearer wrong-key'},body:JSON.stringify({model:'gpt-5.5',input:'denied'}) })
     assert.equal(invalid.status,401)
     assert.equal(received.length,3)
   } finally {
     await gateway.stop()
     assert.deepEqual(readdirSync(root),[],'Runtime credentials should be removed when the service stops')
-    await new Promise<void>(resolve => upstream.close(() => resolve()))
+    upstream.closeAllConnections();await new Promise<void>(resolve => upstream.close(() => resolve()))
     rmSync(root,{recursive:true,force:true})
   }
 })
@@ -156,13 +184,13 @@ test('source-built sidecar: projected Fast reaches HTTP upstream, explicit Stand
 test('source-built profiles honor account/instance precedence and apply changes after restart across models', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cml-tier-profiles-'))
   const bodies: Record<string, unknown>[] = []
-  const upstream = createServer(async (req, res) => {
+  const upstream = createServer(responseFixture(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk
     bodies.push(JSON.parse(raw))
     res.setHeader('Content-Type', 'application/json')
     // Deliberately omit service_tier: configuration is not an upstream echo.
     res.end('{"id":"fixture","object":"response","status":"completed","output":[]}')
-  })
+  }))
   await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
   const address = upstream.address(); assert.ok(address && typeof address === 'object')
   const account = createAPIAccount({ name: 'Profile test', apiKey: 'fake-only', baseUrl: `http://127.0.0.1:${address.port}`, models: ['gpt-5.5','model-b'], wireApi:'responses', defaultTier:'inherit', note:'',tags:[] })
@@ -179,7 +207,7 @@ test('source-built profiles honor account/instance precedence and apply changes 
       account.defaultTier = testcase.provider
       const status = await gateway.start({ id: account.id, port: 0, account, apiKey: 'client-fixture', defaultTier: testcase.instance }, settingsSchema.parse({ defaultTier: 'fast' }))
       for (const model of account.models) {
-        const response = await fetch(`http://127.0.0.1:${status.port}/v1/responses`, { method:'POST', headers:{Authorization:'Bearer client-fixture','Content-Type':'application/json'}, body:JSON.stringify({model,input:'fixture'}) })
+        const response = await fetch(`http://127.0.0.1:${status.port}/v1/responses`, { signal:AbortSignal.timeout(8000), method:'POST', headers:{Authorization:'Bearer client-fixture','Content-Type':'application/json'}, body:JSON.stringify({model,input:'fixture'}) })
         assert.equal(response.status, 200)
         assert.equal((await response.json()).service_tier, undefined)
         assert.equal(bodies.at(-1)?.service_tier, testcase.want)

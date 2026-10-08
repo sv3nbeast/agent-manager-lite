@@ -7,3 +7,9 @@ test('tray close policy hides only for a configured ordinary window close', () =
   assert.equal(shouldHideOnClose({ closeToTray: true, explicitQuit: false }), true)
   assert.equal(shouldHideOnClose({ closeToTray: true, explicitQuit: true }), false)
 })
+
+test('an active instance keeps the manager resident even without tray preference', () => {
+  assert.equal(shouldHideOnClose({ closeToTray: false, explicitQuit: false, activeInstances: true }), true)
+  assert.equal(shouldHideOnClose({ closeToTray: false, explicitQuit: true, activeInstances: true }), false)
+  assert.equal(shouldHideOnClose({ closeToTray: false, explicitQuit: false, activeInstances: false }), false)
+})

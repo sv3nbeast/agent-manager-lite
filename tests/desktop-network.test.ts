@@ -2,11 +2,19 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {chromiumEnvironmentProxy,desktopNetworkArgs} from '../src/main/desktopNetwork'
 import {macLaunchArgs,type DesktopPlan} from '../src/main/instanceRuntime'
-import {createServer} from 'node:http'
+import {createServer,get,type IncomingMessage,type ServerResponse} from 'node:http'
 import {spawn} from 'node:child_process'
 import {mkdtempSync,rmSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join,resolve} from 'node:path'
+
+// Some host tools discover local services with a bodyless GET / and no UA.
+// Exclude only that unrelated probe; client requests remain in the exact route
+// trace so a wrong proxy/bypass route still fails this regression.
+function rejectHostProbe(request:IncomingMessage,response:ServerResponse):boolean {
+  if(request.method!=='GET'||request.url!=='/'||request.headers['user-agent']!==undefined||request.headers['content-length']!==undefined||request.headers['transfer-encoding']!==undefined)return false
+  response.writeHead(404,{Connection:'close'});response.end();return true
+}
 
 test('desktop instances inherit an environment-only network route through supported Chromium switches',()=>{
   const args=desktopNetworkArgs(['--fixture'],{HTTPS_PROXY:'http://127.0.0.1:7890',HTTP_PROXY:'http://127.0.0.1:7890'},false)
@@ -52,11 +60,15 @@ test('actual windowless Electron net needs Chromium proxy switches and keeps the
   const root=mkdtempSync(join(tmpdir(),'cml-desktop-network-'))
   t.after(()=>rmSync(root,{recursive:true,force:true}))
   const proxied:string[]=[],direct:string[]=[]
-  const proxy=createServer((request,response)=>{proxied.push(request.url!);response.end('fixture-proxy-translation')})
-  const gateway=createServer((request,response)=>{direct.push(request.url!);response.end('fixture-local-gateway')})
+  const proxy=createServer((request,response)=>{if(rejectHostProbe(request,response))return;assert.equal(request.method,'GET');proxied.push(request.url!);response.end('fixture-proxy-translation')})
+  const gateway=createServer((request,response)=>{if(rejectHostProbe(request,response))return;assert.equal(request.method,'GET');direct.push(request.url!);response.end('fixture-local-gateway')})
   for(const server of [proxy,gateway]){await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));t.after(()=>{server.closeAllConnections();server.close()})}
   const proxyAddress=proxy.address(),gatewayAddress=gateway.address()
   assert.ok(proxyAddress&&typeof proxyAddress==='object'&&gatewayAddress&&typeof gatewayAddress==='object')
+  for(const address of [proxyAddress,gatewayAddress])await new Promise<void>((resolve,reject)=>{
+    get(`http://127.0.0.1:${address.port}/`,response=>{assert.equal(response.statusCode,404);response.once('end',resolve);response.resume()}).once('error',reject)
+  })
+  assert.deepEqual(proxied,[]);assert.deepEqual(direct,[])
   const environment={HTTP_PROXY:`http://127.0.0.1:${proxyAddress.port}`,HTTPS_PROXY:`http://127.0.0.1:${proxyAddress.port}`}
   const electron=resolve('node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')
   const run=async(args:string[],name:string,external='http://cml-desktop-network.invalid/translation-fixture')=>{

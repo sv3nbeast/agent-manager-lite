@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os'
 import {DatabaseSync} from 'node:sqlite'
 import {scanInstanceHome,copyInstanceHome,relocateCopiedProfile} from '../src/main/instanceCopy'
 import {scanSessionHome} from '../src/main/instanceSessionCopy'
-import {copySavedInstanceHome} from '../src/main/instanceCopySnapshot'
+import {copySavedInstanceHome,normalizeSessionDatabaseCopy} from '../src/main/instanceCopySnapshot'
 
 const supported=process.platform==='darwin'
 function fixture(t:{after(fn:()=>void):void}){
@@ -43,6 +43,65 @@ test('session-only inventory refuses a database configured outside the selected 
   const f=fixture(t),outside=join(f.root,'outside-db')
   mkdirSync(outside);writeFileSync(join(f.source,'config.toml'),`sqlite_home = ${JSON.stringify(outside)}\n`)
   await assert.rejects(scanSessionHome(f.source,f.signal),/目录外/)
+})
+
+test('session-only snapshot carries the thread history projection with the state index',{skip:!supported},async t=>{
+  const f=fixture(t),statePath=join(f.source,'state_5.sqlite'),historyPath=join(f.source,'thread_history_1.sqlite')
+  writeFileSync(join(f.source,'sessions','rollout-thread.jsonl'),meta+line)
+  const state=new DatabaseSync(statePath)
+  state.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT); CREATE TABLE projects(id TEXT PRIMARY KEY)')
+  state.prepare('INSERT INTO threads VALUES(?,?,?)').run('thread',join(f.source,'sessions','rollout-thread.jsonl'),'original')
+  const history=new DatabaseSync(historyPath)
+  history.exec('CREATE TABLE items(id INTEGER PRIMARY KEY,thread_id TEXT,payload TEXT)')
+  history.prepare('INSERT INTO items(thread_id,payload) VALUES(?,?)').run('thread','历史投影')
+  t.after(()=>{state.close();history.close()})
+  const manifest=await scanSessionHome(f.source,f.signal)
+  assert.deepEqual(manifest.entries.filter(entry=>!entry.directory).map(entry=>entry.relative).sort(),['sessions/rollout-thread.jsonl','state_5.sqlite','thread_history_1.sqlite'])
+  const saved=await copySavedInstanceHome(manifest,f.target,f.signal,()=>{})
+  assert.equal(existsSync(join(f.target,'thread_history_1.sqlite')),true)
+  assert.equal(existsSync(join(f.target,'thread_history_1.sqlite-wal')),false)
+  const copied=new DatabaseSync(join(f.target,'thread_history_1.sqlite'),{readOnly:true})
+  try{
+    assert.equal(copied.prepare('PRAGMA integrity_check').get()!.integrity_check,'ok')
+    assert.equal(copied.prepare('SELECT count(*) AS total FROM items').get()!.total,1)
+  }finally{copied.close()}
+  assert.equal(saved.files,3)
+})
+
+test('session-only copy selects the active database and normalizes legacy sqlite_home to the root',async t=>{
+  const f=fixture(t),nested=join(f.source,'sqlite'),dbPath=join(nested,'state_5.sqlite')
+  mkdirSync(nested);writeFileSync(join(f.source,'config.toml'),'profile="work"\n[profiles.work]\nsqlite_home="sqlite"\n')
+  writeFileSync(join(f.source,'sessions','rollout-thread.jsonl'),meta+line)
+  const db=new DatabaseSync(dbPath);db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)');db.prepare('INSERT INTO threads VALUES(?,?)').run('thread',join(f.source,'sessions','rollout-thread.jsonl'));db.close()
+  const history=new DatabaseSync(join(nested,'thread_history_1.sqlite'));history.exec('CREATE TABLE history(thread_id TEXT PRIMARY KEY)');history.prepare('INSERT INTO history VALUES(?)').run('thread');history.close()
+  const manifest=await scanSessionHome(f.source,f.signal)
+  assert.deepEqual(manifest.entries.filter(entry=>!entry.directory).map(entry=>entry.relative),['sessions/rollout-thread.jsonl','sqlite/state_5.sqlite','sqlite/thread_history_1.sqlite'])
+  const saved=await copySavedInstanceHome(manifest,f.target,f.signal,()=>{})
+  await normalizeSessionDatabaseCopy(f.target,f.signal)
+  assert.equal(existsSync(join(f.target,'state_5.sqlite')),true)
+  assert.equal(existsSync(join(f.target,'sqlite','state_5.sqlite')),false)
+  assert.equal(existsSync(join(f.target,'thread_history_1.sqlite')),true)
+  assert.equal(existsSync(join(f.target,'sqlite')),false)
+  const normalized=await scanInstanceHome(f.target,f.signal)
+  assert.ok(normalized.entries.some(entry=>entry.relative==='state_5.sqlite'))
+  assert.equal(saved.root,f.source)
+})
+
+test('normalization refuses to pair databases from different internal directories',async t=>{
+  const f=fixture(t),first=join(f.source,'first'),second=join(f.source,'second')
+  mkdirSync(first);mkdirSync(second)
+  writeFileSync(join(first,'state_5.sqlite'),'fixture state');writeFileSync(join(second,'thread_history_1.sqlite'),'fixture history')
+  await assert.rejects(normalizeSessionDatabaseCopy(f.source,f.signal),/多个内部副本/)
+  assert.equal(existsSync(join(first,'state_5.sqlite')),true)
+  assert.equal(existsSync(join(second,'thread_history_1.sqlite')),true)
+})
+
+test('session-only inventory does not carry an unused sqlite fallback beside the canonical database',async t=>{
+  const f=fixture(t),nested=join(f.source,'sqlite')
+  mkdirSync(nested);writeFileSync(join(f.source,'sessions','rollout-thread.jsonl'),meta+line)
+  writeFileSync(join(f.source,'state_5.sqlite'),'root database');writeFileSync(join(nested,'state_5.sqlite'),'legacy database')
+  const manifest=await scanSessionHome(f.source,f.signal)
+  assert.deepEqual(manifest.entries.filter(entry=>!entry.directory).map(entry=>entry.relative),['sessions/rollout-thread.jsonl','state_5.sqlite'])
 })
 
 test('snapshot copies an appended active rollout that the old frozen metadata copier rejects, without sharing writes',{skip:!supported},async t=>{

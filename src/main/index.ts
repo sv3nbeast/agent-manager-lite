@@ -104,6 +104,15 @@ async function main(): Promise<void> {
   let dataBackups:DataBackups
   const maintenance=()=>!!dataBackups&&(dataBackups.applying||dataBackups.restartRequired)
   const commands=new Map<symbol,string>()
+  // Closing the manager window must not stop a client instance that is still
+  // serving the user. The optional tray preference remains useful when there
+  // are no instances, while an active instance implicitly keeps the manager
+  // resident so its local gateway remains supervised.
+  // A recovered process or a process with a failed gateway is displayed as
+  // "error", but still owns a client and recovery journal. Do not infer
+  // process lifetime from the presentation status or treat it as stopped.
+  const hasActiveInstances = () => instances?.views().some(value =>
+    instances.inUse(value.id, false)) === true
   const clientConfigs = new ClientConfigs(store,Date.now,id=>(instances?.inUse(id) ?? false)||(clientSwitches?.usesTarget(id) ?? false))
   const clientIdentities = new ClientIdentities(store,clientConfigs)
   const runId = randomUUID()
@@ -207,6 +216,20 @@ async function main(): Promise<void> {
   credentialTimer.unref()
   app.on('before-quit', event => {
     if (exiting) return
+    // A normal window close, Cmd+Q, or window-all-closed can reach this hook
+    // without the tray's explicit-quit marker. Keep the manager resident in
+    // that case: the gateway sidecar intentionally monitors this process and
+    // would otherwise terminate roughly two seconds after its parent exits.
+    // The tray's "退出并停止运行实例" action sets explicitQuit and performs the
+    // existing full cleanup path.
+    if (!explicitQuit && hasActiveInstances()) {
+      event.preventDefault()
+      keepAliveInTray = true
+      // Startup failure can request quit before the main window is created.
+      // Preserving the owned instances must not itself throw in that case.
+      for (const openWindow of BrowserWindow.getAllWindows()) openWindow.hide()
+      return
+    }
     explicitQuit = true
     event.preventDefault(); exiting = true
     clearInterval(credentialTimer)
@@ -255,18 +278,21 @@ async function main(): Promise<void> {
     const showWindow = () => { if (window.isMinimized()) window.restore(); window.show(); window.focus() }
     tray.on('click', () => { if (window.isVisible()) window.hide(); else showWindow() })
     refreshTrayMenu = () => {
-      const enabled = store.read().settings.closeToTray
       tray?.setContextMenu(Menu.buildFromTemplate([
         { label: '显示主窗口', click: showWindow },
-        { label: enabled ? '关闭窗口后隐藏到托盘' : '关闭窗口后退出应用', enabled: false },
+        { label: '有运行实例时关闭窗口会继续运行', enabled: false },
         { type: 'separator' },
-        { label: `退出 ${productName}`, click: () => { explicitQuit = true; app.quit() } }
+        { label: `退出并停止运行实例`, click: () => { explicitQuit = true; app.quit() } }
       ]))
     }
     refreshTrayMenu()
   }
   window.on('close', event => {
-    if (shouldHideOnClose({ closeToTray: store.read().settings.closeToTray, explicitQuit })) {
+    const hide = shouldHideOnClose({ closeToTray: store.read().settings.closeToTray, explicitQuit, activeInstances: hasActiveInstances() })
+    // Recompute after the last instance stops. A previous automatic tray hide
+    // must not leave a destroyed window resident when tray mode is disabled.
+    keepAliveInTray = hide
+    if (hide) {
       event.preventDefault()
       window.hide()
     }
@@ -301,6 +327,9 @@ async function main(): Promise<void> {
       case 'restartAfterBackup':
         z.undefined().parse(input)
         if(!dataBackups.restartRequired)throw new Error('当前没有等待重启的恢复操作')
+        // Restore already requires every instance/service to be stopped.
+        // This explicit maintenance restart must not become a tray hide.
+        explicitQuit = true
         app.relaunch();app.quit();return
       case 'listSshServers': z.undefined().parse(input); return sshServers.view()
       case 'saveSshServer': sshServers.save(input); break
@@ -525,7 +554,7 @@ async function main(): Promise<void> {
           try { if (!isolatedTest) applyLaunchAtLogin(app, previous.launchAtLogin) } catch {}
           throw error
         }
-        keepAliveInTray = next.closeToTray
+        keepAliveInTray = next.closeToTray || hasActiveInstances()
         refreshTrayMenu?.()
         quotas.schedule(); break
       }

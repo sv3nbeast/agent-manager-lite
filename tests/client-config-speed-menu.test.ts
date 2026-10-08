@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {randomUUID} from 'node:crypto'
-import {mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs'
+import {mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync,mkdirSync} from 'node:fs'
+import {DatabaseSync} from 'node:sqlite'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {ClientConfigs} from '../src/main/clientConfig'
@@ -9,6 +10,7 @@ import {createAPIAccount,importParsedAccounts} from '../src/main/accounts'
 import {Store} from '../src/main/store'
 import {instanceInputSchema} from '../src/shared/instances'
 import {patchToml,TomlDocument} from '../src/main/tomlPatch'
+import {configPathSchema} from '../src/main/configJournal'
 
 function fixture(t:{after(fn:()=>void):void}){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-config-speed-menu-')))
@@ -64,4 +66,32 @@ test('native-menu mode does not weaken provider guards when the actual provider 
   assert.ok(restore.conflicts.some(key=>key.startsWith('model_providers.')))
   f.configs.apply(restore.ticket)
   assert.equal(new TomlDocument(readFileSync(f.file,'utf8')).scalar(['model_providers','cml_instance','base_url']),'http://127.0.0.1:54321/v1')
+})
+
+test('native history selection overrides the active profile and restores its original scope',t=>{
+  for(const manuallyEdited of [false,true]){
+    const f=fixture(t),home=join(f.store.directory,'instances',f.id,'home'),nested=join(home,'sqlite')
+    mkdirSync(nested)
+    for(const [path,count] of [[join(home,'state_5.sqlite'),4],[join(nested,'state_5.sqlite'),1]] as const){
+      const db=new DatabaseSync(path);db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY)');for(let i=0;i<count;i++)db.prepare('INSERT INTO threads VALUES(?)').run(String(i));db.close()
+    }
+    const source='profile="work"\nsqlite_home="root-original"\n[profiles.work]\nsqlite_home="sqlite"\nmodel_reasoning_effort="high"\n[profiles.other]\nsqlite_home="untouched"\n'
+    writeFileSync(f.file,source)
+    const preview=f.configs.previewInstanceContext(f.id,f.configs.view(f.id).revision,'gpt-5.5')
+    assert.ok(preview.changes.some(change=>change.key==='profiles."work".sqlite_home'))
+    let backup='';f.configs.apply(preview.ticket,id=>{backup=id})
+    let doc=new TomlDocument(readFileSync(f.file,'utf8'))
+    assert.equal(doc.scalar(['profiles','work','sqlite_home']),'.');assert.equal(doc.scalar(['sqlite_home']),'root-original');assert.equal(doc.scalar(['profiles','other','sqlite_home']),'untouched')
+    if(manuallyEdited)writeFileSync(f.file,patchToml(readFileSync(f.file,'utf8'),[{path:['profiles','work','sqlite_home'],raw:'"user-changed"'}]))
+    const restore=f.configs.previewRestore({id:f.id,backup},true)
+    assert.equal(restore.conflicts.includes('profiles."work".sqlite_home'),manuallyEdited)
+    f.configs.apply(restore.ticket);doc=new TomlDocument(readFileSync(f.file,'utf8'))
+    assert.equal(doc.scalar(['profiles','work','sqlite_home']),manuallyEdited?'user-changed':'sqlite')
+    assert.equal(doc.scalar(['profiles','work','model_reasoning_effort']),'high')
+  }
+})
+
+test('journal permits only the managed sqlite_home field inside profiles',()=>{
+  assert.equal(configPathSchema.safeParse(['profiles','work','sqlite_home']).success,true)
+  for(const path of [['profiles','work','model'],['profiles','work','experimental_bearer_token'],['profiles','work','sqlite_home','extra'],['profiles','work\nother','sqlite_home']])assert.equal(configPathSchema.safeParse(path).success,false)
 })

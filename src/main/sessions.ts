@@ -95,7 +95,7 @@ export class SessionCatalog {
               try{
                 const first=await digest(ordered[0].file,signal);identical=true
                 for(const row of ordered.slice(1))if(await digest(row.file,signal)!==first){identical=false;break}
-              }catch{identical=false}
+              }catch{signal.throwIfAborted();identical=false}
             }
             // Identical copies are one logical session. Keep one stable path;
             // distinct bodies remain ambiguous and must be chosen explicitly.

@@ -654,6 +654,41 @@ test('default instance copy migrates sessions only and reinitializes Chinese loc
   await f.instances.stop(target.id)
 })
 
+test('a session-only copy retains its nested index and projection through repeated instance restarts',async t=>{
+  const f=fixture(t),source=f.add(f.account().id,'Nested history source'),databaseHome=join(source.directory,'sqlite')
+  mkdirSync(databaseHome);mkdirSync(join(source.directory,'sessions'))
+  writeFileSync(join(source.directory,'config.toml'),'profile="work"\n[profiles.work]\nsqlite_home="sqlite"\n')
+  const index=new DatabaseSync(join(databaseHome,'state_5.sqlite'))
+  index.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,has_user_event INTEGER)')
+  const projection=new DatabaseSync(join(databaseHome,'thread_history_1.sqlite'))
+  projection.exec('CREATE TABLE items(thread_id TEXT PRIMARY KEY,payload TEXT)')
+  for(const id of ['one','two','three']){
+    const file=join(source.directory,'sessions',`rollout-${id}.jsonl`)
+    writeFileSync(file,JSON.stringify({type:'session_meta',payload:{id,model_provider:'original'}})+'\n'+JSON.stringify({type:'response_item',payload:{text:'saved history '+id}})+'\n')
+    index.prepare('INSERT INTO threads VALUES(?,?,?,1)').run(id,file,'original')
+    projection.prepare('INSERT INTO items VALUES(?,?)').run(id,'saved projection '+id)
+  }
+  index.close();projection.close()
+  f.instances.startCopy(copyInput(source,'Nested history copy'))
+  const done=await copyFinished(f.instances);assert.equal(done.status,'completed',done.error)
+  const target=f.instances.views().find(value=>value.id===done.targetId)!
+  assert.equal(existsSync(join(target.directory,'sqlite')),false)
+  const originalProjection=readFileSync(join(target.directory,'thread_history_1.sqlite'))
+  for(let restart=0;restart<2;restart++){
+    f.instances.start(f.instances.preview({id:target.id,revision:target.revision}).ticket)
+    await f.instances.settled(target.id)
+    assert.equal(f.instances.views().find(value=>value.id===target.id)?.status,'running')
+    assert.equal(connection(target.directory).doc.scalar(['sqlite_home']),'.')
+    const copied=new DatabaseSync(join(target.directory,'state_5.sqlite'),{readOnly:true})
+    assert.equal(copied.prepare('SELECT count(*) AS count FROM threads').get()!.count,3);copied.close()
+    assert.deepEqual(readFileSync(join(target.directory,'thread_history_1.sqlite')),originalProjection)
+    await f.instances.stop(target.id)
+  }
+  assert.equal(existsSync(join(target.directory,'sqlite')),false)
+  assert.deepEqual(readFileSync(join(target.directory,'thread_history_1.sqlite')),originalProjection)
+  assert.equal(readFileSync(join(source.directory,'config.toml'),'utf8'),'profile="work"\n[profiles.work]\nsqlite_home="sqlite"\n')
+})
+
 test('external Cockpit history copy is visible under the launched local API provider without rewriting its source',async t=>{
   const f=fixture(t),account=f.account(),source=join(realpathSync(f.root),'cockpit-history')
   mkdirSync(source);mkdirSync(join(source,'sessions'));mkdirSync(join(source,'archived_sessions'))

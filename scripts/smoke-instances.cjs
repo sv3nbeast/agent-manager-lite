@@ -4,7 +4,7 @@ const {resolve,join,sep,basename}=require('node:path')
 const {tmpdir}=require('node:os')
 const {execFileSync}=require('node:child_process')
 const {randomUUID}=require('node:crypto')
-const {createServer}=require('node:http')
+const {createServer,request}=require('node:http')
 const assert=require('node:assert/strict')
 const directory=process.env.CML_TEST_DATA_DIR
 assert.ok(directory && realpathSync(directory).startsWith(realpathSync(tmpdir())+sep) && basename(directory).startsWith('codex-manager-ui-'))
@@ -65,14 +65,30 @@ app.on('browser-window-created',(_event,window)=>{
     try {
       await wait(`Array.from(document.querySelectorAll('.ant-menu-item')).some(el=>el.textContent.includes('账号管理'))`)
       await run(`Array.from(document.querySelectorAll('.ant-menu-item')).find(el=>el.textContent.includes('账号管理')).click()`)
-      const received=[]
-      upstream=createServer(async(req,res)=>{
-        let raw='';for await(const chunk of req)raw+=chunk
-        received.push({key:req.headers.authorization,tier:JSON.parse(raw).service_tier})
-        res.setHeader('Content-Type','application/json')
-        res.end('{"id":"fixture-instance-ui","object":"response","status":"completed","service_tier":"default","output":[],"usage":{"input_tokens":1,"output_tokens":1}}')
+      const received=[];let upstreamError
+      upstream=createServer((req,res)=>{
+        // Host discovery probes a fresh loopback port with this exact bodyless
+        // signature. Keep all actual upstream requests subject to assertions.
+        if(req.method==='GET'&&req.url==='/'&&req.headers['user-agent']===undefined&&req.headers['content-length']===undefined&&req.headers['transfer-encoding']===undefined){res.writeHead(404,{Connection:'close'});res.end();return}
+        void (async()=>{
+          assert.equal(req.method,'POST');assert.equal(req.url,'/v1/responses')
+          let raw='';for await(const chunk of req)raw+=chunk
+          received.push({key:req.headers.authorization,tier:JSON.parse(raw).service_tier})
+          res.setHeader('Content-Type','application/json')
+          res.end('{"id":"fixture-instance-ui","object":"response","status":"completed","service_tier":"default","output":[],"usage":{"input_tokens":1,"output_tokens":1}}')
+        })().catch(error=>{
+          upstreamError??=error
+          console.error('Instance upstream fixture request failed',error)
+          if(!res.headersSent)res.writeHead(500,{Connection:'close'})
+          res.end('Instance upstream fixture request failed')
+        })
       })
       await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve))
+      assert.equal(await new Promise((resolve,reject)=>{
+        const probe=request({host:'127.0.0.1',port:upstream.address().port,path:'/',method:'GET'},res=>{res.once('end',()=>resolve(res.statusCode));res.resume()})
+        probe.once('error',reject);probe.setTimeout(8000,()=>probe.destroy(new Error('Host probe fixture timed out')));probe.end()
+      }),404)
+      assert.deepEqual(received,[],'Host probes must not count as API requests')
       await run(`window.manager.saveSettings({theme:'light',defaultTier:'standard',port:16321,refreshMinutes:0,launchAtLogin:false})`)
       await run(`window.manager.addAccount(${JSON.stringify({name:'隔离测试账号',apiKey:'fixture-instance-upstream',baseUrl:`http://127.0.0.1:${upstream.address().port}/v1`,models:['fixture-model'],wireApi:'responses',defaultTier:'inherit',tags:[],note:''})})`)
       await run(`document.querySelector('[aria-label="重新加载账号"]').click()`)
@@ -136,7 +152,7 @@ app.on('browser-window-created',(_event,window)=>{
       assert.equal(provider.name,'隔离测试账号')
       const key=provider.experimental_bearer_token,url=provider.base_url
       for(const tier of [undefined,'default']){
-        const response=await fetch(url+'/responses',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture',service_tier:tier})})
+        const response=await fetch(url+'/responses',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture',service_tier:tier}),signal:AbortSignal.timeout(8000)})
         assert.equal(response.status,200);await response.text()
       }
       assert.deepEqual(received,[{key:'Bearer fixture-instance-upstream',tier:'priority'},{key:'Bearer fixture-instance-upstream',tier:'default'}])
@@ -294,7 +310,7 @@ app.on('browser-window-created',(_event,window)=>{
       await wait(`document.querySelectorAll('.instance-card')[2]?.textContent.includes('运行中')`)
       assert.equal((await fixtureEvidence(externalCopy.directory)).home,externalCopy.directory)
       const externalConnection=getStaticTOMLValue(parseTOML(readFileSync(join(externalCopy.directory,'config.toml'),'utf8'))).model_providers.cml_instance
-      const externalResponse=await fetch(externalConnection.base_url+'/responses',{method:'POST',headers:{Authorization:'Bearer '+externalConnection.experimental_bearer_token,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture external copy'})})
+      const externalResponse=await fetch(externalConnection.base_url+'/responses',{method:'POST',headers:{Authorization:'Bearer '+externalConnection.experimental_bearer_token,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture external copy'}),signal:AbortSignal.timeout(8000)})
       assert.equal(externalResponse.status,200);await externalResponse.text();assert.equal(received.at(-1).tier,'priority')
       await click('.instance-card:nth-child(3) button','停止实例')
       await wait(`document.querySelectorAll('.instance-card')[2]?.textContent.includes('已停止')`)
@@ -333,7 +349,7 @@ app.on('browser-window-created',(_event,window)=>{
       assert.equal((await fixtureEvidence(existingHome)).home,existingHome)
       assert.equal((await fixtureEvidence(existingHome)).pid,attachedStatus.pid)
       const attachedConnection=getStaticTOMLValue(parseTOML(readFileSync(join(existingHome,'config.toml'),'utf8'))).model_providers.cml_instance
-      const attachedResponse=await fetch(attachedConnection.base_url+'/responses',{method:'POST',headers:{Authorization:'Bearer '+attachedConnection.experimental_bearer_token,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture existing home'})})
+      const attachedResponse=await fetch(attachedConnection.base_url+'/responses',{method:'POST',headers:{Authorization:'Bearer '+attachedConnection.experimental_bearer_token,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture existing home'}),signal:AbortSignal.timeout(8000)})
       assert.equal(attachedResponse.status,200);await attachedResponse.text();assert.equal(received.at(-1).tier,'priority')
       await capture('instances-existing-running.png')
       await click('.instance-card button','停止实例')
@@ -351,6 +367,7 @@ app.on('browser-window-created',(_event,window)=>{
       assert.equal(readFileSync(join(existingHome,'sessions','keep.jsonl'),'utf8'),'fixture existing session')
       assert.ok(stats().encryptions>0)
       assert.equal(readFileSync(join(directory,'state.vault')).includes('fixture-instance-upstream'),false)
+      assert.equal(upstreamError,undefined,'All non-probe upstream requests must satisfy the fixture')
       console.log('Instance UI smoke passed: local API Fast/Standard, native recovery, CLI, managed/external copy and existing directory registration, actual PID/Fast, stop/restore and detach preserving original files; no OS keychain access')
       clearTimeout(timer);upstream.closeAllConnections();await new Promise(resolve=>upstream.close(resolve));window.destroy();app.exit(0)
     } catch(error) {

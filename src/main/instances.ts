@@ -16,7 +16,7 @@ import { MacInstanceRuntime } from './cliInstanceRuntime'
 import {codexInstanceAdapter,getInstanceClientAdapter} from './codexInstanceAdapter'
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
 import {scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
-import {copySavedInstanceHome} from './instanceCopySnapshot'
+import {copySavedInstanceHome,normalizeSessionDatabaseCopy} from './instanceCopySnapshot'
 import {scanSessionHome} from './instanceSessionCopy'
 import {assertClientDaemonStopped,probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,validateExternalHome,pathContains} from './instancePaths'
@@ -27,6 +27,7 @@ import {initializeDesktopLocale,previewDesktopLocale,systemDesktopLanguages} fro
 import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuInspection} from './codexSpeedMenu'
 import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopServiceTier'
 import {readInstanceHistory} from './instanceHistory'
+import {repairSessionProjection} from './sessionProjectionRepair'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
 const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspectCodexDesktopUi,inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
@@ -238,9 +239,17 @@ export class Instances {
         directory(join(this.root,'instance-copies'),true)
         await mkdir(staging,{mode:0o700});created=true;identity=lstatSync(staging)
         atomic(join(staging,'copy.json'),JSON.stringify({id,sourceId:source.id,...source.external?{external:true,sourceName:source.name}:{}}))
-        const saved=await copySavedInstanceHome(manifest,join(staging,'home'),controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
-        Object.assign(view,{totalFiles:saved.files,totalBytes:saved.bytes,skipped:saved.skipped,omittedSessions:saved.omittedSessions})
-        await relocateCopiedProfile(saved,join(staging,'home'),join(target,'home'),controller.signal,copiedSessionProvider)
+        const stagingHome=join(staging,'home')
+        const saved=await copySavedInstanceHome(manifest,stagingHome,controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
+        if(copyMode==='sessions')await normalizeSessionDatabaseCopy(stagingHome,controller.signal)
+        // Re-scan after normalizing an internal sqlite_home.  The relocation
+        // step must see the canonical target paths and still retain the source
+        // root for validating any rollout/database references.
+        const normalized=copyMode==='sessions'
+          ?{...await scanInstanceHome(stagingHome,controller.signal),root:manifest.root,skipped:saved.skipped,omittedSessions:saved.omittedSessions}
+          :saved
+        Object.assign(view,{totalFiles:normalized.files,totalBytes:normalized.bytes,skipped:normalized.skipped,omittedSessions:normalized.omittedSessions})
+        await relocateCopiedProfile(normalized,stagingHome,join(target,'home'),controller.signal,copiedSessionProvider)
         controller.signal.throwIfAborted()
         verify()
         await mkdir(join(staging,'desktop'),{mode:0o700});await mkdir(join(staging,'workspace'),{mode:0o700})
@@ -385,6 +394,20 @@ export class Instances {
       if(run.profile.externalHome&&run.profile.connectionMode!=='native')assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))
       if(run.profile.connectionMode==='native')await this.nativeAccounts!.prepare(run.profile,run.controller.signal)
       await this.prepareAccount(run.profile.accountId)
+      // A clean stop followed by a start in the same manager process does not
+      // pass through recover(). Apply the same projection repair after account
+      // preparation (which is also the cancellation boundary) and before the
+      // client is launched. This keeps startup cancellation deterministic.
+      if (!run.profile.externalHome && !run.controller.signal.aborted &&
+        await probeClientDaemon(run.plan.directory,run.controller.signal)==='not_detected') {
+        try {
+          const repaired=await repairSessionProjection(run.plan.directory,join(this.root,'instance-trash'))
+          if (repaired) this.notices.set(run.profile.id,`已恢复 ${repaired.inserted} 条会话历史索引；原数据库备份已保留`)
+        } catch (error) {
+          this.notices.set(run.profile.id,'会话历史索引自动恢复失败，原文件已保留；请在客户端完全退出后重试')
+          console.warn('session projection recovery failed',run.profile.id,error)
+        }
+      }
       run.controller.signal.throwIfAborted()
       let context=this.context(run.profile,run.plan.nonce)
       if(context.fingerprint!==fingerprint)throw new Error('实例配置在凭据准备期间已变化，请重新启动')
@@ -524,6 +547,23 @@ export class Instances {
     for(const profile of this.store.read().instances ?? []) {
       try {
         getInstanceClientAdapter(profile.clientType)
+        // Older sessions-only copies retained rollout JSONL and state_5.sqlite
+        // but omitted Codex's thread-history projection. Recover it from an
+        // archived managed copy before a new client process can open the home.
+        // A running or inaccessible daemon is left untouched for a later
+        // restart; this path never kills or rewrites an active client.
+        if (!profile.externalHome) {
+          const home=instanceHomePath(this.root,profile),daemon=await probeClientDaemon(home)
+          if (daemon==='not_detected') {
+            try {
+              const repaired=await repairSessionProjection(home,join(this.root,'instance-trash'))
+              if (repaired) this.notices.set(profile.id,`已恢复 ${repaired.inserted} 条会话历史索引；原数据库备份已保留`)
+            } catch (error) {
+              this.notices.set(profile.id,'会话历史索引自动恢复失败，原文件已保留；请在客户端完全退出后重试')
+              console.warn('session projection recovery failed',profile.id,error)
+            }
+          }
+        }
         const content=readBounded(join(this.folder(profile.id),'launch.json'),4096)
         if(!content){if(this.store.read().clientSwitches?.some(record=>record.targetId===profile.id&&record.instanceNonce))throw new Error('原生恢复记录缺少启动归属');continue}
         const saved=checkpointSchema.parse(JSON.parse(content))

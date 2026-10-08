@@ -2,7 +2,7 @@
 // SQLite uses a pinned read transaction; mutable JSONL uses independent APFS
 // clones. Ordinary configuration and directory identities remain verified.
 import {constants,existsSync,type Stats} from 'node:fs'
-import {lstat,open,mkdir,chmod,realpath} from 'node:fs/promises'
+import {lstat,open,mkdir,chmod,realpath,rename,rm,readdir,rmdir} from 'node:fs/promises'
 import {dirname,basename,join,resolve,relative,isAbsolute,sep} from 'node:path'
 import {spawn} from 'node:child_process'
 import * as sqlite from 'node:sqlite'
@@ -245,4 +245,56 @@ export async function copySavedInstanceHome(manifest:CopyManifest,target:string,
   for(const entry of entries.filter(entry=>entry.directory))await directory(join(manifest.root,entry.relative),entry)
   const copied=await scanInstanceHome(target,signal)
   return {...copied,root:manifest.root,skipped:manifest.skipped,omittedSessions}
+}
+
+/**
+ * Codex resolves its default SQLite home relative to CODEX_HOME.  A source
+ * profile may have used an internal `sqlite_home` (or an older `sqlite/`
+ * layout); carrying that directory into a session-only copy without its
+ * configuration makes a freshly restarted client open an empty database.
+ * Normalize the copied snapshot to the canonical root so the generated
+ * instance configuration can remain disposable and the same history is used
+ * on every launch.  This only touches the new staging directory.
+ */
+export async function normalizeSessionDatabaseCopy(home:string,signal:AbortSignal):Promise<void>{
+  signal.throwIfAborted()
+  const isSessionDatabase=(name:string):boolean=>/^(?:state|thread_history)_\d+\.sqlite$/i.test(name)
+  const rootFiles=(await readdir(home,{withFileTypes:true})).filter(entry=>entry.isFile()&&isSessionDatabase(entry.name)).map(entry=>entry.name).sort()
+  const nested:string[]=[]
+  const walk=async(folder:string,depth:number):Promise<void>=>{
+    signal.throwIfAborted();if(depth>8)return
+    for(const entry of await readdir(folder,{withFileTypes:true})){
+      signal.throwIfAborted();const path=join(folder,entry.name)
+      if(entry.isDirectory())await walk(path,depth+1)
+      else if(folder!==home&&entry.isFile()&&isSessionDatabase(entry.name))nested.push(path)
+    }
+  }
+  await walk(home,0)
+  if(rootFiles.length && nested.length)throw new Error('会话数据库存在多个内部副本，未创建副本')
+  if(rootFiles.length)return
+  // There must be one selected database directory in a session-only manifest.
+  // Refuse to merge competing layouts; doing so would silently pair a stale
+  // state index with a different thread-history projection.
+  if(new Set(nested.map(source=>dirname(source))).size>1)throw new Error('会话数据库存在多个内部副本，未创建副本')
+  const names=new Set<string>()
+  for(const source of nested){
+    const name=basename(source)
+    if(names.has(name))throw new Error('会话数据库存在重复文件，未创建副本')
+    names.add(name)
+    const target=join(home,name)
+    await lstat(source)
+    await rename(source,target)
+  }
+  // Each directory is visited once even when it held both state and projection
+  // files. Otherwise the second rmdir would reject an already removed folder.
+  const removed=new Set<string>()
+  for(const source of nested){
+    let folder=dirname(source)
+    while(folder!==home){
+      signal.throwIfAborted()
+      if(removed.has(folder)){folder=dirname(folder);continue}
+      try{await rmdir(folder);removed.add(folder);folder=dirname(folder)}
+      catch(error){if((error as NodeJS.ErrnoException).code==='ENOTEMPTY')break;throw error}
+    }
+  }
 }

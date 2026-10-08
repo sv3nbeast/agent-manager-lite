@@ -64,6 +64,7 @@ export async function sessionDigest(file:FileHandle,size:number,signal:AbortSign
   }
   const after=await file.stat()
   if(!after.isFile()||after.nlink!==1||after.dev!==before.dev||after.ino!==before.ino||after.size!==before.size||after.mtimeMs!==before.mtimeMs||after.ctimeMs!==before.ctimeMs)throw new Error('会话文件正在变化，请刷新')
+  signal.throwIfAborted()
   return digest.digest('hex')
 }
 export async function* reverseSessionLines(file:FileHandle,size:number,signal:AbortSignal,maxBytes=Infinity):AsyncGenerator<Buffer>{

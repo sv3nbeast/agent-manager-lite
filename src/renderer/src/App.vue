@@ -344,7 +344,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
                   <a-form-item data-settings-field="port" :validate-status="settingsErrors.port?'error':undefined" :help="settingsErrors.port" label="本地 API 端口"><a-input-number v-model:value="settings.port" :min="1024" :max="65535" /></a-form-item>
                   <a-form-item data-settings-field="refreshMinutes" :validate-status="settingsErrors.refreshMinutes?'error':undefined" :help="settingsErrors.refreshMinutes" label="自动刷新间隔（分钟）" extra="0 表示关闭。应用运行期间自动刷新登录账号及已手动查询成功的 API 账号，最多同时查询 3 个账号。"><a-input-number v-model:value="settings.refreshMinutes" :min="0" :max="1440" /></a-form-item>
                   <a-form-item label="开机启动" extra="保存后由系统登录项生效；桌面系统不支持时会保留设置并提示错误。"><a-checkbox v-model:checked="settings.launchAtLogin">登录系统后自动启动 Agent Manager Lite</a-checkbox></a-form-item>
-                  <a-form-item label="关闭窗口行为" extra="启用后点击窗口关闭按钮只隐藏到系统托盘；从托盘选择“退出”才会结束应用。"><a-checkbox v-model:checked="settings.closeToTray">关闭主窗口时隐藏到系统托盘</a-checkbox></a-form-item>
+                  <a-form-item label="关闭窗口行为" extra="有运行实例或待恢复实例时，关闭按钮和 Cmd+Q 会隐藏到系统托盘以保留实例和本地连接；没有实例时可按需启用托盘驻留。从托盘选择“退出并停止运行实例”可停止实例并退出。"><a-checkbox v-model:checked="settings.closeToTray">关闭主窗口时隐藏到系统托盘</a-checkbox></a-form-item>
                 </a-form>
               </a-card>
               <UpstreamProxyPanel />

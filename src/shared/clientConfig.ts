@@ -2,7 +2,7 @@ import { z } from 'zod'
 
 export const configKeys = ['model', 'model_provider', 'model_reasoning_effort', 'service_tier', 'model_context_window', 'model_auto_compact_token_limit'] as const
 export type QuickConfigKey = typeof configKeys[number]
-export type ConfigKey = QuickConfigKey | 'model_catalog_json' | 'cli_auth_credentials_store' | 'forced_login_method' | `model_providers.${string}`
+export type ConfigKey = QuickConfigKey | 'model_catalog_json' | 'cli_auth_credentials_store' | 'forced_login_method' | 'sqlite_home' | `model_providers.${string}` | `profiles.${string}.sqlite_home`
 const optionalText = z.string().trim().min(1).max(200).refine(value => !/[\u0000-\u001f\u007f]/.test(value))
 export const clientConfigChangesSchema = z.object({
   model: optionalText.nullable().optional(),
