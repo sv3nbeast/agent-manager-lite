@@ -107,6 +107,7 @@ const api: ManagerAPI = {
   mutateProvider: input => ipcRenderer.invoke('manager:invoke', 'mutateProvider', input),
   readProviderKey: input => ipcRenderer.invoke('manager:invoke', 'readProviderKey', input),
   readModelContextDefaults: models => ipcRenderer.invoke('manager:invoke', 'readModelContextDefaults', models),
+  readInstanceModelDefaults: clientType => ipcRenderer.invoke('manager:invoke', 'readInstanceModelDefaults', clientType),
   fetchProviderModels: input => ipcRenderer.invoke('manager:invoke','fetchProviderModels',input),
   cancelProviderModels: id => ipcRenderer.invoke('manager:invoke','cancelProviderModels',id),
   startProviderProbe: input => ipcRenderer.invoke('manager:invoke','startProviderProbe',input),

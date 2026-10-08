@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -16,6 +16,7 @@
     "test:desktop": "node scripts/run-desktop-smoke.cjs",
     "test:desktop:probes": "node scripts/run-desktop-smoke.cjs --provider-probes",
     "test:desktop:instances": "node scripts/run-desktop-smoke.cjs --instances",
+    "test:desktop:instance-models": "node scripts/run-desktop-smoke.cjs --instance-models",
     "test:desktop:trash": "node scripts/run-desktop-smoke.cjs --session-trash",
     "test:desktop:account-recycle": "node scripts/run-desktop-smoke.cjs --account-recycle",
     "test:desktop:temp-login": "node scripts/run-desktop-smoke.cjs --temp-login",

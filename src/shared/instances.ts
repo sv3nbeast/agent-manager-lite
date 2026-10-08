@@ -16,6 +16,7 @@ export const instanceInputSchema = z.object({
   if(value.extraArgs.some(arg=>/^(--(?:user-data-dir|cml-instance|remote-debugging.*)|-psn)(?:=|$)/.test(arg)))ctx.addIssue({code:'custom',path:['extraArgs'],message:'附加参数不能覆盖实例隔离或调试参数'})
 })
 export type InstanceInput = z.infer<typeof instanceInputSchema>
+export interface InstanceModelDefaults { models:string[]; defaultModelId:string|null }
 export interface ExternalInstanceHome {directory:string;device:number;inode:number;previousTargetName?:string}
 export interface InstanceProfile extends Omit<InstanceInput,'clientType'> { clientType?:AgentClientType; id:string; revision:number; createdAt:number; externalHome?:ExternalInstanceHome }
 export interface InstanceApplication { clientType?:AgentClientType; id:string; name:string; path:string; kind?:'desktop'|'cli'; supportsTempLogin?:boolean }

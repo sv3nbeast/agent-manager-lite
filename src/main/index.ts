@@ -37,6 +37,7 @@ import {NativeInstanceAccounts} from './nativeInstanceAccounts'
 import { historyFilterSchema, historyQuerySchema } from '../shared/history'
 import { mutateProvider, readProviderKey } from './providerLibrary'
 import {readModelContextDefaults} from './modelContextDefaults'
+import {readInstanceModelDefaults} from './instanceModelDefaults'
 import { ProviderProbes } from './providerProbe'
 import { ProviderModels } from './providerModels'
 import {ProviderUsageQueries} from './providerUsageRefresh'
@@ -450,6 +451,7 @@ async function main(): Promise<void> {
       case 'mutateProvider': mutateProvider(store, input, id => localAccess.usesAccount(id) || instances.usesAccount(id) || clientAuthority.usesAccount(id) || clientSwitches.usesAccount(id)); quotas.schedule(); break
       case 'readProviderKey': return readProviderKey(store, input)
       case 'readModelContextDefaults': return readModelContextDefaults(input)
+      case 'readInstanceModelDefaults': return readInstanceModelDefaults(input)
       case 'saveInstance': instances.save(input); break
       case 'copyInstance': instances.startCopy(input);break
       case 'copyExternalInstance': instances.startExternalCopy(input);break

@@ -225,6 +225,7 @@ export interface ManagerAPI {
   mutateProvider(input: ProviderMutation): Promise<AppSnapshot>
   readProviderKey(input: { id: string; revision: number; keyId: string }): Promise<string>
   readModelContextDefaults(models:string[]):Promise<import('./modelContextWindows').ModelContextDefault[]>
+  readInstanceModelDefaults(clientType:import('./agentClients').AgentClientType):Promise<import('./instances').InstanceModelDefaults>
   fetchProviderModels(input:import('./providerModels').ProviderModelsInput):Promise<import('./providerModels').ProviderModelsResult>
   cancelProviderModels(requestId:string):Promise<void>
   startProviderProbe(input:ProviderProbeInput):Promise<AppSnapshot>

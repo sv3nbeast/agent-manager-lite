@@ -97,6 +97,13 @@ export function defaultModelDefinitions(): ModelDefinition[] {
   definitions.push(modelDefinitionSchema.parse({modelId:reserveId,displayName:'GPT-5.6 Reserve'}))
   return definitions
 }
+// Native identities have no provider model list. Use only visible entries in
+// the client catalog; generated routing templates such as Reserve are not
+// native account recommendations.
+export function nativeModelDefinitions(): ModelDefinition[] {
+  const catalog = { ...builtInCatalog, models: [...builtInCatalog.models].sort((a,b) => Number(a.priority) - Number(b.priority)) }
+  return summarizeCatalog(catalog)
+}
 export function buildModelCatalog(input: ModelDefinition[], base: NativeCatalog, previousModel: string | null, managedModel: string | null): NativeCatalog {
   base = structuredClone(catalogMetadata(base)?.basis ?? base)
   delete base._codex_manager_lite

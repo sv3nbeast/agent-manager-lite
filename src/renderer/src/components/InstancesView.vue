@@ -2,7 +2,7 @@
 import { computed, reactive, ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 import { PlusOutlined, DesktopOutlined, CopyOutlined, FolderOpenOutlined, CheckCircleFilled, LoadingOutlined } from '@ant-design/icons-vue'
-import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource } from '../../../shared/instances'
+import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource, InstanceModelDefaults } from '../../../shared/instances'
 import { accountCompatibility, getAgentClient, implementedAgentClients, resolveAgentClientType } from '../../../shared/agentClients'
 import { instanceInputSchema } from '../../../shared/instances'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
@@ -227,7 +227,27 @@ const supplierChoices=computed(()=>{
 const selectedSupplier=computed(()=>supplierChoices.value.find(item=>item.value===supplierSelection.value))
 const selectedAccount=computed(()=>availableAccounts.value.find(account=>account.id===form.accountId))
 const resourceLabel=computed(()=>resourceKind.value==='provider'?selectedSupplier.value?.label:selectedAccount.value?.name)
-function selectAccount(){form.model=selectedAccount.value?.models[0]??''}
+const nativeModelDefaults=ref<InstanceModelDefaults>(),nativeModelsLoading=ref(false),nativeModelsError=ref('')
+let modelDefaultsRequest=0
+const usesNativeModels=computed(()=>form.clientType==='codex'&&resourceKind.value==='account'&&!!selectedAccount.value&&selectedAccount.value.kind!=='api_key'&&!selectedAccount.value.models.length)
+const modelChoices=computed(()=>{
+  const account=selectedAccount.value
+  if(account)return usesNativeModels.value?nativeModelDefaults.value?.models??[]:account.models
+  return resourceKind.value==='provider'?selectedSupplier.value?.provider?.models??[]:[]
+})
+watch(()=>form.clientType,async clientType=>{
+  const request=++modelDefaultsRequest
+  nativeModelDefaults.value=undefined;nativeModelsLoading.value=true;nativeModelsError.value=''
+  try{const defaults=await window.manager.readInstanceModelDefaults(clientType);if(request===modelDefaultsRequest)nativeModelDefaults.value=defaults}
+  catch{if(request===modelDefaultsRequest)nativeModelsError.value='模型目录读取失败，可手动填写模型 ID。'}
+  finally{if(request===modelDefaultsRequest)nativeModelsLoading.value=false}
+},{immediate:true})
+// A late catalog result may fill an empty identity draft, but must not replace
+// a typed/saved model or leak into a provider selection or a closed dialog.
+watch(()=>[open.value,usesNativeModels.value,modelChoices.value],()=>{
+  if(open.value&&usesNativeModels.value&&!form.model.trim())form.model=nativeModelDefaults.value?.defaultModelId??''
+})
+function selectAccount(){form.model=modelChoices.value[0]??''}
 function selectSupplier(value:string){
   supplierSelection.value=value
   form.accountId=selectedSupplier.value?.account?.id??''
@@ -298,7 +318,7 @@ watch(()=>[open.value,form.model,form.clientType],async()=>{
   try{const values=await window.manager.readModelContextDefaults([form.model.trim()]);if(request===contextRequest)contextDefault.value=values[0]}catch{/* Preview remains the authority if catalog lookup fails. */}
   finally{if(request===contextRequest)contextLoading.value=false}
 })
-onBeforeUnmount(()=>{contextRequest++;historyRequest++;discoveryRequest++;draftGeneration++;launchRequest++;pendingCopyPreview.value=undefined;pendingLogin=undefined})
+onBeforeUnmount(()=>{modelDefaultsRequest++;contextRequest++;historyRequest++;discoveryRequest++;draftGeneration++;launchRequest++;pendingCopyPreview.value=undefined;pendingLogin=undefined})
 const contextLabel=computed(()=>{
   const connectionValue=getModelContextWindow(selectedAccount.value?.modelContextWindows,form.model)
   if(connectionValue!==undefined)return formatModelContextWindow(connectionValue)+' · API 连接设置'
@@ -477,7 +497,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
         <section v-show="!wizard||step===2" class="instance-step" data-step="2">
           <div class="instance-basics-grid">
             <a-form-item data-field="name" :validate-status="fieldErrors.name?'error':undefined" :help="fieldErrors.name" label="实例名称"><a-input v-model:value="form.name" aria-label="实例名称" :maxlength="120" placeholder="自动生成，也可自行修改" /></a-form-item>
-            <a-form-item v-if="client.capabilities.models" data-field="model" :validate-status="fieldErrors.model?'error':undefined" :help="fieldErrors.model" label="默认模型"><a-auto-complete v-model:value="form.model" :options="(selectedAccount?.models??[]).map(value=>({value}))"><a-input aria-label="实例模型" :maxlength="200" placeholder="选择模型或填写模型 ID" /></a-auto-complete></a-form-item>
+            <a-form-item v-if="client.capabilities.models" data-field="model" :validate-status="fieldErrors.model?'error':undefined" :help="fieldErrors.model" label="默认模型"><a-auto-complete v-model:value="form.model" :options="modelChoices.map(value=>({value}))"><a-input aria-label="实例模型" :maxlength="200" placeholder="选择模型或填写模型 ID" /></a-auto-complete><p v-if="usesNativeModels" class="muted instance-model-source">{{nativeModelsLoading?'正在读取客户端模型目录…':nativeModelsError||'来自客户端模型目录，也可填写模型 ID；实际可用性取决于账号。'}}</p></a-form-item>
           </div>
           <a-form-item v-if="client.capabilities.projectDirectoryModes.some(mode=>mode===launchMode)" label="项目目录"><a-select v-model:value="form.workingDirectoryId" aria-label="实例工作目录" allow-clear placeholder="使用实例的独立工作目录" :options="workingDirectories.map(item=>({value:item.id,label:item.path}))" /><a-button type="link" @click="chooseWorkingDirectory">选择工作目录</a-button></a-form-item>
           <section v-if="wizard" data-field="history" class="instance-history-choice" aria-label="会话来源选择">
