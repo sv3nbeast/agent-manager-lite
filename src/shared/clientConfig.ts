@@ -17,7 +17,7 @@ export const clientConfigChangesSchema = z.object({
   if (window === null && threshold != null || window != null && threshold != null && threshold >= window) context.addIssue({code: 'custom', path: ['model_auto_compact_token_limit'], message: '压缩阈值必须小于上下文窗口'})
 })
 export type ClientConfigChanges = z.infer<typeof clientConfigChangesSchema>
-export interface ClientConfigTarget { id: string; name: string; directory: string; managed: boolean }
+export interface ClientConfigTarget { id: string; name: string; directory: string; managed: boolean; role?:'default'|'instance'|'external'; description?:string }
 export interface StoredConfigTarget extends ClientConfigTarget { device: number; inode: number }
 export interface ConfigRevision { id: string; createdAt: number; kind: 'apply' | 'restore' }
 export interface ClientConfigView {

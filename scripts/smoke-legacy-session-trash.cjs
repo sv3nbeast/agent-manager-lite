@@ -50,7 +50,7 @@ app.on('browser-window-created',(_event,window)=>{
       await checkbox('.legacy-trash-items .ant-table-thead input')
       if(rows>25){await run(`document.querySelector('.legacy-trash-editor .ant-pagination-item-2').click()`);await wait(`document.querySelectorAll('.legacy-trash-items tr[data-row-key]').length===${rows-25}`);await checkbox('.legacy-trash-items .ant-table-thead input')}
       assert.equal(await run(`Array.from(document.querySelectorAll('.ant-modal-footer button')).find(el=>el.getClientRects().length&&el.textContent==='预览导入').disabled`),true)
-      if(rows>1)await selectTarget('原受管目录','受管客户端')
+      if(rows>1)await selectTarget('原受管目录','默认 Codex 目录')
       await selectTarget(name);await click('.ant-modal-footer button','预览导入');await wait(`!!document.querySelector('.legacy-trash-preview')`);await run(`document.querySelector('.legacy-trash-preview').scrollIntoView({block:'end'})`)
     }
     const confirmImport=async()=>{await checkbox('.legacy-confirm input');await click('.ant-modal-footer button','确认导入备份');await wait(`!document.querySelector('.legacy-trash-editor')?.getClientRects().length`);await wait(`document.querySelector('.trash-progress')?.textContent.includes('已完成')`)}

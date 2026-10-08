@@ -18,6 +18,7 @@ import {sessionProgram,verifySessionProgram,rebuildSessionMetadata,type SessionP
 import {syncPreviewSchema,syncStartSchema,type SyncPreview,type SyncView,type SyncRecovery,type SyncTargetPreview} from '../shared/sessionSync'
 import type {ClientConfigTarget} from '../shared/clientConfig'
 import type {InstanceApplication} from '../shared/instances'
+import {assertUnpagedSessionSources} from './sessionPaging'
 
 type PlannedFile={merged:MergedSession;projected:SessionTransferSource;relative:string;sha256:string;originals:SessionTransferSource[];changed:boolean}
 type Plan={target:ClientConfigTarget;view:SyncTargetPreview;rootIdentity?:{device:number;inode:number};configHash:string;profileHash:string;inventory:string;indexBefore:string|null;globalBefore:string|null;files:PlannedFile[];metadata:SyncJournal['metadata']}
@@ -80,6 +81,7 @@ export class SessionSync {
       }
       const bytes=sources.reduce((sum,source)=>sum+source.size,0)
       if(sources.length>10000||bytes>100*1024**3||bytes*targets.length>100*1024**3)throw new Error('同步范围超过暂存限制（1 万份副本或 100 GiB），请选择更少目录')
+      await assertUnpagedSessionSources(sources,signal)
       Object.assign(job.view,{sourceFiles:sources.length,totalBytes:bytes});directory(this.scratch,true);const root=join(this.scratch,randomUUID());mkdirSync(root,{mode:0o700})
       try{
         const indexes=await this.transfers.sourceIndexes(sources,signal),merged=await mergeSessionCopies(root,sources,indexes,signal,(files,bytes)=>{job.view.processedFiles=files;job.view.bytes=bytes})

@@ -10,6 +10,7 @@ import type {SessionTransferSource} from './sessions'
 import {verifySource} from './sessionTransferFiles'
 import {openSessionFile,sessionLines,sessionTimestamp} from './sessionFiles'
 import {sourceBytes} from './sessionZip'
+import {assertUnpagedSessionSources} from './sessionPaging'
 
 export interface MergedSession {source:SessionTransferSource;originals:SessionTransferSource[];index:Record<string,unknown>;sha256:string}
 class NumberToken {constructor(readonly raw:string){}}
@@ -33,6 +34,7 @@ export function eventTime(value:any):number|undefined{
 }
 const indexTime=(entry:Record<string,unknown>)=>['updated_at','updatedAt','last_updated_at','lastUpdatedAt'].map(key=>sessionTimestamp(entry[key])).find(value=>value!==undefined)??0
 export async function mergeSessionCopies(root:string,sources:SessionTransferSource[],indexes:Map<string,Record<string,unknown>>,signal:AbortSignal,progress:(files:number,bytes:number)=>void):Promise<MergedSession[]>{
+  await assertUnpagedSessionSources(sources,signal)
   const db=new DatabaseSync(join(root,'events.sqlite'));db.exec('PRAGMA journal_mode=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; CREATE TABLE events (thread TEXT, source INTEGER, line INTEGER, rank INTEGER, time INTEGER, key TEXT, raw TEXT); CREATE INDEX events_thread ON events(thread);')
   const insert=db.prepare('INSERT INTO events VALUES (?,?,?,0,?,?,?)'),rank=db.prepare('UPDATE events SET rank=? WHERE thread=? AND source=?'),results:MergedSession[]=[]
   const grouped=new Map<string,SessionTransferSource[]>()

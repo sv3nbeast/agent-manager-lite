@@ -7,12 +7,12 @@ import {Store} from './store'
 import {ClientConfigs} from './clientConfig'
 import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,sessionStatsSchema,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult} from '../shared/sessions'
 import {openSessionFile,rolloutFiles,firstSessionEvent,sessionActivity,sessionTokens,sessionContains,sessionDigest,cleanText,sessionIdentifier,safeSessionPath} from './sessionFiles'
-import {readSessionDisplay,displayTitle,displayProject} from './sessionDisplay'
+import {readSessionDisplay,readSessionRolloutIndex,displayTitle,displayProject} from './sessionDisplay'
 import {probeClientDaemon} from './clientDaemon'
 
 interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;record:SessionRecord;duplicateOf?:string}
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
-interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;warnings:string[]}
+interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;warnings:string[];sourceCounts:Record<string,number>}
 class SessionLimitError extends Error {}
 export const classifySession=(title:string,cwd:string):SessionKind=>{
   const name=title.toLowerCase(),path=cwd.toLowerCase()
@@ -55,13 +55,15 @@ export class SessionCatalog {
       return `${archived?'1':'0'}\0${path}`
     }
     let fileCount=0
+    const sourceCounts:Record<string,number>={}
     try{
       for(const selected of targets){
         signal.throwIfAborted()
-        const warn=(message:string)=>{if(warnings.size<99)warnings.add(`${selected.name}：${message}`);else warnings.add('其他读取提示已省略，请选择单个目录检查')}
+        let complete=true
+        const warn=(message:string)=>{complete=false;if(warnings.size<99)warnings.add(`${selected.name}：${message}`);else warnings.add('其他读取提示已省略，请选择单个目录检查')}
         try{
           const target=this.configs.identityTarget(selected.id),root=target.directory
-          try{await lstat(root)}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'&&target.managed)continue;throw error}
+          try{await lstat(root)}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'&&target.managed){sourceCounts[target.id]=0;continue}throw error}
           const rootStat=await lstat(root),daemon=await probeClientDaemon(root,signal),targetRunning=this.running(target.id)||daemon==='running',display=await readSessionDisplay(root,signal,warn),sourceRows:{record:SessionRecord;file:SourceFile;matched:boolean}[]=[]
           for await(const path of rolloutFiles(root,signal)){
             signal.throwIfAborted();if(++fileCount>100000)throw new SessionLimitError('会话文件超过 10 万条，请选择单个目录')
@@ -75,8 +77,9 @@ export class SessionCatalog {
                 const cwd=cleanText(meta.payload?.cwd)||'未知工作目录',title=displayTitle(display,id),kind=classifySession(title,cwd)
                 const indexed=display.index.get(id)?.updatedAt,activity=await sessionActivity(file,stat.size,signal)
                 const updatedAt=indexed!==undefined&&(activity===undefined||Math.abs(indexed-activity)<=3600000)?indexed:activity??stat.mtimeMs
-                const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false}
-                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location]}
+                const historyMode=meta.payload?.history_mode==='paginated'?'paginated' as const:undefined
+                const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false,...historyMode?{historyMode}:{}}
+                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],...historyMode?{historyMode}:{}}
                 const matched=title.toLowerCase().includes(input.titleQuery.toLowerCase())&&(!input.contentQuery||await sessionContains(file,stat.size,input.contentQuery,signal))
                 sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,size:stat.size,record:structuredClone(record)}})
               }finally{await file.close()}
@@ -87,6 +90,7 @@ export class SessionCatalog {
           const finalRoot=await lstat(root);if(finalRoot.dev!==rootStat.dev||finalRoot.ino!==rootStat.ino)throw new Error('会话目录已被替换')
           const grouped=new Map<string,typeof sourceRows>()
           for(const row of sourceRows)grouped.set(row.record.id,[...(grouped.get(row.record.id)??[]),row])
+          const indexedRollouts=[...grouped.values()].some(rows=>rows.length>1)?await readSessionRolloutIndex(root,signal,warn):new Map<string,string>()
           for(const [id,rows] of grouped){
             if(rows.some(row=>row.matched))matches.add(id)
             const ordered=rows.slice().sort((a,b)=>canonical(a.file).localeCompare(canonical(b.file)))
@@ -97,14 +101,19 @@ export class SessionCatalog {
                 for(const row of ordered.slice(1))if(await digest(row.file,signal)!==first){identical=false;break}
               }catch{signal.throwIfAborted();identical=false}
             }
-            // Identical copies are one logical session. Keep one stable path;
-            // distinct bodies remain ambiguous and must be chosen explicitly.
-            const selected=identical?[ordered[0]]:ordered
-            if(identical)for(const row of ordered.slice(1))row.file.duplicateOf=ordered[0].file.path
+            // A native paginated thread has distinct continuation segments.
+            // Its active database path, matched against safely scanned files
+            // with the same metadata ID, identifies the current segment. Never
+            // guess from filenames, mtime, the longest file or inactive DBs.
+            const indexed=ordered.filter(row=>row.file.path===indexedRollouts.get(id)),primary=!identical&&indexed.length===1?indexed[0]:undefined
+            const selected=primary?[primary]:identical?[ordered[0]]:ordered
+            const retained=primary?ordered.filter(row=>row!==primary):identical?ordered.slice(1):[]
+            for(const row of retained)row.file.duplicateOf=selected[0].file.path
+            if(primary)primary.record.locations[0].historicalCopies=retained.length
             // Keep every physical file for full-directory sync/trash.  Actions
             // that need one source filter duplicateOf and use the canonical row.
             for(const {record,file} of selected){
-              files.set(id,[...files.get(id)??[],file,...(identical?ordered.slice(1).map(row=>row.file):[])])
+              files.set(id,[...files.get(id)??[],file,...retained.map(row=>row.file)])
               const existing=records.get(id)
               if(existing){
                 const location=existing.locations.find(value=>value.targetId===target.id)
@@ -113,16 +122,17 @@ export class SessionCatalog {
                 if((record.updatedAt??0)>(existing.updatedAt??0)){const locations=existing.locations;records.set(id,{...record,locations})}
               }else records.set(id,record)
             }
-            if(!identical&&rows.length>1){
+            if(!identical&&!primary&&rows.length>1){
               const location=records.get(id)?.locations.find(value=>value.targetId===target.id)
               if(location)location.ambiguous=true
             }
           }
+          if(complete)sourceCounts[target.id]=grouped.size
         }catch(error){signal.throwIfAborted();if(error instanceof SessionLimitError)throw error;warn(error instanceof Error&&error.message.includes('超过')?error.message:'目录已变化或无法读取，请在客户端配置中核对')}
       }
       signal.throwIfAborted()
       const sorted=[...records.values()].filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
-      this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,warnings:[...warnings].slice(0,100)}
+      this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,warnings:[...warnings].slice(0,100),sourceCounts}
       return this.page({snapshotId:this.snapshot.id,page:1,pageSize:25})
     }catch(error){if(signal.aborted)throw new Error('会话读取已取消');throw error}
     finally{if(this.scanning===run)this.scanning=undefined}
@@ -130,7 +140,7 @@ export class SessionCatalog {
   private current(id:string):Snapshot{const snapshot=this.snapshot;if(!snapshot||snapshot.id!==id)throw new Error('会话列表已更新，请重新读取');return snapshot}
   page(raw:unknown):SessionPage{
     const input=sessionPageSchema.parse(raw),snapshot=this.current(input.snapshotId),page=Math.min(input.page,Math.max(1,Math.ceil(snapshot.records.length/input.pageSize)))
-    return {snapshotId:snapshot.id,scannedAt:snapshot.scannedAt,total:snapshot.records.length,page,pageSize:input.pageSize,items:structuredClone(snapshot.records.slice((page-1)*input.pageSize,page*input.pageSize)),warnings:[...snapshot.warnings]}
+    return {snapshotId:snapshot.id,scannedAt:snapshot.scannedAt,total:snapshot.records.length,page,pageSize:input.pageSize,items:structuredClone(snapshot.records.slice((page-1)*input.pageSize,page*input.pageSize)),warnings:[...snapshot.warnings],sourceCounts:{...snapshot.sourceCounts}}
   }
   private async unchanged(source:SourceFile,stat:Stats){
     const target=this.configs.identityTarget(source.targetId);if(target.directory!==source.root)throw new Error('会话来源目录已改变')

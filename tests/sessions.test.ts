@@ -79,6 +79,94 @@ test('identical same-directory copies are de-duplicated while different bodies r
   await assert.rejects(f.catalog.transferSources(page.snapshotId,[id]),/冲突/)
 })
 
+function paginatedRollout(home:string,id:string,input:number,suffix:string){
+  const path=rollout(home,id,[usage(input,25)],'sessions',suffix),lines=readFileSync(path,'utf8').split('\n'),meta=JSON.parse(lines[0])
+  meta.payload.history_mode='paginated';meta.payload.history_base={thread_id:randomUUID(),end_ordinal_exclusive:12,end_byte_offset:1024}
+  lines[0]=JSON.stringify(meta);writeFileSync(path,lines.join('\n'));return path
+}
+function rolloutIndex(path:string,entries:{id:string;path:string}[]){
+  const db=new DatabaseSync(path);db.exec('CREATE TABLE threads(id TEXT,rollout_path TEXT)')
+  for(const entry of entries)db.prepare('INSERT INTO threads VALUES(?,?)').run(entry.id,entry.path)
+  db.close()
+}
+
+test('active state index resolves native paginated segments while retaining every physical rollout',async t=>{
+  const f=fixture(t),a=f.source('paginated'),id=randomUUID(),paths:string[]=[]
+  for(let i=0;i<8;i++)paths.push(paginatedRollout(a.home,id,100+i,'segment-'+i))
+  const current=paths[3];rolloutIndex(join(a.home,'state_5.sqlite'),[{id,path:current.slice(a.home.length+1)}])
+  const before=hashes(a.home),page=await f.scan(),record=page.items[0]
+  assert.deepEqual(page.warnings,[]);assert.equal(page.total,1);assert.equal(record.historyMode,'paginated')
+  assert.equal(record.locations[0].historyMode,'paginated');assert.equal(record.locations[0].ambiguous,false);assert.equal(record.locations[0].historicalCopies,7)
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),current)
+  assert.equal((await f.catalog.transferSources(page.snapshotId,[id]))[0].path,current)
+  assert.equal((await f.catalog.transferSources(page.snapshotId,[id]))[0].record.historyMode,'paginated')
+  assert.deepEqual(await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[id]}),[{id,tokens:{input:103,output:25,total:128},targetId:a.target.id}])
+  const all=await f.catalog.syncSources(page.snapshotId,new AbortController().signal)
+  assert.equal(all.length,8);assert.deepEqual(new Set(all.map(source=>source.path)),new Set(paths));assert.ok(all.every(source=>source.record.historyMode==='paginated'))
+  assert.deepEqual(hashes(a.home),before)
+})
+
+test('only the active profile sqlite_home resolves segments; inactive/root index paths have no authority',async t=>{
+  const f=fixture(t),a=f.source('profiles'),id=randomUUID(),first=paginatedRollout(a.home,id,100,'first'),current=paginatedRollout(a.home,id,200,'current')
+  mkdirSync(join(a.home,'sqlite'));mkdirSync(join(a.home,'inactive'))
+  rolloutIndex(join(a.home,'state_5.sqlite'),[{id,path:first}]);rolloutIndex(join(a.home,'sqlite','state_5.sqlite'),[{id,path:current}]);rolloutIndex(join(a.home,'inactive','state_5.sqlite'),[{id,path:first}])
+  writeFileSync(join(a.home,'config.toml'),'profile="active"\nsqlite_home="inactive"\n[profiles.active]\nsqlite_home="sqlite"\n[profiles.inactive]\nsqlite_home="inactive"\n')
+  let page=await f.scan();assert.equal(page.items[0].locations[0].ambiguous,false)
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),current)
+  writeFileSync(join(a.home,'config.toml'),'[profiles.inactive]\nsqlite_home="sqlite"\n')
+  page=await f.scan();assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),first)
+})
+
+test('stale, foreign, repeated and linked rollout indexes preserve real ambiguous-file protection',async t=>{
+  const f=fixture(t),a=f.source('invalid-index'),b=f.source('foreign'),id=randomUUID(),other=randomUUID(),first=paginatedRollout(a.home,id,100,'first')
+  paginatedRollout(a.home,id,200,'current');const wrongId=rollout(a.home,other),outside=paginatedRollout(b.home,id,300,'foreign'),database=join(a.home,'state_5.sqlite')
+  for(const entries of [[{id,path:outside}],[{id,path:wrongId}],[{id,path:join(a.home,'sessions','missing.jsonl')}],[{id,path:first},{id,path:first}]]){
+    rmSync(database,{force:true});rolloutIndex(database,entries)
+    const page=await f.scan({targetId:a.target.id}),record=page.items.find(row=>row.id===id)!
+    assert.equal(record.locations[0].ambiguous,true)
+    await assert.rejects(f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),/多个同 ID/)
+  }
+  // A valid-looking alternate DB cannot override an externally configured one.
+  rmSync(database);rolloutIndex(database,[{id,path:first}]);writeFileSync(join(a.home,'config.toml'),`sqlite_home=${JSON.stringify(b.home)}\n`)
+  let page=await f.scan({targetId:a.target.id});assert.equal(page.items.find(row=>row.id===id)!.locations[0].ambiguous,true)
+  rmSync(join(a.home,'config.toml'));mkdirSync(join(a.home,'linked-db'));renameSync(database,join(a.home,'linked-db','state_5.sqlite'));symlinkSync('linked-db',join(a.home,'sqlite-link'),'dir');writeFileSync(join(a.home,'config.toml'),'sqlite_home="sqlite-link"\n')
+  page=await f.scan({targetId:a.target.id});assert.equal(page.items.find(row=>row.id===id)!.locations[0].ambiguous,true)
+  assert.ok(page.warnings.some(warning=>warning.includes('当前会话索引无法安全读取')))
+})
+
+test('read-only rollout selection sees committed WAL rows without altering client tables',async t=>{
+  const f=fixture(t),a=f.source('live-index'),id=randomUUID(),first=paginatedRollout(a.home,id,100,'first'),current=paginatedRollout(a.home,id,200,'current')
+  const database=join(a.home,'state_5.sqlite'),db=new DatabaseSync(database);t.after(()=>db.close())
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)')
+  db.prepare('INSERT INTO threads VALUES(?,?)').run(id,first);db.prepare('UPDATE threads SET rollout_path=? WHERE id=?').run(current,id)
+  const before=db.prepare('SELECT * FROM threads').all(),page=await f.scan();assert.deepEqual(page.warnings,[])
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),current)
+  assert.deepEqual(db.prepare('SELECT * FROM threads').all(),before)
+})
+
+test('a client index change during rollout selection never publishes a guessed primary segment',async t=>{
+  const f=fixture(t),a=f.source('changing-index'),id=randomUUID(),first=paginatedRollout(a.home,id,100,'first'),current=paginatedRollout(a.home,id,200,'current')
+  const db=new DatabaseSync(join(a.home,'state_5.sqlite'));t.after(()=>db.close())
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT)')
+  db.prepare('INSERT INTO threads VALUES(?,?)').run(id,first)
+  const original=DatabaseSync.prototype.prepare;let changed=false
+  const mock=t.mock.method(DatabaseSync.prototype,'prepare',function(this:DatabaseSync,sql:string){
+    const statement=original.call(this,sql)
+    if(sql.startsWith('SELECT id,rollout_path FROM threads ')){
+      const iterate=statement.iterate
+      t.mock.method(statement,'iterate',function*(this:typeof statement){
+        yield* iterate.call(this)
+        if(!changed){changed=true;db.prepare('UPDATE threads SET rollout_path=? WHERE id=?').run(current,id)}
+      })
+    }
+    return statement
+  })
+  let page=await f.scan();mock.mock.restore();assert.equal(changed,true)
+  assert.equal(page.items[0].locations[0].ambiguous,true);assert.ok(page.warnings.some(warning=>warning.includes('当前会话索引无法安全读取')))
+  page=await f.scan();assert.equal(page.items[0].locations[0].ambiguous,false)
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),current)
+})
+
 test('filters combine title and raw content in one location, retain every copy and correct stale activity timestamps',async t=>{
   const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID(),other=randomUUID()
   rollout(a.home,id,[{type:'event_msg',timestamp:when,payload:{text:'MixedCASE 中文检索'}}]);rollout(b.home,id)
@@ -203,4 +291,25 @@ test('corrupt display databases fall back visibly, links outside the home are sk
   const before=hashes(a.home),page=await f.scan()
   assert.equal(page.total,1);assert.equal(page.items[0].title,id);assert.ok(page.warnings.some(value=>value.includes('数据库')))
   assert.deepEqual(hashes(a.home),before)
+})
+
+test('source counts describe whole scanned directories and distinguish empty defaults from unreadable sources',async t=>{
+  const f=fixture(t),source=f.source('counted'),id=randomUUID()
+  rollout(source.home,id)
+  const defaultTarget=f.configs.targets().find(value=>value.role==='default')!
+  assert.equal(defaultTarget.name,'默认 Codex 目录')
+  let page=await f.scan({titleQuery:'no matching title'})
+  assert.equal(page.total,0)
+  assert.equal(page.sourceCounts?.[source.target.id],1)
+  assert.equal(page.sourceCounts?.[defaultTarget.id],0)
+  mkdirSync(defaultTarget.directory,{recursive:true})
+  rollout(defaultTarget.directory,randomUUID())
+  page=await f.scan({titleQuery:'still no matching title'})
+  assert.equal(page.total,0)
+  assert.equal(page.sourceCounts?.[defaultTarget.id],1)
+  assert.equal(f.catalog.page({snapshotId:page.snapshotId,page:1}).sourceCounts?.[source.target.id],1)
+  writeFileSync(join(defaultTarget.directory,'state_5.sqlite'),'fixture corrupt database')
+  page=await f.scan()
+  assert.ok(page.warnings.some(value=>value.includes(defaultTarget.name)))
+  assert.equal(page.sourceCounts?.[defaultTarget.id],undefined,'An unreadable source must not be hidden as empty')
 })

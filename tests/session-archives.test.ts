@@ -33,6 +33,19 @@ function rollout(home:string,id:string,archived=false,tail='中文 🧪\n特殊�
 async function customZip(path:string,manifest:unknown,files:{name:string;data:Buffer;mode?:number}[],zip64=false){const zip=new yazl.ZipFile(),task=pipeline(zip.outputStream,createWriteStream(path));zip.addBuffer(Buffer.from(JSON.stringify(manifest)),'manifest.json');for(const file of files)zip.addBuffer(file.data,file.name,{mode:file.mode??0o100600});zip.end({forceZip64Format:zip64,comment:''});await task}
 function manifestFor(path:string,id:string):SessionManifest{const data=readFileSync(path);return {kind:'codex-session-export',packageVersion:1,exportedAt:'2026-10-01T08:00:00Z',sessions:[{sessionId:id,title:'来自 Cockpit',cwd:'/fixture/项目',updatedAt:1790841600,relativeRolloutPath:'sessions/imported/2026/10/01/rollout-'+id+'.jsonl',fileEntry:'files/0001-'+id+'/rollout.jsonl',sizeBytes:data.length,sha256:hash(data),sessionIndexEntry:{id,thread_name:'来源标题',custom:{keep:true}},sourceInstance:{id:'default',name:'默认实例'}}]}}
 
+test('paginated ZIP export is refused without replacing an existing output archive',async t=>{
+  const f=fixture(t),id=randomUUID(),path=rollout(f.source,id),lines=readFileSync(path,'utf8').split('\n'),meta=JSON.parse(lines[0]);meta.payload.history_mode='paginated';lines[0]=JSON.stringify(meta);writeFileSync(path,lines.join('\n'));writeFileSync(f.zipPath,'existing archive');const before=readFileSync(path)
+  await assert.rejects(f.exportPreview([id]),/分段历史.*复制实例/)
+  assert.equal(f.archives.view()?.status,'failed');assert.deepEqual(readFileSync(path),before);assert.equal(readFileSync(f.zipPath,'utf8'),'existing archive');assert.deepEqual(readdirSync(f.target),[])
+})
+
+test('a paginated rollout in an external ZIP cannot import a dangling history_base into a new home',async t=>{
+  const f=fixture(t),id=randomUUID(),path=rollout(f.source,id),lines=readFileSync(path,'utf8').split('\n'),meta=JSON.parse(lines[0]);meta.payload.history_mode='paginated';meta.payload.history_base={thread_id:randomUUID()};lines[0]=JSON.stringify(meta);writeFileSync(path,lines.join('\n'));const manifest=manifestFor(path,id)
+  await customZip(f.zipPath,manifest,[{name:manifest.sessions[0].fileEntry,data:readFileSync(path)}])
+  await assert.rejects(f.prepare(f.zipPath),/分段历史.*复制实例/)
+  assert.equal(f.archives.view()?.status,'failed');assert.deepEqual(readdirSync(f.target),[]);assert.deepEqual(readdirSync(join(f.store.directory,'session-archive-staging')),[]);assert.equal(existsSync(join(f.store.directory,'session-transfers')),false)
+})
+
 test('ZIP round trip preserves original rollout bytes, SHA256, source/unknown metadata and archives; imported files use the recoverable official index path',{timeout:15000},async t=>{
   const indexed:string[][]=[],f=fixture(t,async(_program,_home,ids)=>{indexed.push(ids)}),id=randomUUID(),archived=randomUUID(),file=rollout(f.source,id),old=rollout(f.source,archived,true),before=readFileSync(file)
   writeFileSync(join(f.source,'session_index.jsonl'),JSON.stringify({id,thread_name:'ZIP 中文会话',unknown:{keep:1},rollout_path:file})+'\n')

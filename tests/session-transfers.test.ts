@@ -32,6 +32,16 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},rebuild:ConstructorPa
 }
 function journal(f:ReturnType<typeof fixture>):SessionJournal{const id=f.transfers.view().transfer!.id;return sessionJournalSchema.parse(JSON.parse(readFileSync(join(f.store.directory,'session-transfers',id,'journal.json'),'utf8')))}
 
+test('single-session copy refuses paginated history before writing a truncated destination',async t=>{
+  const f=fixture(t),id=randomUUID(),path=rollout(f.source,id),lines=readFileSync(path,'utf8').split('\n'),meta=JSON.parse(lines[0]);meta.payload.history_mode='paginated';meta.payload.history_base={thread_id:randomUUID()};lines[0]=JSON.stringify(meta);writeFileSync(path,lines.join('\n'));const before=readFileSync(path)
+  const page=await f.scan();assert.equal(page.items[0].historyMode,'paginated')
+  await assert.rejects(f.transfers.preview({snapshotId:page.snapshotId,sessionIds:[id],targetId:f.b.id,applicationId:f.apps[0].id}),/分段历史.*复制实例/)
+  assert.deepEqual(readFileSync(path),before);assert.deepEqual(readdirSync(f.target),[]);assert.equal(existsSync(join(f.store.directory,'session-transfers')),false)
+  // A pre-existing destination is skipped; no segments are published or replaced.
+  const existing=rollout(f.target,id),existingBefore=readFileSync(existing),preview=await f.preview([id]);assert.equal(preview.items[0].status,'existing')
+  f.transfers.start({ticket:preview.ticket,clientsClosed:true});await f.transfers.settled();assert.equal(f.transfers.view().transfer?.status,'completed');assert.equal(f.transfers.view().transfer?.skipped,1);assert.deepEqual(readFileSync(existing),existingBefore)
+})
+
 test('selected copy keeps source bytes, archived layout, Unicode and unknown metadata; only changes rollout provider and relocates index paths',async t=>{
   const indexed:{home:string;ids:string[]}[]=[],f=fixture(t,async(_program,home,ids)=>{indexed.push({home,ids})}),id=randomUUID(),archived=randomUUID(),existing=randomUUID()
   const path=rollout(f.source,id),archivedPath=rollout(f.source,archived,'archived_sessions'),skip=rollout(f.source,existing),existingPath=rollout(f.target,existing)

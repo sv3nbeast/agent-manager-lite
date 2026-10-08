@@ -13,6 +13,7 @@ import type {ClientConfigTarget} from '../shared/clientConfig'
 import type {InstanceApplication} from '../shared/instances'
 import {rolloutFiles,openSessionFile,firstSessionEvent,sessionIdentifier,sessionLines,jsonLine} from './sessionFiles'
 import {probeClientDaemon} from './clientDaemon'
+import {assertUnpagedSessionSources} from './sessionPaging'
 import {sessionProgram,verifySessionProgram,rebuildSessionMetadata,type SessionProgram} from './officialSessions'
 import {sessionJournalSchema,sessionJournalLimit,encodeSessionJournal,stagePath,fileIdentity,textHash,sessionRelative,verifySource,copySessionRollout,publishSessionTransfer,rollbackSessionTransfer,cleanupSessionStage,checkRoot,type SessionJournal} from './sessionTransferFiles'
 
@@ -109,6 +110,7 @@ export class SessionTransfers {
     for(const source of sources)if(source.root!==target.directory&&overlap(source.root,target.directory))throw new Error('来源与目标目录不能相互包含')
     controller.signal.throwIfAborted()
     const config=this.config(target),program=sessionProgram(application),existing=await this.existingIds(target.directory,controller.signal)
+    await assertUnpagedSessionSources(sources.filter(source=>!existing.has(source.record.id)),controller.signal)
     const view:SessionCopyPreview={ticket:randomUUID(),targetId:target.id,targetName:target.name,directory:target.directory,applicationName:application.name,provider:config.provider,items:sources.map(source=>({id:source.record.id,title:source.record.title,sourceName:source.record.locations[0].name,sourceDirectory:source.root,bytes:source.size,status:existing.has(source.record.id)?'existing':'ready'})),totalBytes:sources.filter(source=>!existing.has(source.record.id)).reduce((sum,source)=>sum+source.size,0)}
     if(view.totalBytes>100*1024**3)throw new Error('所选会话超过 100 GiB，请分批复制')
     if(generation!==this.generation)throw new Error('会话复制预览已更新，请重新选择')

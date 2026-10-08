@@ -79,6 +79,7 @@ onMounted(() => run(async () => { targets.value = await window.manager.listClien
     <a-alert v-if="error" type="error" show-icon :message="error" class="error-banner" />
     <a-card title="配置位置" class="settings-card">
       <a-space wrap><a-select v-model:value="selected" aria-label="配置目录" :disabled="busy" :options="targets.map(target => ({ value: target.id, label: target.managed ? target.name : target.directory }))" style="width: 360px" @change="reload" /><a-button :loading="busy" @click="reload">重新读取</a-button></a-space>
+      <p v-if="view?.target.description" class="muted">{{view.target.description}}</p>
       <p class="config-path"><code>{{ view?.target.directory }}/config.toml</code></p>
       <p class="muted">{{ view?.target.managed ? '独立的受管配置目录，可供受管实例使用。' : '此目录由你选择，预览并确认后才会写入。' }}{{ view?.exists ? '' : '文件尚未创建。' }}</p>
       <a-alert v-if="view?.activeProfile" type="info" show-icon :message="`当前默认 Profile：${view.activeProfile}，其中的设置可能覆盖下面的默认值。`" />

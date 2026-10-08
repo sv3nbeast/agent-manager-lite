@@ -1,15 +1,71 @@
 // Title/project precedence follows Cockpit codex_session_display; no DB writes.
 import {DatabaseSync} from 'node:sqlite'
 import {readdir,lstat} from 'node:fs/promises'
-import {join,basename} from 'node:path'
+import {join,basename,resolve} from 'node:path'
 import {setImmediate} from 'node:timers/promises'
 import {safeSessionPath,openSessionFile,sessionLines,jsonLine,cleanText,sessionTimestamp,sessionIdentifier} from './sessionFiles'
+import {readBounded} from './clientConfig'
+import {configuredSessionDatabaseHome} from './sessionDatabase'
 
 interface Display {catalog:Map<string,string>;names:Map<string,string>;previews:Map<string,string>;index:Map<string,{title:string;updatedAt?:number}>;projects:{root:string;name:string}[]}
 const normalized=(value:string)=>value.replace(/\\/g,'/').replace(/\/+$/,'')
 const shortTitle=(value:string)=>{const text=cleanText(value).replace(/\s+/g,' '),chars=Array.from(text);return chars.length>60?chars.slice(0,59).join('').trimEnd()+'…':text}
 export function displayTitle(display:Display,id:string):string {return display.catalog.get(id)||display.names.get(id)||display.index.get(id)?.title||shortTitle(display.previews.get(id)??'')||id}
 export function displayProject(display:Display,cwd:string):string|undefined{const path=normalized(cwd);return display.projects.find(item=>path===item.root||path.startsWith(item.root+'/'))?.name}
+
+/**
+ * A paginated Codex thread can have many distinct rollouts with one metadata
+ * session ID. Only the database actually configured for this home can identify
+ * its current segment; display-title fallbacks must not choose that segment.
+ */
+export async function readSessionRolloutIndex(root:string,signal:AbortSignal,warn:(message:string)=>void):Promise<Map<string,string>>{
+  const result=new Map<string,string>(),configPath=join(root,'config.toml')
+  let db:DatabaseSync|undefined
+  const config=async():Promise<string|null>=>{
+    try{
+      const before=await safeSessionPath(root,configPath)
+      if(!before.isFile()||before.nlink!==1)throw new Error('Unexpected config')
+      const content=readBounded(configPath,1024*1024),after=await safeSessionPath(root,configPath)
+      if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs)throw new Error('Config changed')
+      return content
+    }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error}
+  }
+  try{
+    signal.throwIfAborted()
+    const beforeConfig=await config(),configured=configuredSessionDatabaseHome(beforeConfig)
+    // No external sqlite_home or symlink is followed. Inactive profiles and
+    // stale databases in the alternate sqlite/ folder cannot resolve a thread.
+    if(configured?.startsWith('~/'))return result
+    const home=resolve(root,configured??'.')
+    await safeSessionPath(root,home)
+    const path=join(home,'state_5.sqlite')
+    let before
+    try{before=await safeSessionPath(root,path)}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return result;throw error}
+    if(!before.isFile()||before.nlink!==1)throw new Error('Unexpected database')
+    for(const suffix of ['-wal','-shm'])try{const stat=await safeSessionPath(root,path+suffix);if(!stat.isFile()||stat.nlink!==1)throw new Error('Unexpected database side file')}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error}
+    db=new DatabaseSync(path,{readOnly:true,allowExtension:false});db.exec('PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; PRAGMA busy_timeout=300')
+    const version=()=>Number((db!.prepare('PRAGMA data_version').get() as {data_version:unknown}).data_version),beforeVersion=version()
+    const columns=new Set((db.prepare('PRAGMA table_info(threads)').all() as {name:string}[]).map(row=>row.name))
+    if(!columns.has('id')||!columns.has('rollout_path'))return result
+    const repeated=new Set<string>();let count=0
+    for(const value of db.prepare("SELECT id,rollout_path FROM threads WHERE typeof(id)='text' AND length(id) BETWEEN 1 AND 256 LIMIT 100001").iterate()){
+      signal.throwIfAborted();if(++count>100000)throw new Error('Database exceeds limit')
+      const row=value as Record<string,unknown>
+      const id=sessionIdentifier(row.id);if(!id)continue
+      if(row.id!==id){result.delete(id);repeated.add(id);continue}
+      // Reject duplicate index IDs even when only one row has a usable path.
+      if(result.has(id)||repeated.has(id)){result.delete(id);repeated.add(id);continue}
+      const path=row.rollout_path
+      if(typeof path!=='string'||!path.length||path.length>8192||/[\x00-\x1f\x7f]/.test(path)){repeated.add(id);continue}
+      result.set(id,resolve(root,path))
+      if(count%250===0)await setImmediate()
+    }
+    const after=await safeSessionPath(root,path)
+    if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs||version()!==beforeVersion||await config()!==beforeConfig)throw new Error('Database or config changed')
+    signal.throwIfAborted();return result
+  }catch{signal.throwIfAborted();warn('当前会话索引无法安全读取，保留多文件选择保护');return new Map()}
+  finally{db?.close()}
+}
 export async function readSessionDisplay(root:string,signal:AbortSignal,warn:(message:string)=>void):Promise<Display>{
   const result:Display={catalog:new Map(),names:new Map(),previews:new Map(),index:new Map(),projects:[]},local=new Set<string>()
   try{

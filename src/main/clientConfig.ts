@@ -59,9 +59,9 @@ export class ClientConfigs {
   private importedCatalog?: { target: string; ticket: string; catalog: NativeCatalog; expiresAt: number }
   constructor(private readonly store: Store, private readonly now = Date.now, private readonly inUse:(id:string)=>boolean=()=>false) { this.root = realpathSync(store.directory) }
   targets(): ClientConfigTarget[] {
-    return [{ id: managedId, name: '受管客户端', directory: join(this.root, 'clients', 'default'), managed: true },
-      ...(this.store.read().instances ?? []).map(instance=>({id:instance.id,name:`实例 · ${instance.name}`,directory:instanceHomePath(this.root,instance),managed:!instance.externalHome})),
-      ...(this.store.read().configTargets ?? []).map(({ device: _device, inode: _inode, ...target }) => target)]
+    return [{ id: managedId, name: '默认 Codex 目录', description:'客户端配置使用的默认目录，与实例的独立目录分开。', role:'default', directory: join(this.root, 'clients', 'default'), managed: true },
+      ...(this.store.read().instances ?? []).map(instance=>({id:instance.id,name:`实例 · ${instance.name}`,role:'instance' as const,directory:instanceHomePath(this.root,instance),managed:!instance.externalHome})),
+      ...(this.store.read().configTargets ?? []).map(({ device: _device, inode: _inode, ...target }) => ({...target,role:'external' as const}))]
   }
   register(selectedDirectory: string): ClientConfigTarget {
     const canonical = realpathSync(selectedDirectory)

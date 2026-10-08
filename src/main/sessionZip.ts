@@ -11,6 +11,7 @@ import {z} from 'zod'
 import type {SessionTransferSource} from './sessions'
 import {verifySource,sessionRelative} from './sessionTransferFiles'
 import {openSessionFile} from './sessionFiles'
+import {assertUnpagedSessionSources} from './sessionPaging'
 
 export const archiveMaxBytes=100*1024**3,manifestMaxBytes=8*1024**2
 const safeEntry=(path:string)=>path.length<=2000&&!/[\\\x00-\x1f\x7f:]/.test(path)&&path.split('/').every(part=>!!part&&part!=='.'&&part!=='..')
@@ -93,6 +94,7 @@ export async function hashSource(source:SessionTransferSource,signal:AbortSignal
 // Destination is selected in a native save dialog. Write alongside it and
 // replace only after every source, hash and destination identity still matches.
 export async function writeSessionZip(path:string,manifest:SessionManifest,sources:SessionTransferSource[],signal:AbortSignal,progress:(file:number,bytes:number)=>void):Promise<void>{
+  await assertUnpagedSessionSources(sources,signal)
   path=selectedPath(path);const parent=lstatSync(dirname(path)),before=optionalStamp(path),temporary=path+'.'+randomUUID()+'.tmp'
   if(!path.toLowerCase().endsWith('.zip'))throw new Error('导出文件扩展名必须为 .zip')
   if(before&&(!before.isFile()||before.isSymbolicLink()||before.nlink!==1))throw new Error('不能覆盖链接或特殊文件')

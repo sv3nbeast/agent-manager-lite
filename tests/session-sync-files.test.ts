@@ -25,6 +25,18 @@ function source(home:string,id:string,text:string,title='fixture'):SessionTransf
 const header=(id:string,tag='original')=>JSON.stringify({type:'session_meta',timestamp:'2026-09-30T00:00:00Z',payload:{id,cwd:'/fixture/中文',model_provider:'openai',tag}})
 const event=(time:string,message:string)=>JSON.stringify({type:'event_msg',timestamp:time,payload:{type:'user_message',message}})
 
+test('direct event merge detects actual pagination headers even without catalog metadata and never emits a flat result',async t=>{
+  const f=fixture(t),id=randomUUID()
+  for(const marker of [{history_mode:'paginated'},{history_base:{thread_id:randomUUID()}}]){
+    const meta=JSON.parse(header(id));Object.assign(meta.payload,marker);const a=source(f.home,id,JSON.stringify(meta)+'\n'+event('2026-10-01T00:00:00Z','latest segment'))
+    assert.equal(a.record.historyMode,undefined)
+    await assert.rejects(mergeSessionCopies(f.scratch,[a],new Map(),signal(),()=>{}),/分段历史.*复制实例/)
+    assert.deepEqual(readdirSync(f.scratch),[])
+  }
+  const ordinary=JSON.parse(header(id));Object.assign(ordinary.payload,{history_mode:'flat',history_base:null});const a=source(f.home,id,JSON.stringify(ordinary)+'\n'+event('2026-10-01T00:00:00Z','ordinary')),before=readFileSync(a.path)
+  const [merged]=await mergeSessionCopies(f.scratch,[a],new Map(),signal(),()=>{});assert.deepEqual(readFileSync(merged.source.path),before)
+})
+
 test('merge keeps newest metadata, merges both event branches, deduplicates JSON keys and sorts timestamps then untimed events',async t=>{
   const f=fixture(t),id=randomUUID(),shared=event('2026-10-01T01:00:00Z','共用'),a=source(f.home,id,header(id,'older')+'\n'+shared+'\n'+event('2026-10-01T02:00:00Z','甲')+'\n'+JSON.stringify({z:1,a:2})+'\nnot json\n','Older')
   const second=join(f.root,'b');mkdirSync(second);const b=source(second,id,header(id,'newer')+'\n'+event('2026-10-01T03:00:00Z','乙')+'\n'+shared+'\n'+JSON.stringify({a:2,z:1})+'\n not json \n','Newer')

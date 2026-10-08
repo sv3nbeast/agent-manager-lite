@@ -25,6 +25,16 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},rebuild:ConstructorPa
 }
 async function files(home:string){const result:string[]=[];for await(const path of rolloutFiles(home,new AbortController().signal))result.push(path);return result}
 
+test('sync refuses paginated segments before staging or modifying any selected home',async t=>{
+  const f=fixture(t),id=randomUUID(),first=rollout(f.a,id,when,'first'),latest=rollout(f.a,id,'2026-10-01T09:00:00Z','latest',true),other=rollout(f.b,randomUUID())
+  const lines=readFileSync(latest,'utf8').split('\n'),meta=JSON.parse(lines[0]);meta.payload.history_mode='paginated';meta.payload.history_base={thread_id:randomUUID()};lines[0]=JSON.stringify(meta);writeFileSync(latest,lines.join('\n'))
+  const before=new Map([first,latest,other].map(path=>[path,readFileSync(path)]))
+  await assert.rejects(f.preview(),/分段历史.*复制实例/)
+  assert.equal(f.sync.view().sync?.status,'failed');assert.equal(existsSync(join(f.store.directory,'session-sync-previews')),false);assert.equal(existsSync(join(f.store.directory,'session-sync')),false)
+  for(const [path,bytes] of before)assert.deepEqual(readFileSync(path),bytes)
+  assert.deepEqual(new Set(await files(f.a)),new Set([first,latest]));assert.deepEqual(await files(f.b),[other])
+})
+
 test('sync unions all conversations, merges forks, projects providers, preserves unknown metadata and retains all original backups',async t=>{
   const indexed:string[]=[],f=fixture(t,async(_program,home)=>{indexed.push(home)}),id=randomUUID(),other=randomUUID(),oldA=rollout(f.a,id,when,'甲'),oldB=rollout(f.b,id,'2026-10-01T09:00:00Z','乙'),originalA=readFileSync(oldA),originalB=readFileSync(oldB);rollout(f.a,other)
   writeFileSync(join(f.a,'config.toml'),'model_provider="provider-a"');writeFileSync(join(f.b,'config.toml'),'model_provider="provider-b"')

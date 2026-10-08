@@ -10,6 +10,7 @@ import {firstSessionEvent,openSessionFile,rolloutFiles,sessionIdentifier} from '
 import {archiveImportSchema,archiveSelectionSchema,type ArchivePreview,type ArchiveImportPreview,type ArchiveProgress} from '../shared/sessionArchives'
 import {SessionZip,archiveMaxBytes,hashSource,importRelative,selectedPath,writeSessionZip,type SessionManifest,type FileStamp} from './sessionZip'
 import type {SessionCopyPreview} from '../shared/sessions'
+import {assertUnpagedSessionSources} from './sessionPaging'
 
 type Job={view:ArchiveProgress;controller:AbortController;task?:Promise<unknown>;sourceIds:Set<string>}
 const safeError=(error:unknown)=>error instanceof Error&&/^(会话|来源|目标|导出|不能|相关|所选|请选择|Codex|每次|已有)/.test(error.message)?error.message:'会话 ZIP 操作失败，请检查文件格式、来源变化、权限与可用磁盘空间'
@@ -50,6 +51,7 @@ export class SessionArchives {
     const input=archiveSelectionSchema.parse(raw);this.available();this.clear();const job=this.begin('export')
     return this.execute(job,async()=>{
       const sources=await this.catalog.transferSources(input.snapshotId,input.sessionIds,job.controller.signal),total=sources.reduce((sum,item)=>sum+item.size,0)
+      await assertUnpagedSessionSources(sources,job.controller.signal)
       if(sources.some(source=>this.inUse(source.targetId)))throw new Error('来源目录有正在执行或等待恢复的会话操作')
       if(total>archiveMaxBytes)throw new Error('所选会话超过 100 GiB，请分批导出')
       const view:ArchivePreview={ticket:randomUUID(),totalBytes:total,items:sources.map(source=>({id:source.record.id,title:source.record.title,cwd:source.record.cwd,bytes:source.size,archived:source.record.locations[0].archived,sourceName:source.record.locations[0].name}))}
