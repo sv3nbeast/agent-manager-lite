@@ -224,20 +224,11 @@ async function main(): Promise<void> {
   credentialTimer.unref()
   app.on('before-quit', event => {
     if (exiting) return
-    // A normal window close, Cmd+Q, or window-all-closed can reach this hook
-    // without the tray's explicit-quit marker. Keep the manager resident in
-    // that case: the gateway sidecar intentionally monitors this process and
-    // would otherwise terminate roughly two seconds after its parent exits.
-    // The tray's "退出并停止运行实例" action sets explicitQuit and performs the
-    // existing full cleanup path.
-    if (!explicitQuit && hasActiveInstances()) {
-      event.preventDefault()
-      keepAliveInTray = true
-      // Startup failure can request quit before the main window is created.
-      // Preserving the owned instances must not itself throw in that case.
-      for (const openWindow of BrowserWindow.getAllWindows()) openWindow.hide()
-      return
-    }
+    // Ordinary window closes are handled by the window's `close` listener
+    // below. Do not cancel `before-quit` for active instances: Electron emits
+    // this event for Cmd+Q and the application-menu Quit command too, and
+    // cancelling it makes the manager impossible to exit. The cleanup below
+    // stops owned instances before the process exits.
     explicitQuit = true
     event.preventDefault(); exiting = true
     clearInterval(credentialTimer)
