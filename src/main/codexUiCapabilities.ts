@@ -22,6 +22,18 @@ function visit(root:Node,fn:(node:Node)=>void):void {
 }
 const nodes=(root:Node,predicate:(node:Node)=>boolean):Node[]=>{const found:Node[]=[];visit(root,node=>{if(predicate(node))found.push(node)});return found}
 const one=<T>(values:readonly T[]):T=>{if(values.length!==1)throw new Error('ambiguous feature shape');return values[0]}
+function bindingNames(pattern:Node|undefined):string[] {
+  if(!pattern)return []
+  if(pattern.type==='Identifier')return [pattern.name]
+  if(pattern.type==='RestElement')return bindingNames(pattern.argument)
+  if(pattern.type==='AssignmentPattern')return bindingNames(pattern.left)
+  if(pattern.type==='ArrayPattern')return pattern.elements.flatMap(bindingNames)
+  if(pattern.type==='ObjectPattern')return pattern.properties.flatMap((p:Node)=>bindingNames(p.type==='RestElement'?p.argument:p.value))
+  return []
+}
+function localBindings(fn:Node):Set<string> {
+  return new Set(nodes(fn,n=>['VariableDeclarator','FunctionDeclaration','FunctionExpression','ArrowFunctionExpression','ClassDeclaration','CatchClause'].includes(n.type)).flatMap(n=>[...bindingNames(n.id),...(n.params??[]).flatMap(bindingNames),...bindingNames(n.param)]))
+}
 
 /** Match semantic roles and syntax, never minifier names or release numbers.
  * Every feature is a transaction: ambiguous/missing roles discard its complete
@@ -54,7 +66,12 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     return [edit(enabled.init,'!0'),edit(locale.init,`${text(system)}?\`SYSTEM\`:\`IDE\``)]
   })
   transaction('speed',()=>{
-    const ui=one(functionsWith('isServiceTierAllowed','authMethod','fast_mode'))
+    // Newer clients expose an access object (Fast and Ultra Fast) instead of
+    // one boolean. Follow the returned capability and its requirements mapper;
+    // preserve the official tier rules rather than depending on build names.
+    const ui=one(functionsWith('authMethod','isLoading').filter(fn=>nodes(fn,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name)).length===1))
+    const capability=one(nodes(ui,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name))).key.name
+    const accessObject=capability==='serviceTierAccess'
     const auth=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.init&&text(n.init).includes('authMethod')&&nodes(n.init,c=>c.type==='BinaryExpression'&&c.operator==='==='&&literal(c.right)==='chatgpt').length===1))
     const account=one(nodes(auth.init,n=>n.type==='MemberExpression'&&property(n)==='authMethod'&&n.object.type==='Identifier').map(n=>n.object.name).filter((v,i,a)=>a.indexOf(v)===i))
     const host=one(nodes(ui,n=>n.type==='Property'&&n.key.name==='hostId'&&n.value.type==='Identifier').map(n=>n.value.name).filter((v,i,a)=>a.indexOf(v)===i))
@@ -65,14 +82,22 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     const loading=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.init&&text(n.init).includes('isLoading')))
     const queryPending=one(nodes(loading.init,n=>n.type==='LogicalExpression'&&n.operator==='&&'&&n.left.name===auth.id.name&&n.right.name===pending))
     const needsData=one(nodes(ui,n=>n.type==='BinaryExpression'&&n.operator==='!='&&n.left.name===data&&literal(n.right)===null))
-    const controls=one(functionsWith('isServiceTierAllowed','serviceTierSettings','availableOptions','setServiceTier'))
+    const access=accessObject?one(nodes(ui,n=>n.type==='ConditionalExpression'&&n.consequent.type==='CallExpression'&&n.consequent.callee.type==='Identifier'&&n.consequent.arguments.length===1&&n.consequent.arguments[0].name===data&&literal(n.alternate)===null)):undefined
+    const mapper=access?.consequent.callee.name
+    const controls=one(functionsWith(capability,'serviceTierSettings','availableOptions','setServiceTier'))
     const controlQuery=one(nodes(controls,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='isPending')))
     const controlPending=one<Node>(controlQuery.id.properties.filter((p:Node)=>p.key.name==='isPending')).value.name
-    const permitted=one(nodes(controls,n=>n.type==='Property'&&n.key.name==='isServiceTierAllowed'&&n.value.type==='Identifier')).value.name
+    const controlIdentity=one(nodes(controls,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name===capability)))
+    const permitted=one<Node>(controlIdentity.id.properties.filter((p:Node)=>p.key.name===capability&&p.value.type==='Identifier')).value.name
     const controlLoading=one(nodes(controls,n=>n.type==='LogicalExpression'&&n.operator==='&&'&&n.right.name===controlPending&&n.left.type==='BinaryExpression'&&n.left.operator==='=='&&literal(n.left.right)===null))
-    const confirm=one(functionsWith('authMethod:','fast_mode','return!1').filter(fn=>fn.async))
-    const guard=one(nodes(confirm,n=>n.type==='IfStatement'&&n.consequent.type==='ReturnStatement'&&text(n.test).includes('chatgpt')&&text(n.consequent)==='return!1;'))
+    const confirm=one(functionsWith('authMethod:').filter(fn=>fn.async&&(accessObject?nodes(fn,n=>n.type==='CallExpression'&&n.callee.name===mapper).length===1:text(fn).includes('fast_mode'))))
+    const denied=accessObject?'null':'!1'
+    const guard=one(nodes(confirm,n=>n.type==='IfStatement'&&n.consequent.type==='ReturnStatement'&&text(n.test).includes('chatgpt')&&text(n.consequent.argument)===denied))
     const method=one(nodes(guard.test,n=>n.type==='BinaryExpression'&&literal(n.right)==='chatgpt'&&n.left.type==='Identifier')).left.name
+    // Replace only the known identity guard. A future business restriction in
+    // this condition must disable the patch instead of being silently removed.
+    const guardTerms=[guard.test.left,guard.test.right] as Node[]
+    if(guard.alternate||guard.test.type!=='LogicalExpression'||guard.test.operator!=='&&'||guardTerms.some(term=>term.type!=='BinaryExpression'||term.operator!=='!=='||term.left.type!=='Identifier'||term.left.name!==method)||new Set(guardTerms.map(term=>literal(term.right))).size!==2||guardTerms.some(term=>!['chatgpt','personalAccessToken'].includes(literal(term.right) as string)))throw new Error('auth guard contract')
     const methodRead=one(nodes(confirm,n=>n.type==='VariableDeclarator'&&n.id.name===method&&n.init?.type==='AwaitExpression')).init.argument
     if(methodRead.type!=='CallExpression'||methodRead.callee.type!=='Identifier'||methodRead.arguments.length!==2||methodRead.arguments.some((a:Node)=>a.type!=='Identifier'))throw new Error('auth reader')
     const helper=one(functions.filter(fn=>fn.id?.name===methodRead.callee.name))
@@ -84,15 +109,19 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     if(wrapper.callee.type!=='Identifier'||accessor.arguments.length!==2)throw new Error('account reader')
     const [scopeId,hostId]=methodRead.arguments.map((n:Node)=>n.name)
     if(property(accessor.callee)!=='get'||accessor.callee.object?.name!==helper.params[0]?.name||accessor.arguments[0].type!=='Identifier'||accessor.arguments[1].name!==helper.params[1]?.name)throw new Error('account scope')
+    // These module bindings are copied into a different function. Refuse local
+    // aliases or shadowing rather than emitting a reference outside its scope.
+    const bindings=[...localBindings(helper),...localBindings(confirm)]
+    if([accessor.arguments[0].name,wrapper.callee.name].some(name=>bindings.includes(name)))throw new Error('account reader binding scope')
     const call=`${text(wrapper.callee)}(${scopeId}.get(${text(accessor.arguments[0])},${hostId})?.rpc.getAccount({priority:\`critical\`}))`
-    const fallback=`if(${method}!==\`chatgpt\`&&${method}!==\`personalAccessToken\`&&${method}!==\`apikey\`){if(${method}!==null||${hostId}!==\`local\`)return!1;let __cmlAccount;try{__cmlAccount=await ${call}}catch{return!1}if(__cmlAccount?.account!==null||__cmlAccount?.requiresOpenaiAuth!==!1)return!1;}`
+    const fallback=`if(${method}!==\`chatgpt\`&&${method}!==\`personalAccessToken\`&&${method}!==\`apikey\`){if(${method}!==null||${hostId}!==\`local\`)return ${denied};let __cmlAccount;try{__cmlAccount=await ${call}}catch{return ${denied}}if(__cmlAccount?.account!==null||__cmlAccount?.requiresOpenaiAuth!==!1)return ${denied};}`
     const requirements=one(nodes(confirm,n=>n.type==='AwaitExpression'&&n.argument.type==='CallExpression'&&n.argument!==methodRead))
     const optionalRequirements=`await ${text(requirements.argument)}.catch(__cmlError=>{if(${hostId}===\`local\`&&(${method}===\`apikey\`||${method}===null))return {requirements:null};throw __cmlError})`
     // Signed-in requirements do not exist for custom API providers. Preserve
     // their explicit Fast denial when present, without waiting indefinitely
     // for an unrelated ChatGPT workspace request. Null identities were verified
     // through account/read above before this request-time fallback is reached.
-    return [edit(auth.init,`${text(auth.init)}||${account}?.authMethod===\`apikey\`||${host}===\`local\`&&${account}?.authMethod===null&&${account}?.requiresAuth===!1`),edit(queryPending,`${text(queryPending)}&&!(${custom})`),edit(needsData,`(${text(needsData)}||(${custom}))`),edit(controlLoading,`${text(controlLoading)}&&!${permitted}`),edit(guard,fallback),edit(requirements,optionalRequirements)]
+    return [edit(auth.init,`${text(auth.init)}||${account}?.authMethod===\`apikey\`||${host}===\`local\`&&${account}?.authMethod===null&&${account}?.requiresAuth===!1`),edit(queryPending,`${text(queryPending)}&&!(${custom})`),edit(needsData,`(${text(needsData)}||(${custom}))`),edit(controlLoading,`${text(controlLoading)}&&${accessObject?`${permitted}==null`:`!${permitted}`}`),edit(guard,fallback),edit(requirements,optionalRequirements),...(access?[edit(access.consequent.arguments[0],`${data}??{requirements:null}`)]:[])]
   })
   transaction('ultra',()=>{
     const settings=one(functionsWith('enabledReasoningEfforts','new Set','persistent').filter(fn=>nodes(fn,n=>n.type==='NewExpression'&&n.callee.name==='Set'&&n.arguments[0]?.type==='ArrayExpression'&&text(n.arguments[0]).includes('enabledReasoningEfforts')&&n.arguments[0].elements.some((e:Node)=>literal(e)==='persistent')).length===1))

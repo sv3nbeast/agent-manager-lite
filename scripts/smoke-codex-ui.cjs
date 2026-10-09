@@ -122,7 +122,12 @@ async function main(){
     await key('Escape');await key('Escape')
     await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
     await evaluate('document.querySelector("[data-reasoning-slider]").focus()')
-    for(let step=0;step<6;step++){await key('ArrowRight');await delay(150)}
+    // The client can change the number of intensity stops. Select the visible
+    // Ultra level instead of advancing a fixed count into a different level.
+    for(let step=0;step<12;step++){
+      if(await evaluate('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")'))break
+      await key('ArrowRight');await delay(150)
+    }
     await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
     await key('Enter');await delay(500)
     await capture('codex-ultra-menu.png')

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {randomUUID} from 'node:crypto'
-import {mkdtempSync,mkdirSync,readFileSync,rmSync,realpathSync} from 'node:fs'
+import {existsSync,mkdtempSync,mkdirSync,readFileSync,rmSync,realpathSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {applyCodexUiReplacements,detectCodexUiCapabilities,type CodexUiFeature} from '../src/main/codexUiCapabilities'
@@ -20,6 +20,15 @@ const source=[
   'function updateReasoning(e,t){return (t.thinkingEffort!==`ultra`||e.get(flag,`536305374`))?t.thinkingEffort:null}',
   'function startReasoning(e,t){return t.thinkingEffort===`ultra`&&!e.get(flag,`536305374`)?null:t.thinkingEffort}'
 ].join('\n')
+
+// The current client returns per-tier access through a shared mapper. Keep a
+// small independent fixture so both protocols remain covered after app updates.
+const accessSource=source.split('\n').map(line=>{
+  if(line.startsWith('function menu'))return 'function menu(e){let r=e?.hostId??`local`,i=readIdentity(r),allowed=i?.authMethod===`chatgpt`||i?.authMethod===`personalAccessToken`;const key={authMethod:i?.authMethod,hostId:r};let {data:c,isPending:l}=readQuery(key),loading=!!i?.isLoading||allowed&&l,access=allowed&&!loading&&c!=null?mapAccess(c):null;return {serviceTierAccess:access,isLoading:loading,key}}'
+  if(line.startsWith('function speedControls'))return 'function speedControls(thread){const {data:x,isPending:S}=readQuery({}),{serviceTierAccess:E}=menu({hostId:`local`});const loading=thread==null&&S;return {serviceTierAccess:E,serviceTierSettings:{isLoading:loading,availableOptions:[`standard`,`fast`]},setServiceTier:()=>{}}}'
+  if(line.startsWith('async function confirm'))return 'async function confirm(e,t){let n=await accountMethod(e,t);if(n!==`chatgpt`&&n!==`personalAccessToken`)return null;let r=await readRequirements(e,t);return e.query.setData(requirementKey,{authMethod:n,hostId:t},r),mapAccess(r)}'
+  return line
+}).join('\n')+'\nfunction mapAccess(e){let t=e.requirements?.featureRequirements,n=t?.fast_mode!==!1;return {fast:n,ultrafast:(e.supportsIndependentSpeedModes===!0||n)&&t?.ultrafast_mode!==!1}}'
 
 function patches(body=source,features:readonly CodexUiFeature[]=['locale','speed','ultra']){
   const detected=detectCodexUiCapabilities(body)
@@ -139,4 +148,115 @@ test('missing subscription metadata is optional only for local API identities; s
   await assert.rejects(follow(store,'remote'),/subscription unavailable/)
   method='chatgpt';await assert.rejects(follow(store,'local'),/subscription unavailable/)
   method='personalAccessToken';await assert.rejects(follow(store,'local'),/subscription unavailable/)
+})
+
+test('access-object Fast detection survives renamed symbols and unknown versions',t=>{
+  const renamed=accessSource.replace(/\bmenu\b/g,'renamedMenu').replace(/\bconfirm\b/g,'newRequestAccess').replace(/\bmapAccess\b/g,'tierCapabilities').replace(/\baccountMethod\b/g,'identityReader')
+  const f=fixture(t,renamed,'101.999.123'),result=f.inspect()
+  assert.deepEqual(result.features,['locale','speed','ultra'])
+  const hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable:f.options.executable,nonce:randomUUID()})!
+  assert.ok(hook)
+  const patched=readFileSync(hook.patchedBody!,'utf8')
+  assert.match(patched,/tierCapabilities\(c\?\?\{requirements:null\}\)/)
+  assert.match(patched,/if\(n!==null\|\|t!==`local`\)return null/)
+})
+
+test('access-object menus preserve independent tier restrictions and do not wait for local subscription metadata',()=>{
+  const {detected,body}=patches(accessSource,['speed'])
+  assert.equal(detected.features.speed.supported,true)
+  const functions=body.split('\n').filter(line=>/^function (menu|speedControls|mapAccess)\b/.test(line)).join('\n')
+  let identity:any={authMethod:null,requiresAuth:false,isLoading:false},data:any=null,pending=true
+  const create=new Function('readIdentity','readQuery',functions+';return {menu,speedControls};')
+  const {menu, speedControls}=create(()=>identity,()=>({data,isPending:pending}))
+  assert.deepEqual(menu({hostId:'local'}).serviceTierAccess,{fast:true,ultrafast:true})
+  assert.equal(menu({hostId:'local'}).isLoading,false)
+  assert.equal(speedControls(null).serviceTierSettings.isLoading,false)
+  assert.equal(menu({hostId:'remote'}).serviceTierAccess,null)
+  identity={authMethod:null};assert.equal(menu({hostId:'local'}).serviceTierAccess,null)
+  identity={authMethod:null,requiresAuth:false,isLoading:true};assert.equal(menu({hostId:'local'}).serviceTierAccess,null)
+  identity={authMethod:'apikey',isLoading:false}
+  data={requirements:{featureRequirements:{fast_mode:true,ultrafast_mode:false}}}
+  assert.deepEqual(menu({hostId:'local'}).serviceTierAccess,{fast:true,ultrafast:false})
+  data={requirements:{featureRequirements:{fast_mode:false}}}
+  assert.deepEqual(menu({hostId:'local'}).serviceTierAccess,{fast:false,ultrafast:false})
+  data.supportsIndependentSpeedModes=true
+  assert.deepEqual(menu({hostId:'local'}).serviceTierAccess,{fast:false,ultrafast:true})
+  identity={authMethod:'chatgpt',isLoading:false};data=null
+  assert.equal(menu({hostId:'local'}).serviceTierAccess,null)
+  assert.equal(speedControls(null).serviceTierSettings.isLoading,true)
+  pending=false;data={requirements:{featureRequirements:{fast_mode:true}}}
+  assert.deepEqual(menu({hostId:'local'}).serviceTierAccess,{fast:true,ultrafast:true})
+})
+
+test('access-object request admission keeps null denial and verifies unauthenticated local accounts',async()=>{
+  const {body}=patches(accessSource,['speed'])
+  const functions=body.split('\n').filter(line=>/^(async )?function (confirm|mapAccess)\b/.test(line)).join('\n')
+  let method:any=null,account:any={account:null,requiresOpenaiAuth:false},failure=false,accountFailure=false
+  let requirements:any={requirements:{featureRequirements:{fast_mode:true,ultrafast_mode:false}}}
+  const create=new Function('accountMethod','readRequirements','unwrap','rpcKey','requirementKey',functions+';return confirm;')
+  const follow=create(async()=>method,async()=>{if(failure)throw new Error('subscription unavailable');return requirements},(v:unknown)=>v,'rpc','requirements')
+  const store={get:()=>({rpc:{getAccount:async()=>{if(accountFailure)throw new Error('account unavailable');return account}}}),query:{setData:()=>{}}}
+  assert.deepEqual(await follow(store,'local'),{fast:true,ultrafast:false})
+  assert.equal(await follow(store,'remote'),null)
+  for(const value of [{},{account:null},{account:{},requiresOpenaiAuth:false},{account:null,requiresOpenaiAuth:true}]){account=value;assert.equal(await follow(store,'local'),null)}
+  account={account:null,requiresOpenaiAuth:false};accountFailure=true
+  assert.equal(await follow(store,'local'),null)
+  accountFailure=false;failure=true
+  assert.deepEqual(await follow(store,'local'),{fast:true,ultrafast:true})
+  method='apikey';assert.deepEqual(await follow(store,'local'),{fast:true,ultrafast:true})
+  await assert.rejects(follow(store,'remote'),/subscription unavailable/)
+  for(const value of ['chatgpt','personalAccessToken']){method=value;await assert.rejects(follow(store,'local'),/subscription unavailable/)}
+  method='copilot';assert.equal(await follow(store,'local'),null)
+  failure=false;requirements={requirements:{featureRequirements:{fast_mode:false}}}
+  for(const value of ['chatgpt','personalAccessToken','apikey',null]){method=value;assert.deepEqual(await follow(store,'local'),{fast:false,ultrafast:false})}
+})
+
+test('ambiguous access mapper consumers disable only Fast without leaving partial edits',t=>{
+  const body=accessSource+'\n'+accessSource.split('\n').find(line=>line.startsWith('async function confirm'))!.replace('function confirm','function duplicateConfirm')
+  const detected=detectCodexUiCapabilities(body),f=fixture(t,body)
+  assert.equal(detected.features.speed.supported,false)
+  assert.deepEqual(detected.replacements.speed,[])
+  assert.deepEqual(f.inspect().features,['locale','ultra'])
+})
+
+test('future identity guards with additional restrictions disable only Fast',t=>{
+  for(const original of [source,accessSource]){
+    const extraRestriction=original.replace('if(n!==`chatgpt`&&n!==`personalAccessToken`)','if(n!==`chatgpt`&&n!==`personalAccessToken`||t===`remote`)')
+    const detected=detectCodexUiCapabilities(extraRestriction),f=fixture(t,extraRestriction)
+    assert.equal(detected.features.speed.supported,false)
+    assert.deepEqual(detected.replacements.speed,[])
+    assert.deepEqual(f.inspect().features,['locale','ultra'])
+    const reversed=original.replace('if(n!==`chatgpt`&&n!==`personalAccessToken`)','if(n!==`personalAccessToken`&&n!==`chatgpt`)')
+    assert.equal(detectCodexUiCapabilities(reversed).features.speed.supported,true)
+  }
+})
+
+test('account reader keys and wrappers cannot cross local or shadowed binding scopes',t=>{
+  for(const original of [source,accessSource]){
+    const variants=[
+      original.replace('let r=e.get(rpcKey,t);','const localKey=rpcKey;let r=e.get(localKey,t);'),
+      original.replace('let r=e.get(rpcKey,t);','const {unwrap}=helpers;let r=e.get(rpcKey,t);'),
+      original.replace('async function confirm(e,t){','async function confirm(e,t){const [rpcKey]=keys;'),
+      original.replace('async function confirm(e,t){','async function confirm(e,t,{unwrap}){')
+    ]
+    for(const body of variants){
+      const detected=detectCodexUiCapabilities(body),f=fixture(t,body)
+      assert.equal(detected.features.speed.supported,false)
+      assert.deepEqual(detected.replacements.speed,[])
+      assert.deepEqual(f.inspect().features,['locale','ultra'])
+    }
+  }
+})
+
+test('installed 26.1007 client prepares locale, Fast and Ultra together',t=>{
+  const application='/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
+  if(process.platform!=='darwin'||!existsSync(executable)){t.skip('current desktop client is not installed');return}
+  const result=inspectCodexDesktopUi({application,executable})
+  if(result.version!=='26.1007.21159'){t.skip('installed client is outside this regression fixture');return}
+  assert.equal(result.supported,true,result.reason)
+  assert.deepEqual(result.features,['locale','speed','ultra'])
+  const f=fixture(t),hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable,nonce:randomUUID()})
+  assert.ok(hook?.patchedBody)
+  assert.deepEqual(hook.features,['locale','speed','ultra'])
+  assert.match(readFileSync(hook.patchedBody,'utf8'),/return null;let __cmlAccount/)
 })
