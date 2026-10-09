@@ -48,3 +48,5 @@ jobs:
         run: npm run test:ci
       - name: Typecheck and build Electron source
         run: npm run build
+      - name: Verify instance lifetime across manager Quit and reopen
+        run: npm run test:desktop:tray

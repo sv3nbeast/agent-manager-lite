@@ -506,14 +506,19 @@ export class Instances {
   }
   syncCredentials():void {for(const run of this.active.values())run.gateway?.syncCredentials()}
   async settled(id:string):Promise<void> {await this.active.get(id)?.task}
-  async refresh():Promise<void> {
+  async refresh(options:{settleInactiveErrors?:boolean}={}):Promise<void> {
     if(this.refreshing)return this.refreshing
-    this.refreshing=(async()=>{for(const run of this.active.values())if(run.status==='running'){
-      if(!await this.runtime.find(run.plan)) {
+    this.refreshing=(async()=>{for(const run of this.active.values())if(run.status==='running'||run.status==='error'&&(run.child||options.settleInactiveErrors)){
+      // A failed launch can leave an error card without assigning a PID.
+      // Verify the actual owner before allowing background shutdown; a late
+      // LaunchServices process must be retained even when launch() rejected.
+      const child=await this.runtime.find(run.plan)
+      if(!child) {
         try {await this.stop(run.profile.id)}catch{run.status='error';run.error='实例已退出，但配置或登录状态未保存，请重试停止'}
       } else if(run.profile.connectionMode!=='native'&&!run.gateway?.current().running && run.status==='running') {
         run.status='error';run.error='实例本地连接已退出，请停止后重新启动'
       }
+      if(child)run.child=child
     }})().finally(()=>{this.refreshing=undefined})
     return this.refreshing
   }

@@ -328,12 +328,22 @@ test('native exit saves final credentials; failed recovery retains authority and
 test('native restart recovery distinguishes live and dead processes and verifies encrypted journal ownership',async t=>{
   for(const live of [true,false]){
     const f=fixture(t),instance=f.add();await f.start(instance.id)
+    let finalGeneration='before-recovery'
     writeFileSync(join(instance.directory,'auth.json'),auth('alpha','before-recovery',7200))
     if(!live)f.children.clear()
     const reopened=f.create();await reopened.recover()
     assert.equal(reopened.views()[0].status,live?'error':'stopped')
-    if(live){assert.equal(f.store.read().clientAuthorities?.length,1);await reopened.stop(instance.id)}
-    assert.equal(f.store.read().accounts[0].credentials.refreshToken,'fixture-native-rt-before-recovery')
+    if(live){
+      assert.equal(f.store.read().clientAuthorities?.length,1)
+      await reopened.refresh();assert.equal(reopened.views()[0].status,'error')
+      assert.equal(f.children.size,1,'A live recovered client must keep its auth and configuration')
+      finalGeneration='at-natural-exit'
+      writeFileSync(join(instance.directory,'auth.json'),auth('alpha',finalGeneration,7200))
+      f.children.clear();await reopened.refresh()
+      assert.equal(reopened.views()[0].status,'stopped')
+      assert.equal(existsSync(join(f.store.directory,'instances',instance.id,'launch.json')),false)
+    }
+    assert.equal(f.store.read().accounts[0].credentials.refreshToken,'fixture-native-rt-'+finalGeneration)
     assert.equal(existsSync(join(instance.directory,'auth.json')),false)
   }
   const f=fixture(t),instance=f.add();await f.start(instance.id);f.children.clear()

@@ -18,3 +18,8 @@ export interface TrayCloseState {
 export function shouldHideOnClose(state: TrayCloseState): boolean {
   return !state.explicitQuit && (state.closeToTray || state.activeInstances === true)
 }
+
+/** Ordinary Quit preserves owned clients; stopping them requires an explicit action. */
+export function shouldPreserveInstancesOnQuit(state: Pick<TrayCloseState, 'explicitQuit' | 'activeInstances'>): boolean {
+  return !state.explicitQuit && state.activeInstances === true
+}

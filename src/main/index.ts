@@ -61,7 +61,7 @@ import {DataBackups} from './dataBackups'
 import {backupRequestSchema} from '../shared/dataBackup'
 import { WakeupScheduler } from './wakeupScheduler'
 import { applyLaunchAtLogin } from './loginItem'
-import { shouldHideOnClose } from './trayPolicy'
+import { shouldHideOnClose, shouldPreserveInstancesOnQuit } from './trayPolicy'
 import { SshServers } from './ssh'
 
 const development = !app.isPackaged
@@ -222,16 +222,55 @@ async function main(): Promise<void> {
     })}
   }, 60_000)
   credentialTimer.unref()
+  let backgroundQuit = false
+  let checkingBackgroundInstances = false
+  let dockHideTimer: ReturnType<typeof setTimeout> | undefined
+  const cancelDockHide = () => { clearTimeout(dockHideTimer); dockHideTimer = undefined }
+  const hideBackgroundDock = () => {
+    if (process.platform !== 'darwin') return
+    cancelDockHide()
+    // Hiding inside a cancelled before-quit can be undone by macOS. Electron
+    // also ignores hide calls less than a second apart. Defer and cancel on
+    // reopen so neither OS behavior leaves the foreground app hidden later.
+    dockHideTimer = setTimeout(() => {
+      dockHideTimer = undefined
+      if (backgroundQuit && !exiting) app.dock?.hide()
+    }, 1100)
+    dockHideTimer.unref()
+  }
+  // The renderer may be suspended while hidden. Supervise client exit in the
+  // main process so a requested Quit completes after the last client exits
+  // and its credential/configuration journal has been restored.
+  const backgroundTimer = setInterval(() => {
+    if (!backgroundQuit || exiting || checkingBackgroundInstances) return
+    checkingBackgroundInstances = true
+    void instances.refresh({settleInactiveErrors:true}).then(() => {
+      if (backgroundQuit && !exiting && !hasActiveInstances() && commands.size === 0) {
+        explicitQuit = true
+        app.quit()
+      }
+    }).catch(error => console.error('后台实例状态检查失败，已保留运行状态', error))
+      .finally(() => { checkingBackgroundInstances = false })
+  }, 1000)
+  backgroundTimer.unref()
   app.on('before-quit', event => {
     if (exiting) return
-    // Ordinary window closes are handled by the window's `close` listener
-    // below. Do not cancel `before-quit` for active instances: Electron emits
-    // this event for Cmd+Q and the application-menu Quit command too, and
-    // cancelling it makes the manager impossible to exit. The cleanup below
-    // stops owned instances before the process exits.
+    // Local API gateways and credential refresh belong to this process.
+    // Keep those services alive instead of sending stop signals to clients
+    // when Quit comes from Cmd+Q, the app menu, or the ordinary tray action.
+    if (shouldPreserveInstancesOnQuit({ explicitQuit, activeInstances: hasActiveInstances() })) {
+      event.preventDefault()
+      backgroundQuit = true
+      keepAliveInTray = true
+      for (const openWindow of BrowserWindow.getAllWindows()) openWindow.hide()
+      hideBackgroundDock()
+      return
+    }
     explicitQuit = true
     event.preventDefault(); exiting = true
     clearInterval(credentialTimer)
+    clearInterval(backgroundTimer)
+    cancelDockHide()
     accountFiles.discard()
     sessions.stop()
     sessionVisibility.stop()
@@ -246,7 +285,6 @@ async function main(): Promise<void> {
     historyExport?.abort()
     Promise.allSettled([localDataMigration.stop(),dataBackups.stop(),chatgptModels.stop(),providerModels.stop(),upstreamProxies.stop(),subscriptionStop,wakeups.stop(),proxyEngine.stop(),accountProxies.stop(),accountNetwork.stop(),tempLogin.stop(),quotas.stop(), tokens.stop(), clientAuthority.stop(), agents.stop(), localAccess.stop(), instances.closeAll(),providerProbes.stop(),providerUsageQueries.stop(), accountFiles.stop(), accountRecycle.stop(), sessionArchives.stop(), sessionTransfers.stop(), sessionSync.stop(), sessionTrash.stop(), exportTask]).finally(async () => {await proxyTunnels.stop();history.close();app.quit()})
   })
-  app.on('second-instance', () => { if (window.isMinimized()) window.restore(); window.show(); window.focus() })
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({ applicationName: productName })
     // Preserve Electron's standard menu roles and shortcuts while separating
@@ -269,18 +307,32 @@ async function main(): Promise<void> {
     title: productName, backgroundColor: '#f5f6fa',
     webPreferences: { preload: join(__dirname, '../preload/index.js'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   })
+  const showWindow = () => {
+    if (exiting || window.isDestroyed()) return
+    backgroundQuit = false
+    cancelDockHide()
+    if (process.platform === 'darwin') void app.dock?.show().then(() => {
+      if (backgroundQuit && !exiting) hideBackgroundDock()
+    }).catch(error => console.error('无法显示 Dock 图标', error))
+    if (window.isMinimized()) window.restore()
+    window.show(); window.focus()
+  }
+  // Reopening uses the resident manager and its live gateways, never another
+  // copy of the vault or a second launch of the client's profile.
+  app.on('second-instance', showWindow)
+  app.on('activate', showWindow)
   const trayIconPath = app.isPackaged ? join(process.resourcesPath, 'tray.png') : resolve('resources/tray.png')
   const icon = nativeImage.createFromPath(trayIconPath)
   if (!icon.isEmpty()) {
     tray = new Tray(icon)
     tray.setToolTip(productName)
-    const showWindow = () => { if (window.isMinimized()) window.restore(); window.show(); window.focus() }
     tray.on('click', () => { if (window.isVisible()) window.hide(); else showWindow() })
     refreshTrayMenu = () => {
       tray?.setContextMenu(Menu.buildFromTemplate([
         { label: '显示主窗口', click: showWindow },
-        { label: '有运行实例时关闭窗口会继续运行', enabled: false },
+        { label: '退出后实例继续运行，全部结束后自动退出', enabled: false },
         { type: 'separator' },
+        { label: `退出 ${productName}（保留运行实例）`, click: () => { app.quit() } },
         { label: `退出并停止运行实例`, click: () => { explicitQuit = true; app.quit() } }
       ]))
     }

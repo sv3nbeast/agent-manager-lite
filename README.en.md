@@ -58,7 +58,9 @@ The current release target is **macOS Apple Silicon (arm64)**, with DMG and ZIP 
 
 If a proxy is required, configure the default network in Settings and override it per account as needed. Proxies apply to the manager’s login exchanges, Token refreshes, usage queries and local API. External browsers and native clients use their own network settings.
 
-Quit the application before installing an update. In-app automatic updates are not implemented. Packages include `SHA256SUMS.txt`; current builds do not have Developer ID signing or notarization.
+While instances are active, Cmd+Q, menu Quit and the ordinary tray Quit close the management UI and keep its background services alive. Instances and their local API connections continue running; the manager exits after all instances finish and their configuration is restored. Reopen the app or show its window from the tray to resume management. The tray's “Quit and stop running instances” action stops the instances and exits completely.
+
+Finish active work and wait for the manager to exit completely before installing an update. In-app automatic updates are not implemented. Packages include `SHA256SUMS.txt`; current builds do not have Developer ID signing or notarization.
 
 ## Data
 

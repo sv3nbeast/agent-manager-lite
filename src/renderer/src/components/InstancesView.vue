@@ -497,7 +497,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       </a-card>
     </div>
     <a-pagination v-if="filtered.length>12" v-model:current="page" :total="filtered.length" :page-size="12" :show-size-changer="false" class="pagination" />
-    <p class="muted instance-note">当前支持 macOS 桌面的本地 API 与文件原生账号模式。CLI 支持 macOS Terminal、原生程序及已适配的 npm 入口，会话同步仍在迁移。退出管理器会停止这些实例；其他已打开的客户端保持独立。</p>
+    <p class="muted instance-note">当前支持 macOS 桌面的本地 API 与文件原生账号模式。CLI 支持 macOS Terminal、原生程序及已适配的 npm 入口，会话同步仍在迁移。有运行实例时，退出管理器会保留后台服务，实例全部结束后自动退出。需要同时停止实例时，请从托盘选择“退出并停止运行实例”。</p>
     <a-modal :open="open" class="instance-editor-dialog" :closable="!committing" :mask-closable="!committing" :keyboard="!committing" centered :width="740" :body-style="{maxHeight:`calc(100vh - ${wizard?(error||manager.error||historyError?320:240):(error||manager.error||historyError?260:180)}px)`,overflowY:'auto'}" @cancel="closeEditor">
       <template #title>
         <div class="instance-editor-title"><span>{{wizard?'创建实例':attachingForm?'使用已有目录':copyingForm?'复制实例':'编辑实例'}}</span><span v-if="wizard" class="instance-step-count">{{step+1}} / 4</span></div>

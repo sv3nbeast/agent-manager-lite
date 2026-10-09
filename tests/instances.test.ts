@@ -505,6 +505,25 @@ test('external edits during startup prevent projection; later edits survive natu
   assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).scalar(['model']),'user-after-start')
 })
 
+test('background shutdown settles failed launches only after verifying there is no owned client',async t=>{
+  const f=fixture(t),account=f.account(),instance=f.add(account.id)
+  f.runtime.launch=async()=>{throw new Error('fixture launch rejected')}
+  f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket);await f.instances.settled(instance.id)
+  await f.instances.refresh()
+  assert.equal(f.instances.views()[0].status,'error','Foreground keeps the launch error available')
+  // Recover a PID-less error with an exact nonce-owned client still alive.
+  const savedFind=f.runtime.find.bind(f.runtime)
+  f.runtime.find=async()=>({pid:45000,started:'fixture-late-owner'})
+  await f.instances.refresh({settleInactiveErrors:true})
+  assert.equal(f.instances.views()[0].pid,45000)
+  assert.equal(f.instances.usesAccount(account.id),true)
+  f.runtime.find=savedFind
+  await f.instances.refresh({settleInactiveErrors:true})
+  assert.equal(f.instances.views()[0].status,'stopped')
+  assert.equal(f.instances.usesAccount(account.id),false)
+  assert.equal(existsSync(join(f.store.directory,'instances',instance.id,'launch.json')),false)
+})
+
 test('restart recovery retains owned live instances, restores dead instances, and blocks ambiguous checkpoints',async t=>{
   const f=fixture(t),account=f.account(),instance=f.add(account.id)
   f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket);await f.instances.settled(instance.id)
@@ -573,7 +592,10 @@ test('natural exit and concurrent stop share cleanup; failed local connections b
   await f.gateways[0].stop();await f.instances.refresh()
   assert.equal(f.instances.views()[0].status,'error');assert.match(f.instances.views()[0].error!,/本地连接/)
   assert.equal(f.instances.usesAccount(account.id),true)
-  await f.instances.stop(instance.id)
+  f.runtime.children.clear();await f.instances.refresh()
+  assert.equal(f.instances.views()[0].status,'stopped')
+  assert.equal(f.instances.usesAccount(account.id),false)
+  assert.equal(existsSync(join(f.store.directory,'instances',instance.id,'launch.json')),false)
   f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket);await f.instances.settled(instance.id)
   let stops=0
   const stop=f.runtime.stop.bind(f.runtime)
