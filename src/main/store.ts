@@ -20,7 +20,7 @@ export interface StoredAccount extends Omit<Account, 'credentialConfigured'|'egr
   proxy?:StoredAccountProxy
   generation?:string
   providerUsageRevision?:number
-  credentials: { apiKey?: string; accessToken?: string; refreshToken?: string; idToken?: string; accountId?: string; localAPIKey?: string; agentIdentity?: AgentIdentity }
+  credentials: { apiKey?: string; accessToken?: string; refreshToken?: string; idToken?: string; accountId?: string; lastRefresh?: string; localAPIKey?: string; agentIdentity?: AgentIdentity }
   source?: Record<string, unknown>
 }
 export interface RecycledAccount {id:string;deletedAt:number;account:StoredAccount;groupIds:string[];providerDefault?:StoredAccount['defaultTier'];providerModelContextWindows?:Record<string,number>}

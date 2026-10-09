@@ -153,7 +153,7 @@ async function main(): Promise<void> {
   sessionSync=new SessionSync(store,sessionTransfers,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionTrash?.busy(id))
   sessionTrash=new SessionTrash(store,sessions,sessionTransfers,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionSync?.busy(id))
   clientSwitches=new ClientSwitches(store,clientConfigs,tokens,id=>localAccess.usesAccount(id)||instances.usesAccount(id)||clientAuthority.busy(id),id=>instances.inUse(id))
-  const sessionVisibility=new SessionVisibilityRepair(clientConfigs,id=>instances.inUse(id)||clientSwitches.usesTarget(id))
+  const sessionVisibility=new SessionVisibilityRepair(clientConfigs,id=>instances.inUse(id)||clientSwitches.usesTarget(id),id=>instances.plannedSessionProvider(id))
   sessionTrash.recover()
   await instances.recover()
   await sessionTransfers.recover()

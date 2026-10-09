@@ -12,6 +12,7 @@ import {instanceProviderName} from './instanceProviderName'
 import {TomlDocument,patchToml,scalarRaw,type TomlEdit} from './tomlPatch'
 import {tokenClaims} from './tokens'
 import type {StoredClientSwitch} from './clientSwitch'
+import {nativeAuthRefresh} from './authRefreshMetadata'
 
 export const nativeProvider='cml_native_account'
 export const authKeys=new Set(('access_token refresh_token id_token session_id expired last_refresh expires_in timestamp token_type user_code verification_uri verification_uri_complete openai_api_key personal_access_token tokens agent_identity agentidentity auth_mode authmode base_url api_base_url apibaseurl email account_email accountemail account_name accountname account_id accountid chatgpt_account_id chatgptaccountid chatgpt_user_id chatgptuserid user_id userid type').split(' '))
@@ -36,7 +37,7 @@ export function authFor(account:StoredAccount,template:string|null,proxyState:Pr
   for(const key of Object.keys(value))if(authKeys.has(key.toLowerCase()))delete value[key]
   if(account.kind==='api_key')Object.assign(value,{auth_mode:'apikey',OPENAI_API_KEY:account.credentials.apiKey})
   else if(!account.credentials.idToken&&!account.credentials.refreshToken)Object.assign(value,{OPENAI_API_KEY:null,personal_access_token:account.credentials.accessToken})
-  else Object.assign(value,{auth_mode:'chatgpt',OPENAI_API_KEY:null,tokens:{access_token:account.credentials.accessToken,id_token:account.credentials.idToken??'',refresh_token:account.credentials.refreshToken??'',account_id:accountIdentity(account).accountId??null}})
+  else Object.assign(value,{auth_mode:'chatgpt',OPENAI_API_KEY:null,last_refresh:nativeAuthRefresh(account),tokens:{access_token:account.credentials.accessToken,id_token:account.credentials.idToken??'',refresh_token:account.credentials.refreshToken??'',account_id:accountIdentity(account).accountId??null}})
   const raw=JSON.stringify(value,null,2)+'\n'
   if(account.kind==='oauth'&&!sameNativeAccount(account,accountFromAuth(raw,new TomlDocument(''))))throw new Error('令牌自身无法确认账号身份，请重新登录')
   return raw
@@ -47,7 +48,7 @@ export function adoptNative(state:State,id:string,observed:StoredAccount):void {
   if(account.kind==='api_key')return // Never adopt a different API key from a client config.
   const before=tokenClaims(account.credentials.accessToken).exp,after=tokenClaims(observed.credentials.accessToken).exp
   if(typeof before==='number'&&typeof after==='number'&&after<before)throw new Error('客户端凭据早于账号库版本，请先在客户端重新登录')
-  account.credentials={...account.credentials,accessToken:observed.credentials.accessToken,idToken:observed.credentials.idToken,refreshToken:observed.credentials.refreshToken,accountId:observed.credentials.accountId}
+  account.credentials={...account.credentials,accessToken:observed.credentials.accessToken,idToken:observed.credentials.idToken,refreshToken:observed.credentials.refreshToken,accountId:observed.credentials.accountId,lastRefresh:observed.credentials.lastRefresh}
   account.email=observed.email??account.email;account.plan=observed.plan??account.plan
   delete account.error;delete account.errorAt
 }

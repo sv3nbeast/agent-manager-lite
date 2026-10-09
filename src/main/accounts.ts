@@ -11,6 +11,7 @@ import {invalidateProviderUsage} from './providerUsage'
 import { parseQuota, parseSubscriptionTimestamp } from './quota'
 import { projectSubscriptionClaim } from './subscriptionClaims'
 import { providerModelContextWindows } from './providerModelContext'
+import { importedAuthRefresh } from './authRefreshMetadata'
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('账号必须是 JSON 对象')
@@ -232,7 +233,8 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
           baseUrl: 'https://chatgpt.com/backend-api/codex', models: [], wireApi: 'responses',
           defaultTier: accountInputSchema.shape.defaultTier.parse(metadata.defaultTier),
           note: accountInputSchema.shape.note.parse(metadata.note), tags: accountInputSchema.shape.tags.parse(metadata.tags), createdAt: Date.now(),
-          credentials: { accessToken, refreshToken, idToken, accountId: take('account_id', 'accountId') ?? text(auth.chatgpt_account_id) ?? text(auth.account_id) }
+          credentials: { accessToken, refreshToken, idToken, accountId: take('account_id', 'accountId') ?? text(auth.chatgpt_account_id) ?? text(auth.account_id),
+            lastRefresh: importedAuthRefresh(source,nested) }
         }
       }
       account.createdAt = importedCreatedAt(source)

@@ -65,7 +65,7 @@ export class ClientAuthority {
     // Absence means the client's current file no longer supplies a refresh
     // token. Retaining the old one would resurrect a different token chain.
     account.credentials={...account.credentials,accessToken:observed.credentials.accessToken,idToken:observed.credentials.idToken,
-      refreshToken:observed.credentials.refreshToken,accountId:observed.credentials.accountId}
+      refreshToken:observed.credentials.refreshToken,accountId:observed.credentials.accountId,lastRefresh:observed.credentials.lastRefresh}
     account.email=observed.email??account.email;account.plan=observed.plan??account.plan
     delete account.error;delete account.errorAt
     return structuredClone(account)
@@ -108,7 +108,7 @@ export class ClientAuthority {
       if(!prior)throw new Error('关联账号已删除')
       compatible(prior,observed)
       let account=prior
-      if(credentials(prior)!==credentials({...prior,credentials:{...prior.credentials,accessToken:observed.credentials.accessToken,idToken:observed.credentials.idToken,refreshToken:observed.credentials.refreshToken,accountId:observed.credentials.accountId}})||observed.email!==undefined&&prior.email!==observed.email||observed.plan!==undefined&&prior.plan!==observed.plan){
+      if(credentials(prior)!==credentials({...prior,credentials:{...prior.credentials,accessToken:observed.credentials.accessToken,idToken:observed.credentials.idToken,refreshToken:observed.credentials.refreshToken,accountId:observed.credentials.accountId,lastRefresh:observed.credentials.lastRefresh}})||observed.email!==undefined&&prior.email!==observed.email||observed.plan!==undefined&&prior.plan!==observed.plan){
         this.store.transaction(state=>{account=this.adopt(state,accountId,observed)})
       }
       try{await this.project(account)}catch{throw new Error('客户端凭据已保存，但本地服务尚未同步，请重试同步')}

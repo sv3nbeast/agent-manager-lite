@@ -1,6 +1,7 @@
 import {DatabaseSync} from 'node:sqlite'
 import {randomUUID} from 'node:crypto'
 import {copyFile,mkdir,readdir,readFile,rename,rm,stat,writeFile} from 'node:fs/promises'
+import {lstatSync,realpathSync} from 'node:fs'
 import {basename,dirname,isAbsolute,join,relative,resolve,sep} from 'node:path'
 import {setImmediate} from 'node:timers/promises'
 import {z} from 'zod'
@@ -23,6 +24,7 @@ interface RolloutPlan {path:string;relativePath:string;revision:FileRevision;con
 interface DatabasePlan {path:string;revision:FileRevision;rows:number;rollouts:Map<string,{path:string;updatedAt?:number}>}
 interface TargetPlan {
   target:ClientConfigTarget
+  directoryIdentity?:{device:number;inode:number}
   provider:string
   running:boolean
   databases:DatabasePlan[]
@@ -38,6 +40,11 @@ const asNumber=(value:unknown):number|undefined=>typeof value==='number'&&Number
 const identity=async(path:string):Promise<FileRevision>=>{const value=await stat(path);if(!value.isFile()||value.isSymbolicLink()||value.nlink!==1)throw new Error(`文件不是安全的普通文件：${path}`);return {device:value.dev,inode:value.ino,size:value.size,mtimeMs:value.mtimeMs,ctimeMs:value.ctimeMs}}
 const sameRevision=(left:FileRevision,right:FileRevision)=>left.device===right.device&&left.inode===right.inode&&left.size===right.size&&left.mtimeMs===right.mtimeMs&&left.ctimeMs===right.ctimeMs
 const throwIfAborted=(signal:AbortSignal)=>{if(signal.aborted)throw new Error('会话可见性修复已取消')}
+
+function directoryIdentity(path:string):{device:number;inode:number}|undefined {
+  try{const value=lstatSync(path);if(!value.isDirectory()||value.isSymbolicLink()||realpathSync(path)!==path)throw new Error('会话目录已被替换');return {device:value.dev,inode:value.ino}}
+  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return;throw error}
+}
 
 function providerFromConfig(directory:string):string {
   const raw=readBounded(join(directory,'config.toml'),1024*1024)
@@ -156,6 +163,7 @@ async function inspectDatabase(root:string,path:string,provider:string,ids:strin
 
 async function collectPlan(target:ClientConfigTarget,providerOverride:string|undefined,ids:string[],runningHint:(id:string)=>boolean):Promise<TargetPlan>{
   const actual=target // identityTarget has already validated this capability
+  const targetIdentity=directoryIdentity(actual.directory)
   const provider=providerOverride??providerFromConfig(actual.directory),warnings:string[]=[],databases:DatabasePlan[]=[],rolloutMap=new Map<string,RolloutPlan>()
   let running=runningHint(actual.id)
   const daemon=await probeClientDaemon(actual.directory);if(daemon==='running')running=true
@@ -163,7 +171,7 @@ async function collectPlan(target:ClientConfigTarget,providerOverride:string|und
     const database=await inspectDatabase(actual.directory,path,provider,ids,warnings)
     if(database){databases.push(database);for(const ref of database.rollouts.values()){const plan=await readRolloutPlan(actual.directory,ref.path,provider);if(plan)rolloutMap.set(plan.path,plan)}}
   }
-  return {target:actual,provider,running,databases,rollouts:[...rolloutMap.values()].sort((a,b)=>a.relativePath.localeCompare(b.relativePath)),skippedSqliteFile:warnings.some(value=>value.includes('SQLite')),warnings}
+  return {target:actual,directoryIdentity:targetIdentity,provider,running,databases,rollouts:[...rolloutMap.values()].sort((a,b)=>a.relativePath.localeCompare(b.relativePath)),skippedSqliteFile:warnings.some(value=>value.includes('SQLite')),warnings}
 }
 
 function item(plan:TargetPlan,backupDir?:string):SessionVisibilityRepairItem{return {instanceId:plan.target.id,instanceName:plan.target.name,targetProvider:plan.provider,changedRolloutFileCount:plan.rollouts.length,updatedSqliteRowCount:plan.databases.reduce((sum,value)=>sum+value.rows,0),skippedSqliteFile:plan.skippedSqliteFile,running:plan.running,...backupDir?{backupDir}:{},warnings:[...plan.warnings]}}
@@ -186,7 +194,18 @@ async function backupPlan(plan:TargetPlan):Promise<string>{
   return root
 }
 
-async function verifyRevision(path:string,expected:FileRevision):Promise<void>{const current=await identity(path);if(!sameRevision(current,expected))throw new Error(`修复前文件已变化，请重新预览：${path}`)}
+function verifyRevision(root:string,path:string,expected:FileRevision):void {
+  const suffix=relative(root,path)
+  if(suffix==='..'||suffix.startsWith('..'+sep)||isAbsolute(suffix))throw new Error('会话路径不属于所选目录')
+  let current=root
+  for(const part of suffix.split(sep)){
+    current=join(current,part);const value=lstatSync(current)
+    if(value.isSymbolicLink()||current!==path&&!value.isDirectory())throw new Error('会话路径包含链接或异常目录')
+  }
+  const value=lstatSync(path)
+  if(!value.isFile()||value.nlink!==1||!sameRevision({device:value.dev,inode:value.ino,size:value.size,mtimeMs:value.mtimeMs,ctimeMs:value.ctimeMs},expected))
+    throw new Error(`修复前文件已变化，请重新预览：${path}`)
+}
 
 async function atomicText(path:string,content:string):Promise<void>{const temporary=join(dirname(path),`.${basename(path)}.${randomUUID()}.tmp`);try{await writeFile(temporary,content,{mode:0o600});await rename(temporary,path)}finally{await rm(temporary,{force:true})}}
 
@@ -217,26 +236,46 @@ async function pruneBackups(root:string):Promise<void>{let entries:Awaited<Retur
 export class SessionVisibilityRepair {
   private pending?:PendingRepair
   private running=new Map<string,AbortController>()
-  constructor(private readonly configs:ClientConfigs,private readonly runningTarget:(id:string)=>boolean=()=>false){}
+  constructor(private readonly configs:ClientConfigs,private readonly runningTarget:(id:string)=>boolean=()=>false,
+    private readonly plannedProvider:(id:string)=>string|undefined=()=>undefined){}
+  private provider(target:ClientConfigTarget):string {return this.plannedProvider(target.id)??providerFromConfig(target.directory)}
+  private async verifyPlan(plan:TargetPlan,input:SessionVisibilityRepairInput,signal:AbortSignal):Promise<ClientConfigTarget> {
+    throwIfAborted(signal)
+    let target=this.configs.identityTarget(plan.target.id)
+    if(target.directory!==plan.target.directory)throw new Error('会话目录已变化，请重新预览')
+    const daemon=await probeClientDaemon(target.directory,signal)
+    throwIfAborted(signal)
+    // The daemon probe and backup yield to other instance/config operations.
+    // Resolve the capability again and finish all remaining checks synchronously.
+    target=this.configs.identityTarget(plan.target.id)
+    const current=directoryIdentity(target.directory),expected=plan.directoryIdentity
+    if(target.directory!==plan.target.directory||current?.device!==expected?.device||current?.inode!==expected?.inode)throw new Error('会话目录已被替换，请重新预览')
+    if(!input.targetProvider&&this.provider(target)!==plan.provider)throw new Error('实例接入方式或 Provider 已变化，请重新预览可见性修复')
+    if(plan.running||this.runningTarget(target.id)||daemon==='running')throw new Error(`${target.name} 正在运行，请先完全退出 Codex 客户端或 CLI daemon；未修改会话文件`)
+    if(daemon==='unavailable')throw new Error('无法确认 Codex 后台进程状态，请检查控制套接字后重试；未修改会话文件')
+    for(const database of plan.databases)verifyRevision(target.directory,database.path,database.revision)
+    for(const rollout of plan.rollouts)verifyRevision(target.directory,rollout.path,rollout.revision)
+    return target
+  }
   stop():void { if(this.pending)this.pending=undefined; for(const controller of this.running.values())controller.abort(); this.running.clear() }
   cancel(ticket:string):void {z.string().uuid().parse(ticket);this.running.get(ticket)?.abort();if(this.pending?.ticket===ticket)this.pending=undefined}
   discard(ticket:string):void {z.string().uuid().parse(ticket);if(this.running.has(ticket))throw new Error('修复正在执行，请先取消');if(this.pending?.ticket===ticket)this.pending=undefined}
   async instances():Promise<SessionVisibilityRepairInstanceList>{
     const list:SessionVisibilityRepairInstance[]=[]
-    for(const target of this.configs.targets()){const provider=providerFromConfig(this.configs.identityTarget(target.id).directory);const daemon=await probeClientDaemon(target.directory);list.push({id:target.id,name:target.name,directory:target.directory,currentProvider:provider,running:daemon==='running'||this.runningTarget(target.id),isDefault:target.id===DEFAULT_INSTANCE})}
+    for(const target of this.configs.targets()){const provider=this.provider(this.configs.identityTarget(target.id));const daemon=await probeClientDaemon(target.directory);list.push({id:target.id,name:target.name,directory:target.directory,currentProvider:provider,running:daemon==='running'||this.runningTarget(target.id),isDefault:target.id===DEFAULT_INSTANCE})}
     return {defaultInstanceId:DEFAULT_INSTANCE,instances:list}
   }
   async providers():Promise<SessionVisibilityRepairProviderList>{
-    const sources=new Map<string,Set<'config'|'sqlite'>>(),targets=this.configs.targets();const defaultProvider=targets.length?providerFromConfig(this.configs.identityTarget(targets[0].id).directory):DEFAULT_PROVIDER
+    const sources=new Map<string,Set<'config'|'sqlite'>>(),targets=this.configs.targets();const defaultProvider=targets.length?this.provider(this.configs.identityTarget(targets[0].id)):DEFAULT_PROVIDER
     const add=(id:string,source:'config'|'sqlite')=>{const value=id.trim();if(!value||value.length>200||/[\x00-\x1f\x7f]/.test(value))return;(sources.get(value)??(sources.set(value,new Set()),sources.get(value)!)).add(source)}
-    for(const target of targets){const root=this.configs.identityTarget(target.id).directory;add(providerFromConfig(root),'config');for(const path of sqliteCandidates(root)){try{const db=new DatabaseSync(path,{readOnly:true,allowExtension:false});const columns=tableColumns(db,'threads');if(columns.has('model_provider'))for(const row of db.prepare(`SELECT DISTINCT ${quote('model_provider')} AS provider FROM ${quote('threads')} WHERE COALESCE(${quote('model_provider')},'')<>''`).all() as Array<{provider?:unknown}>)if(typeof row.provider==='string')add(row.provider,'sqlite');db.close()}catch{}}}
+    for(const target of targets){const root=this.configs.identityTarget(target.id).directory;add(this.provider(this.configs.identityTarget(target.id)),'config');for(const path of sqliteCandidates(root)){try{const db=new DatabaseSync(path,{readOnly:true,allowExtension:false});const columns=tableColumns(db,'threads');if(columns.has('model_provider'))for(const row of db.prepare(`SELECT DISTINCT ${quote('model_provider')} AS provider FROM ${quote('threads')} WHERE COALESCE(${quote('model_provider')},'')<>''`).all() as Array<{provider?:unknown}>)if(typeof row.provider==='string')add(row.provider,'sqlite');db.close()}catch{}}}
     const providers:[string,Set<'config'|'sqlite'>][]=[...sources.entries()];providers.sort((a,b)=>(a[0]===defaultProvider?-1:b[0]===defaultProvider?1:a[0].localeCompare(b[0])));return {defaultProvider,providers:providers.map(([id,set])=>({id,sources:[...set].sort(),isDefault:id===defaultProvider}))}
   }
   async preview(raw:unknown):Promise<SessionVisibilityRepairPreview>{
     const input=sessionVisibilityRepairInputSchema.parse(raw);if(this.pending)throw new Error('已有会话可见性修复预览，请先取消或确认')
     const targets=this.configs.targets().filter(target=>!input.targetIds.length||input.targetIds.includes(target.id));if(input.targetIds.length!==targets.length)throw new Error('所选会话目录不存在')
     if(!targets.length)throw new Error('未找到可修复的 Codex 配置目录')
-    const plans:TargetPlan[]=[];for(const target of targets)plans.push(await collectPlan(this.configs.identityTarget(target.id),input.targetProvider,input.sessionIds,this.runningTarget))
+    const plans:TargetPlan[]=[];for(const target of targets)plans.push(await collectPlan(this.configs.identityTarget(target.id),input.targetProvider??this.plannedProvider(target.id),input.sessionIds,this.runningTarget))
     const ticket=randomUUID(),createdAt=Date.now();this.pending={ticket,createdAt,input,plans};const items=plans.map(value=>item(value));const changed=items.reduce((sum,value)=>sum+value.updatedSqliteRowCount,0),rollouts=items.reduce((sum,value)=>sum+value.changedRolloutFileCount,0),skipped=items.filter(value=>value.skippedSqliteFile).length,running=items.filter(value=>value.running).length
     return {ticket,mode:'quick',createdAt,instanceCount:plans.length,changedRolloutFileCount:rollouts,updatedSqliteRowCount:changed,skippedSqliteFileCount:skipped,runningInstanceCount:running,items,warnings:plans.flatMap(value=>value.warnings),message:message(changed,rollouts,running,skipped,true)}
   }
@@ -244,10 +283,13 @@ export class SessionVisibilityRepair {
     const input=sessionVisibilityRepairApplySchema.parse(raw),pending=this.pending;if(!pending||pending.ticket!==input.ticket)throw new Error('修复预览已过期，请重新预览');this.pending=undefined
     const controller=new AbortController();this.running.set(input.ticket,controller);const backups:string[]=[];const resultItems:SessionVisibilityRepairItem[]=[]
     try{
-      for(const plan of pending.plans){throwIfAborted(controller.signal);const target=this.configs.identityTarget(plan.target.id);if(plan.running||this.runningTarget(target.id)){throw new Error(`${target.name} 正在运行，请先完全退出 Codex 客户端或 CLI daemon；未写入任何文件`)}
-        for(const database of plan.databases)await verifyRevision(database.path,database.revision);for(const rollout of plan.rollouts)await verifyRevision(rollout.path,rollout.revision)
+      for(const plan of pending.plans){let target=await this.verifyPlan(plan,pending.input,controller.signal)
         const hasChanges=plan.rollouts.length>0||plan.databases.some(value=>value.rows>0);if(!hasChanges){resultItems.push(item(plan));continue}
-        const backup=await backupPlan(plan);backups.push(backup);try{
+        const backup=await backupPlan(plan);backups.push(backup)
+        // A rejected pre-write check must not restore the backup over an external
+        // edit or a newly running client. Rollback starts only once writes begin.
+        target=await this.verifyPlan(plan,pending.input,controller.signal)
+        try{
           let updated=0;for(const database of plan.databases){if(database.rows){updated+=await applyDatabase(database,plan.provider,pending.input.sessionIds,controller.signal);await setImmediate()}}
           for(const rollout of plan.rollouts){throwIfAborted(controller.signal);await atomicText(rollout.path,rollout.content);await setImmediate()}
           resultItems.push({...item(plan,backup),updatedSqliteRowCount:updated})

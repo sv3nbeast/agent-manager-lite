@@ -10,18 +10,20 @@ const instances=ref<SessionVisibilityRepairInstance[]>([]),providers=ref<Session
 useFormFeedback(()=>error.value,{active:()=>props.open})
 const selectedSessionNote=computed(()=>props.sessionIds.length?`仅修复当前选择的 ${props.sessionIds.length} 个会话`:'修复所选目录中侧边栏可见的会话')
 const selectedTargets=computed(()=>selectedInstances.value.length?selectedInstances.value:instances.value.map(value=>value.id))
+let previewRequest=0
 const runningCount=computed(()=>preview.value?.runningInstanceCount??0)
-async function load(){loading.value=true;error.value='';try{const [instanceList,providerList]=await Promise.all([window.manager.listSessionVisibilityRepairInstances(),window.manager.listSessionVisibilityRepairProviders()]);instances.value=instanceList.instances;providers.value=providerList.providers;provider.value=providerList.defaultProvider}catch(cause){error.value=String(cause)}finally{loading.value=false}}
-async function discard(){const ticket=preview.value?.ticket;preview.value=undefined;if(ticket)await window.manager.discardSessionVisibilityRepair(ticket).catch(()=>{})}
+async function load(){loading.value=true;error.value='';try{const [instanceList,providerList]=await Promise.all([window.manager.listSessionVisibilityRepairInstances(),window.manager.listSessionVisibilityRepairProviders()]);instances.value=instanceList.instances;providers.value=providerList.providers}catch(cause){error.value=String(cause)}finally{loading.value=false}}
+async function discard(){previewRequest++;const ticket=preview.value?.ticket;preview.value=undefined;if(ticket)await window.manager.discardSessionVisibilityRepair(ticket).catch(()=>{})}
 async function close(){if(applying.value)return;await discard();emit('update:open',false)}
-async function makePreview(){loading.value=true;error.value='';try{await discard();preview.value=await window.manager.previewSessionVisibilityRepair({
+async function makePreview(){loading.value=true;error.value='';try{await discard();const request=previewRequest,value=await window.manager.previewSessionVisibilityRepair({
   // `selectedTargets` and `props.sessionIds` can be Vue reactive proxies.
   // Electron's IPC boundary uses structured clone, which rejects proxies;
   // copy both arrays before handing the request to the main process.
-  targetIds:[...selectedTargets.value],sessionIds:[...props.sessionIds],targetProvider:provider.value||undefined
-})}catch(cause){error.value=String(cause)}finally{loading.value=false}}
+  targetIds:[...selectedTargets.value],sessionIds:[...props.sessionIds],...(provider.value?{targetProvider:provider.value}:{})
+});if(request===previewRequest)preview.value=value;else await window.manager.discardSessionVisibilityRepair(value.ticket).catch(()=>{})}catch(cause){error.value=String(cause)}finally{loading.value=false}}
 async function apply(){const value=preview.value;if(!value)return;applying.value=true;error.value='';try{const result=await window.manager.applySessionVisibilityRepair({ticket:value.ticket,confirmed:true});message.success(result.message);preview.value=undefined;emit('completed');emit('update:open',false)}catch(cause){error.value=String(cause)}finally{applying.value=false}}
-function reset(){preview.value=undefined;error.value='';selectedInstances.value=[]}
+function reset(){preview.value=undefined;error.value='';selectedInstances.value=[];provider.value=''}
+watch([selectedInstances,provider,()=>props.sessionIds],()=>{void discard()},{deep:true,flush:'sync'})
 watch(()=>props.open,open=>{if(open){reset();void load()}else void discard()})
 </script>
 
@@ -32,7 +34,7 @@ watch(()=>props.open,open=>{if(open){reset();void load()}else void discard()})
       <a-alert v-if="error" type="error" class="repair-error" :message="error" />
       <a-form layout="vertical" class="repair-form">
         <a-form-item label="修复目录"><a-select v-model:value="selectedInstances" mode="multiple" allow-clear placeholder="全部已登记目录" :options="instances.map(value=>({value:value.id,label:`${value.name} · ${value.currentProvider}${value.running?'（运行中）':''}`}))" /></a-form-item>
-        <a-form-item label="目标 Provider"><a-select v-model:value="provider" :options="providers.map(value=>({value:value.id,label:`${value.id}${value.isDefault?'（当前默认）':''}`}))" /> <span class="muted">{{selectedSessionNote}}</span></a-form-item>
+        <a-form-item label="修复后的连接"><a-select v-model:value="provider" aria-label="修复目标连接" :options="[{value:'',label:'按各实例接入方式自动匹配'},...providers.map(value=>({value:value.id,label:`统一指定：${value.id}${value.isDefault?'（默认目录）':''}`}))]" /><p class="muted">{{provider?'将所有所选目录的会话统一关联到指定 Provider，请在预览中核对。':'已登记实例按下次启动的接入方式匹配，其他目录沿用各自当前连接；预览会列出每个目录的目标 Provider。'}}</p><span class="muted">{{selectedSessionNote}}</span></a-form-item>
       </a-form>
       <a-alert v-if="runningCount" type="warning" class="repair-error" :message="`预览发现 ${runningCount} 个目录正在运行；确认前请完全退出对应客户端。`" />
       <template v-if="preview">

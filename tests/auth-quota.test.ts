@@ -155,6 +155,75 @@ test('token authority serializes refresh, persists rotation before projection, a
   await authority.stop()
 })
 
+test('healthy access tokens do not rotate because ID metadata is expired or absent', async t => {
+  for (const idToken of [jwt({}, -3600), undefined]) {
+    const store = vault(t), lastRefresh = '2020-01-01T00:00:00.000Z'
+    const account = saveOAuthAccount(store, { ...tokens(), idToken, lastRefresh })
+    const authority = new TokenAuthority(store, async () => { assert.fail('healthy access token must not refresh') })
+    t.after(() => authority.stop())
+    const result = await authority.ensure(account.id)
+    assert.equal(result.credentials.accessToken, account.credentials.accessToken)
+    assert.equal(result.credentials.idToken, idToken)
+    assert.equal(result.credentials.refreshToken, account.credentials.refreshToken)
+    assert.equal(result.credentials.lastRefresh, lastRefresh)
+  }
+})
+
+test('refresh without a new ID token preserves expired or absent metadata and persists its actual refresh time', async t => {
+  for (const idToken of [jwt({}, -3600), undefined]) {
+    const store = vault(t)
+    const account = saveOAuthAccount(store, { ...tokens(), accessToken: jwt({}, -1), idToken, lastRefresh: '2020-01-01T00:00:00.000Z' })
+    const started = Date.now()
+    let projected = false
+    const authority = new TokenAuthority(store, async () => ({
+      access_token: tokens('refreshed').accessToken, refresh_token: 'refreshed-without-id'
+    }), updated => {
+      projected = true
+      assert.equal(store.read().accounts[0].credentials.lastRefresh, updated.credentials.lastRefresh)
+      assert.equal(store.read().accounts[0].credentials.refreshToken, 'refreshed-without-id')
+    })
+    t.after(() => authority.stop())
+    const result = await authority.ensure(account.id)
+    assert.equal(projected, true)
+    assert.equal(result.credentials.idToken, idToken)
+    assert.equal(result.credentials.refreshToken, 'refreshed-without-id')
+    const timestamp = Date.parse(result.credentials.lastRefresh!)
+    assert.ok(timestamp >= started && timestamp <= Date.now())
+    const reopened = new Store(store.directory, { encrypt: x => Buffer.from(x), decrypt: x => x.toString() })
+    assert.equal(reopened.read().accounts[0].credentials.lastRefresh, result.credentials.lastRefresh)
+  }
+})
+
+test('OAuth initial exchange still requires a fresh ID token and records only a successful exchange time', () => {
+  assert.throws(() => parseTokens({ access_token: tokens().accessToken }), /有效/)
+  assert.throws(() => parseTokens({ access_token: tokens().accessToken, id_token: jwt({}, -1) }), /有效/)
+  const started = Date.now(), result = parseTokens({ access_token: tokens().accessToken, id_token: tokens().idToken })
+  assert.ok(Date.parse(result.lastRefresh!) >= started && Date.parse(result.lastRefresh!) <= Date.now())
+})
+
+test('token refresh rejects conflicting new access identity even when the prior ID remains present', async t => {
+  const claims = [
+    { chatgpt_account_id: 'another-account' },
+    { account_id: 'another-account' },
+    { chatgpt_user_id: 'another-user' },
+    { organization_id: 'another-org' }
+  ]
+  for (const conflicting of claims) {
+    const store = vault(t), identity = { chatgpt_account_id: 'account-one', chatgpt_user_id: 'user-one', organization_id: 'org-one' }
+    const account = saveOAuthAccount(store, { ...tokens(), idToken: jwt({ 'https://api.openai.com/auth': identity }), accessToken: jwt({ 'https://api.openai.com/auth': identity }, -1) })
+    const authority = new TokenAuthority(store, async () => ({
+      access_token: jwt({ 'https://api.openai.com/auth': { ...identity, ...conflicting } }), refresh_token: 'must-not-persist'
+    }))
+    t.after(() => authority.stop())
+    await assert.rejects(authority.ensure(account.id), /身份/)
+    assert.deepEqual(store.read().accounts[0].credentials, account.credentials)
+  }
+  assert.throws(() => parseTokens({
+    id_token: tokens().idToken,
+    access_token: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'another-account' } })
+  }), /身份/)
+})
+
 test('late refresh cannot resurrect deleted accounts or overwrite newly logged-in credentials', async t => {
   for (const remove of [true, false]) {
     const store = vault(t)

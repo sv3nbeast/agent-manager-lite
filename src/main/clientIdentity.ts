@@ -69,7 +69,7 @@ export function accountFromAuth(raw:string,doc:TomlDocument):StoredAccount {
   // Active custom API providers must not make stale ChatGPT tokens look active.
   if(providerId!=='openai'&&doc.scalar(['model_providers',providerId,'requires_openai_auth'])!==true)throw new Error('当前 Provider 不使用 ChatGPT 登录，请查看其 API Key 配置')
   const tokens=object(value.tokens)
-  const normalized={auth_mode:value.auth_mode,tokens:{access_token:tokens.access_token,id_token:tokens.id_token,refresh_token:tokens.refresh_token,account_id:tokens.account_id},
+  const normalized={auth_mode:value.auth_mode,last_refresh:value.last_refresh,tokens:{access_token:tokens.access_token,id_token:tokens.id_token,refresh_token:tokens.refresh_token,account_id:tokens.account_id},
     agent_identity:!mode||['agentidentity','agent_identity'].includes(mode)?value.agent_identity:undefined,personal_access_token:value.personal_access_token}
   const parsed=parseAccountImport(JSON.stringify(normalized))
   if(parsed.accounts.length!==1||parsed.preview.errors.length)throw new Error('凭据不完整，无法识别身份')

@@ -8,11 +8,12 @@ import {sessionRelative} from './sessionTransferFiles'
 import {setTimeout as delay} from 'node:timers/promises'
 import type {InstanceApplication} from '../shared/instances'
 import {resolveCliRuntime} from './cliResolver'
+import {codexBundledCli} from './codexPrograms'
 
 export interface SessionProgram {path:string;device:number;inode:number;size:number;mtime:number}
 export function sessionProgram(application:InstanceApplication):SessionProgram{
   if(realpathSync(application.path)!==application.path)throw new Error('Codex 程序路径已变化，请重新选择')
-  const path=resolveCliRuntime(application.kind==='cli'?application.path:join(application.path,'Contents','Resources','codex')).executable,stat=lstatSync(path)
+  const path=application.kind==='cli'?resolveCliRuntime(application.path).executable:codexBundledCli(application.path),stat=lstatSync(path)
   return {path,device:stat.dev,inode:stat.ino,size:stat.size,mtime:stat.mtimeMs}
 }
 export function verifySessionProgram(program:SessionProgram):void{

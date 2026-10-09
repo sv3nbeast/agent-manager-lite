@@ -100,6 +100,13 @@ export class Instances {
   usesAccount(id:string):boolean {return this.copying()&&this.copy!.accountId===id||[...this.active.values()].some(value=>value.profile.accountId===id) || (this.store.read().instances ?? []).some(profile=>profile.accountId===id && this.recoveryErrors.has(profile.id))}
   usesNativeAccountOutside(id:string,targetId:string):boolean {return [...this.active.values()].some(value=>value.profile.connectionMode==='native'&&value.profile.id!==targetId&&value.profile.accountId===id)||(this.store.read().instances??[]).some(profile=>profile.connectionMode==='native'&&profile.id!==targetId&&profile.accountId===id&&this.recoveryErrors.has(profile.id))}
   accountIds():string[] {return [...new Set([...this.active.values()].filter(value=>value.gateway?.current().running||value.profile.connectionMode==='native'&&value.status==='running').map(value=>value.profile.accountId))]}
+  plannedSessionProvider(id:string):string|undefined {
+    const state=this.store.read(),profile=state.instances?.find(value=>value.id===id)
+    if(!profile)return
+    const account=state.accounts.find(value=>value.id===profile.accountId)
+    if(!account)throw new Error('绑定账号不存在，请先修正实例设置')
+    return getInstanceClientAdapter(profile.clientType).copiedSessionProvider(profile,account)
+  }
   views():InstanceView[] {
     const applications=this.applications(),state=this.store.read()
     return (state.instances ?? []).map(profile=>{

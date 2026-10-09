@@ -19,6 +19,7 @@ export function serializeAccounts(accounts: StoredAccount[]): string {
     api_base_url: account.baseUrl, api_wire_api: account.wireApi, models: account.models,
     ...(account.kind === 'api_key' ? { integrationType: account.integrationType, modelContextWindows: account.modelContextWindows } : {}),
     ...(account.kind === 'agent_identity' ? { agent_identity: account.credentials.agentIdentity } : account.kind === 'api_key' ? { openai_api_key: account.credentials.apiKey } : {
+      last_refresh: account.credentials.lastRefresh,
       tokens: { access_token: account.credentials.accessToken, refresh_token: account.credentials.refreshToken,
         id_token: account.credentials.idToken, account_id: account.credentials.accountId }
     })

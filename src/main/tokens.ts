@@ -6,7 +6,7 @@ import { projectSubscriptionClaim } from './subscriptionClaims'
 export const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const TOKEN_ENDPOINT = 'https://auth.openai.com/oauth/token'
 export const identityHeaders = { originator: 'Codex Desktop', 'User-Agent': `Codex Desktop/0.1.0 (${process.platform}; ${process.arch})`, 'Content-Type': 'application/json', Accept: 'application/json' }
-export type Tokens = Pick<StoredAccount['credentials'], 'accessToken' | 'refreshToken' | 'idToken' | 'accountId'>
+export type Tokens = Pick<StoredAccount['credentials'], 'accessToken' | 'refreshToken' | 'idToken' | 'accountId' | 'lastRefresh'>
 export function tokenClaims(token?: string): Record<string, unknown> {
   try { return object(JSON.parse(Buffer.from(token?.split('.')[1] ?? '', 'base64url').toString())) } catch { return {} }
 }
@@ -17,12 +17,21 @@ export function tokenFresh(token?: string, leadSeconds = 300): boolean {
 export function parseTokens(value: Record<string, unknown>, previous: Tokens = {}): Tokens {
   const accessToken = nonempty(value.access_token)
   if (!accessToken) throw new Error('授权响应缺少 access_token')
-  const idToken = nonempty(value.id_token) ?? previous.idToken
-  if (!tokenFresh(idToken)) throw new Error('授权响应缺少有效的 id_token，请重新登录')
-  const accountId = nonempty(object(tokenClaims(idToken)['https://api.openai.com/auth']).chatgpt_account_id)
-    ?? nonempty(object(tokenClaims(accessToken)['https://api.openai.com/auth']).chatgpt_account_id) ?? previous.accountId
-  if (previous.accountId && accountId !== previous.accountId) throw new Error('刷新返回的账号身份不匹配，请重新登录')
-  return { accessToken, idToken, refreshToken: nonempty(value.refresh_token) ?? previous.refreshToken, accountId }
+  const returnedIDToken = nonempty(value.id_token), refreshing = Boolean(previous.accessToken || previous.refreshToken)
+  const idToken = returnedIDToken ?? previous.idToken
+  // OAuth refresh may omit the ID token. Its cached identity metadata remains
+  // useful after expiry; only a new login or explicitly returned ID is checked.
+  if ((!refreshing || returnedIDToken) && !tokenFresh(idToken)) throw new Error('授权响应缺少有效的 id_token，请重新登录')
+  const claims = [idToken, accessToken, previous.idToken, previous.accessToken]
+    .map(token => object(tokenClaims(token)['https://api.openai.com/auth']))
+  const identities = (keys: string[]) => claims.flatMap(auth => keys.map(key => nonempty(auth[key]))).filter((value): value is string => Boolean(value))
+  const accountIds = [...identities(['chatgpt_account_id', 'account_id']), ...previous.accountId ? [previous.accountId] : []]
+  // An old ID token must not hide a conflicting workspace returned in the new
+  // access token. Preserve the same boundary for user and organization claims.
+  if ([accountIds, identities(['chatgpt_user_id', 'user_id']), identities(['organization_id'])]
+    .some(values => new Set(values).size > 1)) throw new Error('刷新返回的账号身份不匹配，请重新登录')
+  const accountId = accountIds[0]
+  return { accessToken, idToken, refreshToken: nonempty(value.refresh_token) ?? previous.refreshToken, accountId, lastRefresh: new Date().toISOString() }
 }
 
 // A single authority owns refresh-token rotation; sidecar auto-refresh is disabled.
@@ -59,7 +68,9 @@ export class TokenAuthority {
     if (account.kind !== 'oauth') return Promise.resolve(account)
     // A competing 401 may refer to credentials already rotated by another caller.
     if (options.rejectedToken && account.credentials.accessToken !== options.rejectedToken) return Promise.resolve(this.withSubscriptionClaim(account))
-    if (!options.force && tokenFresh(account.credentials.accessToken) && tokenFresh(account.credentials.idToken, 600)) return Promise.resolve(this.withSubscriptionClaim(account))
+    // The access token authorizes requests. ID-token age alone must not rotate
+    // the refresh chain when the server may legitimately omit a replacement.
+    if (!options.force && tokenFresh(account.credentials.accessToken)) return Promise.resolve(this.withSubscriptionClaim(account))
     if (!account.credentials.refreshToken) {
       // PATs/opaque access tokens carry no local expiry claim; the provider is
       // authoritative. A known expired JWT or an upstream 401 is still rejected.

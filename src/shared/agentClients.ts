@@ -22,6 +22,18 @@ export function getAgentClient(value:unknown) {
   return implementedAgentClients[0]
 }
 
+/** The view includes the effective inherited/default proxy without exposing its credentials. */
+export function hasInstanceUpstreamProxy(account:Pick<Account,'egressProxy'>|undefined):boolean {
+  const proxy=account?.egressProxy
+  return !!proxy&&(!!proxy.invalid||proxy.mode==='custom'||proxy.mode==='resource'||!!proxy.protocol||!!proxy.server||!!proxy.catalog)
+}
+
+/** Recommendation for a new draft only; persisted/legacy modes must not be migrated. */
+export function recommendedInstanceConnectionMode(clientType:unknown,account:Pick<Account,'kind'|'egressProxy'>|undefined):'native'|'local_api' {
+  const client=getAgentClient(clientType)
+  return client.capabilities.nativeAccounts&&account?.kind==='oauth'&&!hasInstanceUpstreamProxy(account)?'native':'local_api'
+}
+
 export interface AccountCompatibility {compatible:boolean;reason?:string}
 export interface AccountCompatibilityOptions {connectionMode:'local_api'|'native';model?:string}
 /** Static capability check; live credential ownership, proxies and refresh locks stay in their services. */

@@ -3,7 +3,7 @@ import { computed, reactive, ref, onMounted, onBeforeUnmount, nextTick, watch } 
 import { Modal, message } from 'ant-design-vue'
 import { PlusOutlined, DesktopOutlined, CopyOutlined, FolderOpenOutlined, CheckCircleFilled, LoadingOutlined } from '@ant-design/icons-vue'
 import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource, InstanceModelDefaults, ChatGPTModelsResult } from '../../../shared/instances'
-import { accountCompatibility, getAgentClient, implementedAgentClients, resolveAgentClientType } from '../../../shared/agentClients'
+import { accountCompatibility, getAgentClient, hasInstanceUpstreamProxy, implementedAgentClients, recommendedInstanceConnectionMode, resolveAgentClientType } from '../../../shared/agentClients'
 import { instanceInputSchema } from '../../../shared/instances'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
 import type { InstanceLoginRequest, InstanceLoginResult } from '../instanceOnboarding'
@@ -142,7 +142,7 @@ watch(()=>[pendingCopyPreview.value,copyJob.value?.id,copyJob.value?.status,copy
 const size=(bytes:number)=>bytes<1024?`${bytes} B`:bytes<1024**2?`${(bytes/1024).toFixed(1)} KiB`:`${(bytes/1024**2).toFixed(1)} MiB`
 const form=reactive<InstanceInput>({clientType:'codex',name:'',applicationId:'',accountId:'',connectionMode:'local_api',defaultTier:'inherit',model:'',extraArgs:[]}),args=ref('')
 const fieldErrors=reactive<Record<string,string>>({})
-let generatedName=''
+let generatedName='',connectionModeTouched=false
 useFormFeedback(()=>error.value||historyError.value)
 function nextInstanceName(){
   const base=getAgentClient(form.clientType).name
@@ -158,7 +158,7 @@ function prepareName(){
 }
 function clearValidation(){error.value='';for(const key of Object.keys(fieldErrors))delete fieldErrors[key]}
 async function focusField(field:string){
-  if(wizard.value)step.value=field==='applicationId'?0:field==='accountId'?1:2
+  if(wizard.value)step.value=field==='applicationId'?0:['accountId','connectionMode'].includes(field)?1:2
   if(field==='extraArgs')advanced.value=['advanced']
   await nextTick();await nextTick()
   const item=document.querySelector<HTMLElement>(`.instance-editor [data-field="${field}"]`)
@@ -191,7 +191,8 @@ watch(open,async visible=>{
   }
 })
 const client=computed(()=>getAgentClient(form.clientType))
-const availableAccounts=computed(()=>accounts.value.filter(account=>accountCompatibility(form.clientType,account,{connectionMode:form.connectionMode}).compatible))
+// Keep resources visible across mode changes so users can resolve incompatibilities without losing their selection.
+const availableAccounts=computed(()=>accounts.value.filter(account=>accountCompatibility(form.clientType,account,{connectionMode:'local_api'}).compatible))
 const identityAccounts=computed(()=>availableAccounts.value.filter(account=>account.kind!=='api_key'))
 const resourceKind=ref<'account'|'provider'>('account'),supplierSelection=ref(''),providerOpen=ref(false)
 watch(()=>[form.name,form.model,form.applicationId,form.accountId,supplierSelection.value,args.value],(values,previous)=>{
@@ -214,18 +215,30 @@ const supplierChoices=computed(()=>{
     ...providers.flatMap(provider=>provider.keys.map(key=>{
       const ids=[...new Set([...key.accountIds,...(key.reusableAccountIds??[])])]
       const candidates=ids.flatMap(id=>{const account=apiAccounts.get(id);return account?[account]:[]})
-      const account=candidates.find(account=>accountCompatibility(form.clientType,account,{connectionMode:form.connectionMode}).compatible)
+      const account=candidates.find(account=>account.id===form.accountId)??candidates.find(account=>accountCompatibility(form.clientType,account,{connectionMode:form.connectionMode}).compatible)??candidates[0]
       const reusingStandalone=!!account&&!key.accountIds.includes(account.id)
-      const incompatible=candidates.length>0&&!account
+      const incompatible=!!account&&!accountCompatibility(form.clientType,account,{connectionMode:form.connectionMode}).compatible
       return {value:provider.id+':'+key.id,label:provider.name+' · '+(key.name||'默认密钥')+(reusingStandalone?' · 已有连接':''),provider,key,account,reusingStandalone,
         disabled:incompatible||(!account&&form.connectionMode==='native'&&provider.wireApi!=='responses'),
         reason:incompatible?'此密钥已有 API 连接，但不支持当前接入方式。请改用本地 API，或在「API 连接」中调整该连接。':undefined}
     })),
-    ...availableAccounts.value.filter(account=>account.kind==='api_key'&&!account.providerId).map(account=>({value:'account:'+account.id,label:account.name+' · 独立连接',account,provider:undefined,key:undefined,reusingStandalone:false,disabled:false,reason:undefined}))
+    ...availableAccounts.value.filter(account=>account.kind==='api_key'&&!account.providerId).map(account=>({value:'account:'+account.id,label:account.name+' · 独立连接',account,provider:undefined,key:undefined,reusingStandalone:false,disabled:!accountCompatibility(form.clientType,account,{connectionMode:form.connectionMode}).compatible,reason:accountCompatibility(form.clientType,account,{connectionMode:form.connectionMode}).reason}))
   ]
 })
 const selectedSupplier=computed(()=>supplierChoices.value.find(item=>item.value===supplierSelection.value))
 const selectedAccount=computed(()=>availableAccounts.value.find(account=>account.id===form.accountId))
+const usesUpstreamProxy=computed(()=>hasInstanceUpstreamProxy(selectedAccount.value))
+const connectionProblem=computed(()=>{
+  if(form.connectionMode!=='native')return ''
+  if(resourceKind.value==='provider'&&selectedSupplier.value?.disabled)return selectedSupplier.value.reason??'此供应商使用 Chat Completions 协议，请切换为本地 API。'
+  if(!selectedAccount.value)return ''
+  if(usesUpstreamProxy.value)return '此账号使用了网络代理设置，当前原生登录无法应用该代理。请使用本地 API，或先在账号代理设置中改为直连。'
+  return accountCompatibility(form.clientType,selectedAccount.value,{connectionMode:form.connectionMode}).reason??''
+})
+watch(connectionProblem,problem=>{if(!problem&&fieldErrors.connectionMode){if(error.value===fieldErrors.connectionMode)error.value='';delete fieldErrors.connectionMode}})
+const connectionDescription=computed(()=>form.connectionMode==='native'
+  ?resourceKind.value==='provider'?'客户端直接使用供应商密钥；API 密钥不会获得 ChatGPT 登录身份。此模式不生成本地网关调用记录。':'客户端直接登录所选 ChatGPT 账号，使用原生身份与账号功能；具体功能由账号套餐和客户端版本决定。此模式不生成本地网关调用记录。'
+  :selectedAccount.value?.kind==='oauth'?'使用 ChatGPT 账号转发 API 请求。客户端显示本地供应商入口，不会获得原生 ChatGPT 登录菜单与全部账号功能；管理器记录网关调用。':'通过管理器的本地 API 连接使用所选资源，支持兼容的 Chat Completions 供应商和账号网络代理；管理器记录网关调用。')
 const resourceLabel=computed(()=>resourceKind.value==='provider'?selectedSupplier.value?.label:selectedAccount.value?.name)
 const nativeModelDefaults=ref<InstanceModelDefaults>(),nativeModelsLoading=ref(false),nativeModelsError=ref('')
 let modelDefaultsRequest=0
@@ -295,15 +308,23 @@ watch(()=>form.clientType,async clientType=>{
 watch(()=>[open.value,usesNativeModels.value,modelChoices.value,officialModelsLoading.value],()=>{
   if(open.value&&usesNativeModels.value&&!officialModelsLoading.value&&(!form.model.trim()||form.model===automaticModel.value))setAutomaticModel(currentOfficialModels.value?.defaultModelId??modelChoices.value[0]??'')
 })
-function selectAccount(){setAutomaticModel(usesNativeModels.value?(currentOfficialModels.value?.defaultModelId??''):modelChoices.value[0]??'')}
+function recommendConnectionMode(){if(!connectionModeTouched)form.connectionMode=recommendedInstanceConnectionMode(form.clientType,selectedAccount.value)}
+function changeConnectionMode(){connectionModeTouched=true;clearValidation()}
+function useNativeLogin(){form.connectionMode='native';changeConnectionMode()}
+function selectAccount(){recommendConnectionMode();setAutomaticModel(usesNativeModels.value?(currentOfficialModels.value?.defaultModelId??''):modelChoices.value[0]??'')}
 function selectSupplier(value:string){
+  if(!connectionModeTouched)form.connectionMode='local_api'
+  if(value!==supplierSelection.value)form.accountId=''
   supplierSelection.value=value
   form.accountId=selectedSupplier.value?.account?.id??''
   form.model=(selectedSupplier.value?.account?.models??selectedSupplier.value?.provider?.models)?.[0]??''
 }
 function resetResource(){
-  if(resourceKind.value==='account'){form.accountId=identityAccounts.value[0]?.id??'';selectAccount()}
-  else selectSupplier(supplierChoices.value.find(item=>!item.disabled)?.value??'')
+  if(resourceKind.value==='account'){form.accountId=identityAccounts.value.find(account=>account.id===form.accountId)?.id??identityAccounts.value[0]?.id??'';selectAccount()}
+  else {
+    if(!connectionModeTouched)form.connectionMode='local_api'
+    selectSupplier(supplierChoices.value.find(item=>item.value===supplierSelection.value)?.value??supplierChoices.value.find(item=>!item.disabled)?.value??supplierChoices.value[0]?.value??'')
+  }
 }
 function addAccount(){pendingLogin=crypto.randomUUID();emit('add-account',{requestId:pendingLogin,clientType:form.clientType})}
 watch(()=>props.loginResult,result=>{
@@ -338,6 +359,7 @@ async function ensureResource(generation=draftGeneration):Promise<boolean>{
     }else form.accountId=choice.account?.id??''
   }
   if(!selectedAccount.value){rejectField('accountId','请选择兼容的账号或供应商。');return false}
+  if(connectionProblem.value){rejectField('connectionMode',connectionProblem.value);return false}
   return true
 }
 async function nextStep(){
@@ -390,8 +412,10 @@ function edit(instance?:InstanceView) {
   sourceMode.value='copy'
   copyMode.value='sessions'
   editing.value=instance;clearValidation();manager.error='';generatedName='';launchMode.value=instance?.launchMode??'desktop'
+  connectionModeTouched=!!instance
+  const firstAccount=accounts.value.find(account=>account.kind!=='api_key')??accounts.value[0]
   Object.assign(form,instance ? {clientType,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
-    {clientType,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:accounts.value[0]?.id ?? '',connectionMode:'local_api',workingDirectoryId:undefined,defaultTier:'inherit',model:accounts.value[0]?.models[0] ?? '',extraArgs:[]})
+    {clientType,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:firstAccount?.id ?? '',connectionMode:recommendedInstanceConnectionMode(clientType,firstAccount),workingDirectoryId:undefined,defaultTier:'inherit',model:firstAccount?.models[0] ?? '',extraArgs:[]})
   resourceKind.value=accounts.value.find(account=>account.id===form.accountId)?.kind==='api_key'?'provider':'account'
   if(resourceKind.value==='provider')supplierSelection.value=supplierChoices.value.find(choice=>choice.account?.id===form.accountId)?.value??''
   else supplierSelection.value=''
@@ -490,6 +514,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <a-card v-for="instance in visible" :key="instance.id" class="instance-card">
         <div class="instance-heading"><div class="instance-name"><DesktopOutlined /><strong>{{ instance.name }}</strong></div><a-tag :color="instance.status==='running'?'green':instance.status==='error'?'red':['preparing','starting','stopping'].includes(instance.status)?'processing':undefined">{{ labels[instance.status] }}</a-tag></div>
         <a-descriptions :column="1" size="small"><a-descriptions-item label="客户端">{{instance.clientType === 'codex' ? 'Codex' : '尚未接入'}}</a-descriptions-item><a-descriptions-item label="运行方式">{{instance.launchMode==='cli'?'CLI · Terminal':'桌面应用'}}</a-descriptions-item><a-descriptions-item label="账号">{{ instance.accountName || '账号已移除' }} · {{modeName(instance.connectionMode)}}</a-descriptions-item><a-descriptions-item label="默认模型">{{ instance.model }}</a-descriptions-item><a-descriptions-item label="速度"><template v-if="instance.speedMenu==='active'||instance.speedMenu==='pending'">{{instance.speedMenu==='active'?'在 Codex 中选择':'正在启用 Codex 速度菜单'}}<span class="muted"> · 启动时 {{initialSpeedName(instance.initialTier)}}</span></template><template v-else>{{ tierName(instance.defaultTier) }}<span v-if="instance.status==='running'"> · {{instance.connectionMode==='native'?'已写入配置':'启动时'}} {{ initialSpeedName(instance.initialTier??instance.appliedTier) }}</span></template></a-descriptions-item><a-descriptions-item v-if="instance.desktopLocaleCompatibility" label="页面语言">{{instance.desktopLocaleCompatibility==='active'?'跟随 Codex 语言设置':instance.desktopLocaleCompatibility==='pending'?'正在加载内置翻译':'翻译适配未加载'}}</a-descriptions-item><a-descriptions-item v-if="instance.ultraCompatibility" label="Ultra 推理">{{instance.ultraCompatibility==='active'?'支持的模型可选 Ultra':instance.ultraCompatibility==='pending'?'正在加载':'暂未兼容'}}</a-descriptions-item><a-descriptions-item v-if="instance.pid" label="进程">{{ instance.pid }}<span v-if="instance.port"> · 本地端口 {{ instance.port }}</span></a-descriptions-item></a-descriptions>
+        <p v-if="instance.connectionMode==='local_api'&&accounts.find(account=>account.id===instance.accountId)?.kind==='oauth'" class="muted instance-connection-note">此实例通过 API 使用 ChatGPT 账号，客户端不会显示原生登录菜单。需要原生账号功能时，可停止实例后在编辑中切换接入方式。</p>
         <p class="instance-path" :title="instance.directory"><a-tag v-if="instance.externalHome">已有目录</a-tag>{{ instance.directory }}</p>
         <a-alert v-if="instance.error" type="error" :message="instance.error" class="error-banner" />
         <a-alert v-if="instance.notice" type="info" :message="instance.notice" class="error-banner" />
@@ -534,14 +559,18 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <p v-if="!identityAccounts.length" class="muted">没有兼容的登录账号，可在此添加后继续。</p>
           </template>
           <template v-else>
-            <a-form-item data-field="accountId" :validate-status="fieldErrors.accountId?'error':undefined" :help="fieldErrors.accountId" label="供应商密钥"><a-select :value="supplierSelection||undefined" aria-label="实例供应商密钥" :options="supplierChoices.map(item=>({value:item.value,label:item.label,disabled:item.disabled}))" placeholder="选择兼容密钥" @change="selectSupplier(String($event))" /><a-button class="instance-add-provider" type="link" @click="providerOpen=true"><PlusOutlined />添加供应商</a-button></a-form-item>
+            <a-form-item data-field="accountId" :validate-status="fieldErrors.accountId?'error':undefined" :help="fieldErrors.accountId" label="供应商密钥"><a-select :value="supplierSelection||undefined" aria-label="实例供应商密钥" :options="supplierChoices.map(item=>({value:item.value,label:item.label+(item.disabled?' · 需本地 API':'')}))" placeholder="选择兼容密钥" @change="selectSupplier(String($event))" /><a-button class="instance-add-provider" type="link" @click="providerOpen=true"><PlusOutlined />添加供应商</a-button></a-form-item>
             <p class="muted">引用已保存的密钥，多个兼容实例可复用。尚未启用的密钥会在继续时建立共享连接。</p>
             <p v-if="selectedSupplier?.reusingStandalone" class="muted instance-reused-connection">使用已有 API 连接「{{selectedSupplier.account?.name}}」，保留它的模型、上下文、服务等级和网络代理配置。</p>
           </template>
-          <a-collapse ghost class="instance-connection-options"><a-collapse-panel key="connection" header="接入方式">
-            <a-form-item label="账号接入方式"><a-select v-model:value="form.connectionMode" aria-label="实例接入方式" :options="[{value:'local_api',label:'本地 API'},{value:'native',label:'原生账号登录'}]" @change="resetResource" /></a-form-item>
-            <p class="muted">{{form.connectionMode==='native'?'客户端使用此实例独立文件中的凭据。Agent Identity及非Responses密钥不支持此方式。':'管理器保管凭据，为此实例提供独立本地连接。支持兼容的Chat Completions供应商。'}}</p>
-          </a-collapse-panel></a-collapse>
+          <div class="instance-connection-options">
+            <a-form-item data-field="connectionMode" label="账号接入方式" :validate-status="fieldErrors.connectionMode?'error':undefined" :help="fieldErrors.connectionMode"><a-select v-model:value="form.connectionMode" aria-label="实例接入方式" :options="[{value:'native',label:'原生账号登录'},{value:'local_api',label:'本地 API'}]" @change="changeConnectionMode" /></a-form-item>
+            <p class="muted instance-connection-description">{{connectionDescription}}</p>
+            <a-alert v-if="connectionProblem" type="warning" show-icon :message="connectionProblem" />
+            <p v-else-if="form.connectionMode==='local_api'&&usesUpstreamProxy" class="muted">此账号已配置网络代理（包括继承的默认代理），使用本地 API 才能应用该设置。</p>
+            <a-button v-else-if="form.connectionMode==='local_api'&&selectedAccount?.kind==='oauth'" type="link" class="instance-use-native" @click="useNativeLogin">切换为原生账号登录</a-button>
+            <p v-if="editing&&form.connectionMode!==(editing.connectionMode??'local_api')" class="muted instance-mode-history-note">切换后已有会话仍保留。若客户端列表不显示，可到「会话 → 修复可见性」选择此实例，使用「按各实例接入方式自动匹配」预览修复。</p>
+          </div>
         </section>
         <section v-show="!wizard||step===2" class="instance-step" data-step="2">
           <div class="instance-basics-grid">
@@ -608,11 +637,11 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <a-alert v-if="preview?.externalHome" class="error-banner" type="info" message="此实例直接使用已有目录。启动会更新该目录的账号连接与配置，停止后恢复；请确认其他客户端已关闭。" />
       <InstanceHistoryOverview v-if="preview?.history" :history="preview.history" aria-label="启动会话概况" />
       <p v-if="preview?.history" class="muted instance-history-launch-note">统计目录内已保存的主会话，包含归档；客户端可能根据当前连接筛选会话。要使用其他历史，请取消并创建实例，选择「从实例复制」或「从目录复制」；当前实例的历史保持不变。</p>
-      <a-descriptions v-if="preview" :column="1" bordered size="small" class="instance-launch-preview"><a-descriptions-item label="实例">{{ preview.name }}</a-descriptions-item><a-descriptions-item label="客户端">{{preview.clientType==='codex'?'Codex':'尚未接入'}}</a-descriptions-item><a-descriptions-item label="应用">{{ preview.application }}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode==='cli' && preview.executable!==preview.application" label="实际程序">{{preview.executable}}</a-descriptions-item><a-descriptions-item label="配置与会话">{{ preview.directory }}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode!=='cli'" label="桌面数据">{{ preview.desktopDirectory }}</a-descriptions-item><a-descriptions-item v-else label="CLI 工作目录">{{preview.workingDirectory}}</a-descriptions-item><a-descriptions-item label="账号与模型">{{ preview.accountName }} · {{ preview.model }}</a-descriptions-item><a-descriptions-item label="供应商名称">{{preview.providerName}}</a-descriptions-item><a-descriptions-item v-if="preview.effectiveContextWindow" label="默认模型上下文">{{formatModelContextWindow(preview.effectiveContextWindow)}}<span class="muted"> · {{contextSourceName(preview.contextWindowSource)}}</span></a-descriptions-item><a-descriptions-item v-if="preview.effectiveAutoCompactTokenLimit" label="自动压缩阈值">{{formatModelContextWindow(preview.effectiveAutoCompactTokenLimit)}}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode!=='cli'" label="语言偏好">{{localeLabel(preview.desktopLocale,preview.desktopLocaleSource,preview.desktopEffectiveLocale)}}<span v-if="preview.desktopLocale" class="muted"> · 保留已有选择</span></a-descriptions-item><a-descriptions-item v-if="preview.desktopLocaleCompatibilityAvailable!==undefined" label="页面语言">{{preview.desktopLocaleCompatibilityAvailable?'使用 Codex 内置翻译':preview.desktopLocaleCompatibilityReason}}</a-descriptions-item><a-descriptions-item :label="preview.speedMenuAvailable?'启动时速度':'默认服务等级'">{{ preview.speedMenuAvailable?initialSpeedName(preview.tier):tierName(preview.tier) }}</a-descriptions-item><a-descriptions-item v-if="preview.speedMenuAvailable!==undefined" label="对话速度">{{preview.speedMenuAvailable?'在 Codex 中选择普通 / Fast':preview.speedMenuReason}}<span v-if="preview.speedMenuAvailable" class="muted"> · 由客户端适配提供，实际是否支持由上游响应决定</span></a-descriptions-item><a-descriptions-item v-if="preview.args.length" label="附加参数"><pre>{{ preview.args.join('\n') }}</pre></a-descriptions-item></a-descriptions>
+      <a-descriptions v-if="preview" :column="1" bordered size="small" class="instance-launch-preview"><a-descriptions-item label="实例">{{ preview.name }}</a-descriptions-item><a-descriptions-item label="客户端">{{preview.clientType==='codex'?'Codex':'尚未接入'}}</a-descriptions-item><a-descriptions-item label="应用">{{ preview.application }}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode==='cli' && preview.executable!==preview.application" label="实际程序">{{preview.executable}}</a-descriptions-item><a-descriptions-item label="配置与会话">{{ preview.directory }}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode!=='cli'" label="桌面数据">{{ preview.desktopDirectory }}</a-descriptions-item><a-descriptions-item v-else label="CLI 工作目录">{{preview.workingDirectory}}</a-descriptions-item><a-descriptions-item label="账号与模型">{{ preview.accountName }} · {{ preview.model }}</a-descriptions-item><a-descriptions-item label="接入方式">{{modeName(preview.connectionMode)}}</a-descriptions-item><a-descriptions-item label="供应商名称">{{preview.providerName}}</a-descriptions-item><a-descriptions-item v-if="preview.effectiveContextWindow" label="默认模型上下文">{{formatModelContextWindow(preview.effectiveContextWindow)}}<span class="muted"> · {{contextSourceName(preview.contextWindowSource)}}</span></a-descriptions-item><a-descriptions-item v-if="preview.effectiveAutoCompactTokenLimit" label="自动压缩阈值">{{formatModelContextWindow(preview.effectiveAutoCompactTokenLimit)}}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode!=='cli'" label="语言偏好">{{localeLabel(preview.desktopLocale,preview.desktopLocaleSource,preview.desktopEffectiveLocale)}}<span v-if="preview.desktopLocale" class="muted"> · 保留已有选择</span></a-descriptions-item><a-descriptions-item v-if="preview.desktopLocaleCompatibilityAvailable!==undefined" label="页面语言">{{preview.desktopLocaleCompatibilityAvailable?'使用 Codex 内置翻译':preview.desktopLocaleCompatibilityReason}}</a-descriptions-item><a-descriptions-item :label="preview.speedMenuAvailable?'启动时速度':'默认服务等级'">{{ preview.speedMenuAvailable?initialSpeedName(preview.tier):tierName(preview.tier) }}</a-descriptions-item><a-descriptions-item v-if="preview.speedMenuAvailable!==undefined" label="对话速度">{{preview.speedMenuAvailable?'在 Codex 中选择普通 / Fast':preview.speedMenuReason}}<span v-if="preview.speedMenuAvailable" class="muted"> · 由客户端适配提供，实际是否支持由上游响应决定</span></a-descriptions-item><a-descriptions-item v-if="preview.args.length" label="附加参数"><pre>{{ preview.args.join('\n') }}</pre></a-descriptions-item></a-descriptions>
       <p class="muted" v-if="preview && preview.launchMode!=='cli'">新实例默认自动检测电脑语言，之后保留你在 Codex 中的选择。各项功能独立检测；暂未兼容的功能保留客户端原有行为。</p>
-      <p class="muted" v-if="preview?.launchMode==='cli'">将在 macOS Terminal 中打开独立 CLI 会话。附加参数可覆盖默认模型或窗口；上方窗口值对应实例默认模型。停止实例或退出管理器会结束此会话；工作目录中的文件保留。</p>
+      <p class="muted" v-if="preview?.launchMode==='cli'">将在 macOS Terminal 中打开独立 CLI 会话。附加参数可覆盖默认模型或窗口；上方窗口值对应实例默认模型。停止实例会结束此会话；普通退出管理器会保留后台服务，工作目录中的文件保留。</p>
       <p class="muted" v-if="preview?.connectionMode==='native'">原生账号登录：凭据仅写入此实例的独立文件目录，客户端维护登录。停止后先保存最新令牌，再恢复原登录和配置；会话保留。此模式不生成本地网关调用记录，配置等级不代表上游已收到。</p>
-      <p class="muted" v-else>本地 API：启动会创建独立连接，并备份、应用模型与连接配置。停止后恢复原配置；会话和工作文件保留。请求中的显式等级优先。</p>
+      <p class="muted" v-else>本地 API：客户端使用自定义供应商连接，不具有原生 ChatGPT 登录菜单与全部账号功能。启动会创建独立连接，并备份、应用模型与连接配置。停止后恢复原配置；会话和工作文件保留。请求中的显式等级优先。</p>
       <a-alert v-if="manager.error" type="error" :message="manager.error" />
     </a-modal>
   </section>
@@ -676,5 +705,5 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
 </style>
 
 <style scoped>
-.instance-wizard-steps{margin:16px 0 8px;padding-right:6px}.instance-step{min-width:0}.instance-step>.muted{font-size:12px;line-height:1.8}.instance-step .ant-form-item{margin-bottom:18px}.instance-confirm{margin:12px 0}.instance-confirm :deep(.ant-descriptions-item-content){overflow-wrap:anywhere}.instance-advanced{margin-top:14px}.instance-context-default{padding:10px 12px;border-radius:8px;background:var(--subtle)}.instance-connection-options :deep(.ant-collapse-header){padding-inline:0}.instance-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr))}
+.instance-wizard-steps{margin:16px 0 8px;padding-right:6px}.instance-step{min-width:0}.instance-step>.muted{font-size:12px;line-height:1.8}.instance-step .ant-form-item{margin-bottom:18px}.instance-confirm{margin:12px 0}.instance-confirm :deep(.ant-descriptions-item-content){overflow-wrap:anywhere}.instance-advanced{margin-top:14px}.instance-context-default{padding:10px 12px;border-radius:8px;background:var(--subtle)}.instance-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr))}
 </style>

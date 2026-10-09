@@ -60,7 +60,7 @@ function mount(store: Store) {
 }
 
 function selectSupplier(ui: ReturnType<typeof mount>, mode: 'local_api' | 'native' = 'local_api') {
-  ui.state.edit(); ui.state.resourceKind = 'provider'; ui.state.form.connectionMode = mode
+  ui.state.edit(); ui.state.resourceKind = 'provider'; ui.state.form.connectionMode = mode; ui.state.changeConnectionMode()
   const provider = ui.manager.data.providers![0], key = provider.keys[0]
   ui.state.selectSupplier(`${provider.id}:${key.id}`)
   ui.state.step = 1
@@ -116,7 +116,7 @@ test('native compatibility follows the reusable connection protocol, not the sup
 
 test('native reuse can use an existing Responses connection even when standalone supplier defaults use Chat Completions', async t => {
   const f = fixture(t)
-  f.store.transaction(state => { state.providers![0].wireApi = 'chat_completions' })
+  f.store.transaction(state => { state.providers![0].wireApi = 'chat_completions'; delete state.accounts[0].proxy })
   const ui = mount(f.store); t.after(ui.unmount)
   selectSupplier(ui, 'native')
   assert.equal(ui.state.selectedSupplier.disabled, false)

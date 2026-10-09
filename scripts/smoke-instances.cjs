@@ -199,7 +199,6 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.instances-panel .toolbar button','刷新状态')
       await click('.instance-card button','编辑')
       await wait('!!document.querySelector(".instance-editor")')
-      await click('.instance-editor .instance-connection-options .ant-collapse-header','接入方式')
       await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
       await click('.ant-select-item-option','原生账号登录')
       await click('.instance-editor .ant-radio-wrapper','账号')

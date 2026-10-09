@@ -36,7 +36,7 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void}){
 }
 function seed(f:ReturnType<typeof fixture>){
   f.add()
-  importIntoStore(f.store,JSON.stringify({access_token:'fixture-oauth-token',refresh_token:'fixture-refresh',email:'fixture@example.invalid'}))
+  importIntoStore(f.store,JSON.stringify({access_token:'fixture-oauth-token',refresh_token:'fixture-refresh',email:'fixture@example.invalid',last_refresh:'2020-01-01T00:00:00.000Z'}))
   mutateProvider(f.store,{action:'create',details:{name:'本地供应商',baseUrl:'http://127.0.0.1:9/v1',models:['fixture-model'],wireApi:'responses',defaultTier:'fast'}})
   let provider=f.store.read().providers![0]
   mutateProvider(f.store,{action:'addKey',id:provider.id,revision:provider.revision,name:'fixture key',apiKey:'fixture-provider-secret'})

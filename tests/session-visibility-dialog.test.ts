@@ -57,7 +57,7 @@ test('visibility preview sends plain snapshots of selected reactive targets and 
   await ui.state.makePreview()
   assert.equal(ui.state.error, '')
   assert.equal(ui.state.preview.ticket, ticket)
-  assert.deepEqual(ui.requests, [{ targetIds: [targetId], sessionIds: [sessionId], targetProvider: 'relay' }])
+  assert.deepEqual(ui.requests, [{ targetIds: [targetId], sessionIds: [sessionId] }])
   assert.equal(vue.isReactive(ui.requests[0].targetIds), false)
   assert.equal(vue.isReactive(ui.requests[0].sessionIds), false)
   ui.state.selectedInstances.push(secondTargetId); ui.sessionIds.length = 0
@@ -70,8 +70,37 @@ test('visibility preview includes all registered directories when none are expli
   await ui.state.load(); ui.sessionIds.length = 0
   await ui.state.makePreview()
   assert.equal(ui.state.error, '')
-  assert.deepEqual(ui.requests, [{ targetIds: [targetId, secondTargetId], sessionIds: [], targetProvider: 'relay' }])
+  assert.deepEqual(ui.requests, [{ targetIds: [targetId, secondTargetId], sessionIds: [] }])
   await ui.state.close()
   assert.deepEqual(ui.discards, [ticket])
   assert.deepEqual(ui.events, ['close'])
+})
+
+
+test('an explicit provider overrides automatic matching only for that draft and changing it discards the old preview', async t => {
+  const ui = mount(); t.after(ui.unmount)
+  await ui.state.load()
+  assert.equal(ui.state.provider, '', 'A global default provider must not override each instance connection')
+  ui.state.provider = 'relay'
+  await ui.state.makePreview()
+  assert.equal(ui.requests[0].targetProvider, 'relay')
+  ui.state.provider = ''
+  assert.equal(ui.state.preview, undefined, 'An old explicit-provider preview cannot be applied after selecting automatic matching')
+  assert.deepEqual(ui.discards, [ticket])
+  await ui.state.makePreview()
+  assert.equal(Object.hasOwn(ui.requests[1], 'targetProvider'), false)
+  ui.state.provider = 'relay'; ui.state.reset(); await ui.state.load()
+  assert.equal(ui.state.provider, '', 'Reopening a repair starts with automatic matching')
+})
+
+test('a slow preview is discarded when the target connection changes during preparation', async t => {
+  let resolve!: (value: SessionVisibilityRepairPreview) => void
+  const ui = mount({ previewSessionVisibilityRepair: () => new Promise(value => { resolve = value }) }); t.after(ui.unmount)
+  await ui.state.load()
+  const pending = ui.state.makePreview()
+  await vue.nextTick()
+  ui.state.provider = 'relay'
+  resolve(fixturePreview()); await pending
+  assert.equal(ui.state.preview, undefined)
+  assert.deepEqual(ui.discards, [ticket])
 })

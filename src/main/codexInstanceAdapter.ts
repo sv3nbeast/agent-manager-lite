@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { basename, isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
@@ -7,8 +7,8 @@ import { accountCompatibility, getAgentClient, resolveAgentClientType } from '..
 import type { Account } from '../shared/types'
 import type { InstanceApplication, InstanceProfile } from '../shared/instances'
 import type { DesktopPlan } from './instanceRuntime'
-import { directory } from './clientConfig'
 import { resolveCliRuntime } from './cliResolver'
+import {codexBundledCli,codexDesktopExecutable} from './codexPrograms'
 import { TomlDocument } from './tomlPatch'
 import {nativeProvider} from './nativeAccountProjection'
 
@@ -18,7 +18,8 @@ function applications(stored:readonly InstanceApplication[]):InstanceApplication
   const detected=['/Applications/Codex.app','/Applications/ChatGPT.app',join(homedir(),'Applications/Codex.app'),join(homedir(),'Applications/ChatGPT.app')]
     .filter(path=>['Codex','ChatGPT'].some(name=>existsSync(join(path,'Contents/MacOS',name))))
     .map(path=>({clientType:'codex' as const,id:digest(path),name:basename(path,'.app'),path:realpathSync(path)}))
-  const cli=['/Applications/Codex.app/Contents/Resources/codex','/Applications/ChatGPT.app/Contents/Resources/codex','/opt/homebrew/bin/codex','/usr/local/bin/codex',
+  const bundled=detected.flatMap(app=>{try{return [codexBundledCli(app.path)]}catch{return []}})
+  const cli=[...bundled,'/opt/homebrew/bin/codex','/usr/local/bin/codex',
     ...(process.env.PATH??'').split(':').filter(isAbsolute).slice(0,100).map(path=>join(path,'codex'))]
     .filter(path=>existsSync(path)).map(path=>({clientType:'codex' as const,id:digest('cli:'+realpathSync(path)),name:'Codex CLI',path:realpathSync(path),kind:'cli' as const}))
   // Project legacy records without persisting a migration. Keep unsupported
@@ -31,13 +32,7 @@ function executable(app:InstanceApplication):string {
   resolveAgentClientType(app.clientType)
   if(realpathSync(app.path)!==app.path)throw new Error('所选程序路径已被替换，请重新选择')
   if(app.kind==='cli')return resolveCliRuntime(app.path).executable
-  if(!app.path.endsWith('.app'))throw new Error('请选择包含 Codex 的桌面应用')
-  directory(app.path)
-  const file=['Codex','ChatGPT'].map(name=>join(app.path,'Contents','MacOS',name)).find(path=>existsSync(path))
-  if(!file)throw new Error('所选应用缺少 Codex 或 ChatGPT 主程序')
-  const stat=lstatSync(file)
-  if(!stat.isFile()||stat.isSymbolicLink()||!(stat.mode&0o111))throw new Error('所选应用缺少可执行的 Codex 主程序')
-  return realpathSync(file)
+  return codexDesktopExecutable(app.path)
 }
 
 function registerApplication(path:string,kind:'desktop'|'cli'):InstanceApplication {
