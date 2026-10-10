@@ -34,7 +34,7 @@ function mount(values: Account[] = [account(), account('oauth'), account('agent_
     saveInstance: async (input: { details: instances.InstanceInput }) => { saved.push(input.details); return manager.data }
   }
   const exports = {}, context = { module: { exports }, exports, crypto: { randomUUID }, document: { querySelector: () => null }, window: { manager: api },
-    require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { Modal: {}, message: { success() {} } } : id === '@ant-design/icons-vue' ? {}
+    require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { Modal: {}, message: { success() {}, warning() {} } } : id === '@ant-design/icons-vue' ? {}
       : id.endsWith('/agentClients') ? clients : id.endsWith('/instances') ? instances : id.endsWith('/modelContextWindows') ? windows
       : id === '../formFeedback' ? { validationErrors, useFormFeedback: () => () => {} }
       : id === '../store' ? { useManager: () => manager } : id.endsWith('.vue') ? { default: {} }
@@ -103,6 +103,34 @@ test('editing and duplicating existing OAuth instances preserves explicit and le
     ui.state.form.accountId = ui.manager.data.accounts[1].id; ui.state.selectAccount()
     assert.equal(ui.state.form.connectionMode, mode ?? 'local_api')
   }
+})
+
+test('legacy OAuth API cards expose identity state and offer an explicit native repair', async t => {
+  const ui = mount(); t.after(ui.unmount)
+  const email = 'account@example.com'
+  ui.manager.data.accounts[0].email = email
+  assert.equal(ui.state.instanceAccountLabel(ui.source), email, 'The account email is the primary card identity label')
+  assert.equal(ui.state.identityStatusLabel(ui.source), '本地 API · 客户端无原生账号身份')
+  assert.equal(ui.state.nativeRepairCandidate(ui.source), true)
+  ui.state.repairNativeLogin(ui.source)
+  await settle()
+  assert.equal(ui.state.form.connectionMode, 'native', 'Repair opens the editor with native mode selected')
+  assert.equal(ui.state.editing.id, ui.source.id)
+  assert.equal(ui.state.form.accountId, ui.source.accountId, 'Repair keeps the bound account')
+  assert.equal(ui.state.form.model, ui.source.model, 'Repair keeps the saved model')
+})
+
+test('native repair stays unavailable while an OAuth API instance is running or proxied', async t => {
+  const ui = mount(); t.after(ui.unmount)
+  ui.source.status = 'running'
+  ui.state.repairNativeLogin(ui.source)
+  await settle()
+  assert.equal(ui.state.open, false, 'Running instances are not opened for repair')
+  ui.source.status = 'stopped'
+  ui.manager.data.accounts[0].egressProxy = { mode: 'custom', protocol: 'HTTP', server: 'proxy.invalid', port: 8080 }
+  ui.state.repairNativeLogin(ui.source)
+  await settle()
+  assert.equal(ui.state.open, false, 'Native repair is blocked when the account has an upstream proxy')
 })
 
 test('new drafts select providers without a native-mode filtering dead end and preserve explicit native choices', async t => {
