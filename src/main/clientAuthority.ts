@@ -80,7 +80,7 @@ export class ClientAuthority {
       if(state.clientAuthorities?.some(entry=>entry.targetId===snapshot.target.id||entry.accountId===input.accountId))throw new Error('此客户端或账号已有关联，请先查看现有关联')
       const current=state.accounts.find(value=>value.id===input.accountId)
       if(!current)throw new Error('请先将此身份导入账号库')
-      if(accountProxyURL(current,state)!==undefined)throw new Error('此账号已配置出口代理，原生客户端代理尚未接入，请使用本地 API 模式')
+      if(accountProxyURL(current,state)!==undefined)throw new Error('此目录没有受管启动网络，请通过实例使用原生账号及代理，或使用本地 API')
       compatible(current,snapshot.account)
       // An RT-only/email-only match cannot authorize an external refresh owner.
       const identity=accountIdentity(snapshot.account)

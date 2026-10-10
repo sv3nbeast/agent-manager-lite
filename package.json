@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.4.10",
+  "version": "0.4.11",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -61,7 +61,8 @@
     "check:public": "node scripts/check-public-repository.mjs",
     "release:check": "node scripts/check-release-version.mjs",
     "test:desktop:session-source-clarity": "node scripts/run-desktop-smoke.cjs --session-source-clarity",
-    "test:native-identity": "tsx scripts/smoke-native-identity.ts"
+    "test:native-identity": "tsx scripts/smoke-native-identity.ts",
+    "test:native-proxy": "tsx scripts/smoke-native-proxy.ts"
   },
   "dependencies": {
     "acorn": "8.15.0",

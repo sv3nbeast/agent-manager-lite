@@ -11,6 +11,7 @@ import { resolveCliRuntime } from './cliResolver'
 import {codexBundledCli,codexDesktopExecutable} from './codexPrograms'
 import { TomlDocument } from './tomlPatch'
 import {nativeProvider} from './nativeAccountProjection'
+import {applyNetworkRouteEnvironment,managedDesktopNetworkArgs,networkRouteEnvironment,type InstanceNetworkRoute} from './desktopNetwork'
 
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
@@ -82,10 +83,10 @@ function copiedSessionProvider(profile:Pick<InstanceProfile,'clientType'|'connec
   return profile.connectionMode==='native'?(account.kind==='api_key'?nativeProvider:'openai'):'cml_instance'
 }
 
-export function codexDesktopEnvironment(source:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
+export function codexDesktopEnvironment(source:NodeJS.ProcessEnv,route?:InstanceNetworkRoute):NodeJS.ProcessEnv {
   const env={...source}
   for(const key of Object.keys(env))if(/^(?:CODEX_|CML_TEST_|CML_TEMP_LOGIN_|CML_CODEX_SPEED_MENU_|ELECTRON_|NODE_|OPENAI_|npm_config_)/.test(key)||['__CFBundleIdentifier','XPC_SERVICE_NAME'].includes(key))delete env[key]
-  return env
+  return applyNetworkRouteEnvironment(env,route)
 }
 
 export function codexMacLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.args):string[] {
@@ -101,10 +102,11 @@ export function codexMacLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.
   const scripts=[...(hook?[hook.script]:[]),...(speed&&speed.transport!=='cdp'?[speed.script]:[])]
   const cdp=Boolean(speed?.transport==='cdp')
   return ['-n','-a',plan.application,'--env',`CODEX_HOME=${plan.directory}`,'--env',`CODEX_ELECTRON_USER_DATA_PATH=${plan.desktopDirectory}`,
+    ...Object.entries(networkRouteEnvironment(plan.networkRoute)).flatMap(([key,value])=>['--env',`${key}=${value}`]),
     ...(scripts.length?['--env',`NODE_OPTIONS=${scripts.map(script=>`--require="${script}"`).join(' ')}`]:[]),
     ...(hook?['--env',`CML_TEMP_LOGIN_CAPTURE=${hook.capture}`]:[]),
     ...(speed?Object.entries(speed.env).flatMap(([key,value])=>['--env',`${key}=${value}`]):[]),
-    '--args',`--user-data-dir=${plan.desktopDirectory}`,`--cml-instance=${plan.nonce}`,...(cdp?[`--remote-debugging-port=${plan.cdpPort??0}`,'--remote-debugging-address=127.0.0.1']:[]),...args]
+    '--args',`--user-data-dir=${plan.desktopDirectory}`,`--cml-instance=${plan.nonce}`,...(cdp?[`--remote-debugging-port=${plan.cdpPort??0}`,'--remote-debugging-address=127.0.0.1']:[]),...managedDesktopNetworkArgs(args,plan.networkRoute)]
 }
 
 /**

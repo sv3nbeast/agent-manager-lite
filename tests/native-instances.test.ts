@@ -1,3 +1,4 @@
+import type {NativeProxyService} from '../src/main/nativeProxy'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {mkdtempSync,mkdirSync,readFileSync,writeFileSync,rmSync,existsSync,realpathSync} from 'node:fs'
@@ -23,7 +24,81 @@ function auth(workspace:string,generation='initial',lifetime=3600){
   const jwt='fixture.'+Buffer.from(JSON.stringify({generation,exp:Math.floor(Date.now()/1000)+lifetime,email:workspace+'@example.invalid','https://api.openai.com/auth':{chatgpt_account_id:workspace,chatgpt_user_id:workspace}})).toString('base64url')+'.signature'
   return JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:jwt,id_token:jwt,refresh_token:'fixture-native-rt-'+generation,account_id:workspace}})
 }
-function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:readonly string[]=['en-US'],compatibility?:InstanceSpeedMenuServices){
+
+test('native proxy leases preserve ChatGPT identity, isolate routes and outlive a failed stop',async t=>{
+  const leases:{scope:string;proxy:string;live:boolean;stops:number}[]=[]
+  const f=fixture(t,undefined,undefined,{async acquire(proxy,scope){
+    const lease={scope,proxy,live:true,stops:0};leases.push(lease)
+    return {url:'http://127.0.0.1:'+String(28000+leases.length),alive:()=>lease.live,stop:async()=>{assert.equal(f.children.size===0||!f.children.has(f.plans.find(plan=>plan.directory.includes(scope))!.nonce),true,'Client must stop before its proxy');lease.stops++;lease.live=false}}
+  }})
+  f.store.transaction(state=>{
+    state.upstreamProxy={revision:0,mode:'custom',url:'https://default:secret@proxy.invalid:443'}
+    state.accounts.find(a=>a.id===f.beta.id)!.proxy={mode:'custom',url:'socks5h://second:password@proxy.invalid:1080'}
+  })
+  const first=f.add(),second=f.add(f.beta.id,'Second')
+  await f.start(first.id);await f.start(second.id)
+  assert.ok(f.instances.views().every(v=>v.status==='running'),JSON.stringify(f.instances.views()))
+  assert.ok(f.instances.views().every(v=>v.identityStatus==='native_verified'))
+  assert.equal(new TomlDocument(readFileSync(join(first.directory,'config.toml'),'utf8')).scalar(['model_provider']),'openai')
+  assert.equal(leases.length,2);assert.notEqual(leases[0].proxy,leases[1].proxy)
+  assert.notDeepEqual(f.plans[0].networkRoute,f.plans[1].networkRoute)
+  assert.equal(JSON.stringify(f.plans).includes('secret'),false)
+  assert.equal(readFileSync(join(f.store.directory,'instances',first.id,'launch.json'),'utf8').includes('secret'),false)
+  const stop=f.runtime.stop;f.runtime.stop=async()=>{throw new Error('fixture stop failure')}
+  await assert.rejects(f.instances.stop(first.id),/fixture stop failure/)
+  assert.equal(leases[0].stops,0);assert.equal(leases[0].live,true)
+  f.runtime.stop=stop
+  await f.instances.stop(first.id)
+  assert.equal(leases[0].stops,1);assert.equal(leases[1].live,true)
+  leases[1].live=false;await f.instances.refresh()
+  assert.equal(f.instances.views()[1].status,'error')
+  assert.match(f.instances.views()[1].error!,/网络代理已退出/)
+  assert.equal(f.children.size,1,'A proxy failure must not kill the user client or fall back to direct')
+  f.children.clear();await f.instances.refresh()
+  assert.equal(leases[1].stops,1);assert.equal(f.instances.views()[1].status,'stopped')
+})
+
+test('native explicit direct overrides inherited proxy without allocating a helper',async t=>{
+  const f=fixture(t,undefined,undefined,{acquire:async()=>assert.fail('Direct needs no helper')})
+  f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:'http://proxy.invalid:8080'};state.accounts[0].proxy={mode:'direct'}})
+  const profile=f.add()
+  await f.start(profile.id)
+  assert.equal(f.instances.views()[0].status,'running',JSON.stringify(f.instances.views()))
+  assert.deepEqual(f.plans[0].networkRoute,{mode:'direct'})
+  await f.instances.stop(profile.id)
+  f.store.transaction(state=>{delete state.accounts[0].proxy;state.upstreamProxy={revision:1,mode:'direct'}})
+  await f.start(profile.id);assert.deepEqual(f.plans[1].networkRoute,{mode:'direct'})
+  await f.instances.stop(profile.id)
+})
+
+test('native proxy changes invalidate preview and async preparation before credentials are written',async t=>{
+  let releases=0
+  const f=fixture(t,undefined,undefined,{async acquire(){
+    f.store.transaction(state=>{state.upstreamProxy!.url='http://changed.invalid:8080'})
+    return {url:'http://127.0.0.1:28002',alive:()=>true,stop:async()=>{releases++}}
+  }})
+  f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:'http://first.invalid:8080'}})
+  const profile=f.add(),preview=f.instances.preview({id:profile.id,revision:profile.revision})
+  f.store.transaction(state=>{state.upstreamProxy!.url='http://second.invalid:8080'})
+  assert.throws(()=>f.instances.start(preview.ticket),/已变化/)
+  await f.start(profile.id)
+  assert.equal(f.instances.views()[0].status,'error');assert.match(f.instances.views()[0].error!,/连接准备期间已变化/)
+  assert.equal(releases,1);assert.equal(f.plans.length,0)
+  assert.equal(existsSync(join(profile.directory,'auth.json')),false)
+  assert.equal(f.store.read().clientSwitches?.length??0,0)
+})
+
+test('native proxy cancellation releases the acquired helper without launching a client',async t=>{
+  let enter!:()=>void,resolve!:()=>void,releases=0
+  const entered=new Promise<void>(r=>{enter=r}),waiting=new Promise<void>(r=>{resolve=r})
+  const f=fixture(t,undefined,undefined,{async acquire(){enter();await waiting;return {url:'http://127.0.0.1:28003',alive:()=>true,stop:async()=>{releases++}}}})
+  f.store.transaction(state=>{state.accounts[0].proxy={mode:'custom',url:'http://proxy.invalid:8080'}})
+  const profile=f.add(),starting=f.start(profile.id);await entered
+  const stopping=f.instances.stop(profile.id);resolve();await Promise.all([starting,stopping])
+  assert.equal(releases,1);assert.equal(f.plans.length,0);assert.equal(f.instances.views()[0].status,'stopped')
+  assert.equal(existsSync(join(profile.directory,'auth.json')),false)
+})
+function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:readonly string[]=['en-US'],compatibility?:InstanceSpeedMenuServices,proxyService?:NativeProxyService){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-native-instance-'))),application=join(root,'Fixture.app')
   mkdirSync(join(application,'Contents','MacOS'),{recursive:true});writeFileSync(join(application,'Contents','MacOS','Codex'),'never execute',{mode:0o700})
   const key=randomBytes(32)
@@ -39,7 +114,7 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:reado
   let instances:Instances
   const create=()=>{
     const native=new NativeInstanceAccounts(store,tokens,(id,target)=>sharedUse||instances?.usesNativeAccountOutside(id,target)||authority.busy(id),account=>project(account))
-    return new Instances(store,()=>assert.fail('Native mode must not start a gateway'),async id=>{await preparing;return tokens.ensure(id)},runtime,native,undefined,undefined,systemLanguages,compatibility)
+    return new Instances(store,()=>assert.fail('Native mode must not start a gateway'),async id=>{await preparing;return tokens.ensure(id)},runtime,native,undefined,undefined,systemLanguages,compatibility,proxyService)
   }
   instances=create();const app=instances.registerApplication(application)
   importParsedAccounts(store,parseAccountImport('['+auth('alpha')+','+auth('beta')+']').accounts)

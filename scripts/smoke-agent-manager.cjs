@@ -8,6 +8,11 @@ const { randomUUID } = require('node:crypto')
 const { execFileSync } = require('node:child_process')
 const { createServer } = require('node:http')
 const assert = require('node:assert/strict')
+// Surface asynchronous fixture failures instead of blocking the runner in a
+// native Electron error dialog, which cannot be captured by renderer evidence.
+process.on('uncaughtException', error => { console.error(error); app.exit(1) })
+process.on('unhandledRejection', error => { console.error(error); app.exit(1) })
+dialog.showErrorBox = (title, content) => { console.error(title, content); app.exit(1) }
 const directory = process.env.CML_TEST_DATA_DIR
 assert.ok(directory && fs.realpathSync(directory).startsWith(fs.realpathSync(tmpdir()) + sep) && basename(directory).startsWith('codex-manager-ui-'))
 assert.equal(fs.existsSync(join(directory, 'state.vault')), false)
@@ -121,6 +126,12 @@ app.on('browser-window-created', (_event, window) => {
       const imported = (await run('window.manager.load()')).accounts.find(account => account.kind === 'oauth')
       assert.ok(imported)
       assert.equal(await run(`document.querySelector('[aria-label=实例账号]').closest('.ant-select').querySelector('.ant-select-selection-item').textContent.includes(${JSON.stringify(imported.name)})`), true)
+      await run('window.manager.saveAccountProxy('+JSON.stringify({accountId:imported.id,revision:imported.revision??0,mode:'custom',url:'http://fixture:proxy-password@127.0.0.1:9'})+')')
+      await wait('document.querySelector(".instance-connection-options")?.innerText.includes("原生登录同样支持")')
+      assert.match(await run('document.querySelector("[aria-label=实例接入方式]").closest(".ant-select").textContent'), /原生账号登录/)
+      assert.equal(await run('document.querySelector(".instance-connection-options").textContent.includes("无法应用该代理")'),false)
+      assert.equal(await run('document.querySelector(".instance-connection-options").textContent.includes("proxy-password")'),false)
+      await capture('agent-manager-native-proxy-account.png')
       await capture('agent-manager-inline-account.png')
       await next(2)
       await fill('[aria-label="实例名称"]', '账号工作空间')
@@ -134,6 +145,7 @@ app.on('browser-window-created', (_event, window) => {
       let snapshot = await run('window.manager.load()')
       assert.equal(snapshot.instances.length, 1); assert.equal(snapshot.instances[0].clientType, 'codex')
       assert.equal(snapshot.instances[0].accountId, imported.id)
+      assert.equal(snapshot.instances[0].connectionMode,'native','Proxy account must create a native instance')
       assert.equal(snapshot.instanceApplications.find(a => a.id === snapshot.instances[0].applicationId).path, application)
       // Duplicate imports return the exact compatible existing identity to the
       // outstanding instance draft, without adding a second account.
@@ -200,12 +212,12 @@ app.on('browser-window-created', (_event, window) => {
       await run('document.querySelector(".instance-wizard").closest(".ant-modal-content").querySelector(".ant-modal-close").click()')
       await wait(`!(${visible('.instance-wizard')})`)
       await click('.instances-panel .page-heading button', '创建实例'); await step(0)
-      assert.equal(await run('document.querySelector("[aria-label=实例名称]").value'), '')
+      assert.equal(await run('document.querySelector("[aria-label=实例名称]").value'), 'Codex 1')
       releaseCreateAccount()
       const completionDeadline = Date.now() + 10_000
       while (!delayedCreationComplete) { assert.ok(Date.now() < completionDeadline, 'delayed actual IPC did not complete'); await new Promise(resolve => setTimeout(resolve, 25)) }
       await settle(); await step(0)
-      assert.equal(await run('document.querySelector("[aria-label=实例名称]").value'), '', 'late result does not overwrite new draft')
+      assert.equal(await run('document.querySelector("[aria-label=实例名称]").value'), 'Codex 1', 'late result does not overwrite new draft')
       assert.equal((await run('window.manager.load()')).instances.length, 3, 'cancelled old draft never saves an instance')
       await capture('agent-manager-cancelled-resource-draft.png')
       await click('.ant-modal-footer button', '取消'); await wait(`!(${visible('.instance-wizard')})`)
@@ -219,13 +231,19 @@ app.on('browser-window-created', (_event, window) => {
       await run('document.querySelector("[aria-label=账号用途]").closest(".ant-modal-content").querySelector(".ant-modal-close").click()')
       const evidence = { clientTypes: ['codex'], unsupportedClientRejected: true, instanceCount: 3, providerId: provider.id, keyId: provider.keys[0].id, sharedConnectionId: first.accountId, reusedBy: [first.id, second.id], distinctDirectories: true, inlineAccountReturned: true, duplicateInlineAccountReturned: true, trimmedNamePreviewed: true, cancelledAsyncDraftDiscarded: true, cancelledDraftSaved: false, requests, realUpstreamRequests: 0, officialClientLaunched: false }
       fs.writeFileSync(join(reports, 'agent-manager-workflow-audit.json'), JSON.stringify(evidence, null, 2))
-      console.log('Agent Manager workflow passed: default instance entrance; Codex-only capabilities; wizard back/cancel; inline Token and duplicate import resume the exact selected account; trimmed names preview correctly; cancelled delayed resource creation cannot advance a reopened draft; inline provider discovery; same provider key and connection reused by two isolated instances; unsupported client rejected; standalone account purpose. Temporary encrypted vault, loopback models, no official client launch or external upstream.')
+      console.log('Agent Manager workflow passed: default instance entrance; Codex-only capabilities; wizard back/cancel; inline Token and duplicate import resume the exact selected account; native proxy wizard continues with hidden credentials; trimmed names preview correctly; cancelled delayed resource creation cannot advance a reopened draft; inline provider discovery; same provider key and connection reused by two isolated instances; unsupported client rejected; standalone account purpose. Temporary encrypted vault, loopback models, no official client launch or external upstream.')
       clearTimeout(timer); app.quit()
     } catch (error) { console.error(error); await capture('agent-manager-workflow-failure.png').catch(() => {}); clearTimeout(timer); app.once('will-quit', () => app.exit(1)); app.quit() }
   })
 })
 app.whenReady().then(async () => {
   server = createServer((req, res) => {
+    // Host discovery probes new loopback listeners with a bodyless root GET.
+    // Reject that exact unauthenticated probe without treating it as a model
+    // request; all actual provider requests remain subject to the assertions.
+    if (req.method === 'GET' && req.url === '/' && req.headers.authorization === undefined && req.headers['proxy-authorization'] === undefined && req.headers['user-agent'] === undefined && req.headers['content-length'] === undefined && req.headers['transfer-encoding'] === undefined) {
+      res.writeHead(404, { Connection: 'close' }); res.end(); return
+    }
     requests.push({ path: req.url, method: req.method })
     assert.equal(req.url, '/v1/models'); assert.equal(req.headers.authorization, 'Bearer ' + providerSecret)
     res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'fixture-model' }] }))

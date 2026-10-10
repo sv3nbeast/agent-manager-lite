@@ -195,13 +195,12 @@ const identityStatusLabel=(instance:InstanceView)=>{
     default: return instance.connectionMode==='native'?'原生账号登录 · 状态待确认':'本地 API · 客户端无原生账号身份'
   }
 }
-const instanceHasUpstreamProxy=(instance:InstanceView)=>hasInstanceUpstreamProxy(accountForInstance(instance))
 const nativeRepairCandidate=(instance:InstanceView)=>instance.connectionMode==='local_api'&&accountForInstance(instance)?.kind==='oauth'
 function repairNativeLogin(instance:InstanceView){
   const account=accountForInstance(instance)
   if(instance.status!=='stopped'){message.warning('请先停止实例，再修复为原生账号登录。');return}
   if(account?.kind!=='oauth'){message.warning('此实例绑定的资源不支持原生账号登录。');return}
-  if(hasInstanceUpstreamProxy(account)){message.warning('此账号使用了网络代理，原生账号登录无法应用该代理，请继续使用本地 API。');return}
+  if(account.egressProxy?.invalid){message.warning('此账号的网络代理配置无效，请先修正账号或默认代理设置。');return}
   edit(instance)
   useNativeLogin()
 }
@@ -258,7 +257,7 @@ const connectionProblem=computed(()=>{
   if(form.connectionMode!=='native')return ''
   if(resourceKind.value==='provider'&&selectedSupplier.value?.disabled)return selectedSupplier.value.reason??'此供应商使用 Chat Completions 协议，请切换为本地 API。'
   if(!selectedAccount.value)return ''
-  if(usesUpstreamProxy.value)return '此账号使用了网络代理设置，当前原生登录无法应用该代理。请使用本地 API，或先在账号代理设置中改为直连。'
+  if(selectedAccount.value.egressProxy?.invalid)return '此账号的网络代理配置无效，请先修正账号或默认代理设置。'
   return accountCompatibility(form.clientType,selectedAccount.value,{connectionMode:form.connectionMode}).reason??''
 })
 watch(connectionProblem,problem=>{if(!problem&&fieldErrors.connectionMode){if(error.value===fieldErrors.connectionMode)error.value='';delete fieldErrors.connectionMode}})
@@ -541,10 +540,9 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
         <div class="instance-heading"><div class="instance-name"><DesktopOutlined /><strong>{{ instance.name }}</strong></div><a-tag :color="instance.status==='running'?'green':instance.status==='error'?'red':['preparing','starting','stopping'].includes(instance.status)?'processing':undefined">{{ labels[instance.status] }}</a-tag></div>
         <a-descriptions :column="1" size="small"><a-descriptions-item label="客户端">{{instance.clientType === 'codex' ? 'Codex' : '尚未接入'}}</a-descriptions-item><a-descriptions-item label="运行方式">{{instance.launchMode==='cli'?'CLI · Terminal':'桌面应用'}}</a-descriptions-item><a-descriptions-item label="账号">{{ instanceAccountLabel(instance) }} · {{modeName(instance.connectionMode)}}</a-descriptions-item><a-descriptions-item label="客户端身份">{{ identityStatusLabel(instance) }}</a-descriptions-item><a-descriptions-item label="默认模型">{{ instance.model }}</a-descriptions-item><a-descriptions-item label="速度"><template v-if="instance.speedMenu==='active'||instance.speedMenu==='pending'">{{instance.speedMenu==='active'?'在 Codex 中选择':'正在启用 Codex 速度菜单'}}<span class="muted"> · 启动时 {{initialSpeedName(instance.initialTier)}}</span></template><template v-else>{{ tierName(instance.defaultTier) }}<span v-if="instance.status==='running'"> · {{instance.connectionMode==='native'?'已写入配置':'启动时'}} {{ initialSpeedName(instance.initialTier??instance.appliedTier) }}</span></template></a-descriptions-item><a-descriptions-item v-if="instance.desktopLocaleCompatibility" label="页面语言">{{instance.desktopLocaleCompatibility==='active'?'跟随 Codex 语言设置':instance.desktopLocaleCompatibility==='pending'?'正在加载内置翻译':'翻译适配未加载'}}</a-descriptions-item><a-descriptions-item v-if="instance.ultraCompatibility" label="Ultra 推理">{{instance.ultraCompatibility==='active'?'支持的模型可选 Ultra':instance.ultraCompatibility==='pending'?'正在加载':'暂未兼容'}}</a-descriptions-item><a-descriptions-item v-if="instance.pid" label="进程">{{ instance.pid }}<span v-if="instance.port"> · 本地端口 {{ instance.port }}</span></a-descriptions-item></a-descriptions>
         <template v-if="nativeRepairCandidate(instance)">
-          <a-alert v-if="instanceHasUpstreamProxy(instance)" type="warning" show-icon class="instance-identity-warning" message="当前账号配置了网络代理；原生账号登录无法应用该代理，请继续使用本地 API。" />
-          <a-alert v-else type="warning" show-icon class="instance-identity-warning" message="当前绑定了管理器账号，但客户端运行在本地 API 模式。客户端左下角显示的是供应商名称，不代表已登录此账号。" />
-          <a-button v-if="instance.status==='stopped'&&!instanceHasUpstreamProxy(instance)" type="link" class="instance-repair-native" @click="repairNativeLogin(instance)">修复为原生账号登录</a-button>
-          <span v-else-if="instance.status!=='stopped'&&!instanceHasUpstreamProxy(instance)" class="muted instance-repair-native-note">实例运行中，请先停止后修复为原生账号登录。</span>
+          <a-alert type="warning" show-icon class="instance-identity-warning" message="当前绑定了管理器账号，但客户端运行在本地 API 模式。客户端左下角显示的是供应商名称，不代表已登录此账号。" />
+          <a-button v-if="instance.status==='stopped'" type="link" class="instance-repair-native" @click="repairNativeLogin(instance)">修复为原生账号登录</a-button>
+          <span v-else class="muted instance-repair-native-note">实例运行中，请先停止后修复为原生账号登录。</span>
         </template>
         <p class="instance-path" :title="instance.directory"><a-tag v-if="instance.externalHome">已有目录</a-tag>{{ instance.directory }}</p>
         <a-alert v-if="instance.error" type="error" :message="instance.error" class="error-banner" />
@@ -598,8 +596,8 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <a-form-item data-field="connectionMode" label="账号接入方式" :validate-status="fieldErrors.connectionMode?'error':undefined" :help="fieldErrors.connectionMode"><a-select v-model:value="form.connectionMode" aria-label="实例接入方式" :options="[{value:'native',label:'原生账号登录'},{value:'local_api',label:'本地 API'}]" @change="changeConnectionMode" /></a-form-item>
             <p class="muted instance-connection-description">{{connectionDescription}}</p>
             <a-alert v-if="connectionProblem" type="warning" show-icon :message="connectionProblem" />
-            <p v-else-if="form.connectionMode==='local_api'&&usesUpstreamProxy" class="muted">此账号已配置网络代理（包括继承的默认代理），使用本地 API 才能应用该设置。</p>
-            <a-button v-else-if="form.connectionMode==='local_api'&&selectedAccount?.kind==='oauth'" type="link" class="instance-use-native" @click="useNativeLogin">切换为原生账号登录</a-button>
+            <p v-if="!connectionProblem&&usesUpstreamProxy" class="muted">实例使用所选账号的网络代理设置（包括继承的默认代理），原生登录同样支持。</p>
+            <a-button v-if="!connectionProblem&&form.connectionMode==='local_api'&&selectedAccount?.kind==='oauth'" type="link" class="instance-use-native" @click="useNativeLogin">切换为原生账号登录</a-button>
             <p v-if="editing&&form.connectionMode!==(editing.connectionMode??'local_api')" class="muted instance-mode-history-note">切换后已有会话仍保留。若客户端列表不显示，可到「会话 → 修复可见性」选择此实例，使用「按各实例接入方式自动匹配」预览修复。</p>
           </div>
         </section>

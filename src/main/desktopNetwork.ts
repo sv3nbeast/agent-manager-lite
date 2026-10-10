@@ -7,6 +7,46 @@ import {isIP} from 'node:net'
 const explicitProxy=/^--(?:proxy-server|proxy-pac-url|proxy-auto-detect|no-proxy-server|proxy-bypass-list)(?:=|$)/i
 const loopbackBypass=['localhost','127.0.0.1','[::1]','<local>']
 
+export type InstanceNetworkRoute={mode:'direct'}|{mode:'proxy';url:string}
+const proxyEnvironmentKeys=['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','http_proxy','https_proxy','all_proxy','no_proxy']
+
+/** Only the manager's credential-free loopback bridge may reach client argv. */
+function routeProxyURL(route:InstanceNetworkRoute):string|undefined {
+  if(route?.mode==='direct'&&Object.keys(route).every(key=>key==='mode'))return
+  if(route?.mode!=='proxy'||Object.keys(route).some(key=>key!=='mode'&&key!=='url')||typeof route.url!=='string')throw new Error('实例网络路由无效')
+  const match=route.url.match(/^http:\/\/(127\.0\.0\.1|\[::1\]):([1-9]\d{0,4})\/?$/)
+  if(!match||match[0]!==route.url||Number(match[2])>65535)throw new Error('实例网络路由仅接受不含凭据的本机 HTTP 代理')
+  return `http://${match[1]}:${Number(match[2])}`
+}
+
+export function networkRouteEnvironment(route?:InstanceNetworkRoute):Record<string,string> {
+  if(route===undefined)return {}
+  const proxy=routeProxyURL(route)??'',bypass=route.mode==='direct'?'*':'localhost,127.0.0.1,::1'
+  return Object.fromEntries(proxyEnvironmentKeys.map(key=>[key,key.toUpperCase()==='NO_PROXY'?bypass:proxy]))
+}
+
+export function applyNetworkRouteEnvironment(source:NodeJS.ProcessEnv,route?:InstanceNetworkRoute):NodeJS.ProcessEnv {
+  if(route===undefined)return {...source}
+  const managed=networkRouteEnvironment(route),env={...source}
+  for(const key of Object.keys(env))if(/^(?:https?|all|no)_proxy$/i.test(key))delete env[key]
+  return {...env,...managed}
+}
+
+/** Account routing overrides system/PAC settings and user proxy switches. */
+export function managedDesktopNetworkArgs(args:readonly string[],route?:InstanceNetworkRoute):string[] {
+  if(route===undefined)return [...args]
+  const proxy=routeProxyURL(route),filtered:string[]=[]
+  for(let i=0;i<args.length;i++){
+    const match=args[i].match(/^--(proxy-server|proxy-pac-url|proxy-auto-detect|no-proxy-server|proxy-bypass-list)(?:=(.*))?$/i)
+    if(!match){filtered.push(args[i]);continue}
+    // Only value-taking switches consume a following argument. Preserve the
+    // next independent switch if the removed proxy option was incomplete.
+    if(match[2]===undefined&&['proxy-server','proxy-pac-url','proxy-bypass-list'].includes(match[1].toLowerCase())&&args[i+1]!==undefined&&!args[i+1].startsWith('-'))i++
+  }
+  // Place managed switches before any user '--' argument terminator.
+  return [...(proxy?[`--proxy-server=${proxy}`,'--proxy-bypass-list=localhost;127.0.0.1;[::1]']:['--no-proxy-server']),...filtered]
+}
+
 function proxyValue(env:NodeJS.ProcessEnv,lower:string):string|undefined {
   const value=env[lower]??env[lower.toUpperCase()]
   return value?.trim()?value:undefined

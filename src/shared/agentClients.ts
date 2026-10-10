@@ -31,7 +31,7 @@ export function hasInstanceUpstreamProxy(account:Pick<Account,'egressProxy'>|und
 /** Recommendation for a new draft only; persisted/legacy modes must not be migrated. */
 export function recommendedInstanceConnectionMode(clientType:unknown,account:Pick<Account,'kind'|'egressProxy'>|undefined):'native'|'local_api' {
   const client=getAgentClient(clientType)
-  return client.capabilities.nativeAccounts&&account?.kind==='oauth'&&!hasInstanceUpstreamProxy(account)?'native':'local_api'
+  return client.capabilities.nativeAccounts&&account?.kind==='oauth'?'native':'local_api'
 }
 
 export interface AccountCompatibility {compatible:boolean;reason?:string}

@@ -35,7 +35,7 @@ export class NativeInstanceAccounts {
   validate(profile:InstanceProfile):void {
     const state=this.store.read(),account=state.accounts.find(value=>value.id===profile.accountId)
     if(!account)throw new Error('绑定账号不存在')
-    if(accountProxyURL(account,state)!==undefined)throw new Error('此账号已配置出口代理，原生客户端代理尚未接入，请使用本地 API 模式')
+    accountProxyURL(account,state) // Validate the route; Instances applies it before injecting credentials.
     if(account.kind==='agent_identity')throw new Error('Agent Identity 仅支持本地 API 接入，请切换实例的账号接入方式')
     if(account.kind==='api_key'&&(account.wireApi!=='responses'||!account.models.includes(profile.model)))throw new Error('原生 API 接入需要 Responses 协议和账号支持的模型，请改用本地 API 或调整模型')
     if((ownsRefreshChain(account)||account.credentials.refreshToken)&&this.accountInUse(account.id,profile.id))throw new Error('此账号正在被其他服务或实例使用，请先停止后再启动原生实例')

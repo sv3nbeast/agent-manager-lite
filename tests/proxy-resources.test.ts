@@ -99,7 +99,7 @@ test('expired, discarded and changed-account previews cannot apply; corrupted sh
   f.apply({action:'disable'});assert.equal(accountProxyURL(f.get(),f.store.proxyState()),undefined)
 })
 
-test('resource bindings and inherited probes follow actual HTTP exits, reject stale resources and protect native paths',async t=>{
+test('resource bindings and inherited probes follow actual HTTP exits, reject stale resources and distinguish managed from unmanaged native paths',async t=>{
   const f=fixture(t),seen:string[]=[]
   const target=await listen(t,createServer((req,res)=>{assert.equal(req.headers.authorization,undefined);seen.push('direct');res.end('{"ip":"203.0.113.1"}')}))
   const proxy=await listen(t,createServer((req,res)=>{assert.equal(req.headers.authorization,undefined);assert.equal(req.headers['proxy-authorization'],'Basic '+Buffer.from('fixture:secret').toString('base64'));seen.push('proxy');res.end('{"ip":"203.0.113.2"}')}))
@@ -115,10 +115,10 @@ test('resource bindings and inherited probes follow actual HTTP exits, reject st
   assert.equal((await service.probe({accountId:f.inherited.id,revision:1,requestId:requestId(),mode:'saved'})).ip,'203.0.113.2')
   assert.throws(()=>authFor(f.get(),null,f.store.proxyState()),/本地 API/)
   const native=new NativeInstanceAccounts(f.store,new TokenAuthority(f.store))
-  assert.throws(()=>native.validate({accountId:f.inherited.id} as never),/本地 API/)
+  assert.doesNotThrow(()=>native.validate({accountId:f.inherited.id} as never))
   service.save({accountId:f.inherited.id,revision:1,mode:'inherit'})
   assert.throws(()=>authFor(f.get(),null,f.store.proxyState()),/本地 API/)
-  assert.throws(()=>native.validate({accountId:f.inherited.id} as never),/本地 API/)
+  assert.doesNotThrow(()=>native.validate({accountId:f.inherited.id} as never))
   f.apply({action:'disable'})
   assert.equal((await service.probe({accountId:f.inherited.id,revision:2,requestId:requestId(),mode:'inherit'})).ip,'203.0.113.1')
   assert.deepEqual(seen,['proxy','proxy','direct','direct','proxy','direct'])

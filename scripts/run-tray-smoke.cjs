@@ -23,12 +23,12 @@ function ownedFixtures(directory) {
   })
 }
 
-async function run(lastClose) {
+async function run(lastClose, nativeProxy = false) {
   const directory = fs.mkdtempSync(join(tmpdir(), 'codex-manager-ui-'))
-  const env = { ...process.env, CML_TEST_DATA_DIR: directory, CML_TEST_SYSTEM_KEYCHAIN: '0', CML_TEST_TRAY_LAST_CLOSE: lastClose ? '1' : '0' }
+  const env = { ...process.env, CML_TEST_DATA_DIR: directory, CML_TEST_SYSTEM_KEYCHAIN: '0', CML_TEST_TRAY_LAST_CLOSE: lastClose ? '1' : '0', CML_TEST_TRAY_NATIVE_PROXY: nativeProxy ? '1' : '0' }
   delete env.ELECTRON_RUN_AS_NODE
   const child = cp.spawn(require('electron'), [resolve(__dirname, 'smoke-tray.cjs')], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' })
-  const marker = `Tray lifecycle smoke passed [${lastClose ? 'last-close' : 'explicit'}]:`
+  const marker = `Tray lifecycle smoke passed [${nativeProxy ? 'native-proxy-' : ''}${lastClose ? 'last-close' : 'explicit'}]:`
   let output = '', timedOut = false, closed = false, cleaning
   const kill = () => {
     if (!child.pid || process.platform === 'win32' && closed) return
@@ -82,7 +82,8 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
 })
 ;(async () => {
   if (process.platform !== 'darwin') throw new Error('Tray lifecycle smoke requires macOS LaunchServices')
-  if (process.argv.includes('--last-close')) await run(true)
+  if (process.argv.includes('--native-proxy')) await run(!process.argv.includes('--explicit'), true)
+  else if (process.argv.includes('--last-close')) await run(true)
   else if (process.argv.includes('--explicit')) await run(false)
-  else { await run(false); await run(true) }
+  else { await run(false); await run(true); await run(true, true) }
 })().catch(error => { console.error(error); process.exitCode = 1 })

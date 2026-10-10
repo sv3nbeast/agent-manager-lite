@@ -94,7 +94,7 @@ export class ClientSwitches {
     const binding=state.clientAuthorities?.find(value=>value.targetId===targetId)
     if(binding&&binding.accountId!==old?.id)throw new Error('客户端文件与现有凭据关联不一致，请先处理原关联')
     if(old&&prior)adopt(state,old.id,prior)
-    const nextAuth=authFor(account,snapshot.auth,state)
+    const nextAuth=authFor(account,snapshot.auth,state,!!this.instance)
     if(typeof tokenClaims(account.credentials.accessToken).exp==='number'&&!tokenFresh(account.credentials.accessToken,30))throw new Error('目标账号的访问令牌已过期，请先刷新用量或重新登录')
     const projection=nativeConfig(snapshot.config,account,state,history),{paths,providerGuards}=projection
     let nextConfig=projection.config
@@ -139,7 +139,7 @@ export class ClientSwitches {
     const account=record.previousAccountId?this.account(record.previousAccountId,state):undefined
     if(!account&&snapshot.auth!==null&&Object.keys(JSON.parse(snapshot.auth)).some(key=>!authKeys.has(key.toLowerCase())))throw new Error('原目录没有登录，当前凭据文件新增了其他字段，已保留文件，请先核对这些修改')
     const configOnlyAPI=account?.kind==='api_key'&&record.beforeAuth===null&&configuredProviderAuth(before)!==null
-    const auth=account&&!configOnlyAPI?authFor(account,snapshot.auth??record.beforeAuth,state):null
+    const auth=account&&!configOnlyAPI?authFor(account,snapshot.auth??record.beforeAuth,state,!!this.instance):null
     if(account){const projected=nativeIdentity(auth,new TomlDocument(config));if(!projected||!sameNativeAccount(account,projected))throw new Error('恢复配置与原账号连接不一致，已保留当前文件')}
     return this.stage('restore',snapshot,record,auth,config,observed,observedId,account)
   }

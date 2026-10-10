@@ -25,8 +25,8 @@ export function ownsRefreshChain(account:StoredAccount):boolean {
   const identity=accountIdentity(account)
   return account.kind==='oauth'&&!!(identity.accountId||identity.userId)
 }
-export function authFor(account:StoredAccount,template:string|null,proxyState:ProxyState={}):string {
-  if(accountProxyURL(account,proxyState)!==undefined)throw new Error('此账号已配置出口代理，原生客户端代理尚未接入，请使用本地 API 模式或先清除账号代理设置')
+export function authFor(account:StoredAccount,template:string|null,proxyState:ProxyState={},managedNetwork=false):string {
+  if(!managedNetwork&&accountProxyURL(account,proxyState)!==undefined)throw new Error('此目录没有受管启动网络，请通过实例使用原生账号及代理，或使用本地 API')
   if(account.kind==='agent_identity')throw new Error('Agent Identity 按来源仅用于 API 服务，不支持原生客户端登录注入')
   if(account.kind==='api_key'&&(!account.credentials.apiKey||account.wireApi!=='responses'))throw new Error('原生 API 切换需要 Responses 账号；Chat Completions 账号请使用本地 API 转换入口')
   if(account.kind==='oauth'&&!account.credentials.accessToken)throw new Error('目标账号尚无访问令牌，请先刷新用量或完成登录')

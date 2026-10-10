@@ -1,3 +1,4 @@
+import type {NativeProxyService,NativeProxyLease} from './nativeProxy'
 import {accountProxyURL} from './proxyPolicy'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, realpathSync, renameSync, rmSync, readdirSync } from 'node:fs'
@@ -32,10 +33,10 @@ import {readInstanceIdentityStatus} from './instanceIdentityStatus'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
 const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspectCodexDesktopUi,inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
-type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string}
+type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const resolveCompatibleApplication=(application:InstanceApplication)=>{try {resolveAgentClientType(application.clientType);return true}catch{return false}}
-const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native']).optional(),nativeTier:z.string().optional()}).strict()
+const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native']).optional(),nativeTier:z.string().optional(),nativeProxy:z.boolean().optional()}).strict()
 
 export class Instances {
   private readonly root:string
@@ -50,7 +51,7 @@ export class Instances {
   constructor(private readonly store:Store,private readonly gatewayFactory:(profile:InstanceProfile)=>Gateway,
     private readonly prepareAccount:(id:string)=>Promise<StoredAccount>,private readonly runtime:DesktopRuntime=new MacInstanceRuntime(),
     private readonly nativeAccounts?:NativeInstanceAccounts,private readonly now:()=>number=Date.now,private readonly externalBusy:(id:string)=>boolean=()=>false,
-    private readonly systemLanguages:readonly string[]=systemDesktopLanguages(),private readonly speedMenuServices:InstanceSpeedMenuServices=defaultSpeedMenuServices) {this.root=realpathSync(store.directory)}
+    private readonly systemLanguages:readonly string[]=systemDesktopLanguages(),private readonly speedMenuServices:InstanceSpeedMenuServices=defaultSpeedMenuServices,private readonly nativeProxyService?:NativeProxyService) {this.root=realpathSync(store.directory)}
   applications():InstanceApplication[] {
     const stored=this.store.read().instanceApplications ?? []
     return codexInstanceAdapter.applications(stored)
@@ -400,7 +401,7 @@ export class Instances {
     this.active.set(id,run)
     run.task=this.launch(run,context.view.revision,pending.fingerprint).finally(()=>{run.task=undefined})
   }
-  private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,connectionMode:run.profile.connectionMode??'local_api',nativeTier:run.nativeTier}))}
+  private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,connectionMode:run.profile.connectionMode??'local_api',nativeTier:run.nativeTier,nativeProxy:run.plan.networkRoute?.mode==='proxy'||undefined}))}
   private async launch(run:Running,revision:string,fingerprint:string):Promise<void> {
     try {
       if(run.profile.externalHome&&run.profile.connectionMode!=='native')assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))
@@ -440,6 +441,16 @@ export class Instances {
         else run.plan.desktopLocaleHook=hook
       }
       if(run.profile.connectionMode==='native'){
+        const proxy=accountProxyURL(context.account,this.store.read())
+        if(proxy==='direct')run.plan.networkRoute={mode:'direct'}
+        else if(proxy!==undefined){
+          if(!this.nativeProxyService)throw new Error('原生实例代理服务不可用，请重新安装管理器')
+          run.nativeProxy=await this.nativeProxyService.acquire(proxy,run.profile.id,run.controller.signal)
+          run.plan.networkRoute={mode:'proxy',url:run.nativeProxy.url}
+          run.controller.signal.throwIfAborted()
+          if(!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
+          if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例网络代理或配置在连接准备期间已变化，请重新预览')
+        }
         run.nativeTier=context.tier.tier
         const contextPreview=context.configs.previewInstanceContext(run.profile.id,context.view.revision,run.profile.model)
         context.configs.apply(contextPreview.ticket,backup=>{run.backup=backup;this.checkpoint(run)})
@@ -448,11 +459,14 @@ export class Instances {
         // A crash at any later boundary can locate only this launch's journal.
         this.checkpoint(run)
         await this.nativeAccounts!.inject(run.profile,run.plan.nonce,context.tier.tier,run.controller.signal,()=>{
+          if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
           if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例设置在等待凭据写入期间已变化，请重新预览')
         })
         run.controller.signal.throwIfAborted();run.status='starting'
         run.child=await this.runtime.launch(run.plan,run.controller.signal)
-        run.controller.signal.throwIfAborted();run.status='running';run.startedAt=Date.now()
+        run.controller.signal.throwIfAborted()
+        if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
+        run.status='running';run.startedAt=Date.now()
         return
       }
       const localKey=`cml-instance-${randomBytes(32).toString('hex')}`
@@ -480,6 +494,7 @@ export class Instances {
   private async cleanup(run:Running):Promise<void> {
     await this.runtime.stop(run.plan)
     await run.gateway?.stop()
+    await run.nativeProxy?.stop();run.nativeProxy=undefined
     if(run.profile.connectionMode==='native'){
       if(!this.nativeAccounts)throw new Error('原生登录恢复服务不可用，文件已保留')
       await this.nativeAccounts.restore(run.profile,run.plan.nonce)
@@ -527,6 +542,8 @@ export class Instances {
       const child=await this.runtime.find(run.plan)
       if(!child) {
         try {await this.stop(run.profile.id)}catch{run.status='error';run.error='实例已退出，但配置或登录状态未保存，请重试停止'}
+      } else if(run.nativeProxy&&!run.nativeProxy.alive()&&run.status==='running'){
+        run.status='error';run.error='实例网络代理已退出，连接已中断；请停止后重新启动'
       } else if(run.profile.connectionMode!=='native'&&!run.gateway?.current().running && run.status==='running') {
         run.status='error';run.error='实例本地连接已退出，请停止后重新启动'
       }
@@ -587,7 +604,7 @@ export class Instances {
         if(resolveAgentClientType(saved.clientType)!==resolveAgentClientType(profile.clientType))throw new Error('实例客户端与恢复记录不一致')
         const plan=this.plan(profile,saved.nonce)
         if((saved.connectionMode??'local_api')!==(profile.connectionMode??'local_api'))throw new Error('实例启动模式与恢复记录不一致')
-        const run:Running={profile,plan,status:'error',controller:new AbortController(),backup:saved.backup,nativeTier:saved.nativeTier,error:'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
+        const run:Running={profile,plan,status:'error',controller:new AbortController(),backup:saved.backup,nativeTier:saved.nativeTier,error:saved.nativeProxy?'上次运行的实例代理已结束，请停止并回收登录状态后重新启动':'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
         this.active.set(profile.id,run);run.child=await this.runtime.find(run.plan)
         if(!run.child){await this.cleanup(run);this.active.delete(profile.id)}
       } catch {this.recoveryErrors.set(profile.id,'上次实例记录无法安全恢复，已保留原目录；请检查应用路径与 launch.json 后重开管理器')}

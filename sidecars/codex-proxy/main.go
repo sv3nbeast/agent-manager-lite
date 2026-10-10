@@ -100,7 +100,17 @@ func main() {
 	catalogValidate := flag.Bool("validate-model-catalog", false, "Validate bounded stdin model catalog JSON (offline)")
 	egressHTTP := flag.Bool("egress-http", false, "Bounded account HTTP request over an explicit proxy, from stdin JSON")
 	proxyEngine := flag.Bool("proxy-engine", false, "Supervise the pinned account proxy engine using a stdin lifetime pipe")
+	nativeProxy := flag.Bool("native-proxy", false, "Forward native client traffic through an explicit proxy using a stdin lifetime pipe")
 	flag.Parse()
+	if *nativeProxy {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		monitorParentProcessPlatform(ctx, os.Getppid(), cancel, nil)
+		if runNativeProxy(ctx, os.Stdin, os.Stdout) != nil {
+			os.Exit(2)
+		}
+		return
+	}
 	if *proxyEngine {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()

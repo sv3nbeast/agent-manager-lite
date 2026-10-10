@@ -54,10 +54,10 @@ test('native recommendation reflects effective inherited proxies and explicit di
   const scenarios = [
     { state: {}, proxy: undefined, expected: 'native' },
     { state: { upstreamProxy: { mode: 'direct' as const, revision: 0 } }, proxy: undefined, expected: 'native' },
-    { state: { upstreamProxy: { mode: 'custom' as const, revision: 0, url: 'http://proxy.invalid:8888' } }, proxy: undefined, expected: 'local_api' },
+    { state: { upstreamProxy: { mode: 'custom' as const, revision: 0, url: 'http://proxy.invalid:8888' } }, proxy: undefined, expected: 'native' },
     { state: { upstreamProxy: { mode: 'custom' as const, revision: 0, url: 'http://proxy.invalid:8888' } }, proxy: { mode: 'direct' as const }, expected: 'native' },
-    { state: {}, proxy: { mode: 'custom' as const, url: 'socks5h://proxy.invalid:1080' }, expected: 'local_api' },
-    { state: {}, proxy: { mode: 'resource' as const, resourceId: 'missing' }, expected: 'local_api' }
+    { state: {}, proxy: { mode: 'custom' as const, url: 'socks5h://proxy.invalid:1080' }, expected: 'native' },
+    { state: {}, proxy: { mode: 'resource' as const, resourceId: 'missing' }, expected: 'native' }
   ]
   for (const scenario of scenarios) {
     const egressProxy = accountProxyView({ ...stored, proxy: scenario.proxy }, scenario.state)
@@ -65,7 +65,7 @@ test('native recommendation reflects effective inherited proxies and explicit di
   }
   const resourceId = randomUUID(), egressProxy = accountProxyView(stored, { unifiedProxy: { mode: 'all_accounts', resourceId }, proxyResources: [{ id: resourceId, revision: 0, name: 'Fixture', url: 'http://proxy.invalid:8888' }] })
   assert.equal(egressProxy?.source, 'unified')
-  assert.equal(clients.recommendedInstanceConnectionMode('codex', { kind: 'oauth', egressProxy }), 'local_api')
+  assert.equal(clients.recommendedInstanceConnectionMode('codex', { kind: 'oauth', egressProxy }), 'native')
   for (const kind of ['api_key', 'agent_identity'] as const) assert.equal(clients.recommendedInstanceConnectionMode('codex', { kind }), 'local_api')
   assert.equal(instances.instanceInputSchema.parse({ name: 'Legacy', applicationId: randomUUID(), accountId: randomUUID(), model: 'fixture' }).connectionMode, 'local_api', 'The persisted legacy default remains unchanged')
 })
@@ -120,7 +120,7 @@ test('legacy OAuth API cards expose identity state and offer an explicit native 
   assert.equal(ui.state.form.model, ui.source.model, 'Repair keeps the saved model')
 })
 
-test('native repair stays unavailable while an OAuth API instance is running or proxied', async t => {
+test('native repair waits for instance stop and supports a configured proxy', async t => {
   const ui = mount(); t.after(ui.unmount)
   ui.source.status = 'running'
   ui.state.repairNativeLogin(ui.source)
@@ -130,7 +130,9 @@ test('native repair stays unavailable while an OAuth API instance is running or 
   ui.manager.data.accounts[0].egressProxy = { mode: 'custom', protocol: 'HTTP', server: 'proxy.invalid', port: 8080 }
   ui.state.repairNativeLogin(ui.source)
   await settle()
-  assert.equal(ui.state.open, false, 'Native repair is blocked when the account has an upstream proxy')
+  assert.equal(ui.state.open, true, 'Stopped proxy accounts can repair their native identity')
+  assert.equal(ui.state.form.connectionMode, 'native')
+  assert.equal(await ui.state.ensureResource(), true)
 })
 
 test('new drafts select providers without a native-mode filtering dead end and preserve explicit native choices', async t => {
@@ -151,14 +153,17 @@ test('new drafts select providers without a native-mode filtering dead end and p
   assert.equal(await ui.state.ensureResource(), true)
 })
 
-test('proxy defaults fall back to local API and explicit native selection is explained before continuing', async t => {
+test('proxy accounts default to native and only invalid routes block continuing', async t => {
   const ui = mount([account('oauth', { egressProxy: { mode: 'inherit', source: 'global', protocol: 'HTTPS', server: 'proxy.invalid', port: 443 } })]); t.after(ui.unmount)
   ui.state.edit(); await settle()
-  assert.equal(ui.state.form.connectionMode, 'local_api')
+  assert.equal(ui.state.form.connectionMode, 'native')
   assert.equal(ui.state.usesUpstreamProxy, true)
   ui.state.useNativeLogin()
+  assert.equal(await ui.state.ensureResource(), true)
+  ui.manager.data.accounts[0].egressProxy!.invalid = true
+  await settle()
   assert.equal(await ui.state.ensureResource(), false)
-  assert.match(ui.state.error, /原生登录无法应用该代理/)
+  assert.match(ui.state.error, /代理配置无效/)
   assert.equal(ui.state.form.accountId, ui.manager.data.accounts[0].id)
   const direct = account(); ui.manager.data.accounts.push(direct)
   ui.state.form.accountId = direct.id; ui.state.selectAccount(); await settle()

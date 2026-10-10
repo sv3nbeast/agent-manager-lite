@@ -2,14 +2,14 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
 import type {CliPackage} from './cliResolver'
-import {desktopNetworkArgs,macSystemProxyEnabled} from './desktopNetwork'
+import {desktopNetworkArgs,macSystemProxyEnabled,type InstanceNetworkRoute} from './desktopNetwork'
 import type {CodexSpeedMenuHook} from './codexSpeedMenu'
 import {CodexSpeedMenuCdpSession,markCodexSpeedMenuCdpFailure} from './codexSpeedMenuCdp'
 import type {AgentClientType} from '../shared/agentClients'
 import {getInstanceClientAdapter,codexDesktopEnvironment,reserveCodexCdpPort} from './codexInstanceAdapter'
 
 const exec=promisify(execFile)
-export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';cliPackage?:CliPackage;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
+export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
 export interface DesktopProcess { pid:number; started:string }
 export interface DesktopRuntime {
   find(plan:DesktopPlan):Promise<DesktopProcess|undefined>
@@ -17,8 +17,8 @@ export interface DesktopRuntime {
   stop(plan:DesktopPlan):Promise<void>
   focus(plan:DesktopPlan):Promise<void>
 }
-export function desktopEnvironment(source:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
-  return codexDesktopEnvironment(source)
+export function desktopEnvironment(source:NodeJS.ProcessEnv,route?:InstanceNetworkRoute):NodeJS.ProcessEnv {
+  return codexDesktopEnvironment(source,route)
 }
 export function macLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.args):string[] {
   return getInstanceClientAdapter(plan.clientType).macLaunchArgs(plan,args)
@@ -49,8 +49,8 @@ export class MacDesktopRuntime implements DesktopRuntime {
   async launch(plan:DesktopPlan,signal:AbortSignal):Promise<DesktopProcess> {
     getInstanceClientAdapter(plan.clientType)
     this.supported();signal.throwIfAborted()
-    const env=desktopEnvironment(process.env)
-    const args=desktopNetworkArgs(plan.args,env,macSystemProxyEnabled())
+    const env=desktopEnvironment(process.env,plan.networkRoute)
+    const args=plan.networkRoute?plan.args:desktopNetworkArgs(plan.args,env,macSystemProxyEnabled())
     const hook=plan.speedMenuHook??plan.desktopLocaleHook
     let cdpSession:CodexSpeedMenuCdpSession|undefined
     let cdpStart:Promise<void>|undefined

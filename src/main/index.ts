@@ -1,3 +1,4 @@
+import {NativeProxy} from './nativeProxy'
 import {ProxyResources} from './proxyResources'
 import {ProxyCatalog} from './proxyCatalog'
 import {ProxySubscriptions} from './proxySubscriptions'
@@ -144,7 +145,7 @@ async function main(): Promise<void> {
   instances=new Instances(store,()=>{
     const instanceRunId=randomUUID()
     return new Gateway(binary,runtimeRoot,event=>history.record(instanceRunId,event),(id,identity,expected,generation)=>agents.adopt(id,identity,expected,generation),()=>store.proxyState(),proxyTunnels)
-  },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages())
+  },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages(),undefined,new NativeProxy(binary,proxyTunnels))
   const externalInstanceSources=new ExternalInstanceSources({managerRoot:realpathSync(store.directory),managedDirectories:()=>instances.views().map(instance=>instance.directory),...(isolatedTest?{home:join(realpathSync(store.directory),'external-source-home')}:{})})
   const localAccess=new LocalAccess(store,gateway,async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},ids=>effectiveKeyUsage(store.read(),history.keyTokenUsage(ids)))
   const sessions=new SessionCatalog(store,id=>instances.inUse(id))

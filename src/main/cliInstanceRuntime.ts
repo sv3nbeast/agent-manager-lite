@@ -8,6 +8,7 @@ import {setTimeout as delay} from 'node:timers/promises'
 import {atomic,readBounded} from './clientConfig'
 import {MacDesktopRuntime,type DesktopRuntime,type DesktopPlan,type DesktopProcess} from './instanceRuntime'
 import {getInstanceClientAdapter} from './codexInstanceAdapter'
+import {networkRouteEnvironment} from './desktopNetwork'
 export {validateCodexCliArgs as validateCliArgs} from './codexInstanceAdapter'
 
 const exec=promisify(execFile)
@@ -20,12 +21,14 @@ export function cliLaunchFiles(plan:DesktopPlan){
 export function cliLaunchScript(plan:DesktopPlan):string {
   getInstanceClientAdapter(plan.clientType).validateCliArgs(plan.args)
   const files=cliLaunchFiles(plan),q=shellQuote
+  const network=networkRouteEnvironment(plan.networkRoute)
   // Claim is atomic. Write the process identity before consuming the permit,
   // so cancellation can revoke a late Terminal launch without a hidden child.
   return ['#!/bin/bash','set -e',`/bin/mkdir ${q(files.claim)} || exit 1`,
     `printf '%s\\n%s\\n' "$$" "$(LC_ALL=C /bin/ps -p $$ -o lstart=)" > ${q(files.record+'.tmp')}`,
     `/bin/mv ${q(files.record+'.tmp')} ${q(files.record)}`,`/bin/rmdir ${q(files.permit)} || exit 1`,
     'for key in $(compgen -e); do case "$key" in CODEX_*|CML_TEST_*|ELECTRON_*|NODE_*|OPENAI_*|npm_config_*|__CFBundleIdentifier|XPC_SERVICE_NAME) unset "$key";; esac; done',
+    ...Object.entries(network).map(([key,value])=>`export ${key}=${q(value)}`),
     ...(plan.cliPackage?[`export CODEX_MANAGED_PACKAGE_ROOT=${q(plan.cliPackage.root)}`,`export CODEX_MANAGED_BY_${plan.cliPackage.manager.toUpperCase().replace('-','_')}=1`]:[]),
     `export CODEX_HOME=${q(plan.directory)}`,`cd -- ${q(plan.workingDirectory)}`,
     `exec -a ${q(marker(plan))} ${q(plan.executable)} ${plan.args.map(q).join(' ')}`,''].join('\n')
@@ -98,9 +101,9 @@ export class MacCliRuntime implements DesktopRuntime {
   async launch(plan:DesktopPlan,signal:AbortSignal):Promise<DesktopProcess>{
     getInstanceClientAdapter(plan.clientType).validateCliArgs(plan.args)
     this.supported();signal.throwIfAborted()
-    const files=cliLaunchFiles(plan)
+    const files=cliLaunchFiles(plan),script=cliLaunchScript(plan)
     mkdirSync(files.permit,{mode:0o700})
-    atomic(files.script,cliLaunchScript(plan));chmodSync(files.script,0o700)
+    atomic(files.script,script);chmodSync(files.script,0o700)
     try{await this.open(files.script)}catch{throw new Error('无法打开 CLI 终端，请检查所选程序和 Terminal 应用')}
     const end=Date.now()+10_000
     while(Date.now()<end){
