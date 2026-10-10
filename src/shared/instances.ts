@@ -25,6 +25,12 @@ export interface ExternalInstanceHome {directory:string;device:number;inode:numb
 export interface InstanceProfile extends Omit<InstanceInput,'clientType'> { clientType?:AgentClientType; id:string; revision:number; createdAt:number; externalHome?:ExternalInstanceHome }
 export interface InstanceApplication { clientType?:AgentClientType; id:string; name:string; path:string; kind?:'desktop'|'cli'; supportsTempLogin?:boolean }
 export interface InstanceWorkingDirectory {id:string;path:string;device:number;inode:number}
+export type InstanceIdentityStatus='native_verified'|'native_unverified'|'local_api'|'missing'|'unknown'
+export interface InstanceIdentityView {
+  status:InstanceIdentityStatus
+  email?:string
+  accountId?:string
+}
 export interface InstanceView extends Omit<InstanceProfile,'clientType'> {
   clientType?:unknown
   directory:string; desktopDirectory:string; applicationName?:string; accountName?:string
@@ -36,6 +42,9 @@ export interface InstanceView extends Omit<InstanceProfile,'clientType'> {
   desktopLocaleCompatibility?:'pending'|'active'|'fallback'|'unavailable'
   ultraCompatibility?:'pending'|'active'|'fallback'|'unavailable'
   clientVersion?:string
+  identityStatus?:InstanceIdentityStatus
+  identityEmail?:string
+  identityAccountId?:string
 }
 export interface InstanceLaunchPreview {
   clientType:AgentClientType
@@ -59,6 +68,9 @@ export interface InstanceLaunchPreview {
   ultraAvailable?:boolean
   ultraReason?:string
   clientVersion?:string
+  identityStatus:InstanceIdentityStatus
+  identityEmail?:string
+  identityAccountId?:string
   history?:InstanceHistorySummary
 }
 export interface InstanceHistorySummary {

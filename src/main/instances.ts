@@ -28,6 +28,7 @@ import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCo
 import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopServiceTier'
 import {readInstanceHistory} from './instanceHistory'
 import {repairSessionProjection} from './sessionProjectionRepair'
+import {readInstanceIdentityStatus} from './instanceIdentityStatus'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
 const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspectCodexDesktopUi,inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
@@ -122,11 +123,14 @@ export class Instances {
       const localeNotice=localeState==='fallback'?locale?.reason:run?.localeInspection&&!run.localeInspection.supported?run.localeInspection.reason:undefined
       const ultraState=ultra?.state??(run?.ultraInspection?'unavailable':undefined)
       const ultraNotice=ultraState==='fallback'?ultra?.reason:run?.ultraInspection&&!run.ultraInspection.supported?run.ultraInspection.reason:undefined
+      const account=state.accounts.find(value=>value.id===profile.accountId)
+      const identity=readInstanceIdentityStatus(instanceHomePath(this.root,profile),profile.connectionMode??'local_api',account)
       return {...profile,clientType,copying:this.copyingTarget(profile.id),connectionMode:profile.connectionMode??'local_api',directory:instanceHomePath(this.root,profile),desktopDirectory:join(this.root,'instances',profile.id,'desktop'),
         launchMode:applications.find(app=>app.id===profile.applicationId)?.kind??'desktop',workingDirectory:profile.workingDirectoryId?this.workingDirectories().find(value=>value.id===profile.workingDirectoryId)?.path:join(this.root,'instances',profile.id,'workspace'),
         accountName:state.accounts.find(account=>account.id===profile.accountId)?.name,applicationName:applications.find(app=>app.id===profile.applicationId)?.name,
         status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),menuNotice,localeNotice,ultraNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
-        speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState,ultraCompatibility:ultraState,clientVersion:run?.clientVersion}
+        speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState,ultraCompatibility:ultraState,clientVersion:run?.clientVersion,
+        identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId}
     })
   }
   private validateDetails(details:InstanceInput,id:string):void {
@@ -370,7 +374,7 @@ export class Instances {
   preview(raw:unknown):InstanceLaunchPreview {
     const {id,revision}=instanceRevisionSchema.parse(raw),profile=this.profile(id)
     if(profile.revision!==revision || this.inUse(id))throw new Error('实例已变化或正在运行，请刷新后重试')
-    const context=this.context(profile),preview:InstanceLaunchPreview={clientType:resolveAgentClientType(profile.clientType),ticket:randomUUID(),instanceId:id,name:profile.name,application:context.plan.application,
+    const context=this.context(profile),identity=readInstanceIdentityStatus(context.plan.directory,profile.connectionMode??'local_api',context.account),preview:InstanceLaunchPreview={clientType:resolveAgentClientType(profile.clientType),ticket:randomUUID(),instanceId:id,name:profile.name,application:context.plan.application,
       executable:context.plan.executable,directory:context.plan.directory,desktopDirectory:context.plan.desktopDirectory,workingDirectory:context.plan.workingDirectory,args:[...profile.extraArgs],
       accountName:context.account.name,providerName:context.providerName,desktopLocale:context.language?.locale,desktopEffectiveLocale:context.language?.effectiveLocale,desktopLocaleSource:context.language?.source,
       effectiveContextWindow:context.modelContext.window,effectiveAutoCompactTokenLimit:context.modelContext.compact,contextWindowSource:context.modelContext.origin,
@@ -378,6 +382,7 @@ export class Instances {
       speedMenuAvailable:context.speedMenu?.supported,speedMenuReason:context.speedMenu?.reason,speedPreferenceSource:context.speedPreference?.source,
       desktopLocaleCompatibilityAvailable:context.localeCompatibility?.supported,desktopLocaleCompatibilityReason:context.localeCompatibility?.reason,
       ultraAvailable:context.ultraCompatibility?.supported,ultraReason:context.ultraCompatibility?.reason,clientVersion:context.compatibility?.version,
+      identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId,
       history:context.history}
     this.previews.set(id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000})
     return structuredClone(preview)
