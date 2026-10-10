@@ -5,6 +5,7 @@ import {readBounded} from './clientConfig'
 import {TomlDocument} from './tomlPatch'
 import {nativeIdentity,sameNativeAccount} from './nativeAccountProjection'
 import {accountIdentity} from './accountIdentity'
+import {authRefreshTimestamp} from './authRefreshMetadata'
 
 const configLimit=1024*1024
 const authLimit=2*1024*1024
@@ -37,17 +38,25 @@ export function readInstanceIdentityStatus(directory:string,connectionMode:'loca
   } catch {
     return {status:'unknown'}
   }
-  if(config===null||auth===null)return {status:'missing'}
+  if(config===null)return {status:'missing'}
   try {
+    const doc=new TomlDocument(config)
+    // Managed native projections force file credentials. An external native
+    // directory may still use a keychain or ephemeral store, which cannot be
+    // verified from auth.json and must not be reported as missing credentials.
+    if(auth===null){
+      const store=doc.scalar(['cli_auth_credentials_store'])
+      return store&&store!=='file'?{status:'unknown'}:{status:'missing'}
+    }
     const parsed=JSON.parse(auth.replace(/^\uFEFF/,'')) as Record<string,unknown>
     const mode=typeof parsed.auth_mode==='string'?parsed.auth_mode.toLowerCase():''
     const tokens=parsed.tokens&&typeof parsed.tokens==='object'&&!Array.isArray(parsed.tokens)
     const oauth=mode==='chatgpt'||mode==='oauth'||(!['apikey','api_key','api','agentidentity','agent_identity','personalaccesstoken','personal_access_token'].includes(mode)&&tokens)
     if(oauth){
       const timestamp=parsed.last_refresh
-      if(typeof timestamp!=='string'||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.\d+)?Z$/.test(timestamp)||!Number.isFinite(Date.parse(timestamp))||Date.parse(timestamp)>Date.now())return {status:'native_unverified'}
+      if(!authRefreshTimestamp(timestamp))return {status:'native_unverified'}
     }
-    const observed=nativeIdentity(auth,new TomlDocument(config))
+    const observed=nativeIdentity(auth,doc)
     if(!observed)return {status:'native_unverified'}
     const identity=labels(observed)
     return {status:bound&&sameNativeAccount(bound,observed)?'native_verified':'native_unverified',...identity}

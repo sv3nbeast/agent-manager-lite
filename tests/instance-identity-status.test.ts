@@ -54,3 +54,10 @@ test('native OAuth identity requires the persisted last_refresh timestamp before
   writeFileSync(join(home,'auth.json'),JSON.stringify(auth))
   assert.deepEqual(readInstanceIdentityStatus(home,'native',account),{status:'native_unverified'})
 })
+
+test('native keychain or ephemeral stores remain unknown when no file credential is available',t=>{
+  const root=mkdtempSync(join(tmpdir(),'cml-instance-identity-'));t.after(()=>rmSync(root,{recursive:true,force:true}))
+  const account=oauth('workspace-a'),home=join(root,'home');mkdirSync(home)
+  writeFileSync(join(home,'config.toml'),'cli_auth_credentials_store = "auto"\n'+config)
+  assert.deepEqual(readInstanceIdentityStatus(home,'native',account),{status:'unknown'})
+})

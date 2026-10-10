@@ -77,6 +77,16 @@ function speedMenuFixture(includeLocale=false) {
   return {service,prepared,observedScopes,changeClient:()=>{fingerprint='fixture-speed-v2'}}
 }
 
+test('instance views and launch previews expose local API identity semantics',t=>{
+  const f=fixture(t),account=f.account(),instance=f.add(account.id)
+  const view=f.instances.views()[0]
+  assert.equal(view.identityStatus,'local_api')
+  assert.equal(view.identityEmail,undefined)
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.identityStatus,'local_api')
+  assert.equal(preview.identityEmail,undefined)
+})
+
 test('history previews are scoped to a stopped instance and included in launch review without changing files',async t=>{
   const f=fixture(t),instance=f.add(f.account().id)
   const statePath=join(instance.directory,'.codex-global-state.json')
