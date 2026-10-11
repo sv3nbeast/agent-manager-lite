@@ -111,6 +111,7 @@ test('OAuth local API cards explain the automatic identity projection', async t 
   ui.manager.data.accounts[0].email = email
   assert.equal(ui.state.instanceAccountLabel(ui.source), email, 'The account email is the primary card identity label')
   assert.equal(ui.state.identityStatusLabel(ui.source), '本地 API · 客户端无原生账号身份')
+  assert.equal(ui.state.identityStatusLabel({ ...ui.source, identityStatus: 'local_api' }), '本地 API · 启动时投影 ChatGPT 账号')
   ui.state.edit(ui.source)
   await settle()
   assert.equal(ui.state.form.connectionMode, 'local_api')
