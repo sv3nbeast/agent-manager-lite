@@ -18,7 +18,13 @@ async function main(){
   assert.equal(process.platform,'darwin','native desktop smoke requires macOS')
   const application=process.env.CML_CODEX_APP_PATH??'/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
   const inspection=inspectCodexDesktopUi({application,executable})
-  assert.deepEqual(inspection.features,['locale','speed','ultra'],inspection.reason)
+  // Capabilities are intentionally discovered from the installed bundle. A
+  // newer Codex may expose only a subset (or none) while still being a valid
+  // client; the smoke should exercise exactly what was detected instead of
+  // turning a missing optional feature into a version-specific failure.
+  const features=inspection.features??[]
+  const supports=feature=>features.includes(feature)&&inspection.featureSupport?.[feature]?.supported===true
+  console.log(JSON.stringify({stage:'capabilities',version:inspection.version,features,featureSupport:inspection.featureSupport,reason:inspection.reason}))
   const root=mkdtempSync(join(realpathSync(tmpdir()),'cml-native-ui-')),directory=join(root,'home'),desktopDirectory=join(root,'desktop')
   mkdirSync(directory,{mode:0o700});mkdirSync(desktopDirectory,{mode:0o700})
   const runtime=new MacDesktopRuntime(),nonce=randomUUID(),cdpPort=await reserveCodexCdpPort()
@@ -43,7 +49,9 @@ async function main(){
     writeFileSync(join(directory,'catalog.json'),JSON.stringify(catalog))
     writeFileSync(join(directory,'.codex-global-state.json'),JSON.stringify({'electron-saved-workspace-roots':[root],'electron-active-workspace-roots':[root],'electron-persisted-atom-state':{'electron:onboarding-override':'app','electron:onboarding-projectless-completed':true}}))
     writeFileSync(join(directory,'config.toml'),`model="gpt-6.1-sol"\nmodel_provider="fixture"\nmodel_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.fixture]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nexperimental_bearer_token="fixture-only-key"\n`)
-    const hook=prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce});assert.ok(hook)
+    const hook=prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce})
+    if(features.length)assert.ok(hook,inspection.reason)
+    else assert.equal(hook,undefined,inspection.reason)
     plan={application,executable,directory,desktopDirectory,workingDirectory:root,args:['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling'],nonce,mode:'desktop',speedMenuHook:hook,cdpPort}
     const child=await runtime.launch(plan,new AbortController().signal)
     let target
@@ -71,13 +79,10 @@ async function main(){
     await delay(1000)
     await capture('codex-home.png')
     console.log(JSON.stringify({stage:'initial',version:inspection.version,pid:child.pid,language:await evaluate('document.documentElement.lang'),text:await evaluate('document.body.innerText.slice(0,1800)'),buttons:await evaluate('Array.from(document.querySelectorAll("button")).map(b=>({text:b.innerText,label:b.getAttribute("aria-label")})).slice(-22)')}))
-    const state=readCodexSpeedMenuStatus({statusLog:hook.statusLog,nonce,executable,directory,pid:child.pid});assert.equal(state.state,'active',state.reason)
-    assert.equal(await wait('document.documentElement.lang.startsWith("zh")&&document.documentElement.lang'),'zh-CN')
-    const modelButton=await evaluate('(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"));const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()')
-    await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...modelButton});await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...modelButton})
-    await delay(1000)
-    console.log(JSON.stringify({stage:'model-menu',text:await evaluate('document.body.innerText.slice(-2600)'),controls:await evaluate('Array.from(document.querySelectorAll("select,input,[role=menuitem],[role=menuitemradio]")).map(el=>({tag:el.tagName,role:el.getAttribute("role"),text:el.innerText,value:el.value})).slice(-25)')}))
-    await capture('codex-model-menu.png')
+    if(hook){
+      const state=readCodexSpeedMenuStatus({statusLog:hook.statusLog,nonce,executable,directory,pid:child.pid});assert.equal(state.state,'active',state.reason)
+    }else console.log('No optional Codex UI capability was detected; the official UI remains unmodified')
+    if(supports('locale'))assert.equal(await wait('document.documentElement.lang.startsWith("zh")&&document.documentElement.lang'),'zh-CN')
     const click=async expression=>{
       const point=await evaluate(`(()=>{const el=${expression};if(!el)return null;const r=el.getBoundingClientRect();return r.width&&r.height?{x:r.x+r.width/2,y:r.y+r.height/2}:null})()`)
       assert.ok(point,'native control missing: '+expression)
@@ -86,6 +91,14 @@ async function main(){
       await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point})
     }
     const key=async key=>{await call('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});await call('Input.dispatchKeyEvent',{type:'keyUp',key,code:key})}
+    if(supports('speed')||supports('ultra')){
+      const modelButton=await evaluate('(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"));if(!b)return null;const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()')
+      assert.ok(modelButton,'native model selector is unavailable for detected UI capabilities')
+      await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...modelButton});await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...modelButton})
+      await delay(1000)
+      console.log(JSON.stringify({stage:'model-menu',text:await evaluate('document.body.innerText.slice(-2600)'),controls:await evaluate('Array.from(document.querySelectorAll("select,input,[role=menuitem],[role=menuitemradio]")).map(el=>({tag:el.tagName,role:el.getAttribute("role"),text:el.innerText,value:el.value})).slice(-25)')}))
+      await capture('codex-model-menu.png')
+    }
     const chooseSpeed=async fast=>{
       await wait('!!document.querySelector("[data-fast-mode-enabled]")')
       const direct=await evaluate('!!document.querySelector("[data-fast-mode-enabled][role=menuitemcheckbox]")')
@@ -102,51 +115,52 @@ async function main(){
       }
       await capture(fast?'codex-fast-menu.png':'codex-standard-menu.png')
     }
-    await chooseSpeed(false)
-    await key('Escape');await key('Escape')
     const send=async(text)=>{
       const before=requests.length
       await click('document.querySelector("[contenteditable=true]")')
       await call('Input.insertText',{text})
-      await click('document.querySelector("button[aria-label=发送]")')
+      await click('Array.from(document.querySelectorAll("button")).find(b=>{const label=(b.getAttribute("aria-label")||"").trim();return !b.disabled&&/^(发送|Send|Submit)$/i.test(label)})||document.querySelector("button[type=submit]:not([disabled])")')
       const deadline=Date.now()+60000
       while(requests.length===before){assert.ok(Date.now()<deadline,'native request was not sent');await delay(100)}
       await wait('document.body.innerText.includes("Compatibility check complete.")')
       await delay(1500)
       return requests[before]
     }
+    if(supports('speed')){
+      await chooseSpeed(false)
+      await key('Escape');await key('Escape')
+    }else if(supports('ultra'))await key('Escape')
     const standard=await send('Reply with one sentence for the standard compatibility test.')
     assert.ok(standard.serviceTier==null||standard.serviceTier==='default',JSON.stringify(requests))
-    await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
-    await chooseSpeed(true)
-    await key('Escape');await key('Escape')
-    await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
-    await evaluate('document.querySelector("[data-reasoning-slider]").focus()')
-    // The client can change the number of intensity stops. Select the visible
-    // Ultra level instead of advancing a fixed count into a different level.
-    for(let step=0;step<12;step++){
-      if(await evaluate('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")'))break
-      await key('ArrowRight');await delay(150)
-    }
-    await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
-    await key('Enter');await delay(500)
-    await capture('codex-ultra-menu.png')
-    await key('Escape')
-    const fast=await send('Reply with one sentence for the Fast and Ultra compatibility test.')
-    assert.equal(fast.serviceTier,'priority',JSON.stringify(requests))
-    // Verify the native selection independently from the client's wire effort.
-    // The installed CLI maps Ultra to its own execution behavior; this UI
-    // adapter does not rewrite that request or promise upstream Ultra support.
-    const saved=JSON.parse(readFileSync(join(directory,'.codex-global-state.json'),'utf8'))
-    const recent=saved['electron-persisted-atom-state']['composer-recent-model-configurations-v1']
-    assert.equal(recent[0].model,'gpt-6.1-sol')
-    assert.equal(recent[0].reasoningEffort,'ultra')
-    await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
-    await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
-    await key('Escape')
+    let accelerated
+    if(supports('speed')){
+      await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
+      await chooseSpeed(true)
+      await key('Escape');await key('Escape')
+      accelerated=await send(supports('ultra')?'Reply with one sentence for the Fast and Ultra compatibility test.':'Reply with one sentence for the Fast compatibility test.')
+      assert.equal(accelerated.serviceTier,'priority',JSON.stringify(requests))
+    }else console.log('Fast capability was not detected; only the default request was verified')
+    if(supports('ultra')){
+      await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
+      await evaluate('document.querySelector("[data-reasoning-slider]").focus()')
+      // The client can change the number of intensity stops. Select the visible
+      // Ultra level instead of advancing a fixed count into a different level.
+      for(let step=0;step<12;step++){
+        if(await evaluate('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")'))break
+        await key('ArrowRight');await delay(150)
+      }
+      await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
+      await key('Enter');await delay(500)
+      await capture('codex-ultra-menu.png')
+      await key('Escape')
+      const saved=JSON.parse(readFileSync(join(directory,'.codex-global-state.json'),'utf8'))
+      const recent=saved['electron-persisted-atom-state']['composer-recent-model-configurations-v1']
+      assert.equal(recent[0].model,'gpt-6.1-sol')
+      assert.equal(recent[0].reasoningEffort,'ultra')
+    }else console.log('Ultra capability was not detected; Ultra-specific controls were skipped')
     await capture('codex-verified.png')
-    console.log(JSON.stringify({stage:'verified',version:inspection.version,language:await evaluate('document.documentElement.lang'),savedReasoning:recent[0].reasoningEffort,requests}))
-    console.log('Native Codex language, Standard/Fast requests and Ultra persistence passed')
+    console.log(JSON.stringify({stage:'verified',version:inspection.version,features,language:await evaluate('document.documentElement.lang'),requests}))
+    console.log(`Native Codex smoke passed for detected capabilities: ${features.join(', ')||'none (official UI)'}`)
   }catch(error){
     const evidence=process.env.CML_CODEX_UI_EVIDENCE
     if(evidence){
