@@ -191,7 +191,12 @@ function patch(source:string,profile:CodexReleaseProfile,enhancements:CodexSpeed
   }
   return result
 }
-export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reader:CodexSpeedMenuReader=defaultReader):CodexSpeedMenuInspection {
+/**
+ * Historical hash-pinned inspection retained for old bundles. New versions
+ * enter through the semantic capability inspector below instead of being
+ * rejected merely because their package version is absent from the table.
+ */
+function inspectCodexSpeedMenuPinned(options:CodexSpeedMenuInspectOptions,reader:CodexSpeedMenuReader=defaultReader):CodexSpeedMenuInspection {
   if(options.features)return inspectCodexDesktopUi(options,reader)
   const enhancements=options.enhancements??'speed'
   const parts:unknown[]=[options.application,options.executable,options.platform??process.platform,enhancements],digest=reader.digest??hash
@@ -234,6 +239,26 @@ export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reade
     if(sourceDigest!==profile.source||digest(patch(source,profile,enhancements))!==patchedSha256)return finish(false,'Codex 界面资源已变化，使用原界面')
     return finish(true,enhancements==='locale'?'可按语言偏好显示 Codex 内置翻译':enhancements==='speed-locale'?'可显示内置翻译并选择普通或 Fast':'可在 Codex 对话中选择普通或 Fast')
   }catch{return finish(false,'无法读取 Codex 兼容信息，使用原界面')}
+}
+
+/**
+ * Compatibility entry point used by older callers. Translate the requested
+ * menu into independent semantic capabilities first. Exact release profiles
+ * remain a fallback for historical bundles whose renderer predates the
+ * capability detector; an unknown version therefore never becomes a manager
+ * release gate.
+ */
+export function inspectCodexSpeedMenu(options:CodexSpeedMenuInspectOptions,reader:CodexSpeedMenuReader=defaultReader):CodexSpeedMenuInspection {
+  if(options.features)return inspectCodexDesktopUi(options,reader)
+  const enhancements=options.enhancements??'speed'
+  if(!['speed','locale','speed-locale'].includes(enhancements))return inspectCodexSpeedMenuPinned(options,reader)
+  const features:readonly CodexUiFeature[]=enhancements==='speed'?['speed']:enhancements==='locale'?['locale']:['locale','speed']
+  const dynamic=inspectCodexDesktopUi({...options,features},reader)
+  if(dynamic.supported)return dynamic
+  // Unknown/future clients stay on the official page when detection is
+  // inconclusive. Only a known historical profile may use the pinned path.
+  if(!dynamic.version||!releaseByVersion.has(dynamic.version))return dynamic
+  return inspectCodexSpeedMenuPinned(options,reader)
 }
 
 const capabilityCache=new Map<string,ReturnType<typeof detectCodexUiCapabilities>>()
@@ -297,7 +322,7 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:'app://-/assets/'+asset.split('/').pop(),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements}
     const patchedDigest=digest(patch(source!,profile,'speed-locale'))
     profile.patched={speed:patchedDigest,locale:patchedDigest,'speed-locale':patchedDigest}
-    const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:'speed-locale',transport:profile.injection})
+    const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:options.enhancements??'speed-locale',transport:profile.injection})
     checked.set(result,{options:{...options,features:requested},reader,profile})
     if(cacheKey){if(inspectionCache.size>=16)inspectionCache.delete(inspectionCache.keys().next().value!);inspectionCache.set(cacheKey,result)}
     return result

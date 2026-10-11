@@ -1,13 +1,12 @@
-// Static adaptation of openai/codex rust-v0.153.2 codex-cli/bin/codex.js.
-// Only the audited launcher is accepted; no selected JavaScript is executed.
-import {createHash} from 'node:crypto'
+// Static adaptation of the official @openai/codex package launcher.
+// The selected JavaScript is never executed: it is only used to locate and
+// validate the package-owned native runtime.
 import {closeSync,constants,existsSync,fstatSync,openSync,readSync,realpathSync} from 'node:fs'
 import {createRequire} from 'node:module'
 import {basename,dirname,join,parse} from 'node:path'
 
 export interface CliPackage {root:string;manager:'npm'|'pnpm'|'bun'|'vite-plus'}
 export interface CliResolution {executable:string;cliPackage?:CliPackage}
-const auditedLauncher='61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70'
 const nativeHeaders=new Set(['cffaedfe','cefaedfe','feedfacf','feedface','cafebabe','bebafeca','cafebabf','bfbafeca','7f454c46'])
 
 function readProgram(path:string,limit:number):Buffer {
@@ -61,8 +60,12 @@ export function resolveCliRuntime(selected:string):CliResolution {
   const entry=realpathSync(selected)
   if(isNative(entry))return {executable:entry}
   if(basename(entry)!=='codex.js'||basename(dirname(entry))!=='bin')throw new Error('请选择原生 CLI 或标准 @openai/codex npm 入口')
-  const launcher=readProgram(entry,64*1024)
-  if(createHash('sha256').update(launcher).digest('hex')!==auditedLauncher)throw new Error('此 CLI 启动脚本尚未适配，请选择其原生 Codex 程序')
+  // Launcher contents change between official CLI releases. The resolver does
+  // not interpret or execute them, so an exact hash would turn every release
+  // into a manager update requirement without adding a security boundary.
+  // Reading the file still enforces the regular-file/size check before using
+  // its package location.
+  readProgram(entry,64*1024)
   const root=realpathSync(join(dirname(entry),'..')),pkg=manifest(join(root,'package.json'))
   if(pkg.name!=='@openai/codex'||pkg.bin?.codex!=='bin/codex.js')throw new Error('所选脚本不是标准 @openai/codex 安装入口')
   const cpu=process.arch==='arm64'?'aarch64':process.arch==='x64'?'x86_64':undefined

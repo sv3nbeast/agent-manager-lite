@@ -253,6 +253,93 @@ test('ChatGPT OAuth accounts keep the Normal / Fast selector for newly released 
   assert.equal(preview.speedMenuReason,'')
 })
 
+test('local API desktop instances always prefer the capability inspector for API and ChatGPT accounts',async t=>{
+  const menus=speedMenuFixture(),legacyCalls:string[]=[]
+  let featureCalls=0
+  menus.service.inspect=()=>{legacyCalls.push('speed');throw new Error('legacy speed inspector must not run')}
+  menus.service.inspectLocale=()=>{legacyCalls.push('locale');throw new Error('legacy locale inspector must not run')}
+  menus.service.inspectCombined=()=>{legacyCalls.push('combined');throw new Error('legacy combined inspector must not run')}
+  menus.service.inspectFeatures=()=>{
+    featureCalls++
+    return {supported:true,reason:'capability fixture',fingerprint:'capability-fixture-v1',version:'99.7.0',enhancements:'speed-locale',features:['locale','speed','ultra'] as const,featureSupport:{
+      locale:{supported:true,reason:'locale fixture'},speed:{supported:true,reason:'speed fixture'},ultra:{supported:true,reason:'ultra fixture'}
+    }}
+  }
+  const f=fixture(t,['zh-Hans-CN'],menus.service),api=f.account('http://127.0.0.1:9','fixture-api'),oauth=f.account('http://127.0.0.1:9','fixture-oauth')
+  f.store.transaction(state=>{
+    const account=state.accounts.find(value=>value.id===oauth.id)!
+    account.kind='oauth';account.credentials={accessToken:'fixture-chatgpt-token'}
+  })
+  for(const [account,name] of [[api,'API local'],[oauth,'ChatGPT local']] as const){
+    const instance=f.add(account.id,name)
+    const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+    assert.equal(preview.speedMenuAvailable,true)
+    assert.equal(preview.clientVersion,'99.7.0')
+    f.instances.start(preview.ticket);await f.instances.settled(instance.id)
+    assert.equal(f.instances.views().find(value=>value.id===instance.id)?.status,'running')
+    await f.instances.stop(instance.id)
+  }
+  assert.ok(featureCalls>0)
+  assert.deepEqual(legacyCalls,[])
+})
+
+test('all unsupported desktop features preserve the original launch and expose the detected reason and version',async t=>{
+  const menus=speedMenuFixture(),reason='future renderer has no audited feature structure'
+  menus.service.inspect=()=>{throw new Error('legacy inspector must not run')}
+  menus.service.inspectLocale=()=>{throw new Error('legacy locale inspector must not run')}
+  menus.service.inspectCombined=()=>{throw new Error('legacy combined inspector must not run')}
+  menus.service.inspectFeatures=()=>({supported:false,reason,fingerprint:'all-unsupported-v1',version:'99.9.9',enhancements:'speed-locale',features:[],featureSupport:{
+    locale:{supported:false,reason},speed:{supported:false,reason},ultra:{supported:false,reason}
+  }})
+  const f=fixture(t,['zh-Hans-CN'],menus.service),instance=f.add(f.account().id),preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.clientVersion,'99.9.9')
+  assert.equal(preview.speedMenuAvailable,false);assert.equal(preview.speedMenuReason,reason)
+  assert.equal(preview.desktopLocaleCompatibilityAvailable,false);assert.equal(preview.desktopLocaleCompatibilityReason,reason)
+  assert.equal(preview.ultraAvailable,false);assert.equal(preview.ultraReason,reason)
+  f.instances.start(preview.ticket);await f.instances.settled(instance.id)
+  const view=f.instances.views()[0]
+  assert.equal(view.status,'running',view.error)
+  assert.equal(view.clientVersion,'99.9.9')
+  assert.equal(view.speedMenu,'unavailable');assert.equal(view.desktopLocaleCompatibility,'unavailable');assert.equal(view.ultraCompatibility,'unavailable')
+  assert.match(view.notice??'',new RegExp(reason))
+  assert.equal(f.runtime.plans[0].speedMenuHook,undefined);assert.equal(f.runtime.plans[0].desktopLocaleHook,undefined)
+  await f.instances.stop(instance.id)
+})
+
+test('replacing an app executable invalidates stale previews without writes, keeps a running instance alive, and re-probes after stop',async t=>{
+  const menus=speedMenuFixture(),probed:string[]=[]
+  menus.service.inspectFeatures=options=>{
+    const marker=readFileSync(options.executable,'utf8').trim();probed.push(marker)
+    return {supported:true,reason:'fixture '+marker,fingerprint:'executable-'+marker,version:marker,enhancements:'speed-locale',features:['locale','speed','ultra'] as const,featureSupport:{
+      locale:{supported:true,reason:'locale fixture'},speed:{supported:true,reason:'speed fixture'},ultra:{supported:true,reason:'ultra fixture'}
+    }}
+  }
+  const f=fixture(t,['en-US'],menus.service),account=f.account(),instance=f.add(account.id),executable=join(f.app.path,'Contents','MacOS','Codex'),vault=readFileSync(join(f.store.directory,'state.vault'))
+  const replace=(marker:string)=>{renameSync(executable,executable+'.old-'+marker);writeFileSync(executable,marker,{mode:0o700})}
+  const first=f.instances.preview({id:instance.id,revision:instance.revision})
+  replace('codex-v2')
+  assert.throws(()=>f.instances.start(first.ticket),/已变化/)
+  assert.deepEqual(readFileSync(join(f.store.directory,'state.vault')),vault)
+  assert.equal(f.runtime.plans.length,0)
+  assert.equal(existsSync(join(instance.directory,'config.toml')),false)
+
+  const second=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(second.clientVersion,'codex-v2')
+  f.instances.start(second.ticket);await f.instances.settled(instance.id)
+  const running=f.instances.views()[0],runningPid=running.pid
+  assert.equal(running.status,'running',running.error);assert.ok(runningPid)
+  const probesBeforeReplacement=probed.length
+  replace('codex-v3')
+  assert.equal(f.instances.views()[0].status,'running')
+  assert.equal(f.instances.views()[0].pid,runningPid)
+  assert.equal(probed.length,probesBeforeReplacement)
+  await f.instances.stop(instance.id)
+  assert.equal(f.instances.views()[0].status,'stopped')
+  const third=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(third.clientVersion,'codex-v3')
+  assert.ok(probed.length>probesBeforeReplacement)
+})
+
 test('speed menu launch environment is instance scoped and composes with temporary login without inheriting flags',()=>{
   const base:DesktopPlan={application:'/fixture/app.app',executable:'/fixture/app.app/Contents/MacOS/Codex',directory:'/fixture/home',desktopDirectory:'/fixture/desktop',workingDirectory:'/fixture/workspace',args:[],nonce:randomUUID()}
   const hook={script:'/fixture/desktop/speed hook.cjs',manifest:'/fixture/desktop/manifest.json',statusLog:'/fixture/desktop/status.jsonl',env:{CML_CODEX_SPEED_MENU_MANIFEST:'/fixture/desktop/manifest.json',CML_CODEX_SPEED_MENU_LOG:'/fixture/desktop/status.jsonl'}}

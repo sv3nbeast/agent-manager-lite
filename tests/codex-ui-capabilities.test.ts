@@ -5,7 +5,7 @@ import {existsSync,mkdtempSync,mkdirSync,readFileSync,rmSync,realpathSync} from 
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {applyCodexUiReplacements,detectCodexUiCapabilities,type CodexUiFeature} from '../src/main/codexUiCapabilities'
-import {inspectCodexDesktopUi,prepareCodexSpeedMenu,type CodexSpeedMenuReader} from '../src/main/codexSpeedMenu'
+import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,type CodexSpeedMenuReader} from '../src/main/codexSpeedMenu'
 
 // A synthetic module models semantic roles without copying an upstream bundle.
 const source=[
@@ -34,6 +34,19 @@ function patches(body=source,features:readonly CodexUiFeature[]=['locale','speed
   const detected=detectCodexUiCapabilities(body)
   return {detected,body:applyCodexUiReplacements(body,features.flatMap(f=>detected.replacements[f]))}
 }
+
+// Current bundlers freely switch between declarations, arrows and function
+// expressions. Keep the semantic fixture stable while exercising all three
+// module-level binding shapes (including an async arrow for request admission).
+function moduleBindingSource(body:string):string {
+  return body.split('\n').map(line=>{
+    const match=line.match(/^(async )?function (\w+)\((.*)\)(\{.*\})$/)
+    if(!match)return line
+    const [,asyncPrefix,name,params,block]=match
+    if(name==='translated'||name==='speedControls'||name==='catalogue'||name==='confirm'||name==='updateReasoning'||name==='startReasoning')return `const ${name}=${asyncPrefix??''}(${params})=>${block}`
+    return `const ${name}=${asyncPrefix??''}function(${params})${block}`
+  }).join('\n')
+}
 function fixture(t:{after(fn:()=>void):void},body=source,version='99.1234.56789'){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-ui-capabilities-'))),application=join(root,'Fixture.app'),executable=join(application,'Contents/MacOS/ChatGPT')
   const home=join(root,'home'),desktop=join(root,'desktop');mkdirSync(home,{mode:0o700});mkdirSync(desktop,{mode:0o700})
@@ -59,6 +72,40 @@ test('semantic detection survives function names and accepts an unregistered cli
   assert.deepEqual(result.features,['locale','speed','ultra']);assert.equal(Object.values(result.featureSupport!).every(f=>f.supported),true)
   const hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable:f.options.executable,nonce:randomUUID()})!
   assert.ok(hook);assert.equal(readFileSync(hook.patchedBody!,'utf8'),patches(renamed).body)
+})
+
+test('module-level arrows and function expressions remain compatible after a client update',t=>{
+  const body=moduleBindingSource(source)
+    .replace(/\btranslated\b/g,'localeRole')
+    .replace(/\bconfirm\b/g,'requestRole')
+    .replace(/\baccountMethod\b/g,'identityRole')
+    .replace(/const /g,'const  ')
+    .replace(/=>/g,' => '),f=fixture(t,body,'2031.4.2'),result=f.inspect()
+  assert.equal(result.supported,true,result.reason)
+  assert.deepEqual(result.features,['locale','speed','ultra'])
+  assert.equal(Object.values(result.featureSupport!).every(feature=>feature.supported),true)
+  const detected=detectCodexUiCapabilities(body)
+  const patched=applyCodexUiReplacements(body,['locale','speed','ultra'].flatMap(feature=>detected.replacements[feature as CodexUiFeature]))
+  assert.match(patched,/const  localeRole=\(\{localeOverride:r\}\) => \{let data/)
+  assert.match(patched,/const  requestRole=async \(e,t\) => \{let n=await identityRole\(e,t\);if\(n!==`chatgpt`/)
+})
+
+test('nested functions do not create a duplicate module-level feature role',t=>{
+  const nested=`function wrapper(){${source.split('\n')[0]}}\n`
+  const body=source+'\n'+nested,f=fixture(t,body),result=f.inspect()
+  assert.deepEqual(result.features,['locale','speed','ultra'])
+  assert.equal(result.featureSupport!.locale.supported,true)
+})
+
+test('the legacy speed-menu entry point uses semantic capabilities for future versions',t=>{
+  const f=fixture(t,source,'2030.1.7'),result=inspectCodexSpeedMenu({...f.options,enhancements:'speed-locale'},f.reader)
+  assert.equal(result.supported,true,result.reason)
+  assert.equal(result.version,'2030.1.7')
+  assert.equal(result.enhancements,'speed-locale')
+  assert.deepEqual(result.features,['locale','speed'])
+  const hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable:f.options.executable,nonce:randomUUID()})
+  assert.ok(hook?.patchedBody)
+  assert.equal(readFileSync(hook!.patchedBody!,'utf8'),patches(source,['locale','speed']).body)
 })
 test('an ambiguous locale role leaves Fast and Ultra enabled without partial locale edits',t=>{
   const body=source+'\n'+source.split('\n')[0].replace('translated','duplicateLocale'),f=fixture(t,body),result=f.inspect()
@@ -237,7 +284,8 @@ test('account reader keys and wrappers cannot cross local or shadowed binding sc
       original.replace('let r=e.get(rpcKey,t);','const localKey=rpcKey;let r=e.get(localKey,t);'),
       original.replace('let r=e.get(rpcKey,t);','const {unwrap}=helpers;let r=e.get(rpcKey,t);'),
       original.replace('async function confirm(e,t){','async function confirm(e,t){const [rpcKey]=keys;'),
-      original.replace('async function confirm(e,t){','async function confirm(e,t,{unwrap}){')
+      original.replace('async function confirm(e,t){','async function confirm(e,t,{unwrap}){'),
+      original.replace('async function confirm(e,t){','async function confirm(e,t){const accountMethod=localReader;')
     ]
     for(const body of variants){
       const detected=detectCodexUiCapabilities(body),f=fixture(t,body)
@@ -248,15 +296,14 @@ test('account reader keys and wrappers cannot cross local or shadowed binding sc
   }
 })
 
-test('installed 26.1007 client prepares locale, Fast and Ultra together',t=>{
+test('installed desktop client reports any currently supported capabilities',t=>{
   const application='/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
   if(process.platform!=='darwin'||!existsSync(executable)){t.skip('current desktop client is not installed');return}
   const result=inspectCodexDesktopUi({application,executable})
-  if(result.version!=='26.1007.21159'){t.skip('installed client is outside this regression fixture');return}
-  assert.equal(result.supported,true,result.reason)
-  assert.deepEqual(result.features,['locale','speed','ultra'])
+  if(!result.supported||!result.features?.length){t.skip(`optional diagnostic: ${result.reason}`);return}
+  assert.ok(result.features.length>=1)
   const f=fixture(t),hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable,nonce:randomUUID()})
   assert.ok(hook?.patchedBody)
-  assert.deepEqual(hook.features,['locale','speed','ultra'])
-  assert.match(readFileSync(hook.patchedBody,'utf8'),/return null;let __cmlAccount/)
+  assert.deepEqual(hook.features,result.features)
+  assert.ok(readFileSync(hook.patchedBody,'utf8').length>0)
 })

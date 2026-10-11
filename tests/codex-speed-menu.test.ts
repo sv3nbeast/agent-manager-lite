@@ -145,11 +145,11 @@ test('hook validates its pinned mode, count and exact replacement set independen
     assert.match(readCodexSpeedMenuStatus(runtime.scope).reason!,/适配文件/)
   }
 })
-test('unsupported platforms, wrong package versions and drifted JS use the original client',t=>{
+test('unsupported platforms, unknown structures and drifted JS keep the original client',t=>{
   const f=fixture(t)
   assert.equal(inspectCodexSpeedMenu({...f.options,platform:'linux'},f.reader).supported,false)
   f.entries.set('package.json',Buffer.from('{"name":"openai-codex-electron","version":"26.999.1","main":".vite/build/early-bootstrap.js"}'))
-  assert.match(f.inspect().reason,/版本/)
+  const unknown=f.inspect();assert.equal(unknown.supported,false);assert.doesNotMatch(unknown.reason,/版本尚未适配/)
   f.entries.set('package.json',Buffer.from('{"name":"openai-codex-electron","version":"26.915.31945","main":".vite/build/early-bootstrap.js"}'))
   f.entries.set('webview/assets/app-initial-a498f911edeb.js',Buffer.from(source+'\n// updated'))
   assert.match(f.inspect().reason,/资源已变化/)

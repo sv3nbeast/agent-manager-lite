@@ -166,12 +166,12 @@ test('npm entry launches the resolved native process with package ownership, the
   await recovered.stop(instance.id);assert.throws(()=>process.kill(evidence.pid,0));assert.equal(existsSync(join(instance.directory,'auth.json')),false)
 })
 
-test('npm runtime resolves bundled vendor and rejects modified launchers, incomplete installs and script payloads',{skip:!supported},t=>{
+test('npm runtime resolves bundled vendor across launcher upgrades and rejects incomplete installs and script payloads',{skip:!supported},t=>{
   const f=fixture(t),npm=npmCliPackage(join(f.root,'legacy'),binary,'bundled')
   assert.equal(resolveCliRuntime(npm.entry).executable,npm.executable)
   const source=readFileSync(npm.entry)
   writeFileSync(npm.entry,Buffer.concat([source,Buffer.from('\nconsole.log("modified");')]))
-  assert.throws(()=>resolveCliRuntime(npm.entry),/尚未适配/);writeFileSync(npm.entry,source)
+  assert.equal(resolveCliRuntime(npm.entry).executable,npm.executable);writeFileSync(npm.entry,source)
   rmSync(npm.executable);assert.throws(()=>resolveCliRuntime(npm.entry),/安装不完整/)
   writeFileSync(npm.executable,'#!/bin/bash\nexit 0\n',{mode:0o700});assert.throws(()=>resolveCliRuntime(npm.entry),/不是原生/)
   writeFileSync(join(npm.root,'package.json'),JSON.stringify({name:'different',bin:{codex:'bin/codex.js'}}));assert.throws(()=>resolveCliRuntime(npm.entry),/不是标准/)

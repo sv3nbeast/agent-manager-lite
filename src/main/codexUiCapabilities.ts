@@ -10,6 +10,41 @@ const label:Record<CodexUiFeature,string>={locale:'页面语言',speed:'普通 /
 const literal=(node:Node|undefined):unknown=>node?.type==='Literal'?node.value:node?.type==='TemplateLiteral'&&node.expressions.length===0?node.quasis[0].value.cooked:undefined
 const property=(node:Node|undefined):string|undefined=>node?.type==='MemberExpression'&&!node.computed?node.property.name:undefined
 const unwrap=(node:Node):Node=>node.type==='ChainExpression'?node.expression:node
+const isFunction=(node:Node|undefined):boolean=>Boolean(node&&['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression'].includes(node.type))
+
+/**
+ * Return only functions which are bound in the module scope.  Walking every
+ * FunctionDeclaration below Program used to make a nested helper look like a
+ * second feature role (or make a nested function satisfy a role by itself).
+ * Function expressions and arrows are common output from newer bundlers, so
+ * their VariableDeclarator binding is part of the same contract.
+ */
+function moduleFunctions(program:Node):Node[] {
+  const functions:Node[]=[]
+  const add=(fn:Node,name:string|undefined)=>{
+    if(name)fn.__cmlBindingName=name
+    functions.push(fn)
+  }
+  const statement=(node:Node|undefined)=>{
+    if(!node)return
+    if(node.type==='FunctionDeclaration'){
+      if(node.id?.type==='Identifier')add(node,node.id.name)
+      return
+    }
+    if(node.type==='VariableDeclaration'){
+      for(const declaration of node.declarations??[]){
+        if(declaration.id?.type==='Identifier'&&isFunction(declaration.init))add(declaration.init,declaration.id.name)
+      }
+      return
+    }
+    // A module export still binds its declaration at Program scope.
+    if(['ExportNamedDeclaration','ExportDefaultDeclaration'].includes(node.type))statement(node.declaration)
+  }
+  for(const node of program.body??[])statement(node)
+  return functions
+}
+
+const functionName=(fn:Node):string|undefined=>fn.__cmlBindingName??fn.id?.name
 function visit(root:Node,fn:(node:Node)=>void):void {
   const stack=[root]
   while(stack.length){
@@ -42,13 +77,20 @@ function localBindings(fn:Node):Set<string> {
 export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatureSupports;replacements:Record<CodexUiFeature,CodexUiReplacement[]>} {
   const features={} as CodexUiFeatureSupports,replacements:Record<CodexUiFeature,CodexUiReplacement[]>={locale:[],speed:[],ultra:[]}
   let functions:Node[]
-  try{functions=nodes(parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node,n=>n.type==='FunctionDeclaration')}
+  try{functions=moduleFunctions(parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node)}
   catch{
     for(const feature of codexUiFeatures)features[feature]={supported:false,reason:`${label[feature]}：无法确认客户端页面结构`}
     return {features,replacements}
   }
   const text=(node:Node)=>source.slice(node.start,node.end)
-  const functionsWith=(...terms:string[])=>functions.filter(fn=>{const body=text(fn);return terms.every(term=>body.includes(term))})
+  const functionsWith=(...terms:string[])=>functions.filter(fn=>{
+    const body=text(fn)
+    if(!terms.every(term=>body.includes(term)))return false
+    // A module-level wrapper may contain a nested function which has the
+    // complete semantic signature.  Treat the nested function as the role's
+    // owner; otherwise the wrapper would create a false ambiguity.
+    return !nodes(fn,n=>n!==fn&&isFunction(n)&&terms.every(term=>text(n).includes(term))).length
+  })
   const edit=(node:Node,after:string):CodexUiReplacement=>({begin:'',end:'',offset:node.start,before:text(node),after})
   const transaction=(feature:CodexUiFeature,detect:()=>CodexUiReplacement[])=>{
     try{
@@ -100,7 +142,7 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     if(guard.alternate||guard.test.type!=='LogicalExpression'||guard.test.operator!=='&&'||guardTerms.some(term=>term.type!=='BinaryExpression'||term.operator!=='!=='||term.left.type!=='Identifier'||term.left.name!==method)||new Set(guardTerms.map(term=>literal(term.right))).size!==2||guardTerms.some(term=>!['chatgpt','personalAccessToken'].includes(literal(term.right) as string)))throw new Error('auth guard contract')
     const methodRead=one(nodes(confirm,n=>n.type==='VariableDeclarator'&&n.id.name===method&&n.init?.type==='AwaitExpression')).init.argument
     if(methodRead.type!=='CallExpression'||methodRead.callee.type!=='Identifier'||methodRead.arguments.length!==2||methodRead.arguments.some((a:Node)=>a.type!=='Identifier'))throw new Error('auth reader')
-    const helper=one(functions.filter(fn=>fn.id?.name===methodRead.callee.name))
+    const helper=one(functions.filter(fn=>functionName(fn)===methodRead.callee.name))
     const rpc=one(nodes(helper,n=>n.type==='CallExpression'&&property(unwrap(n.callee))==='getAccount'))
     const receiver=unwrap(rpc.callee).object
     if(property(receiver)!=='rpc'||receiver.object.type!=='Identifier')throw new Error('account RPC')
@@ -111,8 +153,8 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     if(property(accessor.callee)!=='get'||accessor.callee.object?.name!==helper.params[0]?.name||accessor.arguments[0].type!=='Identifier'||accessor.arguments[1].name!==helper.params[1]?.name)throw new Error('account scope')
     // These module bindings are copied into a different function. Refuse local
     // aliases or shadowing rather than emitting a reference outside its scope.
-    const bindings=[...localBindings(helper),...localBindings(confirm)]
-    if([accessor.arguments[0].name,wrapper.callee.name].some(name=>bindings.includes(name)))throw new Error('account reader binding scope')
+    const helperBindings=localBindings(helper),confirmBindings=localBindings(confirm),bindings=[...helperBindings,...confirmBindings]
+    if([accessor.arguments[0].name,wrapper.callee.name].some(name=>bindings.includes(name))||confirmBindings.has(methodRead.callee.name))throw new Error('account reader binding scope')
     const call=`${text(wrapper.callee)}(${scopeId}.get(${text(accessor.arguments[0])},${hostId})?.rpc.getAccount({priority:\`critical\`}))`
     const fallback=`if(${method}!==\`chatgpt\`&&${method}!==\`personalAccessToken\`&&${method}!==\`apikey\`){if(${method}!==null||${hostId}!==\`local\`)return ${denied};let __cmlAccount;try{__cmlAccount=await ${call}}catch{return ${denied}}if(__cmlAccount?.account!==null||__cmlAccount?.requiresOpenaiAuth!==!1)return ${denied};}`
     const requirements=one(nodes(confirm,n=>n.type==='AwaitExpression'&&n.argument.type==='CallExpression'&&n.argument!==methodRead))
