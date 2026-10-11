@@ -8,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {createCipheriv,createDecipheriv,randomBytes} from 'node:crypto'
 import {spawnSync} from 'node:child_process'
 import {Store,type VaultCodec,type StoredAccount} from '../src/main/store'
+import type {Gateway} from '../src/main/gateway'
 import {Instances,type InstanceSpeedMenuServices} from '../src/main/instances'
 import {NativeInstanceAccounts} from '../src/main/nativeInstanceAccounts'
 import {ClientConfigs} from '../src/main/clientConfig'
@@ -19,6 +20,7 @@ import {parseAccountImport,importParsedAccounts,createAPIAccount} from '../src/m
 import {TomlDocument,patchToml} from '../src/main/tomlPatch'
 import {mutateProvider} from '../src/main/providerLibrary'
 import type {DesktopRuntime,DesktopPlan,DesktopProcess} from '../src/main/instanceRuntime'
+import type {InstanceProfile} from '../src/shared/instances'
 
 function auth(workspace:string,generation='initial',lifetime=3600){
   const jwt='fixture.'+Buffer.from(JSON.stringify({generation,exp:Math.floor(Date.now()/1000)+lifetime,email:workspace+'@example.invalid','https://api.openai.com/auth':{chatgpt_account_id:workspace,chatgpt_user_id:workspace}})).toString('base64url')+'.signature'
@@ -98,7 +100,7 @@ test('native proxy cancellation releases the acquired helper without launching a
   assert.equal(releases,1);assert.equal(f.plans.length,0);assert.equal(f.instances.views()[0].status,'stopped')
   assert.equal(existsSync(join(profile.directory,'auth.json')),false)
 })
-function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:readonly string[]=['en-US'],compatibility?:InstanceSpeedMenuServices,proxyService?:NativeProxyService){
+function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:readonly string[]=['en-US'],compatibility?:InstanceSpeedMenuServices,proxyService?:NativeProxyService,gatewayFactory?:(profile:InstanceProfile)=>Gateway){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-native-instance-'))),application=join(root,'Fixture.app')
   mkdirSync(join(application,'Contents','MacOS'),{recursive:true});writeFileSync(join(application,'Contents','MacOS','Codex'),'never execute',{mode:0o700})
   const key=randomBytes(32)
@@ -114,7 +116,7 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:reado
   let instances:Instances
   const create=()=>{
     const native=new NativeInstanceAccounts(store,tokens,(id,target)=>sharedUse||instances?.usesNativeAccountOutside(id,target)||authority.busy(id),account=>project(account))
-    return new Instances(store,()=>assert.fail('Native mode must not start a gateway'),async id=>{await preparing;return tokens.ensure(id)},runtime,native,undefined,undefined,systemLanguages,compatibility,proxyService)
+    return new Instances(store,gatewayFactory??(()=>assert.fail('Native mode must not start a gateway')),async id=>{await preparing;return tokens.ensure(id)},runtime,native,undefined,undefined,systemLanguages,compatibility,proxyService)
   }
   instances=create();const app=instances.registerApplication(application)
   importParsedAccounts(store,parseAccountImport('['+auth('alpha')+','+auth('beta')+']').accounts)
@@ -124,6 +126,44 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},systemLanguages:reado
   t.after(async()=>{children.clear();await instances.closeAll().catch(()=>{});await tokens.stop();await authority.stop();rmSync(root,{recursive:true,force:true})})
   return {root,key,codec,store,tokens,configs,authority,alpha,beta,app,instances,create,add,start,runtime,children,plans,requests:()=>requests,setShared:(value:boolean)=>{sharedUse=value},setPreparing:(value:Promise<void>)=>{preparing=value},setProject:(value:typeof project)=>{project=value}}
 }
+
+function fixtureGateway(profile:InstanceProfile):Gateway {
+  let status={running:false,port:39123,defaultTier:'standard',profileId:profile.id}
+  return {
+    current:()=>({...status}),runtimeDirectory:()=>undefined,
+    usesAccount:()=>status.running,accountIds:()=>status.running?[profile.accountId]:[],
+    start:async(_profile:unknown,_settings:unknown,signal?:AbortSignal)=>{signal?.throwIfAborted();status={...status,running:true};return {...status}},
+    stop:async()=>{status={...status,running:false}},
+    updateRoutingAccount:()=>{},updateCredentials:async()=>{},syncCredentials:()=>undefined
+  } as unknown as Gateway
+}
+
+test('local API OAuth projection keeps the gateway and exposes the official account identity',async t=>{
+  const f=fixture(t,undefined,undefined,undefined,fixtureGateway)
+  const instanceName='Local API OAuth',account=f.alpha
+  f.instances.save({details:{name:instanceName,accountId:account.id,applicationId:f.app.id,connectionMode:'local_api',model:'native-model',defaultTier:'standard',extraArgs:[]}})
+  const instance=f.instances.views()[0],configFile=join(instance.directory,'config.toml'),authFile=join(instance.directory,'auth.json')
+  const beforeConfig='model="before-local-api"\nservice_tier="default"\n',beforeAuth=auth('alpha','before-local-api',7200)
+  writeFileSync(configFile,beforeConfig);writeFileSync(authFile,beforeAuth)
+  await f.start(instance.id)
+  let view=f.instances.views()[0]
+  assert.equal(view.status,'running',JSON.stringify(view))
+  assert.equal(view.identityStatus,'native_verified')
+  assert.equal(view.identityEmail,'alpha@example.invalid')
+  const projected=new TomlDocument(readFileSync(configFile,'utf8'))
+  assert.equal(projected.scalar(['model_provider']),'cml_instance')
+  assert.equal(projected.scalar(['forced_login_method']),'chatgpt')
+  assert.equal(projected.scalar(['model_providers','cml_instance','requires_openai_auth']),true)
+  assert.equal(JSON.parse(readFileSync(authFile,'utf8')).tokens.account_id,'alpha')
+  assert.equal(f.store.read().clientSwitches?.length,1)
+  assert.deepEqual(f.store.read().clientAuthorities?.map(binding=>binding.accountId),[account.id])
+  await f.instances.stop(instance.id)
+  assert.equal(readFileSync(configFile,'utf8'),beforeConfig)
+  assert.equal(readFileSync(authFile,'utf8'),beforeAuth)
+  assert.equal(f.store.read().clientSwitches?.length??0,0)
+  assert.equal(f.store.read().clientAuthorities?.length??0,0)
+  view=f.instances.views()[0];assert.equal(view.status,'stopped');assert.equal(view.identityStatus,'local_api')
+})
 
 test('external native instance recovers rotated credentials and detaches without losing the original login or its refresh authority',async t=>{
   const f=fixture(t),home=join(f.root,'existing-home'),config='# preserved\nmodel="original"\nservice_tier="default"\ncustom=true\n[desktop]\nlocaleOverride="en-US"\n'

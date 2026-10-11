@@ -105,32 +105,26 @@ test('editing and duplicating existing OAuth instances preserves explicit and le
   }
 })
 
-test('legacy OAuth API cards expose identity state and offer an explicit native repair', async t => {
+test('OAuth local API cards explain the automatic identity projection', async t => {
   const ui = mount(); t.after(ui.unmount)
   const email = 'account@example.com'
   ui.manager.data.accounts[0].email = email
   assert.equal(ui.state.instanceAccountLabel(ui.source), email, 'The account email is the primary card identity label')
   assert.equal(ui.state.identityStatusLabel(ui.source), '本地 API · 客户端无原生账号身份')
-  assert.equal(ui.state.nativeRepairCandidate(ui.source), true)
-  ui.state.repairNativeLogin(ui.source)
+  ui.state.edit(ui.source)
   await settle()
-  assert.equal(ui.state.form.connectionMode, 'native', 'Repair opens the editor with native mode selected')
-  assert.equal(ui.state.editing.id, ui.source.id)
-  assert.equal(ui.state.form.accountId, ui.source.accountId, 'Repair keeps the bound account')
-  assert.equal(ui.state.form.model, ui.source.model, 'Repair keeps the saved model')
+  assert.equal(ui.state.form.connectionMode, 'local_api')
+  assert.match(readFileSync(path, 'utf8'), /投影到此实例的客户端身份区/)
+  assert.equal(ui.state.form.accountId, ui.source.accountId, 'Editing keeps the bound account')
+  assert.equal(ui.state.form.model, ui.source.model, 'Editing keeps the saved model')
 })
 
-test('native repair waits for instance stop and supports a configured proxy', async t => {
+test('OAuth local API mode can still be changed explicitly to native login', async t => {
   const ui = mount(); t.after(ui.unmount)
-  ui.source.status = 'running'
-  ui.state.repairNativeLogin(ui.source)
+  ui.state.edit(ui.source)
   await settle()
-  assert.equal(ui.state.open, false, 'Running instances are not opened for repair')
-  ui.source.status = 'stopped'
-  ui.manager.data.accounts[0].egressProxy = { mode: 'custom', protocol: 'HTTP', server: 'proxy.invalid', port: 8080 }
-  ui.state.repairNativeLogin(ui.source)
-  await settle()
-  assert.equal(ui.state.open, true, 'Stopped proxy accounts can repair their native identity')
+  assert.equal(ui.state.open, true)
+  ui.state.useNativeLogin()
   assert.equal(ui.state.form.connectionMode, 'native')
   assert.equal(await ui.state.ensureResource(), true)
 })

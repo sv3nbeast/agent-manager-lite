@@ -195,15 +195,6 @@ const identityStatusLabel=(instance:InstanceView)=>{
     default: return instance.connectionMode==='native'?'原生账号登录 · 状态待确认':'本地 API · 客户端无原生账号身份'
   }
 }
-const nativeRepairCandidate=(instance:InstanceView)=>instance.connectionMode==='local_api'&&accountForInstance(instance)?.kind==='oauth'
-function repairNativeLogin(instance:InstanceView){
-  const account=accountForInstance(instance)
-  if(instance.status!=='stopped'){message.warning('请先停止实例，再修复为原生账号登录。');return}
-  if(account?.kind!=='oauth'){message.warning('此实例绑定的资源不支持原生账号登录。');return}
-  if(account.egressProxy?.invalid){message.warning('此账号的网络代理配置无效，请先修正账号或默认代理设置。');return}
-  edit(instance)
-  useNativeLogin()
-}
 function localeLabel(value?:string,source?:string,effectiveLocale?:string) {
   const names:Record<string,string>={'zh-CN':'简体中文','zh-TW':'繁体中文（台湾）','zh-HK':'繁体中文（香港）','en-US':'English'}
   if(!value)return effectiveLocale?`自动检测 · ${names[effectiveLocale]??effectiveLocale}`:source==='existing'||source==='legacy'?'保留已有语言配置':'自动检测'
@@ -263,7 +254,7 @@ const connectionProblem=computed(()=>{
 watch(connectionProblem,problem=>{if(!problem&&fieldErrors.connectionMode){if(error.value===fieldErrors.connectionMode)error.value='';delete fieldErrors.connectionMode}})
 const connectionDescription=computed(()=>form.connectionMode==='native'
   ?resourceKind.value==='provider'?'客户端直接使用供应商密钥；API 密钥不会获得 ChatGPT 登录身份。此模式不生成本地网关调用记录。':'客户端直接登录所选 ChatGPT 账号，使用原生身份与账号功能；具体功能由账号套餐和客户端版本决定。此模式不生成本地网关调用记录。'
-  :selectedAccount.value?.kind==='oauth'?'使用 ChatGPT 账号转发 API 请求。客户端显示本地供应商入口，不会获得原生 ChatGPT 登录菜单与全部账号功能；管理器记录网关调用。':'通过管理器的本地 API 连接使用所选资源，支持兼容的 Chat Completions 供应商和账号网络代理；管理器记录网关调用。')
+  :selectedAccount.value?.kind==='oauth'?'使用 ChatGPT 账号转发 API 请求，并将同一真实账号投影到此实例的客户端身份区；请求仍经本地 API 网关转发，管理器记录网关调用。':'通过管理器的本地 API 连接使用所选资源，支持兼容的 Chat Completions 供应商和账号网络代理；管理器记录网关调用。')
 const resourceLabel=computed(()=>resourceKind.value==='provider'?selectedSupplier.value?.label:selectedAccount.value?.name)
 const nativeModelDefaults=ref<InstanceModelDefaults>(),nativeModelsLoading=ref(false),nativeModelsError=ref('')
 let modelDefaultsRequest=0
@@ -539,11 +530,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <a-card v-for="instance in visible" :key="instance.id" class="instance-card">
         <div class="instance-heading"><div class="instance-name"><DesktopOutlined /><strong>{{ instance.name }}</strong></div><a-tag :color="instance.status==='running'?'green':instance.status==='error'?'red':['preparing','starting','stopping'].includes(instance.status)?'processing':undefined">{{ labels[instance.status] }}</a-tag></div>
         <a-descriptions :column="1" size="small"><a-descriptions-item label="客户端">{{instance.clientType === 'codex' ? 'Codex' : '尚未接入'}}</a-descriptions-item><a-descriptions-item label="运行方式">{{instance.launchMode==='cli'?'CLI · Terminal':'桌面应用'}}</a-descriptions-item><a-descriptions-item label="账号">{{ instanceAccountLabel(instance) }} · {{modeName(instance.connectionMode)}}</a-descriptions-item><a-descriptions-item label="客户端身份">{{ identityStatusLabel(instance) }}</a-descriptions-item><a-descriptions-item label="默认模型">{{ instance.model }}</a-descriptions-item><a-descriptions-item label="速度"><template v-if="instance.speedMenu==='active'||instance.speedMenu==='pending'">{{instance.speedMenu==='active'?'在 Codex 中选择':'正在启用 Codex 速度菜单'}}<span class="muted"> · 启动时 {{initialSpeedName(instance.initialTier)}}</span></template><template v-else>{{ tierName(instance.defaultTier) }}<span v-if="instance.status==='running'"> · {{instance.connectionMode==='native'?'已写入配置':'启动时'}} {{ initialSpeedName(instance.initialTier??instance.appliedTier) }}</span></template></a-descriptions-item><a-descriptions-item v-if="instance.desktopLocaleCompatibility" label="页面语言">{{instance.desktopLocaleCompatibility==='active'?'跟随 Codex 语言设置':instance.desktopLocaleCompatibility==='pending'?'正在加载内置翻译':'翻译适配未加载'}}</a-descriptions-item><a-descriptions-item v-if="instance.ultraCompatibility" label="Ultra 推理">{{instance.ultraCompatibility==='active'?'支持的模型可选 Ultra':instance.ultraCompatibility==='pending'?'正在加载':'暂未兼容'}}</a-descriptions-item><a-descriptions-item v-if="instance.pid" label="进程">{{ instance.pid }}<span v-if="instance.port"> · 本地端口 {{ instance.port }}</span></a-descriptions-item></a-descriptions>
-        <template v-if="nativeRepairCandidate(instance)">
-          <a-alert type="warning" show-icon class="instance-identity-warning" message="当前绑定了管理器账号，但客户端运行在本地 API 模式。客户端左下角显示的是供应商名称，不代表已登录此账号。" />
-          <a-button v-if="instance.status==='stopped'" type="link" class="instance-repair-native" @click="repairNativeLogin(instance)">修复为原生账号登录</a-button>
-          <span v-else class="muted instance-repair-native-note">实例运行中，请先停止后修复为原生账号登录。</span>
-        </template>
+        <a-alert v-if="instance.connectionMode==='local_api'&&accountForInstance(instance)?.kind==='oauth'&&instance.identityStatus==='local_api'" type="info" show-icon class="instance-identity-warning" message="启动时会保留本地 API 网关，并将绑定的 ChatGPT 账号投影到客户端身份区；停止实例后自动恢复原文件。" />
         <p class="instance-path" :title="instance.directory"><a-tag v-if="instance.externalHome">已有目录</a-tag>{{ instance.directory }}</p>
         <a-alert v-if="instance.error" type="error" :message="instance.error" class="error-banner" />
         <a-alert v-if="instance.notice" type="info" :message="instance.notice" class="error-banner" />

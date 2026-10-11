@@ -32,6 +32,12 @@ function modeOf(doc:TomlDocument):CredentialStoreMode {
 export function configuredProviderAuth(doc:TomlDocument):string|null {
   const provider=doc.scalar(['model_provider']),id=typeof provider==='string'?provider:'openai'
   const path=(key:string)=>['model_providers',id,key]
+  // A manager-owned local API instance may keep the loopback Provider for
+  // inference while temporarily projecting a real ChatGPT OAuth bundle for
+  // the official client's account surface. In that explicit hybrid mode the
+  // auth.json is the identity source; the Provider bearer remains the gateway
+  // credential and must not be mistaken for it.
+  if(id==='cml_instance'&&doc.scalar(path('requires_openai_auth'))===true)return null
   if(id==='cml_instance')throw new Error('此目录使用受管本地 API，请在实例中查看绑定账号')
   const command=doc.raw(path('auth'))!==null||doc.children(path('auth')).length>0
   const headers=['http_headers','env_http_headers'].some(field=>doc.children(path(field)).some(key=>['authorization','x-api-key','api-key'].includes(key.toLowerCase())))
@@ -52,7 +58,7 @@ export function accountFromAuth(raw:string,doc:TomlDocument):StoredAccount {
   if(mode && !['chatgpt','oauth','apikey','api_key','api','agentidentity','agent_identity','personalaccesstoken','personal_access_token'].includes(mode))throw new Error('暂不支持此登录类型')
   const isAPI=['apikey','api_key','api'].includes(mode??'')||!mode&&!!nonempty(value.OPENAI_API_KEY)
   const provider=doc.scalar(['model_provider']),providerId=typeof provider==='string'?provider:'openai'
-  if(providerId==='cml_instance')throw new Error('此目录使用受管本地 API，请在实例中查看绑定账号')
+  if(providerId==='cml_instance'&&doc.scalar(['model_providers',providerId,'requires_openai_auth'])!==true)throw new Error('此目录使用受管本地 API，请在实例中查看绑定账号')
   if(isAPI){
     if(doc.scalar(['forced_login_method'])==='chatgpt')throw new Error('配置要求 ChatGPT 登录，与文件中的 API 身份不一致')
     const base=doc.scalar(['model_providers',providerId,'base_url'])??(providerId==='openai'?doc.scalar(['openai_base_url']):null)

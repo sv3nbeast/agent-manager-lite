@@ -41,8 +41,8 @@ export class NativeInstanceAccounts {
     if((ownsRefreshChain(account)||account.credentials.refreshToken)&&this.accountInUse(account.id,profile.id))throw new Error('此账号正在被其他服务或实例使用，请先停止后再启动原生实例')
     if(state.clientAuthorities?.some(binding=>binding.accountId===account.id&&binding.targetId!==profile.id)||state.clientSwitches?.some(record=>record.targetId===profile.id||account.credentials.refreshToken&&(record.accountId===account.id||record.previousAccountId===account.id)))throw new Error('此账号或目录仍有原生登录关联或恢复记录，请先处理后再启动实例')
   }
-  private service(profile:InstanceProfile,nonce:string,tier?:string):ClientSwitches {
-    const owner:InstanceSwitchOwner={instanceId:profile.id,nonce,model:profile.model,tier}
+  private service(profile:InstanceProfile,nonce:string,tier?:string,connectionMode:'native'|'local_api'='native'):ClientSwitches {
+    const owner:InstanceSwitchOwner={instanceId:profile.id,nonce,model:profile.model,tier,connectionMode}
     return new ClientSwitches(this.store,new ClientConfigs(this.store),this.tokens,id=>{
       const account=this.store.read().accounts.find(value=>value.id===id)
       return !!account&&(ownsRefreshChain(account)||!!account.credentials.refreshToken)&&this.accountInUse(id,profile.id)
@@ -54,11 +54,14 @@ export class NativeInstanceAccounts {
     return current
   }
   inject(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal,verify:()=>void=()=>{}):Promise<void> {
-    return this.serial(()=>{verify();return this.injectNow(profile,nonce,tier,signal)})
+    return this.serial(()=>{verify();return this.injectNow(profile,nonce,tier,signal,'native')})
   }
-  private async injectNow(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal):Promise<void> {
-    signal.throwIfAborted();this.validate(profile)
-    const service=this.service(profile,nonce,tier),cancel=()=>service.stop()
+  injectLocalApi(profile:InstanceProfile,nonce:string,signal:AbortSignal,verify:()=>void=()=>{}):Promise<void> {
+    return this.serial(()=>{verify();return this.injectNow(profile,nonce,undefined,signal,'local_api')})
+  }
+  private async injectNow(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal,connectionMode:'native'|'local_api'):Promise<void> {
+    signal.throwIfAborted();connectionMode==='local_api'?this.validateLocalApi(profile):this.validate(profile)
+    const service=this.service(profile,nonce,tier,connectionMode),cancel=()=>service.stop()
     signal.addEventListener('abort',cancel,{once:true})
     try{
       const preview=service.preview({targetId:profile.id,accountId:profile.accountId})
@@ -66,20 +69,30 @@ export class NativeInstanceAccounts {
       await service.applyWhenClosed({ticket:preview.ticket,clientClosed:true})
       signal.throwIfAborted()
       try{await this.project(this.store.read().accounts.find(account=>account.id===profile.accountId)!)}
-      catch{throw new Error('原生登录已保存，但其他本地连接尚未同步，请重试启动')}
+      catch{throw new Error('账号身份已保存，但其他本地连接尚未同步，请重试启动')}
     }finally{signal.removeEventListener('abort',cancel);service.stop()}
   }
-  restore(profile:InstanceProfile,nonce:string):Promise<void> {return this.serial(()=>this.restoreNow(profile,nonce))}
-  private async restoreNow(profile:InstanceProfile,nonce:string):Promise<void> {
+  restore(profile:InstanceProfile,nonce:string):Promise<void> {return this.serial(()=>this.restoreNow(profile,nonce,'native'))}
+  restoreLocalApi(profile:InstanceProfile,nonce:string):Promise<void> {return this.serial(()=>this.restoreNow(profile,nonce,'local_api'))}
+  private async restoreNow(profile:InstanceProfile,nonce:string,connectionMode:'native'|'local_api'):Promise<void> {
     const records=this.store.read().clientSwitches?.filter(record=>record.targetId===profile.id)??[]
     if(records.length){
       if(records.length!==1||records[0].instanceNonce!==nonce)throw new Error('实例登录恢复记录归属不一致，已保留原文件')
-      const service=this.service(profile,nonce)
+      const service=this.service(profile,nonce,undefined,connectionMode)
       try{await service.applyWhenClosed({ticket:service.previewRestore({targetId:profile.id}).ticket,clientClosed:true})}
       finally{service.stop()}
     }
     const state=this.store.read(),ids=new Set([profile.accountId,...(state.clientAuthorities??[]).filter(binding=>binding.targetId===profile.id).map(binding=>binding.accountId)])
     try{await Promise.all(state.accounts.filter(account=>ids.has(account.id)).map(account=>this.project(account)))}
     catch{throw new Error('实例最新凭据已保存，但其他本地连接尚未同步，请重试停止')}
+  }
+
+  private validateLocalApi(profile:InstanceProfile):void {
+    const state=this.store.read(),account=state.accounts.find(value=>value.id===profile.accountId)
+    if(!account)throw new Error('绑定账号不存在')
+    if(account.kind!=='oauth')throw new Error('本地 API 账号身份投影仅支持 ChatGPT OAuth 账号')
+    if(!account.credentials.accessToken)throw new Error('ChatGPT 账号缺少访问令牌，请先刷新用量或重新登录')
+    if(account.credentials.refreshToken&&!ownsRefreshChain(account))throw new Error('ChatGPT 账号缺少可核对的工作区或用户标识，请重新登录')
+    if(this.accountInUse(account.id,profile.id))throw new Error('此账号正在被其他服务或实例使用，请先停止后再启动')
   }
 }

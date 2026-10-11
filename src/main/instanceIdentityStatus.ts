@@ -30,17 +30,27 @@ function labels(account:StoredAccount):Pick<InstanceIdentityView,'email'|'accoun
  * client can actually use. This deliberately never returns auth-file content.
  */
 export function readInstanceIdentityStatus(directory:string,connectionMode:'local_api'|'native',bound?:StoredAccount):InstanceIdentityView {
-  if(connectionMode!=='native')return {status:'local_api'}
   let config:string|null,auth:string|null
   try {
     config=readBounded(join(directory,'config.toml'),configLimit)
     auth=readBounded(join(directory,'auth.json'),authLimit)
   } catch {
+    // A manager-owned local API profile does not require a client auth file.
+    // An unreadable file only matters when it has opted into the hybrid OAuth
+    // projection below; native profiles still report an unknown state.
+    if(connectionMode!=='native')return {status:'local_api'}
     return {status:'unknown'}
   }
-  if(config===null)return {status:'missing'}
+  if(config===null)return connectionMode==='native'?{status:'missing'}:{status:'local_api'}
   try {
     const doc=new TomlDocument(config)
+    // Local API normally deliberately hides OAuth identity behind the loopback
+    // provider.  During a hybrid launch the provider opts into the official
+    // account surface and the temporary auth projection is owned by the launch
+    // journal.  Detect that opt-in from the client config instead of trusting
+    // a stale auth.json left by an older run.
+    const hybrid=connectionMode==='local_api'&&doc.scalar(['model_provider'])==='cml_instance'&&doc.scalar(['model_providers','cml_instance','requires_openai_auth'])===true
+    if(connectionMode!=='native'&&!hybrid)return {status:'local_api'}
     // Managed native projections force file credentials. An external native
     // directory may still use a keychain or ephemeral store, which cannot be
     // verified from auth.json and must not be reported as missing credentials.

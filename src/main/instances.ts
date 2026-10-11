@@ -100,7 +100,14 @@ export class Instances {
   copyView():InstanceCopyView|undefined {return this.copy?structuredClone(this.copy.view):undefined}
   inUse(id:string,includeExternal=true):boolean {return this.active.has(id) || this.recoveryErrors.has(id)||this.copyingTarget(id)||includeExternal&&this.externalBusy(id)}
   usesAccount(id:string):boolean {return this.copying()&&this.copy!.accountId===id||[...this.active.values()].some(value=>value.profile.accountId===id) || (this.store.read().instances ?? []).some(profile=>profile.accountId===id && this.recoveryErrors.has(profile.id))}
-  usesNativeAccountOutside(id:string,targetId:string):boolean {return [...this.active.values()].some(value=>value.profile.connectionMode==='native'&&value.profile.id!==targetId&&value.profile.accountId===id)||(this.store.read().instances??[]).some(profile=>profile.connectionMode==='native'&&profile.id!==targetId&&profile.accountId===id&&this.recoveryErrors.has(profile.id))}
+  usesNativeAccountOutside(id:string,targetId:string):boolean {
+    // Both native mode and the hybrid local API projection write the OAuth
+    // bundle into an isolated CODEX_HOME. A refresh chain must therefore have
+    // one manager owner even when requests are routed through the gateway.
+    const oauth=this.store.read().accounts.find(account=>account.id===id)?.kind==='oauth'
+    return [...this.active.values()].some(value=>value.profile.id!==targetId&&value.profile.accountId===id&&(value.profile.connectionMode==='native'||oauth&&value.profile.connectionMode==='local_api'))
+      ||(this.store.read().instances??[]).some(profile=>profile.id!==targetId&&profile.accountId===id&&(profile.connectionMode==='native'||oauth&&profile.connectionMode==='local_api')&&this.recoveryErrors.has(profile.id))
+  }
   accountIds():string[] {return [...new Set([...this.active.values()].filter(value=>value.gateway?.current().running||value.profile.connectionMode==='native'&&value.status==='running').map(value=>value.profile.accountId))]}
   plannedSessionProvider(id:string):string|undefined {
     const state=this.store.read(),profile=state.instances?.find(value=>value.id===id)
@@ -480,6 +487,14 @@ export class Instances {
       if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例供应商或配置在连接准备期间已变化，请重新预览启动')
       const preview=context.configs.previewInstanceConnection(run.profile.id,revision,{port:status.port!,key:localKey,model:run.profile.model,tier:run.plan.speedMenuHook?context.initialTier:status.defaultTier,manageServiceTier:!run.plan.speedMenuHook})
       context.configs.apply(preview.ticket,backup=>{run.backup=backup;this.checkpoint(run)})
+      // Keep the manager-owned loopback Provider for inference while exposing
+      // the real OAuth account in the official client's identity surface.
+      // The projection is journaled separately and is restored before the
+      // temporary gateway configuration on stop.
+      if(context.account.kind==='oauth'){
+        if(!this.nativeAccounts)throw new Error('账号身份投影服务不可用')
+        await this.nativeAccounts.injectLocalApi(run.profile,run.plan.nonce,run.controller.signal)
+      }
       run.status='starting'
       run.child=await this.runtime.launch(run.plan,run.controller.signal)
       run.controller.signal.throwIfAborted()
@@ -498,6 +513,9 @@ export class Instances {
     if(run.profile.connectionMode==='native'){
       if(!this.nativeAccounts)throw new Error('原生登录恢复服务不可用，文件已保留')
       await this.nativeAccounts.restore(run.profile,run.plan.nonce)
+    }else if(run.profile.connectionMode==='local_api'&&this.store.read().clientSwitches?.some(record=>record.targetId===run.profile.id&&record.instanceNonce===run.plan.nonce)){
+      if(!this.nativeAccounts)throw new Error('账号身份恢复服务不可用，文件已保留')
+      await this.nativeAccounts.restoreLocalApi(run.profile,run.plan.nonce)
     }
     if(run.backup) {
       if(run.profile.externalHome)assertClientDaemonStopped(await probeClientDaemon(validateExternalHome(this.root,run.profile.externalHome)))

@@ -18,6 +18,8 @@ import {mutateProvider} from '../src/main/providerLibrary'
 import {instanceProviderName} from '../src/main/instanceProviderName'
 import {builtInCatalog,parseNativeCatalog} from '../src/main/modelCatalog'
 import { MacDesktopRuntime, desktopEnvironment, macLaunchArgs, type DesktopRuntime, type DesktopPlan, type DesktopProcess } from '../src/main/instanceRuntime'
+import { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
+import { TokenAuthority } from '../src/main/tokens'
 
 class FixtureDesktop implements DesktopRuntime {
   readonly children=new Map<string,DesktopProcess>()
@@ -33,13 +35,14 @@ function fixture(t:Context,systemLanguages:readonly string[]=['en-US'],speedMenu
   mkdirSync(join(application,'Contents','MacOS'),{recursive:true})
   writeFileSync(join(application,'Contents','MacOS','Codex'),'fixture-not-executed',{mode:0o700})
   const codec={encrypt:(text:string)=>Buffer.from(text),decrypt:(buffer:Buffer)=>buffer.toString()}
-  const store=new Store(join(root,'data'),codec),runtime=new FixtureDesktop(),gateways:Gateway[]=[]
+  const store=new Store(join(root,'data'),codec),runtime=new FixtureDesktop(),gateways:Gateway[]=[],tokens=new TokenAuthority(store)
+  const nativeAccounts=new NativeInstanceAccounts(store,tokens)
   const events:Record<string,unknown>[]=[]
   let prepare=async(id:string)=>store.read().accounts.find(value=>value.id===id)!
   let now=Date.now()
-  const create=()=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event));gateways.push(gateway);return gateway},id=>prepare(id),runtime,undefined,()=>now,undefined,systemLanguages,speedMenus)
+  const create=()=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event));gateways.push(gateway);return gateway},id=>prepare(id),runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus)
   const instances=create(),app=instances.registerApplication(application)
-  t.after(async()=>{await instances.closeAll().catch(()=>{});await Promise.all(gateways.map(gateway=>gateway.stop()));rmSync(root,{recursive:true,force:true})})
+  t.after(async()=>{await instances.closeAll().catch(()=>{});await Promise.all(gateways.map(gateway=>gateway.stop()));await tokens.stop();rmSync(root,{recursive:true,force:true})})
   function account(url='http://127.0.0.1:9',key='fixture-upstream',models=['fixture-model']) {const a=createAPIAccount({name:`Account ${randomUUID()}`,apiKey:key,baseUrl:url,models,wireApi:'responses',defaultTier:'inherit',note:'',tags:[]});store.transaction(state=>state.accounts.push(a));return a}
   function add(accountId:string,name='Fixture',defaultTier='fast',model='fixture-model') {instances.save({details:{name,applicationId:app.id,accountId,model,defaultTier,extraArgs:[]}});return instances.views().at(-1)!}
   return {root,store,runtime,instances,create,app,account,add,gateways,events,advance:()=>{now+=300001},setPrepare:(value:typeof prepare)=>{prepare=value}}

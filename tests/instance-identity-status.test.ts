@@ -10,6 +10,7 @@ import {readInstanceIdentityStatus} from '../src/main/instanceIdentityStatus'
 const token=(workspace:string,email=`${workspace}@example.invalid`)=>'fixture.'+Buffer.from(JSON.stringify({exp:2_000_000_000,email,'https://api.openai.com/auth':{chatgpt_account_id:workspace,chatgpt_user_id:`user-${workspace}`}})).toString('base64url')+'.signature'
 const oauth=(workspace:string)=>parseAccountImport(JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:token(workspace),id_token:token(workspace),refresh_token:`refresh-${workspace}`,account_id:workspace}})).accounts[0]
 const config='model_provider = "openai"\nforced_login_method = "chatgpt"\nmodel = "fixture-model"\n'
+const hybridConfig='model_provider = "cml_instance"\nforced_login_method = "chatgpt"\ncli_auth_credentials_store = "file"\n[model_providers.cml_instance]\nrequires_openai_auth = true\n'
 
 test('instance identity status distinguishes local API from a verified native account without returning credentials',t=>{
   const root=mkdtempSync(join(tmpdir(),'cml-instance-identity-'));t.after(()=>rmSync(root,{recursive:true,force:true}))
@@ -24,6 +25,20 @@ test('instance identity status distinguishes local API from a verified native ac
   assert.equal(verified.accountId,'workspace-a')
   assert.equal(JSON.stringify(verified).includes('refresh-workspace-a'),false)
   assert.equal(JSON.stringify(verified).includes(token('workspace-a')),false)
+})
+
+test('hybrid local API identity is verified only when the managed provider opts into OAuth',t=>{
+  const root=mkdtempSync(join(tmpdir(),'cml-instance-identity-'));t.after(()=>rmSync(root,{recursive:true,force:true}))
+  const account=oauth('workspace-hybrid'),home=join(root,'home');mkdirSync(home)
+  writeFileSync(join(home,'config.toml'),hybridConfig)
+  writeFileSync(join(home,'auth.json'),authFor(account,null))
+  const verified=readInstanceIdentityStatus(home,'local_api',account)
+  assert.equal(verified.status,'native_verified')
+  assert.equal(verified.email,'workspace-hybrid@example.invalid')
+  // A stale auth file must not turn an ordinary local API profile into a
+  // reported ChatGPT login when the provider explicitly disables auth.
+  writeFileSync(join(home,'config.toml'),'model_provider = "cml_instance"\n[model_providers.cml_instance]\nrequires_openai_auth = false\n')
+  assert.deepEqual(readInstanceIdentityStatus(home,'local_api',account),{status:'local_api'})
 })
 
 test('native identity status reports mismatches and malformed files as unverified, and unsafe files as unknown',t=>{

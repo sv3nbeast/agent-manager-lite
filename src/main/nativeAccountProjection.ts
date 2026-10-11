@@ -18,6 +18,9 @@ export const nativeProvider='cml_native_account'
 export const authKeys=new Set(('access_token refresh_token id_token session_id expired last_refresh expires_in timestamp token_type user_code verification_uri verification_uri_complete openai_api_key personal_access_token tokens agent_identity agentidentity auth_mode authmode base_url api_base_url apibaseurl email account_email accountemail account_name accountname account_id accountid chatgpt_account_id chatgptaccountid chatgpt_user_id chatgptuserid user_id userid type').split(' '))
 const providerKeys=['name','base_url','wire_api','requires_openai_auth','supports_websockets','experimental_bearer_token']
 export function nativeIdentity(raw:string|null,doc:TomlDocument):StoredAccount|undefined {
+  // A plain loopback provider must continue to report API mode. Only the
+  // explicit OAuth projection opts into the client's native identity gate.
+  if(doc.scalar(['model_provider'])==='cml_instance'&&doc.scalar(['model_providers','cml_instance','requires_openai_auth'])!==true)return undefined
   const active=configuredProviderAuth(doc)??raw
   return active===null?undefined:accountFromAuth(active,doc)
 }
@@ -25,8 +28,8 @@ export function ownsRefreshChain(account:StoredAccount):boolean {
   const identity=accountIdentity(account)
   return account.kind==='oauth'&&!!(identity.accountId||identity.userId)
 }
-export function authFor(account:StoredAccount,template:string|null,proxyState:ProxyState={},managedNetwork=false):string {
-  if(!managedNetwork&&accountProxyURL(account,proxyState)!==undefined)throw new Error('此目录没有受管启动网络，请通过实例使用原生账号及代理，或使用本地 API')
+function buildAuth(account:StoredAccount,template:string|null,proxyState:ProxyState={},allowProxy=false):string {
+  if(!allowProxy&&accountProxyURL(account,proxyState)!==undefined)throw new Error('此目录没有受管启动网络，请通过实例使用原生账号及代理，或使用本地 API')
   if(account.kind==='agent_identity')throw new Error('Agent Identity 按来源仅用于 API 服务，不支持原生客户端登录注入')
   if(account.kind==='api_key'&&(!account.credentials.apiKey||account.wireApi!=='responses'))throw new Error('原生 API 切换需要 Responses 账号；Chat Completions 账号请使用本地 API 转换入口')
   if(account.kind==='oauth'&&!account.credentials.accessToken)throw new Error('目标账号尚无访问令牌，请先刷新用量或完成登录')
@@ -42,6 +45,14 @@ export function authFor(account:StoredAccount,template:string|null,proxyState:Pr
   if(account.kind==='oauth'&&!sameNativeAccount(account,accountFromAuth(raw,new TomlDocument(''))))throw new Error('令牌自身无法确认账号身份，请重新登录')
   return raw
 }
+/** Project a real OAuth identity while requests use the manager gateway. */
+export function authFor(account:StoredAccount,template:string|null,proxyState:ProxyState={},managedNetwork=false):string {
+  return buildAuth(account,template,proxyState,managedNetwork)
+}
+export function authForLocalApi(account:StoredAccount,template:string|null):string {
+  if(account.kind!=='oauth')throw new Error('本地 API 账号身份投影仅支持 ChatGPT OAuth 账号')
+  return buildAuth(account,template,{},true)
+}
 export function adoptNative(state:State,id:string,observed:StoredAccount):void {
   const account=state.accounts.find(value=>value.id===id)
   if(!account||!sameNativeAccount(account,observed))throw new Error('客户端身份与账号库不匹配，已暂停切换')
@@ -52,12 +63,24 @@ export function adoptNative(state:State,id:string,observed:StoredAccount):void {
   account.email=observed.email??account.email;account.plan=observed.plan??account.plan
   delete account.error;delete account.errorAt
 }
-export function nativeConfig(source:string|null,account:StoredAccount,state:State,history:StoredClientSwitch[]):{config:string;paths:string[][];providerGuards:string[]} {
+export function nativeConfig(source:string|null,account:StoredAccount,state:State,history:StoredClientSwitch[],mode:'native'|'local_api'='native'):{config:string;paths:string[][];providerGuards:string[]} {
   const doc=new TomlDocument(source??''),edits:TomlEdit[]=[],last=history.at(-1),providerPath=['model_providers',nativeProvider]
   const existing=doc.children(providerPath).length>0
-  if(existing&&(!last||new TomlDocument(last.nextConfig).subtree(providerPath)!==doc.subtree(providerPath)))throw new Error('原生切换专用 Provider 已被外部修改，已保留其配置')
-  if(doc.children(['model_providers','openai']).length)throw new Error('内建 OpenAI Provider 存在自定义覆盖，请先核对连接配置')
+  // Local API starts by journaling cml_instance, then adds the OAuth identity
+  // projection. There is no switch record during that first pass.
+  if(existing&&mode!=='local_api'&&(!last||new TomlDocument(last.nextConfig).subtree(providerPath)!==doc.subtree(providerPath)))throw new Error('原生切换专用 Provider 已被外部修改，已保留其配置')
+  if(mode==='native'&&doc.children(['model_providers','openai']).length)throw new Error('内建 OpenAI Provider 存在自定义覆盖，请先核对连接配置')
   const set=(path:string[],value:string|boolean|null)=>edits.push({path,raw:scalarRaw(value)})
+  if(mode==='local_api') {
+    if(account.kind!=='oauth')throw new Error('本地 API 身份投影仅支持 ChatGPT OAuth 账号')
+    if(doc.scalar(['model_provider'])!=='cml_instance')throw new Error('本地 API 身份投影需要受管 cml_instance Provider')
+    set(['cli_auth_credentials_store'],'file')
+    set(['forced_login_method'],'chatgpt')
+    set(['model_providers','cml_instance','requires_openai_auth'],true)
+    set(['model_providers','cml_instance','supports_websockets'],false)
+    const config=patchToml(source??'',edits)
+    return {config,paths:edits.filter(edit=>doc.raw(edit.path)!==edit.raw).map(edit=>edit.path),providerGuards:['cml_instance']}
+  }
   set(['model_provider'],account.kind==='api_key'?nativeProvider:'openai')
   // Cockpit only aligns an existing forced login choice; absence stays absent.
   if(doc.raw(['forced_login_method'])!==null)set(['forced_login_method'],account.kind==='api_key'?'api':'chatgpt')

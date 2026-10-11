@@ -10,7 +10,7 @@ import {Store,type StoredAccount} from './store'
 import {ClientConfigs,atomic,readBounded} from './clientConfig'
 import {accountIdentity} from './accountIdentity'
 import {configuredProviderAuth} from './clientIdentity'
-import {authFor,authKeys,adoptNative as adopt,nativeIdentity,sameNativeAccount,ownsRefreshChain,nativeConfig,recoveryIdentity} from './nativeAccountProjection'
+import {authFor,authForLocalApi,authKeys,adoptNative as adopt,nativeIdentity,sameNativeAccount,ownsRefreshChain,nativeConfig,recoveryIdentity} from './nativeAccountProjection'
 import {displayConfigValue} from './configJournal'
 import {TokenAuthority,tokenClaims,tokenFresh} from './tokens'
 import {TomlDocument,patchToml,scalarRaw,type TomlEdit} from './tomlPatch'
@@ -23,7 +23,7 @@ export interface StoredClientSwitch {
   paths?:string[][];providerGuards?:string[]
   instanceNonce?:string
 }
-export interface InstanceSwitchOwner {instanceId:string;nonce:string;model:string;tier?:string}
+export interface InstanceSwitchOwner {instanceId:string;nonce:string;model:string;tier?:string;connectionMode?:'native'|'local_api'}
 interface Snapshot {target:ClientSwitchPreview['target'];auth:string|null;config:string|null;device:number;inode:number}
 interface Pending {view:ClientSwitchPreview;snapshot:Snapshot;stateHash:string;expires:number;record:StoredClientSwitch;auth:string|null;config:string;observed?:StoredAccount;observedId?:string}
 const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -74,7 +74,8 @@ export class ClientSwitches {
     const history=(state.clientSwitches??[]).filter(record=>record.targetId===targetId),latest=history.at(-1)
     if(this.instance){
       const profile=state.instances?.find(value=>value.id===targetId)
-      if(targetId!==this.instance.instanceId||profile?.connectionMode!=='native'||profile.accountId!==accountId||history.length)throw new Error('实例原生登录与启动记录不一致，请先停止并恢复实例')
+      const mode=this.instance.connectionMode??'native'
+      if(targetId!==this.instance.instanceId||profile?.connectionMode!==mode||profile.accountId!==accountId||history.length)throw new Error('实例登录与启动记录不一致，请先停止并恢复实例')
     }else if(history.some(record=>record.instanceNonce))throw new Error('此登录由实例维护，请从实例页面停止并恢复')
     if(history.some(record=>record.status!=='committed'))throw new Error('此目录有未完成切换，请先恢复')
     if(history.length>=100)throw new Error('此目录已有 100 次可恢复切换，请先逐次恢复后再切换')
@@ -94,9 +95,10 @@ export class ClientSwitches {
     const binding=state.clientAuthorities?.find(value=>value.targetId===targetId)
     if(binding&&binding.accountId!==old?.id)throw new Error('客户端文件与现有凭据关联不一致，请先处理原关联')
     if(old&&prior)adopt(state,old.id,prior)
-    const nextAuth=authFor(account,snapshot.auth,state,!!this.instance)
+    const projectionMode=this.instance?.connectionMode??'native'
+    const nextAuth=projectionMode==='local_api'?authForLocalApi(account,snapshot.auth):authFor(account,snapshot.auth,state,!!this.instance)
     if(typeof tokenClaims(account.credentials.accessToken).exp==='number'&&!tokenFresh(account.credentials.accessToken,30))throw new Error('目标账号的访问令牌已过期，请先刷新用量或重新登录')
-    const projection=nativeConfig(snapshot.config,account,state,history),{paths,providerGuards}=projection
+    const projection=nativeConfig(snapshot.config,account,state,history,projectionMode),{paths,providerGuards}=projection
     let nextConfig=projection.config
     if(this.instance){
       const edits:TomlEdit[]=[{path:['cli_auth_credentials_store'],raw:scalarRaw('file')},{path:['model'],raw:scalarRaw(this.instance.model)},
@@ -139,7 +141,12 @@ export class ClientSwitches {
     const account=record.previousAccountId?this.account(record.previousAccountId,state):undefined
     if(!account&&snapshot.auth!==null&&Object.keys(JSON.parse(snapshot.auth)).some(key=>!authKeys.has(key.toLowerCase())))throw new Error('原目录没有登录，当前凭据文件新增了其他字段，已保留文件，请先核对这些修改')
     const configOnlyAPI=account?.kind==='api_key'&&record.beforeAuth===null&&configuredProviderAuth(before)!==null
-    const auth=account&&!configOnlyAPI?authFor(account,snapshot.auth??record.beforeAuth,state,!!this.instance):null
+    const projectionMode=this.instance?.connectionMode??'native'
+    // A local API launch may start from an unidentifiable auth.json. The
+    // journal owns that exact file, so restore it verbatim when no account
+    // binding can be established instead of deleting user data.
+    const auth=account&&!configOnlyAPI?(projectionMode==='local_api'?authForLocalApi(account,snapshot.auth??record.beforeAuth):authFor(account,snapshot.auth??record.beforeAuth,state,!!this.instance)):
+      !account&&projectionMode==='local_api'&&record.beforeAuth!==null?record.beforeAuth:null
     if(account){const projected=nativeIdentity(auth,new TomlDocument(config));if(!projected||!sameNativeAccount(account,projected))throw new Error('恢复配置与原账号连接不一致，已保留当前文件')}
     return this.stage('restore',snapshot,record,auth,config,observed,observedId,account)
   }
