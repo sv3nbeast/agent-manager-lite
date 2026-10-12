@@ -222,10 +222,11 @@ export function releaseClaudeGlobalStateLock(lock: ClaudeGlobalStateLock): void 
   } catch {/* A missing, malformed, or changed-owner lock is preserved. */}
 }
 
-type ClaudeCodeAccount = Pick<Account,'kind'|'identityService'|'credentialKind'|'wireApi'|'models'> & { credentials?: { apiKey?: string; accessToken?: string } }
+type ClaudeCodeAccount = Pick<Account,'kind'|'identityService'|'credentialKind'|'wireApi'|'models'|'protocol'> & { credentials?: { apiKey?: string; accessToken?: string } }
 
 export function claudeCodeAuthEnvironment(account: ClaudeCodeAccount): Pick<ClaudeCodeProjection,'environment'>['environment'] {
   if(account.identityService!=='anthropic')throw new Error('Claude Code 账号必须属于 Anthropic 身份服务')
+  if(account.protocol!=='anthropic_messages')throw new Error('Claude Code 需要 Anthropic Messages 协议')
   if(account.kind==='api_key'){
     const key=account.credentials?.apiKey
     if(typeof key !== 'string' || !key.trim())throw new Error('Claude Code API 账号缺少 API Key')

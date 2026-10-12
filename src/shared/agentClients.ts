@@ -49,11 +49,12 @@ export function recommendedInstanceConnectionMode(clientType:unknown,account:Pic
 export interface AccountCompatibility {compatible:boolean;reason?:string}
 export interface AccountCompatibilityOptions {connectionMode:'local_api'|'native';model?:string}
 /** Static capability check; live credential ownership, proxies and refresh locks stay in their services. */
-export function accountCompatibility(clientType:unknown,account:Pick<Account,'kind'|'wireApi'|'models'|'identityService'|'credentialKind'>,options:AccountCompatibilityOptions):AccountCompatibility {
+export function accountCompatibility(clientType:unknown,account:Pick<Account,'kind'|'wireApi'|'models'|'identityService'|'credentialKind'|'protocol'>,options:AccountCompatibilityOptions):AccountCompatibility {
   let type:AgentClientType
   try {type=resolveAgentClientType(clientType)}catch(error){return {compatible:false,reason:error instanceof Error?error.message:'客户端尚未接入'}}
   if(type==='claude_code') {
     if(account.identityService!=='anthropic')return {compatible:false,reason:'Claude Code 只能使用 Anthropic 身份或兼容网关凭据，不能复用 OpenAI 账号'}
+    if(account.protocol!=='anthropic_messages')return {compatible:false,reason:'Claude Code 需要 Anthropic Messages 协议，不能复用 OpenAI 协议账号'}
     const kind=account.credentialKind as ClaudeCodeCredentialKind|undefined
     if(options.connectionMode==='local_api')return {compatible:false,reason:'Claude Code 当前不支持管理器本地 API 转换，请使用 CLI 原生连接'}
     if(account.kind==='api_key'&&!['anthropic_api_key','anthropic_bearer','gateway'].includes(kind??''))return {compatible:false,reason:'此 API 凭据未声明为 Anthropic Messages 连接'}

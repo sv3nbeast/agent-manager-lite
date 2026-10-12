@@ -47,6 +47,8 @@ function safeDirectory(path: string): string | undefined {
 /** Read only the small, stable subset of an XML Info.plist that identifies an app. */
 function plistValues(path: string): Record<string, string> | undefined {
   try {
+    const original = lstatSync(path)
+    if (original.isSymbolicLink() || !original.isFile() || realpathSync(path) !== path) return
     const raw = readFileSync(path, 'utf8')
     if (raw.length > 256 * 1024 || !raw.includes('<plist')) return
     const values: Record<string, string> = {}

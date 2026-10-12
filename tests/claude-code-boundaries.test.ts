@@ -8,6 +8,7 @@ import { detectClaudeCodeApplications } from '../src/main/claudeCodeInstanceAdap
 import { discoverClaudeCodeCandidates, inspectClaudeCodeLoginBoundary, inspectClaudeCodeSessions, probeClaudeCodeCliCapabilities, probeClaudeCodeCliVersion, probeClaudeCodeLoginStatus, verifyClaudeCodeCli, verifyClaudeCodeDesktop } from '../src/main/claudeCodeVerification'
 import { claudeCodeAuthEnvironment, claudeCodeConfigPaths, projectClaudeCodeConfig, readClaudeCodeAuthStatus } from '../src/main/claudeCodeInstanceAdapter'
 import { claudeCodeCapabilitySchema, claudeCodeCredentialCompatibility, claudeCodeDesktopClient, claudeCodeClient } from '../src/shared/claudeCode'
+import { accountCompatibility } from '../src/shared/agentClients'
 import { assertImplementedClient, getClientAdapterRegistration, listClientAdapterRegistrations } from '../src/main/clientAdapterRegistry'
 
 test('Claude CLI and Desktop remain separate planned application boundaries', () => {
@@ -33,6 +34,12 @@ test('Claude Desktop detection validates bundle identity and version without lau
   mkdirSync(join(wrong, 'Contents', 'MacOS'), { recursive: true })
   writeFileSync(join(wrong, 'Contents', 'Info.plist'), '<plist><dict><key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>')
   assert.equal(detectClaudeCodeDesktopApplications({ platform: 'darwin', roots: [wrong] }).length, 0)
+  const linked = join(root, 'Linked.app'), externalPlist = join(root, 'external.plist')
+  mkdirSync(join(linked, 'Contents', 'MacOS'), { recursive: true })
+  writeFileSync(externalPlist, '<plist><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string></dict></plist>')
+  symlinkSync(externalPlist, join(linked, 'Contents', 'Info.plist'))
+  writeFileSync(join(linked, 'Contents', 'MacOS', 'Claude'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  assert.equal(detectClaudeCodeDesktopApplications({ platform: 'darwin', roots: [linked] }).length, 0)
   const windowsRoot = join(root, 'Programs', 'Claude'), windowsExecutable = join(windowsRoot, 'Claude.exe')
   mkdirSync(windowsRoot, { recursive: true }); writeFileSync(windowsExecutable, 'binary', { mode: 0o700 }); chmodSync(windowsExecutable, 0o700)
   const windows = detectClaudeCodeDesktopApplications({ platform: 'win32', roots: [windowsExecutable] })
@@ -102,15 +109,18 @@ test('Claude login boundary rejects ambiguous credential precedence and credenti
 })
 
 test('Claude auth projection keeps API key, bearer, and OAuth credentials in separate channels', () => {
-  const common = { identityService: 'anthropic' as const, models: ['claude-sonnet'], wireApi: 'chat_completions' as const }
+  const common = { identityService: 'anthropic' as const, protocol: 'anthropic_messages' as const, models: ['claude-sonnet'], wireApi: 'chat_completions' as const }
   assert.deepEqual(claudeCodeAuthEnvironment({ ...common, kind: 'api_key', credentialKind: 'anthropic_api_key', credentials: { apiKey: 'api-key-fixture' } }), { ANTHROPIC_API_KEY: 'api-key-fixture' })
   assert.deepEqual(claudeCodeAuthEnvironment({ ...common, kind: 'api_key', credentialKind: 'anthropic_bearer', credentials: { apiKey: 'bearer-fixture' } }), { ANTHROPIC_AUTH_TOKEN: 'bearer-fixture' })
   assert.deepEqual(claudeCodeAuthEnvironment({ ...common, kind: 'oauth', credentialKind: 'claude_ai_oauth', credentials: { accessToken: 'oauth-fixture' } }), { CLAUDE_CODE_OAUTH_TOKEN: 'oauth-fixture' })
   assert.throws(() => claudeCodeAuthEnvironment({ ...common, kind: 'api_key', credentialKind: 'openai_api_key' as never, credentials: { apiKey: 'wrong-boundary' } }), /凭据类型未通过/)
+  assert.throws(() => claudeCodeAuthEnvironment({ ...common, kind: 'api_key', credentialKind: 'anthropic_api_key', protocol: 'openai_responses' as never, credentials: { apiKey: 'wrong-protocol' } }), /Anthropic Messages 协议/)
   assert.throws(() => claudeCodeAuthEnvironment({ ...common, kind: 'api_key', credentialKind: 'anthropic_api_key', credentials: { apiKey: '   ' } }), /缺少 API Key/)
   assert.throws(() => claudeCodeAuthEnvironment({ ...common, kind: 'oauth', credentialKind: 'claude_ai_oauth', credentials: { accessToken: '   ' } }), /没有可用/)
   assert.throws(() => claudeCodeAuthEnvironment({ ...common, kind: 'api_key', credentialKind: 'anthropic_api_key', credentials: { apiKey: 'secret' }, identityService: 'openai' as never }), /Anthropic 身份服务/)
   assert.throws(() => projectClaudeCodeConfig({ instanceHome: '/tmp/aml-claude-instance', authToken: 'bearer', apiKey: 'api-key' }), /API Key 或 Bearer Token/)
+  assert.equal(accountCompatibility('claude_code', { ...common, kind: 'api_key', credentialKind: 'anthropic_api_key' }, { connectionMode: 'native' }).compatible, true)
+  assert.equal(accountCompatibility('claude_code', { ...common, kind: 'api_key', credentialKind: 'anthropic_api_key', protocol: 'openai_responses' as never }, { connectionMode: 'native' }).compatible, false)
 })
 
 test('Claude auth status probe uses a stable config directory and strips untrusted labels', async t => {
