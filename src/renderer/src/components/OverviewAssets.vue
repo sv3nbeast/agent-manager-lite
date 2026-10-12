@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { ArrowRightOutlined, KeyOutlined, UserOutlined } from '@ant-design/icons-vue'
 import type { Account, CreditUsage, QuotaWindow } from '../../../shared/types'
 import type { ProviderKeySummary, ProviderSummary } from '../../../shared/providerLibrary'
+import { accountCardType } from './accountCardPresentation'
 
 const props = defineProps<{ accounts: Account[]; providers: ProviderSummary[] }>()
 const emit = defineEmits<{
@@ -53,14 +54,14 @@ function keyUsage(key: ProviderKeySummary): string {
   <div class="overview-assets">
     <section class="asset-section" aria-labelledby="overview-accounts-heading">
       <div class="asset-heading">
-        <div><h2 id="overview-accounts-heading">ChatGPT 账号 <span class="asset-count">{{ accounts.length }}</span></h2><p>查看已保存的账号与最近查询的用量。</p></div>
+        <div><h2 id="overview-accounts-heading">登录账号 <span class="asset-count">{{ accounts.length }}</span></h2><p>查看已保存的账号与最近查询的用量。</p></div>
         <a-button type="link" @click="emit('manage-accounts')">管理账号 <ArrowRightOutlined /></a-button>
       </div>
-      <div v-if="!accounts.length" class="asset-empty"><span class="asset-empty-icon"><UserOutlined /></span><strong>还没有 ChatGPT 账号</strong><p>登录账号或迁移本机账号后，在这里查看用量。</p><a-button @click="emit('manage-accounts')">添加账号</a-button></div>
+      <div v-if="!accounts.length" class="asset-empty"><span class="asset-empty-icon"><UserOutlined /></span><strong>还没有登录账号</strong><p>登录账号或迁移本机账号后，在这里查看用量。</p><a-button @click="emit('manage-accounts')">添加账号</a-button></div>
       <div v-else class="asset-grid">
         <button v-for="account in visibleAccounts" :key="account.id" type="button" class="asset-card account-thumbnail" :data-account-id="account.id" :aria-label="`查看账号 ${account.name}`" @click="emit('view-account', account.id)">
           <span class="asset-identity"><span class="asset-icon"><UserOutlined /></span><span class="asset-names"><strong :title="account.name">{{ account.name }}</strong><small :title="account.email">{{ account.email || '未提供邮箱' }}</small></span><ArrowRightOutlined class="asset-open" /></span>
-          <span class="asset-meta"><span class="asset-chip">{{ account.kind === 'agent_identity' ? 'Agent 身份' : 'ChatGPT 登录' }}</span><span v-if="account.plan" class="asset-plan" :title="account.plan">{{ account.plan }}</span><span v-else class="asset-plan">套餐未查询</span></span>
+          <span class="asset-meta"><span class="asset-chip">{{ accountCardType(account) }}</span><span v-if="account.plan" class="asset-plan" :title="account.plan">{{ account.plan }}</span><span v-else class="asset-plan">套餐未查询</span></span>
           <span class="asset-quota">
             <span v-if="!account.quota" class="asset-unknown">用量尚未查询</span>
             <template v-else>

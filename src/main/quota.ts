@@ -210,7 +210,9 @@ export class QuotaService {
     const state = this.store.read(), now = Date.now()
     const alive = new Set<string>()
     // API keys enter automatic refresh only after an explicit successful query.
-    for (const account of state.accounts.filter(a => a.kind !== 'api_key' || a.providerUsage?.summary && !a.providerUsage.unavailable)) {
+    // Anthropic credentials have a separate usage contract. Keep them out of
+    // the ChatGPT/OpenAI refresh queue until that adapter is verified.
+    for (const account of state.accounts.filter(a => a.identityService !== 'anthropic' && (a.kind !== 'api_key' || a.providerUsage?.summary && !a.providerUsage.unavailable))) {
       const minutes = groupRefreshMinutes(account.id, state.groups, state.settings.refreshMinutes)
       if (minutes <= 0) continue
       alive.add(account.id)
@@ -236,6 +238,7 @@ export class QuotaService {
     const wanted = new Set(ids)
     const accounts = this.store.read().accounts.filter(a => wanted.has(a.id))
     if (accounts.length !== wanted.size) throw new Error('部分账号不存在，请重新加载')
+    if (accounts.some(account => account.identityService === 'anthropic')) throw new Error('Anthropic 账号的用量查询尚未接入独立适配器')
     for (const account of accounts) {
       const scheduled = this.scheduled.get(account.id)
       if (scheduled) scheduled.due = Date.now() + scheduled.minutes * 60_000
@@ -252,6 +255,9 @@ export class QuotaService {
           const current = this.store.read().accounts.find(value => value.id === account.id)
           if (account.kind === 'api_key') {
             if (sameUsageAccount(current, account)) await this.refreshProvider(account, signal)
+          } else if (account.identityService === 'anthropic' || account.protocol === 'anthropic_messages') {
+            // Claude credentials are owned by Claude Code. Never send them to
+            // the Codex/OpenAI refresh or quota endpoints.
           } else if (current && current.generation === account.generation) await this.refresh(account.id, signal)
         }
         catch (error) {
@@ -291,6 +297,7 @@ export class QuotaService {
     if (this.status.running) throw new Error('已有用量或订阅刷新正在进行')
     const account = this.store.read().accounts.find(value => value.id === id)
     if (!account) throw new Error('账号不存在，请重新加载')
+    if (account.identityService === 'anthropic') throw new Error('Anthropic 账号的订阅查询尚未接入独立适配器')
     if (account.kind === 'api_key') throw new Error('API Key 账号不支持刷新订阅信息')
     if (account.kind === 'agent_identity') throw new Error('Agent Identity 账号暂不支持刷新订阅信息')
     this.controller = new AbortController()
@@ -326,6 +333,7 @@ export class QuotaService {
     if (this.status.running) throw new Error('已有用量或订阅刷新正在进行')
     const account = this.store.read().accounts.find(value => value.id === id)
     if (!account) throw new Error('账号不存在，请重新加载')
+    if (account.identityService === 'anthropic') throw new Error('Anthropic 账号的额度查询尚未接入独立适配器')
     if (account.kind === 'api_key') throw new Error('API Key 账号不支持查询主动重置额度')
     if (account.kind === 'agent_identity') throw new Error('Agent Identity 账号暂不支持查询主动重置额度')
     this.controller = new AbortController(); const signal = this.controller.signal
@@ -346,6 +354,7 @@ export class QuotaService {
     if (this.status.running) throw new Error('已有用量或额度操作正在进行')
     const account = this.store.read().accounts.find(value => value.id === id)
     if (!account) throw new Error('账号不存在，请重新加载')
+    if (account.identityService === 'anthropic') throw new Error('Anthropic 账号的额度操作尚未接入独立适配器')
     if (account.kind !== 'oauth') throw new Error('只有 OAuth 账号支持主动重置额度')
     if ((account.quota?.resetCreditsAvailable ?? 0) <= 0) throw new Error('当前没有可用的主动重置额度')
     this.controller = new AbortController(); const signal = this.controller.signal
@@ -366,6 +375,8 @@ export class QuotaService {
     await this.job
   }
   private async refresh(id: string, signal: AbortSignal): Promise<void> {
+    const stored = this.store.read().accounts.find(value => value.id === id)
+    if (stored?.identityService === 'anthropic') return
     let account = await this.tokens.ensure(id)
     if (account.kind === 'agent_identity') {
       if (!this.agents) throw new Error('Agent Identity 服务未初始化')

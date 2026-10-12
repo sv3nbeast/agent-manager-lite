@@ -31,7 +31,7 @@ export function providerView(doc:TomlDocument,revision:string,store:Store):Provi
       envKey:typeof env==='string'&&/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(env)?env:undefined,
       extraFields:doc.children(['model_providers',id]).filter(key=>!providerFields.includes(key as typeof providerFields[number])),invalidFields}
   })
-  return {revision,providers,accounts:store.read().accounts.filter(account=>account.kind==='api_key'&&!!account.credentials.apiKey).map(account=>({id:account.id,name:account.name,baseUrl:account.baseUrl,wireApi:account.wireApi}))}
+    return {revision,providers,accounts:store.read().accounts.filter(account=>account.kind==='api_key'&&account.identityService!=='anthropic'&&!!account.credentials.apiKey).map(account=>({id:account.id,name:account.name,baseUrl:account.baseUrl,wireApi:account.wireApi}))}
 }
 
 export function providerEdits(input:unknown,store:Store,sourceFor:(id:string)=>{target:ClientConfigTarget;source:string|null;revision:string}) {

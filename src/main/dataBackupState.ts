@@ -1,5 +1,5 @@
 import {z} from 'zod'
-import {settingsSchema,accountInputSchema,defaultTierSchema,groupInputSchema} from '../shared/types'
+import {settingsSchema,accountInputSchema,defaultTierSchema,groupInputSchema,accountProtocolSchema,accountIdentityServiceSchema,accountCredentialKindSchema} from '../shared/types'
 import {providerDetailsSchema} from '../shared/providerLibrary'
 import {instanceInputSchema} from '../shared/instances'
 import {localPoolSchema,localKeyDetailsSchema} from '../shared/localAccess'
@@ -18,7 +18,7 @@ const providerUsage=z.object({checkedAt:date,error:text.optional(),unavailable:z
 const proxy=z.object({mode:z.enum(['direct','custom','resource']),url:z.string().max(2*1024*1024).optional(),resourceId:id.optional()}).strict()
 const identity=z.object({agent_runtime_id:text,agent_private_key:text,task_id:text.optional(),account_id:text,chatgpt_user_id:text,email:text.optional(),plan_type:text.optional(),chatgpt_account_is_fedramp:z.boolean()}).strict()
 const account=z.object({id,name:accountInputSchema.shape.name,email:text.optional(),kind:z.enum(['oauth','api_key','agent_identity']),plan:text.optional(),baseUrl:accountInputSchema.shape.baseUrl,
-  models:z.array(z.string().max(200)).max(500),wireApi:z.enum(['responses','chat_completions']),integrationType:accountInputSchema.shape.integrationType,modelContextWindows:accountInputSchema.shape.modelContextWindows,providerUsageRevision:integer.optional(),defaultTier:defaultTierSchema,note:z.string().max(2000),tags:accountInputSchema.shape.tags,createdAt:date,
+  models:z.array(z.string().max(200)).max(500),wireApi:z.enum(['responses','chat_completions']),protocol:accountProtocolSchema.optional(),identityService:accountIdentityServiceSchema.optional(),credentialKind:accountCredentialKindSchema.optional(),integrationType:accountInputSchema.shape.integrationType,modelContextWindows:accountInputSchema.shape.modelContextWindows,providerUsageRevision:integer.optional(),defaultTier:defaultTierSchema,note:z.string().max(2000),tags:accountInputSchema.shape.tags,createdAt:date,
   credentials:z.object({apiKey:text.optional(),accessToken:text.optional(),refreshToken:text.optional(),idToken:text.optional(),accountId:text.optional(),lastRefresh:z.string().datetime({offset:true}).optional(),localAPIKey:text.optional(),agentIdentity:identity.optional()}).strict(),
   generation:text.optional(),source:json.optional(),revision:integer.optional(),providerId:id.optional(),providerKeyId:id.optional(),proxy:proxy.optional(),quota:quota.optional(),providerUsage:providerUsage.optional(),subscriptionActiveUntil:date.optional(),subscriptionSource:z.enum(['token','web']).optional(),subscriptionQueryLastAttemptAt:date.optional(),subscriptionQueryNextRetryAt:date.optional(),subscriptionQueryLastSuccessAt:date.optional(),subscriptionQueryLastError:text.optional(),error:text.optional(),errorAt:date.optional(),needsTokenExchange:z.boolean().optional()
 }).strict()

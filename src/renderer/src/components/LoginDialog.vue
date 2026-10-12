@@ -12,6 +12,7 @@ const props = defineProps<{clientType?:AgentClientType}>()
 const emit = defineEmits<{ 'scan-local': []; completed:[id?:string] }>()
 const selectedClient = ref<AgentClientType>('codex')
 const client = computed(() => getAgentClient(props.clientType ?? selectedClient.value))
+const isClaude = computed(() => (props.clientType ?? selectedClient.value) === 'claude_code')
 let previousLoginSuccess: string | undefined
 let previousTemporarySuccess: string | undefined
 let completionSent = false
@@ -65,7 +66,7 @@ function scanLocal() {
   open.value = false
   emit('scan-local')
 }
-watch(open, value => {
+watch([open, () => props.clientType], ([value]) => {
   callback.value = ''
   pendingImportIds.value = []
   if (value) {
@@ -73,7 +74,7 @@ watch(open, value => {
     previousLoginSuccess = login.value?.status === 'success' ? login.value.id : undefined
     previousTemporarySuccess = manager.data?.tempLogin?.phase === 'completed' ? manager.data.tempLogin.id : undefined
     completionSent = false
-    method.value = temporaryRunning.value ? 'official' : active.value ? 'oauth' : 'official'
+    method.value = isClaude.value ? 'token' : temporaryRunning.value ? 'official' : active.value ? 'oauth' : 'official'
     cancelledOAuthId = undefined
     cancelledTemporaryId = undefined
   } else cancelPending()
@@ -117,21 +118,21 @@ onUnmounted(cancelPending)
       <a-form-item v-if="!clientType" label="客户端用途"><a-select v-model:value="selectedClient" aria-label="账号用途" :disabled="locked" :options="implementedAgentClients.map(item=>({value:item.id,label:item.name}))" /></a-form-item>
       <p v-else class="muted">用于 {{ client.name }} · 添加完成后回到实例配置</p>
     </div>
-    <p class="muted login-introduction">为 {{ client.name }} 登录 ChatGPT 账号。选择一种添加方式；供应商密钥在供应商页管理。</p>
+    <p class="muted login-introduction">为 {{ client.name }} 添加登录身份或连接。选择一种添加方式；供应商密钥在供应商页管理。</p>
     <a-tabs v-model:active-key="method" class="login-methods" :animated="false">
-      <a-tab-pane key="official" :disabled="locked && method !== 'official'"><template #tab><span class="method-label"><DesktopOutlined />官方客户端</span></template></a-tab-pane>
-      <a-tab-pane key="oauth" :disabled="locked && method !== 'oauth'"><template #tab><span class="method-label"><GlobalOutlined />浏览器授权</span></template></a-tab-pane>
+      <a-tab-pane v-if="!isClaude" key="official" :disabled="locked && method !== 'official'"><template #tab><span class="method-label"><DesktopOutlined />官方客户端</span></template></a-tab-pane>
+      <a-tab-pane v-if="!isClaude" key="oauth" :disabled="locked && method !== 'oauth'"><template #tab><span class="method-label"><GlobalOutlined />浏览器授权</span></template></a-tab-pane>
       <a-tab-pane key="token" :disabled="locked && method !== 'token'"><template #tab><span class="method-label"><KeyOutlined />Token</span></template></a-tab-pane>
       <a-tab-pane key="json" :disabled="locked && method !== 'json'"><template #tab><span class="method-label"><CodeOutlined />JSON / 文件</span></template></a-tab-pane>
       <a-tab-pane key="local" :disabled="locked && method !== 'local'"><template #tab><span class="method-label"><ScanOutlined />扫描本机</span></template></a-tab-pane>
     </a-tabs>
 
-    <template v-if="method === 'official'">
+    <template v-if="method === 'official' && !isClaude">
       <a-alert v-if="manager.error" type="error" :message="manager.error" class="error-banner" />
       <TempLoginPanel :disabled="active || starting || !open" />
     </template>
 
-    <section v-if="method === 'oauth'" class="oauth-panel">
+    <section v-if="method === 'oauth' && !isClaude" class="oauth-panel">
       <p class="muted">通过 ChatGPT 官方授权页面登录。浏览器授权会自动打开页面；设备码适合在其他浏览器或设备上完成登录。</p>
       <a-alert v-if="login?.status === 'error'" type="error" :message="login.error" show-icon class="error-banner" />
       <a-alert v-if="login?.status === 'success'" type="success" message="登录成功，账号已保存。可在账号卡片刷新用量。" show-icon class="error-banner" />
@@ -150,7 +151,7 @@ onUnmounted(cancelPending)
       </div>
     </section>
 
-    <LoginCredentialsPanel v-if="method === 'token' || method === 'json'" :mode="credentialMode" :active="open" @busy="importing = $event" @imported="imported" />
+    <LoginCredentialsPanel v-if="method === 'token' || method === 'json'" :mode="credentialMode" :active="open" :client-type="props.clientType ?? selectedClient" @busy="importing = $event" @imported="imported" />
 
     <section v-if="method === 'local'" class="local-import-panel">
       <div class="local-import-mark"><ScanOutlined /></div>

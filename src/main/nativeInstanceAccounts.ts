@@ -35,6 +35,7 @@ export class NativeInstanceAccounts {
   validate(profile:InstanceProfile):void {
     const state=this.store.read(),account=state.accounts.find(value=>value.id===profile.accountId)
     if(!account)throw new Error('绑定账号不存在')
+    if(account.identityService === 'anthropic' || account.protocol === 'anthropic_messages')throw new Error('Anthropic 凭据不能写入 Codex 原生登录目录，请使用 Claude Code 实例')
     accountProxyURL(account,state) // Validate the route; Instances applies it before injecting credentials.
     if(account.kind==='agent_identity')throw new Error('Agent Identity 仅支持本地 API 接入，请切换实例的账号接入方式')
     if(account.kind==='api_key'&&(account.wireApi!=='responses'||!account.models.includes(profile.model)))throw new Error('原生 API 接入需要 Responses 协议和账号支持的模型，请改用本地 API 或调整模型')

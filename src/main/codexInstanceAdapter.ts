@@ -72,7 +72,7 @@ function validateApplication(profile:Pick<InstanceProfile,'clientType'|'extraArg
   if(profile.workingDirectoryId&&application.kind!=='cli')throw new Error('自定义工作目录仅用于 CLI 实例，桌面工作区请在客户端内选择')
 }
 
-function validateAccount(profile:Pick<InstanceProfile,'clientType'|'connectionMode'|'model'>,account:Pick<Account,'kind'|'wireApi'|'models'>):void {
+function validateAccount(profile:Pick<InstanceProfile,'clientType'|'connectionMode'|'model'>,account:Pick<Account,'kind'|'wireApi'|'models'|'identityService'|'credentialKind'>):void {
   resolveAgentClientType(profile.clientType)
   const result=accountCompatibility(profile.clientType,account,{connectionMode:profile.connectionMode??'local_api',model:profile.model})
   if(!result.compatible)throw new Error(result.reason)
@@ -133,6 +133,7 @@ export const codexInstanceAdapter={client:getAgentClient('codex'),applications,r
 
 /** Add verified clients here, rather than branching in each lifecycle method. */
 export function getInstanceClientAdapter(clientType:unknown) {
-  resolveAgentClientType(clientType)
+  const type=resolveAgentClientType(clientType)
+  if(type!=='codex')throw new Error('Claude Code 尚未通过登录、配置、隔离和会话边界验收')
   return codexInstanceAdapter
 }

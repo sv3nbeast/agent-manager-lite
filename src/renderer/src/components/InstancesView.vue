@@ -4,6 +4,7 @@ import { Modal, message } from 'ant-design-vue'
 import { PlusOutlined, DesktopOutlined, CopyOutlined, FolderOpenOutlined, CheckCircleFilled, LoadingOutlined } from '@ant-design/icons-vue'
 import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkingDirectory, InstanceCopySource, InstanceHistorySummary, ExternalInstanceSource, InstanceModelDefaults, ChatGPTModelsResult } from '../../../shared/instances'
 import { accountCompatibility, getAgentClient, hasInstanceUpstreamProxy, implementedAgentClients, recommendedInstanceConnectionMode, resolveAgentClientType } from '../../../shared/agentClients'
+import type { AgentClientType } from '../../../shared/agentClients'
 import { instanceInputSchema } from '../../../shared/instances'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
 import type { InstanceLoginRequest, InstanceLoginResult } from '../instanceOnboarding'
@@ -420,7 +421,7 @@ const initialSpeedName=(value?:string)=>value===undefined?'普通':tierName(valu
 const contextSourceName=(value?:string)=>value==='connection'?'API 连接设置':value==='provider'?'供应商设置':value==='config'?'实例配置':value==='catalog'?'模型目录':'默认模板'
 function edit(instance?:InstanceView) {
   cancelOfficialModelRequest();automaticModel.value=null;draftGeneration++;cancelCopyPreview();closePreview()
-  let clientType:'codex'
+  let clientType:AgentClientType
   try{clientType=resolveAgentClientType(instance?.clientType)}catch(cause){error.value=String(cause);return}
   step.value=0;advanced.value=[];pendingLogin=undefined
   clearHistorySource();historyMode.value='empty';historySourceKind.value='instance';editorFlow.value='wizard'

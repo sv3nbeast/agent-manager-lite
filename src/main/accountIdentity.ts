@@ -35,7 +35,8 @@ export function compareIdentity(left:IdentitySummary,right:IdentitySummary):'mat
 
 export function sameNativeAccount(a:StoredAccount,b:StoredAccount):boolean {
   if(a.kind!==b.kind)return false
-  if(a.kind==='api_key')return !!a.credentials.apiKey&&a.credentials.apiKey===b.credentials.apiKey&&providerEndpoint(a.baseUrl)===providerEndpoint(b.baseUrl)&&a.wireApi===b.wireApi
+  if(a.kind==='api_key')return a.identityService===b.identityService&&a.protocol===b.protocol&&a.credentialKind===b.credentialKind
+    &&!!a.credentials.apiKey&&a.credentials.apiKey===b.credentials.apiKey&&providerEndpoint(a.baseUrl)===providerEndpoint(b.baseUrl)&&a.wireApi===b.wireApi
   const left=accountIdentity(a),right=accountIdentity(b)
   if(strongIdentityConflict(left,right))return false
   if(compareIdentity(left,right)==='matched')return true

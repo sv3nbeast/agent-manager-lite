@@ -30,6 +30,17 @@ export const tierModeSchema = z.enum(['follow', 'standard', 'fast'])
 export type TierMode = z.infer<typeof tierModeSchema>
 export const defaultTierSchema = z.enum(['inherit', 'follow', 'standard', 'fast', 'auto', 'flex'])
 export type DefaultTier = z.infer<typeof defaultTierSchema>
+/** Transport and identity metadata are independent from the credential form. */
+export const accountProtocolSchema = z.enum(['openai_responses', 'openai_chat_completions', 'anthropic_messages'])
+export type AccountProtocol = z.infer<typeof accountProtocolSchema>
+export const accountIdentityServiceSchema = z.enum(['openai', 'anthropic'])
+export type AccountIdentityService = z.infer<typeof accountIdentityServiceSchema>
+export const accountCredentialKindSchema = z.enum([
+  'openai_oauth', 'openai_api_key', 'agent_identity',
+  'claude_ai_oauth', 'anthropic_api_key', 'anthropic_bearer', 'anthropic_profile',
+  'bedrock', 'vertex', 'foundry', 'gateway',
+])
+export type AccountCredentialKind = z.infer<typeof accountCredentialKindSchema>
 export const settingsSchema = z.object({
   theme: z.enum(['system', 'light', 'dark']).default('system'),
   defaultTier: tierModeSchema.default('follow'),
@@ -54,6 +65,9 @@ export const accountInputSchema = z.object({
   }, '请输入不含账号密码、查询参数的 HTTP(S) 地址'),
   models: z.array(z.string().trim().min(1).max(200)).min(1).max(500),
   wireApi: z.enum(['responses', 'chat_completions']).default('responses'),
+  protocol: accountProtocolSchema.optional(),
+  identityService: accountIdentityServiceSchema.optional(),
+  credentialKind: accountCredentialKindSchema.optional(),
   integrationType: integrationTypeSchema.optional(),
   modelContextWindows: modelContextWindowsSchema.optional(),
   defaultTier: defaultTierSchema.default('inherit'),
@@ -100,6 +114,8 @@ export interface Account {
   egressProxy?:AccountProxyView
   id: string; name: string; email?: string; kind: 'oauth' | 'api_key' | 'agent_identity'; plan?: string
   baseUrl: string; models: string[]; wireApi: 'responses' | 'chat_completions'
+  /** Explicit client protocol / identity metadata. Missing means legacy Codex. */
+  protocol?: AccountProtocol; identityService?: AccountIdentityService; credentialKind?: AccountCredentialKind
   integrationType?: IntegrationType
   modelContextWindows?: Record<string, number>
   defaultTier: DefaultTier; note: string; tags: string[]; createdAt: number
@@ -293,8 +309,8 @@ export interface ManagerAPI {
   discardAccountRecycle():Promise<void>
   previewImport(text: string): Promise<ImportPreview>
   importAccounts(text: string): Promise<AppSnapshot>
-  stageImport(text: string): Promise<StagedImport>
-  chooseImportFile(selectionId?:string): Promise<StagedImport | undefined>
+  stageImport(text: string, clientType?: 'codex' | 'claude_code'): Promise<StagedImport>
+  chooseImportFile(selectionId?:string, clientType?: 'codex' | 'claude_code'): Promise<StagedImport | undefined>
   cancelImportFileSelection(selectionId:string):Promise<void>
   commitImport(ticket: string): Promise<{ snapshot: AppSnapshot; added: number; duplicates: number; skipped: number; accountIds:string[] }>
   discardImport(ticket?:string): Promise<void>

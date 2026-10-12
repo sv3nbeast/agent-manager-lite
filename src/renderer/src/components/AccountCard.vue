@@ -4,7 +4,7 @@ import { EditOutlined, GlobalOutlined, InfoCircleOutlined, ReloadOutlined } from
 import type { Account } from '../../../shared/types'
 import AccountQuota from './AccountQuota.vue'
 import AccountIconAction from './AccountIconAction.vue'
-import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardStatus, accountCardTier } from './accountCardPresentation'
+import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardProtocol, accountCardStatus, accountCardTier, accountCardType, isAnthropicAccountRecord } from './accountCardPresentation'
 
 const props = defineProps<{
   account: Account
@@ -40,9 +40,7 @@ function openDetails() { quota.value?.openDetails() }
     <div class="account-tags">
       <div class="account-plan-tags">
         <span class="account-plan">{{ accountCardPlan(account) }}</span>
-        <span v-if="account.kind === 'oauth'" class="account-type">ChatGPT · OAuth</span>
-        <span v-else-if="account.kind === 'agent_identity'" class="account-type">Agent Identity</span>
-        <span v-else class="account-type">API 连接</span>
+        <span class="account-type">{{ accountCardType(account) }}</span>
       </div>
       <div v-if="clientMaintained || labels.length" class="account-labels">
         <span v-if="clientMaintained" class="account-label client-maintained" title="在客户端配置中同步凭据或解除关联">客户端维护</span>
@@ -62,7 +60,7 @@ function openDetails() { quota.value?.openDetails() }
             <div><dt>套餐 / 配置</dt><dd>{{ accountCardPlan(account) }}</dd></div>
             <div v-if="connectionLabel"><dt>供应商连接</dt><dd>{{ connectionLabel }}</dd></div>
             <div><dt>API 地址</dt><dd>{{ account.baseUrl || '未配置' }}</dd></div>
-            <div><dt>接口协议</dt><dd>{{ account.wireApi === 'responses' ? 'Responses' : 'Chat Completions' }}</dd></div>
+            <div><dt>接口协议</dt><dd>{{ accountCardProtocol(account) }}</dd></div>
             <div><dt>默认速度</dt><dd>{{ accountCardTier(account) }}</dd></div>
             <div><dt>凭据状态</dt><dd>{{ account.needsTokenExchange ? '刷新令牌待验证' : account.credentialConfigured ? '凭据已保存' : '缺少凭据' }}{{ clientMaintained ? ' · 客户端维护登录' : '' }}</dd></div>
             <div><dt>创建时间</dt><dd>{{ accountCardDate(account.createdAt) }}</dd></div>
@@ -76,7 +74,7 @@ function openDetails() { quota.value?.openDetails() }
     </AccountQuota>
 
     <footer class="account-actions" aria-label="账号操作">
-      <AccountIconAction action-class="account-refresh" :label="refreshing ? '正在刷新用量' : '刷新用量'" :accessible-label="`刷新用量 · ${account.name}`" :loading="refreshing" @click="$emit('refresh')"><ReloadOutlined /></AccountIconAction>
+      <AccountIconAction v-if="!isAnthropicAccountRecord(account)" action-class="account-refresh" :label="refreshing ? '正在刷新用量' : '刷新用量'" :accessible-label="`刷新用量 · ${account.name}`" :loading="refreshing" @click="$emit('refresh')"><ReloadOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-edit" label="编辑账号" :accessible-label="`编辑账号 · ${account.name}`" @click="$emit('edit')"><EditOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-proxy" label="网络代理" :accessible-label="`网络代理 · ${account.name}`" @click="$emit('proxy')"><GlobalOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-details" label="查看详情" :accessible-label="`查看详情 · ${account.name}`" @click="openDetails"><InfoCircleOutlined /></AccountIconAction>

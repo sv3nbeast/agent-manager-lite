@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -35,6 +35,7 @@
     "build:unpack": "npm run build:proxy && npm run build && electron-builder --dir",
     "test:proxy:vendor": "cd sidecars/codex-proxy/third_party/CLIProxyAPI && go test ./internal/translator/openai/openai/responses ./internal/translator/codex/openai/responses ./internal/translator/codex/openai/chat-completions ./sdk/api/handlers/openai ./internal/runtime/executor",
     "test:native-cli": "tsx scripts/smoke-native-cli.ts",
+    "test:claude-code": "tsx --test tests/claude-code-support.test.ts tests/claude-code-boundaries.test.ts tests/claude-code-accounts.test.ts tests/claude-code-capability.test.ts tests/claude-code-lock.test.ts tests/claude-code-sessions.test.ts",
     "test:client-config-cli": "tsx scripts/smoke-client-config-cli.ts",
     "test:copy-cli": "tsx scripts/smoke-instance-copy.ts",
     "test:trash-cli": "tsx scripts/smoke-session-trash.ts",

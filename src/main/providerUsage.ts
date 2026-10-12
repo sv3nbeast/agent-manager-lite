@@ -152,13 +152,14 @@ export function invalidateProviderUsage(account: StoredAccount): void {
 }
 
 export function sameUsageAccount(current: StoredAccount | undefined, account: StoredAccount): current is StoredAccount {
-  return !!current && current.kind === 'api_key' && current.generation === account.generation
+  return !!current && account.identityService !== 'anthropic' && current.identityService !== 'anthropic' && current.kind === 'api_key' && current.generation === account.generation
     && current.baseUrl === account.baseUrl && current.credentials.apiKey === account.credentials.apiKey
     && (current.integrationType ?? 'auto') === (account.integrationType ?? 'auto')
     && (current.providerUsageRevision ?? 0) === (account.providerUsageRevision ?? 0)
 }
 
 export async function queryProviderUsage(account: StoredAccount, signal: AbortSignal, request: JSONRequest = requestJSON): Promise<ProviderUsage> {
+  if (account.identityService === 'anthropic' || account.protocol === 'anthropic_messages') throw new ProviderUsageUnavailable()
   const base = new URL(accountInputSchema.shape.baseUrl.parse(account.baseUrl))
   const integrationType = accountInputSchema.shape.integrationType.parse(account.integrationType) ?? 'auto'
   if (!account.credentials.apiKey) throw new Error('账号缺少 API Key')

@@ -3,26 +3,36 @@ import { open, realpath, rename, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { accountIdsSchema, type StagedImport } from '../shared/types'
 import { parseAccountImport, importParsedAccounts } from './accounts'
+import { parseClaudeCodeAccountImport } from './claudeCodeAccounts'
 import { Store, type StoredAccount } from './store'
 import { providerTierForAccount } from './providerLibrary'
 import { effectiveModelContextWindows } from './providerModelContext'
 
 const MAX_BYTES = 16 * 1024 * 1024
+export type AccountImportClientType = 'codex' | 'claude_code'
+type AccountImportResult = ReturnType<typeof parseAccountImport>
 
 export function serializeAccounts(accounts: StoredAccount[]): string {
   return JSON.stringify(accounts.map(account => ({
     auth_mode: account.kind === 'api_key' ? 'apikey' : account.kind === 'agent_identity' ? 'agentIdentity' : 'oauth',
     account_name: account.name, account_note: account.note, tags: account.tags,
     email: account.email, plan_type: account.plan, defaultTier: account.defaultTier,
+    ...(account.protocol ? { protocol: account.protocol } : {}),
+    ...(account.identityService ? { identity_service: account.identityService } : {}),
+    ...(account.credentialKind ? { credential_kind: account.credentialKind } : {}),
     ...(account.subscriptionActiveUntil !== undefined ? { subscription_active_until: account.subscriptionActiveUntil,
       subscription_source: account.subscriptionSource ?? (account.subscriptionQueryLastSuccessAt !== undefined ? 'web' : undefined) } : {}),
     api_base_url: account.baseUrl, api_wire_api: account.wireApi, models: account.models,
     ...(account.kind === 'api_key' ? { integrationType: account.integrationType, modelContextWindows: account.modelContextWindows } : {}),
-    ...(account.kind === 'agent_identity' ? { agent_identity: account.credentials.agentIdentity } : account.kind === 'api_key' ? { openai_api_key: account.credentials.apiKey } : {
-      last_refresh: account.credentials.lastRefresh,
-      tokens: { access_token: account.credentials.accessToken, refresh_token: account.credentials.refreshToken,
-        id_token: account.credentials.idToken, account_id: account.credentials.accountId }
-    })
+    ...(account.kind === 'agent_identity' ? { agent_identity: account.credentials.agentIdentity } : account.identityService === 'anthropic'
+      ? account.kind === 'api_key'
+        ? (account.credentialKind === 'anthropic_bearer' ? { anthropic_auth_token: account.credentials.apiKey } : { anthropic_api_key: account.credentials.apiKey })
+        : { claude_code_oauth_token: account.credentials.accessToken, refresh_token: account.credentials.refreshToken }
+      : account.kind === 'api_key' ? { openai_api_key: account.credentials.apiKey } : {
+        last_refresh: account.credentials.lastRefresh,
+        tokens: { access_token: account.credentials.accessToken, refresh_token: account.credentials.refreshToken,
+          id_token: account.credentials.idToken, account_id: account.credentials.accountId }
+      })
   })), null, 2) + '\n'
 }
 
@@ -43,9 +53,9 @@ export async function writeAccountExport(directory:string,accounts:StoredAccount
 // Paths come only from native dialogs in the main process. Renderer gets a
 // short-lived opaque ticket and display metadata, never file credentials.
 export class AccountFiles {
-  private pending?: { result: ReturnType<typeof parseAccountImport>; ticket: string; expires: number }
+  private pending?: { result: AccountImportResult; ticket: string; expires: number; clientType: AccountImportClientType }
   private generation = 0
-  private fileSelection?:{id:string;generation:number}
+  private fileSelection?:{id:string;generation:number;clientType:AccountImportClientType}
   private expiryTimer?: NodeJS.Timeout
   private readonly exports = new Set<Promise<number>>()
   constructor(private readonly store: Store, private readonly now: () => number = Date.now) {}
@@ -53,22 +63,23 @@ export class AccountFiles {
     if(ticket!==undefined && this.pending?.ticket!==ticket)return
     this.generation++; this.fileSelection=undefined; this.pending = undefined; clearTimeout(this.expiryTimer)
   }
-  stage(raw: string, fileName?: string): StagedImport {
+  stage(raw: string, fileName?: string, clientType: AccountImportClientType = 'codex'): StagedImport {
     this.discard()
-    const result = parseAccountImport(raw)
+    if (clientType !== 'codex' && clientType !== 'claude_code') throw new Error('此客户端尚未接入账号导入')
+    const result = (clientType === 'claude_code' ? parseClaudeCodeAccountImport(raw) : parseAccountImport(raw)) as AccountImportResult
     const ticket = randomUUID()
-    this.pending = { result, ticket, expires: this.now() + 10 * 60_000 }
+    this.pending = { result, ticket, expires: this.now() + 10 * 60_000, clientType }
     this.expiryTimer = setTimeout(() => this.discard(), 10 * 60_000)
     this.expiryTimer.unref()
     return { ticket, preview: structuredClone(result.preview), fileName }
   }
-  beginFileSelection(id:string=randomUUID()):number {this.discard();this.fileSelection={id,generation:this.generation};return this.generation}
+  beginFileSelection(id:string=randomUUID(), clientType: AccountImportClientType = 'codex'):number {this.discard();if(clientType !== 'codex' && clientType !== 'claude_code') throw new Error('此客户端尚未接入账号导入');this.fileSelection={id,generation:this.generation,clientType};return this.generation}
   cancelFileSelection(id:string):void {if(this.fileSelection?.id===id&&this.fileSelection.generation===this.generation)this.discard()}
   async finishFileSelection(operation:number,path:string):Promise<StagedImport>{
     if(operation!==this.generation)throw new Error('导入选择已取消或被新预览替换')
-    return this.stageFile(path)
+    return this.stageFile(path, this.fileSelection?.clientType ?? 'codex')
   }
-  async stageFile(path: string): Promise<StagedImport> {
+  async stageFile(path: string, clientType: AccountImportClientType = 'codex'): Promise<StagedImport> {
     this.discard()
     const generation = this.generation
     const file = await open(path, 'r')
@@ -86,14 +97,14 @@ export class AccountFiles {
       }
       if (size > MAX_BYTES) throw new Error('导入文件超过 16 MB')
       if (generation !== this.generation) throw new Error('导入操作已取消或被新预览替换')
-      return this.stage(Buffer.concat(chunks).toString('utf8'), basename(path))
+      return this.stage(Buffer.concat(chunks).toString('utf8'), basename(path), clientType)
     } finally { await file.close() }
   }
   commit(ticket: string): { added: number; duplicates: number; skipped: number; accountIds:string[] } {
     const staged = this.pending
     if (!staged || staged.ticket !== ticket || this.now() >= staged.expires) throw new Error('导入预览已过期，请重新预览')
     if (staged.result.preview.errors.length) throw new Error('请先修正所有导入错误')
-    if (!staged.result.accounts.length) throw new Error('没有可导入的 Codex 账号')
+    if (!staged.result.accounts.length) throw new Error(`没有可导入的 ${staged.clientType === 'claude_code' ? 'Claude' : 'Codex'} 账号`)
     const accountIds=new Set<string>()
     const result = importParsedAccounts(this.store, staged.result.accounts,id=>accountIds.add(id))
     this.discard()

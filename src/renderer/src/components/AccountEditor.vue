@@ -13,6 +13,7 @@ const props = defineProps<{ open: boolean; account?: Account }>()
 const emit = defineEmits<{ 'update:open': [value: boolean]; 'edit-provider': [providerId: string] }>()
 const manager = useManager()
 const managedConnection = computed(() => props.account?.kind === 'api_key' && !!props.account.providerId)
+const isAnthropic = computed(() => props.account?.identityService === 'anthropic' || props.account?.protocol === 'anthropic_messages' || props.account?.credentialKind?.startsWith('anthropic_') === true || props.account?.credentialKind === 'claude_ai_oauth')
 const linkedProvider = computed(() => manager.data?.providers?.find(provider => provider.id === props.account?.providerId))
 const linkedKey = computed(() => linkedProvider.value?.keys.find(key => key.id === props.account?.providerKeyId))
 const inheritedModels = computed(() => linkedProvider.value?.models ?? props.account?.models ?? [])
@@ -81,7 +82,10 @@ async function save() {
   const original = editingAccount.value, request = keyRead
   const values = { ...form, tags: [...form.tags], models: [...connectionModels.value], modelContextWindows: form.modelContextWindows ? { ...form.modelContextWindows } : undefined }
   formError.value = ''
-  const metadataOnly = original && (original.kind !== 'api_key' || original.providerId)
+  // Claude credentials have a separate identity/protocol contract. Until its
+  // live editor is verified, preserve the imported credential and endpoint and
+  // allow only display metadata edits.
+  const metadataOnly = original && (original.kind !== 'api_key' || original.providerId || isAnthropic.value)
   const schema = metadataOnly
     ? accountInputSchema.pick({ name: true, note: true, tags: true, defaultTier: true, modelContextWindows: true }) : accountInputSchema
   const validation = schema.safeParse(metadataOnly ? { name: values.name, note: values.note, tags: values.tags, defaultTier: values.defaultTier, modelContextWindows: values.modelContextWindows } : values)
@@ -96,7 +100,7 @@ async function save() {
     for (const key of ['name', 'note', 'tags', 'defaultTier'] as const) {
       if (JSON.stringify(values[key]) !== JSON.stringify(original[key])) Object.assign(changes, { [key]: values[key] })
     }
-    if (original.kind === 'api_key') {
+    if (original.kind === 'api_key' && !isAnthropic.value) {
       if (JSON.stringify(values.modelContextWindows ?? {}) !== JSON.stringify(original.modelContextWindows ?? {})) {
         changes.modelContextWindows = values.modelContextWindows ?? {}
       }
@@ -146,17 +150,27 @@ function editProvider() {
         <div class="connection-source-footer"><small>{{ linkedProvider ? '地址、密钥和模型在供应商处统一维护。' : '解除关联后保留现有连接配置。' }}</small><a-button type="link" size="small" @click="unlink">解除关联</a-button></div>
       </section>
       <a-form-item :label="managedConnection ? '连接名称' : '账号名称'" required :validate-status="fieldErrors.name ? 'error' : undefined" :help="fieldErrors.name"><a-input v-model:value="form.name" :maxlength="120" /></a-form-item>
-      <template v-if="(!account || account.kind === 'api_key') && !managedConnection">
+      <section v-if="isAnthropic" class="anthropic-boundary" aria-label="Anthropic 账号边界">
+        <a-alert type="info" show-icon message="Anthropic / Claude Code 账号已保留，等待独立适配器验证" description="登录、配置、隔离和会话边界完成验证前，管理器不会把此凭据投影到 Codex 或 OpenAI API。当前仅允许修改名称、标签、备注和服务等级。" />
+        <dl class="anthropic-details">
+          <div><dt>身份服务</dt><dd>Anthropic</dd></div>
+          <div><dt>凭据类型</dt><dd>{{ account?.credentialKind === 'claude_ai_oauth' ? 'Claude OAuth' : account?.credentialKind === 'anthropic_bearer' ? 'Bearer Token' : account?.credentialKind === 'anthropic_profile' ? 'Anthropic Profile' : account?.credentialKind === 'gateway' ? 'Anthropic Gateway' : 'Anthropic API Key' }}</dd></div>
+          <div><dt>接口协议</dt><dd>Anthropic Messages</dd></div>
+          <div><dt>API 地址</dt><dd>{{ account?.baseUrl || '未配置' }}</dd></div>
+          <div><dt>模型目录</dt><dd>{{ account?.models.join(' · ') || '未声明' }}</dd></div>
+        </dl>
+      </section>
+      <template v-else-if="(!account || account.kind === 'api_key') && !managedConnection">
         <a-form-item label="Base URL" required :validate-status="fieldErrors.baseUrl ? 'error' : undefined" :help="fieldErrors.baseUrl"><a-input v-model:value="form.baseUrl" /></a-form-item>
         <a-form-item label="API Key" required :validate-status="fieldErrors.apiKey ? 'error' : undefined" :help="fieldErrors.apiKey" :extra="keyNeedsEntry ? '地址已更改，请填写用于此地址的 API Key' : undefined"><a-input v-model:value="form.apiKey" aria-label="账号 API Key" autocomplete="off" :disabled="keyLoading" :placeholder="keyLoading ? '正在读取已保存的 API Key…' : '请输入 API Key'" /></a-form-item>
         <a-form-item label="模型列表" extra="多个模型用逗号或换行分隔" required :validate-status="fieldErrors.models ? 'error' : undefined" :help="fieldErrors.models"><a-textarea v-model:value="models" :rows="3" /></a-form-item>
         <a-form-item label="上游协议"><a-select v-model:value="form.wireApi" :options="[{ label: 'Responses', value: 'responses' }, { label: 'Chat Completions', value: 'chat_completions' }]" /></a-form-item>
       </template>
-      <a-form-item v-if="!account || account.kind === 'api_key'" label="模型上下文窗口" :validate-status="fieldErrors.modelContextWindows ? 'error' : undefined" :help="fieldErrors.modelContextWindows" :extra="managedConnection ? '仅覆盖此连接；未设置的模型继承供应商配置。保存后重新启动使用此连接的实例生效。' : '按模型单独配置，仅作用于此连接。保存后重新启动使用此连接的实例生效。'">
+      <a-form-item v-if="(!account || account.kind === 'api_key') && !isAnthropic" label="模型上下文窗口" :validate-status="fieldErrors.modelContextWindows ? 'error' : undefined" :help="fieldErrors.modelContextWindows" :extra="managedConnection ? '仅覆盖此连接；未设置的模型继承供应商配置。保存后重新启动使用此连接的实例生效。' : '按模型单独配置，仅作用于此连接。保存后重新启动使用此连接的实例生效。'">
         <ModelContextWindowsField :key="account?.id ?? 'new-api'" v-model="form.modelContextWindows" :models="connectionModels" :inherited-windows="managedConnection ? linkedProvider?.modelContextWindows : undefined" :active="open" />
       </a-form-item>
       <a-form-item label="服务等级" extra="服务运行期间保存的等级修改，在停止并重新启动后应用。"><a-select v-model:value="form.defaultTier" :options="[{ label: account?.providerId ? '继承供应商设置' : '继承全局设置', value: 'inherit' }, { label: '跟随请求', value: 'follow' }, { label: 'Standard', value: 'standard' }, { label: 'Fast', value: 'fast' }, {label:'Auto',value:'auto'}, {label:'Flex',value:'flex'}]" /></a-form-item>
-      <a-form-item v-if="(!account || account.kind === 'api_key') && !managedConnection" label="额度查询方式" extra="仅影响自定义服务商的额度查询；官方服务商仍使用专用接口。更改后请重新刷新用量。"><a-select v-model:value="form.integrationType" aria-label="账号额度查询方式" :options="integrationTypeOptions" /></a-form-item>
+      <a-form-item v-if="(!account || account.kind === 'api_key') && !managedConnection && !isAnthropic" label="额度查询方式" extra="仅影响自定义服务商的额度查询；官方服务商仍使用专用接口。更改后请重新刷新用量。"><a-select v-model:value="form.integrationType" aria-label="账号额度查询方式" :options="integrationTypeOptions" /></a-form-item>
       <a-form-item label="标签" extra="输入后按回车，可添加多个标签"><a-select v-model:value="form.tags" mode="tags" :token-separators="[',']" /></a-form-item>
       <a-form-item label="备注"><a-textarea v-model:value="form.note" :maxlength="2000" :rows="3" /></a-form-item>
     </a-form>
@@ -166,6 +180,11 @@ function editProvider() {
 
 <style scoped>
 .connection-shared-config { padding: 15px; margin-bottom: 22px; border: 1px solid #7c3aed26; border-radius: 11px; background: #7c3aed06; }
+.anthropic-boundary { margin-bottom: 22px; }
+.anthropic-details { margin: 14px 0 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 9px; font-size: 12px; }
+.anthropic-details > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; padding: 6px 0; }
+.anthropic-details dt { color: var(--muted); }
+.anthropic-details dd { margin: 0; overflow-wrap: anywhere; }
 .connection-source-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .connection-source-heading > span { min-width: 0; }
 .connection-source-heading small { display: block; font-size: 11px; opacity: .6; margin-bottom: 4px; }

@@ -72,7 +72,13 @@ export function createAPIAccount(input: AccountInput): StoredAccount {
   const valid = accountInputSchema.parse(input)
   const { apiKey, ...metadata } = valid
   if (!Object.keys(metadata.modelContextWindows ?? {}).length) delete metadata.modelContextWindows
-  return { ...metadata, id: randomUUID(), kind: 'api_key', createdAt: Date.now(), credentials: { apiKey } }
+  return {
+    ...metadata,
+    identityService: valid.identityService ?? 'openai',
+    credentialKind: valid.credentialKind ?? (valid.identityService === 'anthropic' ? 'anthropic_api_key' : 'openai_api_key'),
+    protocol: valid.protocol ?? (valid.identityService === 'anthropic' ? 'anthropic_messages' : valid.wireApi === 'responses' ? 'openai_responses' : 'openai_chat_completions'),
+    id: randomUUID(), kind: 'api_key', createdAt: Date.now(), credentials: { apiKey }
+  }
 }
 
 // Only an explicit edit request reads a credential; list snapshots stay summaries.
@@ -180,6 +186,13 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
       const source = typeof value === 'string'
         ? (/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(value.trim()) || value.trim().startsWith('at-') ? { access_token: value.trim() } : { refresh_token: value.trim() })
         : object(value)
+      const declaredIdentity = text(source.identityService) ?? text(source.identity_service) ?? text(source.provider) ?? text(source.platform)
+      const anthropicFields = Object.keys(source).some(key => /^(?:anthropic|claude(?:_|ai)|ANTHROPIC_|CLAUDE_CODE_)/i.test(key))
+      if (anthropicFields || declaredIdentity?.toLowerCase() === 'anthropic' || declaredIdentity?.toLowerCase() === 'claude' || text(source.protocol)?.toLowerCase() === 'anthropic_messages') {
+        // Anthropic credentials must go through the Claude-specific parser so
+        // an access token is never interpreted as an OpenAI OAuth identity.
+        preview.skipped!++; return
+      }
       if (source.platform !== undefined && (text(source.platform)?.toLowerCase() !== 'openai' || text(source.type)?.toLowerCase() !== 'oauth')) { preview.skipped!++; return }
       const nested = source.credentials ? object(source.credentials) : {}
       const agentIdentity = parseAgentIdentity(source)
@@ -198,7 +211,7 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
       let account: StoredAccount
       if (agentIdentity) {
         account = {
-          id: randomUUID(), kind: 'agent_identity',
+          id: randomUUID(), kind: 'agent_identity', identityService: 'openai', credentialKind: 'agent_identity', protocol: 'openai_responses',
           name: accountInputSchema.shape.name.parse(metadata.name ?? agentIdentity.email ?? `Agent Identity ${index + 1}`),
           email: agentIdentity.email, plan: agentIdentity.plan_type,
           baseUrl: 'https://chatgpt.com/backend-api/codex', models: [], wireApi: 'responses',
@@ -215,7 +228,7 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
           integrationType: source.integrationType,
           modelContextWindows: source.modelContextWindows ?? source.model_context_windows ?? source.api_model_context_windows
         })
-        account = { ...connection, id: randomUUID(), kind: 'api_key', createdAt: Date.now(), credentials: { apiKey: importedKey },
+        account = { ...connection, identityService: 'openai', credentialKind: 'openai_api_key', protocol: connection.wireApi === 'responses' ? 'openai_responses' : 'openai_chat_completions', id: randomUUID(), kind: 'api_key', createdAt: Date.now(), credentials: { apiKey: importedKey },
           email: text(source.email), plan: text(source.plan_type) ?? text(source.plan) }
       } else {
         const accessToken = take('access_token', 'accessToken', 'personal_access_token', 'personalAccessToken', 'at_token', 'token')
@@ -228,7 +241,7 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
         const profile = identity['https://api.openai.com/profile']
         const email = text(source.email) ?? text(identity.email) ?? (profile && typeof profile === 'object' ? text(object(profile).email) : undefined)
         account = {
-          id: randomUUID(), kind: 'oauth', name: accountInputSchema.shape.name.parse(metadata.name ?? email ?? `OAuth 账号 ${index + 1}`),
+          id: randomUUID(), kind: 'oauth', identityService: 'openai', credentialKind: 'openai_oauth', protocol: 'openai_responses', name: accountInputSchema.shape.name.parse(metadata.name ?? email ?? `OAuth 账号 ${index + 1}`),
           email, plan: text(source.plan_type) ?? text(auth.chatgpt_plan_type),
           baseUrl: 'https://chatgpt.com/backend-api/codex', models: [], wireApi: 'responses',
           defaultTier: accountInputSchema.shape.defaultTier.parse(metadata.defaultTier),
@@ -261,13 +274,25 @@ export function parseAccountImport(raw: string): { accounts: StoredAccount[]; pr
 }
 
 export function sameAccount(a: StoredAccount, b: StoredAccount): boolean {
+  // Older vaults predate identity/protocol metadata.  Resolve their
+  // read-only compatibility defaults before comparing them with newly
+  // imported records; otherwise a duplicate legacy OpenAI key would be
+  // imported as a second account merely because the new record is explicit.
+  const identityA = a.identityService ?? 'openai'
+  const identityB = b.identityService ?? 'openai'
+  const protocolA = a.protocol ?? (identityA === 'anthropic' ? 'anthropic_messages' : a.kind === 'api_key' ? (a.wireApi === 'chat_completions' ? 'openai_chat_completions' : 'openai_responses') : 'openai_responses')
+  const protocolB = b.protocol ?? (identityB === 'anthropic' ? 'anthropic_messages' : b.kind === 'api_key' ? (b.wireApi === 'chat_completions' ? 'openai_chat_completions' : 'openai_responses') : 'openai_responses')
+  const credentialKindA = a.credentialKind ?? (identityA === 'anthropic' ? 'anthropic_api_key' : a.kind === 'oauth' ? 'openai_oauth' : a.kind === 'agent_identity' ? 'agent_identity' : 'openai_api_key')
+  const credentialKindB = b.credentialKind ?? (identityB === 'anthropic' ? 'anthropic_api_key' : b.kind === 'oauth' ? 'openai_oauth' : b.kind === 'agent_identity' ? 'agent_identity' : 'openai_api_key')
+  if (identityA !== identityB || protocolA !== protocolB) return false
   if(a.kind==='oauth'&&b.kind==='oauth'&&strongIdentityConflict(accountIdentity(a),accountIdentity(b)))return false
   if (a.kind === 'agent_identity' || b.kind === 'agent_identity') {
     const left = a.credentials.agentIdentity, right = b.credentials.agentIdentity
     return a.kind === b.kind && Boolean(left && right && left.account_id === right.account_id && left.chatgpt_user_id === right.chatgpt_user_id)
   }
   return a.kind === b.kind && (a.kind === 'api_key'
-    ? a.credentials.apiKey === b.credentials.apiKey && providerEndpoint(a.baseUrl) === providerEndpoint(b.baseUrl)
+    ? identityA === identityB && protocolA === protocolB && credentialKindA === credentialKindB
+      && a.credentials.apiKey === b.credentials.apiKey && providerEndpoint(a.baseUrl) === providerEndpoint(b.baseUrl)
     : Boolean(a.credentials.accessToken) && a.credentials.accessToken === b.credentials.accessToken
       || Boolean(a.credentials.refreshToken) && a.credentials.refreshToken === b.credentials.refreshToken
       || Boolean(a.credentials.accountId) && a.credentials.accountId === b.credentials.accountId && a.email === b.email)
@@ -308,6 +333,9 @@ export function saveOAuthAccount(store: Store, tokens: Tokens): StoredAccount {
       if(state.clientAuthorities?.some(binding=>binding.accountId===existing.id))throw new Error('此账号由客户端维护登录，请先在客户端退出并解除关联后再重新登录')
       const previousIDToken = existing.credentials.idToken
       existing.credentials = { ...existing.credentials, ...tokens }
+      existing.identityService ??= 'openai'
+      existing.credentialKind ??= 'openai_oauth'
+      existing.protocol ??= 'openai_responses'
       existing.email = email ?? existing.email
       existing.plan = text(auth.chatgpt_plan_type) ?? existing.plan
       projectSubscriptionClaim(existing, { previousIDToken, returnedIDToken: tokens.idToken })
@@ -315,7 +343,7 @@ export function saveOAuthAccount(store: Store, tokens: Tokens): StoredAccount {
       result = structuredClone(existing)
     } else {
       result = {
-        id: randomUUID(), kind: 'oauth', name: email ?? 'ChatGPT 账号', email, plan: text(auth.chatgpt_plan_type),
+        id: randomUUID(), kind: 'oauth', identityService: 'openai', credentialKind: 'openai_oauth', protocol: 'openai_responses', name: email ?? 'ChatGPT 账号', email, plan: text(auth.chatgpt_plan_type),
         baseUrl: 'https://chatgpt.com/backend-api/codex', models: [], wireApi: 'responses',
         defaultTier: 'inherit', note: '', tags: [], createdAt: Date.now(), credentials: { ...tokens }
       }

@@ -33,6 +33,8 @@ test('projection isolates config, credentials and sessions without writing files
     assert.equal(projection.environment.CLAUDE_CONFIG_DIR, join(root, 'claude'))
     assert.equal(projection.environment.ANTHROPIC_API_KEY, 'test-key')
     assert.equal(projection.paths.globalStateFile.endsWith('.claude.json'), true)
+    assert.throws(() => projectClaudeCodeConfig({ instanceHome: root, baseUrl: 'ftp://gateway.invalid', apiKey: 'test-key' }), /干净的 HTTP\(S\)/)
+    assert.throws(() => projectClaudeCodeConfig({ instanceHome: root, baseUrl: 'https://gateway.invalid/?token=secret', apiKey: 'test-key' }), /干净的 HTTP\(S\)/)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
@@ -43,7 +45,7 @@ test('environment removes inherited provider credentials before applying the pro
 })
 
 test('policy rejects arguments that escape instance config or workspace', () => {
-  for (const args of [['--settings', '/tmp/settings.json'], ['--resume', '/tmp/other.jsonl'], ['--worktree', 'other'], ['--add-dir=/tmp/other'], ['--model', 'opus'], ['--model=opus']]) assert.throws(() => validateClaudeCodeCliArgs(args), /参数|模型/)
+  for (const args of [['--settings', '/tmp/settings.json'], ['--plugin-dir', '/tmp/plugin'], ['--mcp-config', '/tmp/mcp.json'], ['--strict-mcp-config'], ['--setting-sources', 'project'], ['--resume', '/tmp/other.jsonl'], ['--continue'], ['--desktop'], ['--cloud', 'other'], ['--from-pr', '123'], ['--worktree', 'other'], ['--add-dir=/tmp/other'], ['--model', 'opus'], ['--model=opus']]) assert.throws(() => validateClaudeCodeCliArgs(args), /参数|模型/)
   assert.doesNotThrow(() => validateClaudeCodeCliArgs(['--print', 'hello']))
   assert.throws(() => claudeCodeConfigPaths('relative'), /绝对路径/)
 })

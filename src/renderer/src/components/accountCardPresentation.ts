@@ -6,10 +6,46 @@ export interface AccountCardStatus {
   detail: string
 }
 
+function isAnthropicAccount(account: Account): boolean {
+  return account.identityService === 'anthropic'
+    || account.protocol === 'anthropic_messages'
+    || account.credentialKind?.startsWith('anthropic_') === true
+    || account.credentialKind === 'claude_ai_oauth'
+}
+
+export function isAnthropicAccountRecord(account: Account): boolean {
+  return isAnthropicAccount(account)
+}
+
+/**
+ * Account.kind only describes the credential container.  The identity service
+ * and credential kind determine the label shown to users, otherwise a Claude
+ * OAuth record would be rendered as a ChatGPT OAuth account simply because it
+ * also uses the generic `oauth` container.
+ */
+export function accountCardType(account: Account): string {
+  if (isAnthropicAccount(account)) {
+    if (account.kind === 'oauth') return 'Claude · OAuth'
+    if (account.kind === 'agent_identity') return 'Anthropic · Agent Identity'
+    if (account.credentialKind === 'anthropic_bearer') return 'Anthropic · Bearer'
+    if (account.credentialKind === 'anthropic_profile') return 'Claude · Profile'
+    if (account.credentialKind === 'gateway') return 'Anthropic · Gateway'
+    return 'Anthropic · API Key'
+  }
+  if (account.kind === 'oauth') return 'ChatGPT · OAuth'
+  if (account.kind === 'agent_identity') return 'Agent Identity'
+  return 'API 连接'
+}
+
+export function accountCardProtocol(account: Account): string {
+  if (account.protocol === 'anthropic_messages') return 'Anthropic Messages'
+  return account.wireApi === 'responses' ? 'Responses' : 'Chat Completions'
+}
+
 export function accountCardIdentity(account: Account, connectionLabel?: string) {
   const name = account.name.trim() || account.email?.trim() || '未命名账号'
   const email = account.email?.trim()
-  const type = account.kind === 'oauth' ? 'ChatGPT · OAuth' : account.kind === 'agent_identity' ? 'Agent Identity' : 'API 连接'
+  const type = accountCardType(account)
   const subtitle = account.kind === 'api_key'
     ? connectionLabel?.trim() || account.baseUrl || type
     : email && email.toLocaleLowerCase() !== name.toLocaleLowerCase() ? email : ''
@@ -30,6 +66,7 @@ export function accountCardPlan(account: Account): string {
 export function accountCardStatus(account: Account): AccountCardStatus {
   if (account.needsTokenExchange) return { label: '待验证', tone: 'warning', detail: '刷新令牌尚待验证，刷新用量或启动本地 API 时交换凭据。' }
   if (!account.credentialConfigured) return { label: '缺少凭据', tone: 'error', detail: '尚未保存可用凭据，请编辑账号。' }
+  if (isAnthropicAccount(account)) return { label: '待适配器验证', tone: 'warning', detail: 'Anthropic 登录、配置、隔离和会话边界尚未完成验证；不会调用 OpenAI / ChatGPT 用量接口。' }
   if (account.kind === 'api_key') {
     const usage = account.providerUsage
     if (usage?.error) return { label: '查询失败', tone: usage.unavailable ? 'neutral' : 'error', detail: `${usage.error}${usage.summary ? '；用量区域保留上次成功结果。' : ''}` }

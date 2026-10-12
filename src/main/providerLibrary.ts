@@ -29,7 +29,7 @@ export function providerSummaries(state: State): ProviderSummary[] {
   const references = new Map<string, Map<string, string[]>>()
   const reusable = new Map<string, Map<string, string[]>>()
   for (const account of state.accounts) {
-    if (account.kind === 'api_key' && account.credentials.apiKey) {
+    if (account.kind === 'api_key' && account.identityService !== 'anthropic' && account.credentials.apiKey) {
       const endpoint = providerEndpoint(account.baseUrl)
       const connections = reusable.get(endpoint) ?? new Map<string, string[]>()
       const ids = connections.get(account.credentials.apiKey) ?? []
@@ -78,7 +78,7 @@ export function reconcileProviderKeys(state: State): void {
   const excluded = new Map((state.providers ?? []).map(p => [p.id, new Set(p.excludedKeyHashes)]))
   const changed = new Set<StoredProvider>()
   for (const account of state.accounts) {
-    if (account.kind !== 'api_key' || !account.credentials.apiKey) continue
+    if (account.kind !== 'api_key' || account.identityService === 'anthropic' || !account.credentials.apiKey) continue
     const provider = providers.get(providerEndpoint(account.baseUrl))
     if (!provider || keys.get(provider.id)!.has(account.credentials.apiKey)
       || excluded.get(provider.id)!.has(fingerprint(account.credentials.apiKey))) continue
@@ -158,7 +158,7 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
     }
     const accountById = (id: string, revision: number) => {
       const account = state.accounts.find(a => a.id === id)
-      if (!account || account.kind !== 'api_key') throw new Error('请选择现有 API 账号')
+      if (!account || account.kind !== 'api_key' || account.identityService === 'anthropic') throw new Error('请选择现有 OpenAI API 账号')
       if ((account.revision ?? 0) !== revision) throw new Error('账号已被修改，请重新打开操作窗口')
       return account
     }

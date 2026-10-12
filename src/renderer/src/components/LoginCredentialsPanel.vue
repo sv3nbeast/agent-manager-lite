@@ -4,7 +4,7 @@ import { message } from 'ant-design-vue'
 import type { StagedImport } from '../../../shared/types'
 import { useManager } from '../store'
 
-const props = defineProps<{ mode: 'token' | 'json'; active: boolean }>()
+const props = defineProps<{ mode: 'token' | 'json'; active: boolean; clientType?: 'codex' | 'claude_code' }>()
 const emit = defineEmits<{ busy: [value: boolean]; imported: [accountIds: string[]] }>()
 const manager = useManager()
 const raw = ref(''), error = ref(''), busy = ref(false), committing = ref(false)
@@ -14,7 +14,7 @@ let generation = 0
 let mounted = true
 let fileSelectionId: string | undefined
 const canConfirm = computed(() => !!staged.value?.preview.entries.length && !staged.value.preview.errors.length && !busy.value && !committing.value)
-const kindLabels = { oauth: 'ChatGPT', agent_identity: 'ChatGPT 登录身份', api_key: '供应商连接' }
+const kindLabels = { oauth: '登录身份', agent_identity: 'Agent Identity', api_key: 'API 连接' }
 
 function discard(ticket?: string): void {
   if (ticket) void window.manager.discardImport(ticket).catch(() => undefined)
@@ -41,7 +41,9 @@ async function inspect(file: boolean): Promise<void> {
   fileSelectionId = selectionId
   busy.value = true
   try {
-    const result = file ? await window.manager.chooseImportFile(selectionId) : await window.manager.stageImport(raw.value)
+    const result = file
+      ? await window.manager.chooseImportFile(selectionId, props.clientType ?? 'codex')
+      : await window.manager.stageImport(raw.value, props.clientType ?? 'codex')
     if (mounted && props.active && started === generation) staged.value = result
     else discard(result?.ticket)
   } catch (cause) {
@@ -78,11 +80,11 @@ async function confirm(): Promise<void> {
 <template>
   <section class="credential-import-panel">
     <template v-if="mode === 'token'">
-      <p class="muted">粘贴已有的 ChatGPT 登录令牌，每行一个。支持 access_token、at-… 个人访问令牌或 refresh_token，也可粘贴包含完整 tokens 的 JSON。</p>
+      <p class="muted">粘贴已有的 {{ props.clientType === 'claude_code' ? 'Claude' : 'ChatGPT' }} 登录令牌，每行一个。支持对应客户端的 Token 或完整 JSON。</p>
       <a-alert type="info" message="仅有 refresh_token 的账号会保存为待验证；刷新用量或使用账号时再完成验证。" show-icon class="error-banner" />
     </template>
     <template v-else>
-      <p class="muted">选择 auth.json、账号 JSON / JSONL 文件，或粘贴导出的账号数据。可以一次导入多个账号，已有账号不会被覆盖。</p>
+      <p class="muted">选择 {{ props.clientType === 'claude_code' ? 'Claude 凭据文件' : 'auth.json、账号 JSON / JSONL 文件' }}，或粘贴导出的账号数据。可以一次导入多个账号，已有账号不会被覆盖。</p>
       <a-button :disabled="busy || committing || !active" @click="inspect(true)">选择账号文件</a-button>
       <p v-if="staged?.fileName" class="muted import-file-name">已选择：{{ staged.fileName }}</p>
     </template>
@@ -92,7 +94,7 @@ async function confirm(): Promise<void> {
     <div v-if="staged" class="credential-preview">
       <a-alert v-for="item in staged.preview.errors" :key="item" type="error" :message="item" class="error-banner" />
       <p><strong>识别到 {{ staged.preview.entries.length }} 个账号</strong><span v-if="staged.preview.skipped" class="muted">，跳过 {{ staged.preview.skipped }} 个其他平台账号</span></p>
-      <div v-for="entry in staged.preview.entries.slice(0, 20)" :key="entry.index" class="credential-preview-row"><a-tag>{{ kindLabels[entry.kind] }}</a-tag><span>{{ entry.name }}</span><a-tag v-if="entry.needsVerification" color="orange">待验证</a-tag></div>
+      <div v-for="entry in staged.preview.entries.slice(0, 20)" :key="entry.index" class="credential-preview-row"><a-tag>{{ props.clientType === 'claude_code' ? (entry.kind === 'oauth' ? 'Claude OAuth' : 'Anthropic API') : kindLabels[entry.kind] }}</a-tag><span>{{ entry.name }}</span><a-tag v-if="entry.needsVerification" color="orange">待验证</a-tag></div>
       <p v-if="staged.preview.entries.length > 20" class="muted">其余 {{ staged.preview.entries.length - 20 }} 个账号也已识别</p>
       <p v-if="staged.preview.entries.some(entry => entry.kind === 'api_key')" class="muted">API Key 连接导入后在供应商页管理。</p>
     </div>

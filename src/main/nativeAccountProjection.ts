@@ -29,6 +29,7 @@ export function ownsRefreshChain(account:StoredAccount):boolean {
   return account.kind==='oauth'&&!!(identity.accountId||identity.userId)
 }
 function buildAuth(account:StoredAccount,template:string|null,proxyState:ProxyState={},allowProxy=false):string {
+  if(account.identityService === 'anthropic' || account.protocol === 'anthropic_messages') throw new Error('Anthropic 凭据不能写入 Codex 原生登录文件，请使用 Claude Code 适配器')
   if(!allowProxy&&accountProxyURL(account,proxyState)!==undefined)throw new Error('此目录没有受管启动网络，请通过实例使用原生账号及代理，或使用本地 API')
   if(account.kind==='agent_identity')throw new Error('Agent Identity 按来源仅用于 API 服务，不支持原生客户端登录注入')
   if(account.kind==='api_key'&&(!account.credentials.apiKey||account.wireApi!=='responses'))throw new Error('原生 API 切换需要 Responses 账号；Chat Completions 账号请使用本地 API 转换入口')
