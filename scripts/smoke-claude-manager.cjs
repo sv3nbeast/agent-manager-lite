@@ -17,6 +17,7 @@ assert.equal(resolve(evidence).includes(sep + 'docs' + sep + 'evidence'), false)
 fs.mkdirSync(evidence, { recursive: true, mode: 0o700 })
 fs.rmSync(join(evidence, 'validation.json'), { force: true })
 fs.rmSync(join(evidence, 'claude-ui-failure.png'), { force: true })
+fs.rmSync(join(evidence, 'claude-ui-failure.json'), { force: true })
 require('./test-vault.cjs').installTestVault(safeStorage)
 fs.writeFileSync(join(directory, 'state.vault'), safeStorage.encryptString(JSON.stringify({
   version: 1, settings: { refreshMinutes: 0, theme: 'light' }, groups: [], accounts: [],
@@ -57,6 +58,7 @@ app.whenReady().then(() => {
 })
 const opened = [], pickerOutcomes = []
 let copiedId = '', lastPage, lastPreview
+const stagedImports = { started: 0, completed: 0, failed: 0 }
 shell.openPath = async path => { opened.push({ action: 'file', path }); return '' }
 shell.showItemInFolder = path => { opened.push({ action: 'location', path }) }
 clipboard.writeText = value => { copiedId = value }
@@ -64,7 +66,15 @@ const nativeHandle = ipcMain.handle.bind(ipcMain)
 ipcMain.handle = (channel, listener) => nativeHandle(channel, async (event, ...args) => {
   if (channel === 'manager:invoke') {
     assert.notEqual(args[0], 'startInstance', 'UI smoke must never launch a real CLI or Terminal')
-    const value = await listener(event, ...args)
+    if (args[0] === 'stageImport') stagedImports.started++
+    let value
+    try {
+      value = await listener(event, ...args)
+      if (args[0] === 'stageImport') stagedImports.completed++
+    } catch (error) {
+      if (args[0] === 'stageImport') stagedImports.failed++
+      throw error
+    }
     if (args[0] === 'scanSessions') lastPage = value
     if (args[0] === 'previewInstanceLaunch') lastPreview = value
     if (args[0] === 'chooseInstanceCli') pickerOutcomes.push(value)
@@ -78,11 +88,16 @@ app.on('browser-window-created', (_event, window) => {
   window.webContents.setBackgroundThrottling(false)
   window.setContentSize(1440, 1040)
   window.webContents.once('did-finish-load', async () => {
+    let waitingFor = ''
     const run = code => window.webContents.executeJavaScript('(async()=>(' + code + '))()')
     const visible = selector => 'Array.from(document.querySelectorAll(' + JSON.stringify(selector) + ')).filter(el=>el.getClientRects().length&&getComputedStyle(el).visibility!=="hidden")'
-    const wait = async expression => {
+    const wait = async (expression, rejectIf = 'false') => {
+      waitingFor = expression
       const deadline = Date.now() + 10_000
-      while (!await run(expression)) {
+      for (;;) {
+        const state = await run('({ready:!!(' + expression + '),rejected:!!(' + rejectIf + ')})')
+        assert.equal(state.rejected, false, 'UI validation rejected: ' + expression)
+        if (state.ready) return
         assert.ok(Date.now() < deadline, 'UI timeout: ' + expression)
         await new Promise(resolve => setTimeout(resolve, 25))
       }
@@ -111,11 +126,51 @@ app.on('browser-window-created', (_event, window) => {
       const expression = choices + '.find(el=>el.textContent' + (contains ? '.includes(' + JSON.stringify(text) + ')' : '.replace(/\\s/g,"")===' + JSON.stringify(text.replace(/\s/g, ''))) + ')'
       await wait('!!(' + expression + ')'); await run('(' + expression + ').click()')
     }
+    const addTag = async (label, value) => {
+      const selector = '[aria-label="' + label + '"]'
+      const root = 'document.querySelector(' + JSON.stringify(selector) + ').closest(".ant-select")'
+      await fill(selector, value)
+      const controls = await run(root + '.querySelector("input").getAttribute("aria-controls")')
+      const option = 'Array.from(document.getElementById(' + JSON.stringify(controls) + ')?.closest(".ant-select-dropdown")?.querySelectorAll(".ant-select-item-option")??[]).find(el=>el.getClientRects().length&&el.querySelector(".ant-select-item-option-content")?.textContent===' + JSON.stringify(value) + ')'
+      await wait('!!(' + option + ')')
+      await run('(' + option + ').click()')
+      // The hidden search-width mirror contains the typed text before a tag is
+      // selected. Check the committed tag and cleared search, not parent text.
+      const committed = 'Array.from(' + root + '.querySelectorAll(".ant-select-selection-item-content")).some(el=>el.textContent===' + JSON.stringify(value) + ')&&' + root + '.querySelector("input").value===""'
+      await wait(committed)
+      await run(root + '.querySelector("input").blur()')
+      await wait(committed + '&&!' + root + '.contains(document.activeElement)')
+    }
     const capture = async name => {
       if (name !== 'claude-ui-failure.png') await wait(visible('.ant-message-notice') + '.length===0')
       await run('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
       await run('Promise.all(document.getAnimations().filter(a=>a.effect?.getTiming().iterations!==Infinity).map(a=>a.finished.catch(()=>{})))')
       fs.writeFileSync(join(evidence, name), (await window.webContents.capturePage()).toPNG(), { mode: 0o600 })
+    }
+    const captureFailure = async () => {
+      // Whitelist form state from this isolated synthetic vault. Never collect
+      // raw DOM, IPC arguments, credential values or account/vault contents.
+      const readFormState = () => {
+        const form = document.querySelector('.claude-api-connection')
+        const modelSelect = form?.querySelector('[aria-label="Claude 连接模型"]')?.closest('.ant-select')
+        const active = document.activeElement
+        return {
+          documentHasFocus: document.hasFocus(),
+          activeElement: { tag: active?.tagName, label: active?.getAttribute('aria-label') ?? active?.closest('[aria-label]')?.getAttribute('aria-label') },
+          form: form ? {
+            name: form.querySelector('[aria-label="Claude 连接名称"]')?.value,
+            baseUrl: form.querySelector('[aria-label="Claude API 地址"]')?.value,
+            secretPresent: !!form.querySelector('[aria-label="Claude API 凭据"]')?.value,
+            selectedModels: Array.from(modelSelect?.querySelectorAll('.ant-select-selection-item-content') ?? []).map(el => el.textContent),
+            modelInput: modelSelect?.querySelector('input')?.value,
+          } : null,
+          errors: Array.from(document.querySelectorAll('.credential-import-panel .ant-form-item-explain-error,.credential-import-panel .ant-alert-error .ant-alert-message')).map(el => el.textContent),
+          previewPresent: !!document.querySelector('.credential-preview'),
+        }
+      }
+      const diagnostic = { syntheticDataOnly: true, waitingFor, stagedImports, ...await run('(' + readFormState.toString() + ')()') }
+      fs.writeFileSync(join(evidence, 'claude-ui-failure.json'), JSON.stringify(diagnostic, null, 2), { mode: 0o600 })
+      console.error('Claude UI failure diagnostic:', JSON.stringify(diagnostic))
     }
     const vault = () => JSON.parse(safeStorage.decryptString(fs.readFileSync(join(directory, 'state.vault'))))
     const step = async index => wait(visible('.instance-step[data-step="' + index + '"]') + '.length===1')
@@ -151,12 +206,9 @@ app.on('browser-window-created', (_event, window) => {
       if (kind === 'bearer') await select('Claude 认证方式', 'Bearer Token（Authorization）')
       const secret = 'fixture-' + kind + '-not-a-real-secret'
       await fill('[aria-label="Claude API 凭据"]', secret)
-      await fill('[aria-label="Claude 连接模型"]', model)
-      window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' })
-      window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' })
-      await wait('document.querySelector("[aria-label=\\"Claude 连接模型\\"]").closest(".ant-select").textContent.includes(' + JSON.stringify(model) + ')')
+      await addTag('Claude 连接模型', model)
       await click('.credential-actions button', '检查连接配置')
-      await wait('document.querySelector(".credential-preview")?.textContent.includes(' + JSON.stringify(name + '连接') + ')')
+      await wait('document.querySelector(".credential-preview")?.textContent.includes(' + JSON.stringify(name + '连接') + ')', visible('.credential-import-panel .ant-form-item-explain-error,.credential-import-panel .ant-alert-error') + '.length>0')
       assert.equal(await run('document.querySelector(".credential-preview").innerText.includes(' + JSON.stringify(secret) + ')'), false)
       await capture('claude-' + kind + '-connection.png')
       await click('.credential-actions button', '保存连接')
@@ -330,6 +382,7 @@ app.on('browser-window-created', (_event, window) => {
       clearTimeout(timer); window.destroy(); app.exit(0)
     } catch (error) {
       console.error(error)
+      await captureFailure().catch(() => {})
       await capture('claude-ui-failure.png').catch(() => {})
       clearTimeout(timer); app.exit(1)
     }
