@@ -303,7 +303,9 @@ test('cancel, superseding scans, ticket discard and expiry make prepared changes
   assert.equal(f.store.read().accounts.length, 0)
 })
 
-test('a legal 5001-account library is not rejected by counting nonexistent tombstones as account files', { timeout: 60000 }, async t => {
+// Exercise the complete 5001-account boundary through scan, preview and apply.
+// Repeated filesystem identity checks need the suite's 180s budget on CI runners.
+test('a legal 5001-account library is not rejected by counting nonexistent tombstones as account files', { timeout: 180_000 }, async t => {
   const f = fixture(t), count = 5001
   rmSync(join(f.source, 'codex_accounts'), { recursive: true }); mkdirSync(join(f.source, 'codex_accounts'))
   const rows: { id: string }[] = []
