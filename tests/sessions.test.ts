@@ -9,6 +9,7 @@ import {Store} from '../src/main/store'
 import {ClientConfigs} from '../src/main/clientConfig'
 import {SessionCatalog,classifySession} from '../src/main/sessions'
 import {openSessionFile,reverseSessionLines,sessionContains,sessionTokens,sessionDigest} from '../src/main/sessionFiles'
+import {instanceInputSchema} from '../src/shared/instances'
 
 const when='2026-10-01T08:00:00.000Z'
 function fixture(t:{after(fn:()=>void):void}){
@@ -312,4 +313,92 @@ test('source counts describe whole scanned directories and distinguish empty def
   page=await f.scan()
   assert.ok(page.warnings.some(value=>value.includes(defaultTarget.name)))
   assert.equal(page.sourceCounts?.[defaultTarget.id],undefined,'An unreadable source must not be hidden as empty')
+})
+
+function claudeSource(f:ReturnType<typeof fixture>,name:string,sessionId:string){
+  const id=randomUUID(),profile={...instanceInputSchema.parse({clientType:'claude_code',name,applicationId:'fixture-claude-cli',accountId:randomUUID(),connectionMode:'native',model:'claude-sonnet-4-5'}),id,revision:0,createdAt:Date.now()}
+  f.store.transaction(state=>{state.instances=[...(state.instances??[]),profile]})
+  const home=join(f.store.directory,'instances',id,'home'),project=join(home,'projects','fixture-project'),cwd=join(f.root,'claude-workspace')
+  mkdirSync(project,{recursive:true});mkdirSync(cwd,{recursive:true})
+  const path=join(project,sessionId+'.jsonl')
+  writeFileSync(path,[
+    {type:'user',sessionId,cwd,timestamp:when,message:{role:'user',content:'ACCOUNT_CONVERSATION_BODY_NOT_RETURNED'}},
+    {type:'custom-title',sessionId,customTitle:name+' history'},
+  ].map(value=>JSON.stringify(value)).join('\n')+'\n')
+  return {id,home,path,project,cwd,profile}
+}
+
+test('unified catalog isolates identical Claude session IDs by instance and never merges them with Codex',async t=>{
+  const f=fixture(t),codex=f.source('codex-source'),id=randomUUID(),a=claudeSource(f,'first-account',id),b=claudeSource(f,'second-account',id)
+  rollout(codex.home,id,[usage()])
+  const before=hashes(f.root),page=await f.scan()
+  assert.equal(page.total,3)
+  const rows=page.items.filter(row=>row.clientType==='claude_code')
+  assert.equal(rows.length,2)
+  assert.equal(new Set(page.items.map(row=>row.id)).size,3)
+  assert.ok(rows.every(row=>row.id!==id&&row.sourceSessionId===id&&row.locations.length===1&&!row.locations[0].ambiguous))
+  assert.equal(JSON.stringify(page).includes('ACCOUNT_CONVERSATION_BODY_NOT_RETURNED'),false)
+  assert.ok(page.sources?.some(source=>source.id===a.id&&source.readOnly&&source.clientType==='claude_code'))
+  assert.equal(page.sourceCounts?.[a.id],1);assert.equal(page.sourceCounts?.[b.id],1)
+  assert.ok(!f.configs.targets().some(target=>target.id===a.id),'Codex config targets cannot expose Claude homes')
+  for(const source of [a,b]){
+    const row=rows.find(row=>row.locations[0].targetId===source.id)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:source.id}
+    assert.equal(await f.catalog.location(selection),source.path)
+    assert.equal(f.catalog.originalSessionId(selection),id)
+    await assert.rejects(f.catalog.location({...selection,targetId:codex.target.id}),/不属于/)
+  }
+  assert.deepEqual(hashes(f.root),before,'Indexing and opening metadata cannot mutate credentials or transcripts')
+})
+
+test('Claude rows retain each conflicting project source while all Codex mutation methods reject them',async t=>{
+  const f=fixture(t),id=randomUUID(),a=claudeSource(f,'claude',id),other=join(a.home,'projects','second-project')
+  mkdirSync(other);const copy=join(other,id+'.jsonl');writeFileSync(copy,readFileSync(a.path))
+  const page=await f.scan({targetId:a.id})
+  assert.equal(page.total,2)
+  assert.ok(page.items.every(row=>row.locations[0].ambiguous))
+  const opened=await Promise.all(page.items.map(row=>f.catalog.location({snapshotId:page.snapshotId,sessionId:row.id,targetId:a.id})))
+  assert.deepEqual(new Set(opened),new Set([a.path,copy]))
+  for(const row of page.items){
+    assert.equal(row.capabilities?.transfer,false)
+    assert.equal(row.capabilities?.trash,false)
+    assert.equal(row.capabilities?.visibilityRepair,false)
+    assert.throws(()=>f.catalog.selectedRecords(page.snapshotId,[row.id]),/Claude Code.*只读/)
+    await assert.rejects(f.catalog.transferSources(page.snapshotId,[row.id]),/Claude Code.*只读/)
+  }
+  await assert.rejects(f.catalog.syncSources(page.snapshotId,new AbortController().signal),/Claude Code.*只读/)
+  const tokens=await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:page.items.map(row=>row.id)})
+  assert.ok(tokens.every(value=>!value.tokens&&value.error?.includes('尚未接入')))
+})
+
+test('Claude title filters preserve source counts and raw content filters explicitly omit unsupported Claude search',async t=>{
+  const f=fixture(t),id=randomUUID(),a=claudeSource(f,'claude-search',id)
+  let page=await f.scan({targetId:a.id,titleQuery:'CLAUDE-SEARCH'})
+  assert.equal(page.total,1)
+  page=await f.scan({targetId:a.id,titleQuery:'not-present'})
+  assert.equal(page.total,0);assert.equal(page.sourceCounts?.[a.id],1)
+  page=await f.scan({targetId:a.id,contentQuery:'ACCOUNT_CONVERSATION'})
+  assert.equal(page.total,0)
+  assert.ok(page.warnings.some(warning=>warning.includes('正文搜索未包含')))
+})
+
+test('Claude opening rechecks the instance account binding, revision and safe managed directory',async t=>{
+  const f=fixture(t),id=randomUUID(),a=claudeSource(f,'claude-boundary',id)
+  const page=await f.scan({targetId:a.id}),selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id}
+  f.store.transaction(state=>{state.instances![0].accountId=randomUUID();state.instances![0].revision++})
+  await assert.rejects(f.catalog.location(selection),/实例已变化/)
+  f.store.transaction(state=>{state.instances=[a.profile]})
+  renameSync(join(f.store.directory,'instances',a.id),join(f.root,'moved-instance'))
+  symlinkSync(join(f.root,'moved-instance'),join(f.store.directory,'instances',a.id))
+  await assert.rejects(f.catalog.location(selection),/链接|目录|替换/)
+  const changed=await f.scan({targetId:a.id})
+  assert.equal(changed.total,0)
+  assert.ok(changed.warnings.some(warning=>warning.includes('安全读取')))
+})
+
+test('cancelled Claude scans never publish a partial catalog',async t=>{
+  const f=fixture(t),a=claudeSource(f,'claude-cancel',randomUUID()),before=await f.scan({targetId:a.id})
+  const runId=randomUUID(),pending=f.scan({runId,targetId:a.id})
+  f.catalog.cancel(runId)
+  await assert.rejects(pending,/已取消/)
+  assert.throws(()=>f.catalog.page({snapshotId:before.snapshotId,page:1}),/已更新/)
 })

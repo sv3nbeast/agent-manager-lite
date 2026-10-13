@@ -2,13 +2,23 @@
 import {computed,ref,watch} from 'vue'
 import {useManager} from '../store'
 import type {TempCredentialStore} from '../../../shared/tempLogin'
+import type {InstanceApplicationChoice} from '../../../shared/types'
 const props=defineProps<{disabled:boolean}>(),manager=useManager(),applicationId=ref(''),intercept=ref(true),actionError=ref('')
 const credentialStore=ref<TempCredentialStore>('file')
 const login=computed(()=>manager.data?.tempLogin),cleanup=computed(()=>manager.data?.tempLoginCleanup)
-const applications=computed(()=>(manager.data?.instanceApplications??[]).filter(app=>app.kind!=='cli'&&app.supportsTempLogin===true))
+const applications=computed(()=>(manager.data?.instanceApplications??[]).filter(app=>(app.clientType===undefined||app.clientType==='codex')&&app.kind!=='cli'&&app.supportsTempLogin===true))
 const labels={'idle':'准备登录','preparing':'正在准备临时客户端','launching':'正在打开临时客户端','waiting-login':'等待你在临时客户端中登录','importing':'正在读取并保存账号','closing':'正在关闭临时客户端','cleaning':'正在清理临时文件','completed':'登录成功','cancelled':'登录已取消','failed':'登录未完成'}
 watch(applications,value=>{if(!value.some(app=>app.id===applicationId.value))applicationId.value=value[0]?.id??''},{immediate:true})
-async function choose(){actionError.value='';const old=new Set(applications.value.map(app=>app.id));if(await manager.execute(()=>window.manager.chooseInstanceApplication())){const selected=applications.value.find(app=>!old.has(app.id));if(selected)applicationId.value=selected.id;else if(!applications.value.length)actionError.value='请选择安装的 Codex 桌面应用，或使用浏览器授权登录。'}}
+async function choose(){
+  actionError.value=''
+  let choice:InstanceApplicationChoice|undefined
+  const saved=await manager.execute(async()=>{choice=await window.manager.chooseInstanceApplication();return choice.application?choice.snapshot:manager.data??choice.snapshot})
+  if(saved&&choice?.application){
+    const selected=applications.value.find(app=>app.id===choice?.application?.id)
+    if(selected)applicationId.value=selected.id
+    else actionError.value='请选择支持此登录方式的 Codex 桌面应用，或使用浏览器授权登录。'
+  }
+}
 async function start(){actionError.value='';await manager.execute(()=>window.manager.startTempLogin({applicationId:applicationId.value,interceptAuthUrl:intercept.value,credentialStore:credentialStore.value}))}
 async function cancel(){if(login.value?.id)await manager.execute(()=>window.manager.cancelTempLogin(login.value!.id!))}
 async function retryCleanup(){await manager.execute(()=>window.manager.cleanupTempLogin())}

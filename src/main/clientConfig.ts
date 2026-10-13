@@ -11,7 +11,7 @@ import { buildModelCatalog, builtInCatalog, catalogCapabilities, catalogMetadata
 import {journalSchema,configKey,displayConfigValue} from './configJournal'
 import {providerView,providerEdits} from './providerConfig'
 import type {ProviderConfigView} from '../shared/providerConfig'
-import {instanceHomePath,validateExternalHome} from './instancePaths'
+import {instanceHomePath,validateExternalHome,pathContains} from './instancePaths'
 import {instanceProviderName} from './instanceProviderName'
 import {effectiveModelContextWindows} from './providerModelContext'
 import {chooseSessionDatabase,sessionDatabaseConfigPath} from './sessionDatabase'
@@ -59,13 +59,16 @@ export class ClientConfigs {
   private importedCatalog?: { target: string; ticket: string; catalog: NativeCatalog; expiresAt: number }
   constructor(private readonly store: Store, private readonly now = Date.now, private readonly inUse:(id:string)=>boolean=()=>false) { this.root = realpathSync(store.directory) }
   targets(): ClientConfigTarget[] {
-    return [{ id: managedId, name: '默认 Codex 目录', description:'客户端配置使用的默认目录，与实例的独立目录分开。', role:'default', directory: join(this.root, 'clients', 'default'), managed: true },
-      ...(this.store.read().instances ?? []).map(instance=>({id:instance.id,name:`实例 · ${instance.name}`,role:'instance' as const,directory:instanceHomePath(this.root,instance),managed:!instance.externalHome})),
+    const claudeHomes=(this.store.read().instances??[]).filter(instance=>instance.clientType==='claude_code').map(instance=>instanceHomePath(this.root,instance))
+    return [{ id: managedId, name: '默认 Codex 目录', description:'客户端配置使用的默认目录，与实例的独立目录分开。', role:'default' as const, directory: join(this.root, 'clients', 'default'), managed: true },
+      ...(this.store.read().instances ?? []).filter(instance=>instance.clientType===undefined||instance.clientType==='codex').map(instance=>({id:instance.id,name:`实例 · ${instance.name}`,role:'instance' as const,directory:instanceHomePath(this.root,instance),managed:!instance.externalHome})),
       ...(this.store.read().configTargets ?? []).map(({ device: _device, inode: _inode, ...target }) => ({...target,role:'external' as const}))]
+      .filter(target=>!claudeHomes.some(home=>pathContains(home,target.directory)||pathContains(target.directory,home)))
   }
   register(selectedDirectory: string): ClientConfigTarget {
     const canonical = realpathSync(selectedDirectory)
     directory(canonical)
+    if(this.store.read().instances?.some(profile=>profile.clientType==='claude_code'&&(pathContains(instanceHomePath(this.root,profile),canonical)||pathContains(canonical,instanceHomePath(this.root,profile)))))throw new Error('Claude 实例目录不能登记为 Codex 配置目录')
     const existing = this.targets().find(target => target.directory === canonical)
     if(existing&&this.store.read().instances?.some(instance=>instance.id===existing.id))return this.target(existing.id)
     const stat = lstatSync(canonical)

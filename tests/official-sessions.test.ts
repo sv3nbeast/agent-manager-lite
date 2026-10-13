@@ -4,9 +4,12 @@ import {spawn} from 'node:child_process'
 import {mkdtempSync,lstatSync,realpathSync,rmSync} from 'node:fs'
 import {join} from 'node:path'
 import {tmpdir} from 'node:os'
-import {rebuildSessionMetadata} from '../src/main/officialSessions'
+import {rebuildSessionMetadata,sessionProgram} from '../src/main/officialSessions'
 
 const path=realpathSync(process.execPath),stat=lstatSync(path),program={path,device:stat.dev,inode:stat.ino,size:stat.size,mtime:stat.mtimeMs}
+test('Codex session mutations reject a Claude installation before resolving or executing its path',()=>{
+  assert.throws(()=>sessionProgram({id:'fixture-claude',clientType:'claude_code',name:'Claude',kind:'cli',path:'/nonexistent-claude-fixture'}),/只能选择 Codex/)
+})
 function fixture(t:{after(fn:()=>void):void}){const home=realpathSync(mkdtempSync(join(tmpdir(),'cml-indexer-')));t.after(()=>rmSync(home,{recursive:true,force:true}));return home}
 const prelude=String.raw`const rl=require('node:readline').createInterface({input:process.stdin});const reply=(id,result)=>process.stdout.write(JSON.stringify({id,result})+'\n');let initialized=false;rl.on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize'){reply(m.id,{serverInfo:{name:'fixture'}});return}if(m.method==='initialized'){initialized=true;return}if(!initialized)process.exit(3);`
 

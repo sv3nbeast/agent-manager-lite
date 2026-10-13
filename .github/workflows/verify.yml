@@ -50,3 +50,5 @@ jobs:
         run: npm run build
       - name: Verify instance lifetime across manager Quit and reopen
         run: npm run test:desktop:tray
+      - name: Verify Claude connections and session boundaries in the manager UI
+        run: npm run test:desktop:claude-manager

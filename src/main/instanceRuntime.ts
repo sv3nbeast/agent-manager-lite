@@ -9,7 +9,7 @@ import type {AgentClientType} from '../shared/agentClients'
 import {getInstanceClientAdapter,codexDesktopEnvironment,reserveCodexCdpPort} from './codexInstanceAdapter'
 
 const exec=promisify(execFile)
-export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
+export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';managedArgs?:string[];launchEnvironment?:Record<string,string>;cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
 export interface DesktopProcess { pid:number; started:string }
 export interface DesktopRuntime {
   find(plan:DesktopPlan):Promise<DesktopProcess|undefined>
@@ -21,7 +21,7 @@ export function desktopEnvironment(source:NodeJS.ProcessEnv,route?:InstanceNetwo
   return codexDesktopEnvironment(source,route)
 }
 export function macLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.args):string[] {
-  return getInstanceClientAdapter(plan.clientType).macLaunchArgs(plan,args)
+  return getInstanceClientAdapter(plan.clientType,'desktop').macLaunchArgs(plan,args)
 }
 // LaunchServices owns the launcher PID. Only an exact executable + private nonce
 // match proves that a discovered PID belongs to this managed desktop instance.
@@ -29,7 +29,7 @@ export class MacDesktopRuntime implements DesktopRuntime {
   private readonly cdpSessions=new Map<string,CodexSpeedMenuCdpSession>()
   private supported() {if(process.platform!=='darwin')throw new Error('桌面实例当前仅在 macOS 接入，其他平台仍在迁移')}
   async find(plan:DesktopPlan):Promise<DesktopProcess|undefined> {
-    getInstanceClientAdapter(plan.clientType)
+    getInstanceClientAdapter(plan.clientType,'desktop')
     this.supported()
     const result=await exec('/bin/ps',['-ww','-axo','pid=,args='],{encoding:'utf8',maxBuffer:4*1024*1024,timeout:5000})
     const marker=`--cml-instance=${plan.nonce}`
@@ -47,7 +47,7 @@ export class MacDesktopRuntime implements DesktopRuntime {
     }
   }
   async launch(plan:DesktopPlan,signal:AbortSignal):Promise<DesktopProcess> {
-    getInstanceClientAdapter(plan.clientType)
+    getInstanceClientAdapter(plan.clientType,'desktop')
     this.supported();signal.throwIfAborted()
     const env=desktopEnvironment(process.env,plan.networkRoute)
     const args=plan.networkRoute?plan.args:desktopNetworkArgs(plan.args,env,macSystemProxyEnabled())

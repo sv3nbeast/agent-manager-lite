@@ -3,8 +3,10 @@ import { computed, nextTick, ref, watch, type CSSProperties } from 'vue'
 import { theme } from 'ant-design-vue'
 import { ExclamationCircleOutlined, FolderOutlined, RightOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import type { InstanceHistorySummary } from '../../../shared/instances'
+import type { AgentClientType } from '../../../shared/agentClients'
 
-const props = defineProps<{ history: InstanceHistorySummary }>()
+const props = defineProps<{ history: InstanceHistorySummary; clientType?:AgentClientType }>()
+const isClaude = computed(() => props.clientType === 'claude_code')
 const { token } = theme.useToken()
 const detailsOpen = ref(false), query = ref(''), detailsButton = ref<HTMLButtonElement>()
 const colors = computed<CSSProperties>(() => ({
@@ -38,10 +40,10 @@ watch(() => props.history, () => {
 
 <template>
   <section class="instance-history-overview" :style="colors">
-    <dl class="history-metrics">
+    <dl class="history-metrics" :class="{'history-metrics-claude':isClaude}">
       <div><dt>已保存会话</dt><dd>{{ number(history.sessions) }}</dd></div>
       <div><dt>项目</dt><dd>{{ number(history.projects.length) }}</dd></div>
-      <div><dt>其中已归档</dt><dd>{{ number(history.archived) }}</dd></div>
+      <div v-if="!isClaude"><dt>其中已归档</dt><dd>{{ number(history.archived) }}</dd></div>
     </dl>
 
     <div v-if="history.projects.length" class="history-project-preview">
@@ -51,13 +53,13 @@ watch(() => props.history, () => {
           <span v-for="(project, index) in projectPreview" :key="project.path + ':' + index" class="history-project-name" :title="project.name">{{ project.name }}</span>
           <span v-if="remainingProjects" class="history-project-more">+{{ remainingProjects }}</span>
         </div>
-        <p v-if="history.unassigned" class="history-unassigned">{{ number(history.unassigned) }} 个未关联项目的会话显示在「最近」。</p>
+        <p v-if="history.unassigned" class="history-unassigned">{{ number(history.unassigned) }} {{isClaude?'个会话未记录项目目录。':'个未关联项目的会话显示在「最近」。'}}</p>
       </div>
       <button ref="detailsButton" type="button" class="history-details-button" aria-label="查看项目" aria-haspopup="dialog" :aria-expanded="detailsOpen" @click="openDetails">
         查看项目 <RightOutlined aria-hidden="true" />
       </button>
     </div>
-    <p v-else class="history-unassigned">没有项目分组，会话显示在「最近」。</p>
+    <p v-else class="history-unassigned">{{isClaude?(history.sessions?'会话未记录项目目录。':'尚无已保存会话。'):'没有项目分组，会话显示在「最近」。'}}</p>
 
     <div v-if="history.issues.length" class="history-issues" role="status">
       <ExclamationCircleOutlined aria-hidden="true" />
@@ -70,7 +72,7 @@ watch(() => props.history, () => {
         <a-input v-model:value="query" allow-clear aria-label="搜索项目" placeholder="搜索项目名称或路径">
           <template #prefix><SearchOutlined aria-hidden="true" /></template>
         </a-input>
-        <p class="history-project-result" aria-live="polite">{{ query.trim() ? `找到 ${number(filteredProjects.length)} 个项目` : `${number(history.projects.length)} 个项目` }}<span v-if="history.unassigned"> · {{ number(history.unassigned) }} 个会话在「最近」</span></p>
+        <p class="history-project-result" aria-live="polite">{{ query.trim() ? `找到 ${number(filteredProjects.length)} 个项目` : `${number(history.projects.length)} 个项目` }}<span v-if="history.unassigned"> · {{ number(history.unassigned) }} {{isClaude?'个会话未记录项目目录':'个会话在「最近」'}}</span></p>
         <ul v-if="filteredProjects.length" class="history-project-list" aria-label="项目会话分组">
           <li v-for="(project, index) in filteredProjects" :key="project.path + ':' + index" class="history-project-row">
             <FolderOutlined class="history-folder-icon" aria-hidden="true" />
@@ -91,6 +93,7 @@ watch(() => props.history, () => {
 <style scoped>
 .instance-history-overview{padding:14px 18px;border:1px solid var(--history-border);border-radius:12px;background:var(--history-surface);color:var(--history-text)}
 .history-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0}
+.history-metrics-claude{grid-template-columns:repeat(2,minmax(0,1fr))}
 .history-metrics>div{padding:0 18px;border-left:1px solid var(--history-border)}
 .history-metrics>div:first-child{padding-left:0;border-left:0}
 .history-metrics>div:last-child{padding-right:0}

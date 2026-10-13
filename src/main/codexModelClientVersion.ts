@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, sep } from 'node:path'
 import type { InstanceApplication } from '../shared/instances'
 import { codexDesktopEnvironment, getInstanceClientAdapter } from './codexInstanceAdapter'
 import { resolveCliRuntime } from './cliResolver'
+import { resolveAgentClientType } from '../shared/agentClients'
 
 const missingCLI = () => new Error('所选客户端缺少可安全读取版本的 Codex CLI，请重新选择客户端程序')
 
@@ -38,6 +39,7 @@ function bundledCLI(application: InstanceApplication): string {
 /** The models endpoint uses the bundled CLI version, rather than the desktop UI version. */
 export async function readCodexModelClientVersion(application: InstanceApplication, signal: AbortSignal): Promise<string> {
   signal.throwIfAborted()
+  if(resolveAgentClientType(application.clientType)!=='codex')throw new Error('Codex 模型查询只能选择 Codex 程序')
   const adapter = getInstanceClientAdapter(application.clientType)
   adapter.validateApplication({ clientType: adapter.client.id, extraArgs: [] }, application)
   const runtime = adapter.launchRuntime(application)

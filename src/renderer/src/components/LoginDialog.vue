@@ -26,14 +26,14 @@ const starting = ref(false)
 const login = computed(() => manager.data?.login)
 const active = computed(() => ['starting', 'waiting', 'exchanging'].includes(login.value?.status ?? ''))
 const temporaryRunning = computed(() => !!manager.data?.tempLogin?.running)
-const credentialMode = computed(() => method.value === 'json' ? 'json' : 'token')
+const credentialMode = computed(() => method.value === 'json' ? 'json' : isClaude.value ? 'api' : 'token')
 const locked = computed(() => active.value || starting.value || temporaryRunning.value || importing.value)
 let cancelledOAuthId: string | undefined
 let cancelledTemporaryId: string | undefined
 let cancelledStarting = false
 
 async function start(kind: 'browser' | 'device') {
-  if (locked.value || manager.loading) return
+  if (isClaude.value || locked.value || manager.loading) return
   callback.value = ''
   starting.value = true
   cancelledStarting = false
@@ -62,7 +62,7 @@ function cancelPending() {
   }
 }
 function scanLocal() {
-  if (locked.value || manager.loading) return
+  if (isClaude.value || locked.value || manager.loading) return
   open.value = false
   emit('scan-local')
 }
@@ -79,6 +79,11 @@ watch([open, () => props.clientType], ([value]) => {
     cancelledTemporaryId = undefined
   } else cancelPending()
 })
+watch(selectedClient, () => {
+  pendingImportIds.value = []
+  completionSent = false
+  method.value = isClaude.value ? 'token' : 'official'
+})
 // A start response can arrive after the modal closes. Cancel that login too.
 watch(() => [login.value?.id, login.value?.status, manager.data?.tempLogin?.id, temporaryRunning.value], () => {
   if (!open.value) cancelPending()
@@ -93,7 +98,7 @@ function finishImport() {
   if(!open.value||!pendingImportIds.value.length)return
   const visible=manager.data?.accounts??[]
   if(pendingImportIds.value.some(id=>!visible.some(account=>account.id===id)))return
-  const account = pendingImportIds.value.map(id=>visible.find(account=>account.id===id&&account.kind!=='api_key')).find(Boolean)
+  const account = pendingImportIds.value.map(id=>visible.find(account=>account.id===id&&(isClaude.value?account.identityService==='anthropic'&&account.kind==='api_key':account.kind!=='api_key'))).find(Boolean)
   pendingImportIds.value=[]
   if(props.clientType&&!account){message.info('导入已完成，请返回实例选择已保存的兼容账号或供应商密钥。');return}
   completed(account?.id)
@@ -105,7 +110,7 @@ function imported(accountIds:string[]) {
 }
 watch(()=>manager.data?.accounts,finishImport)
 watch(() => [login.value?.status, login.value?.accountId, manager.data?.tempLogin?.phase, manager.data?.tempLogin?.accountId], () => {
-  if (!open.value) return
+  if (!open.value || isClaude.value) return
   if (login.value?.status === 'success' && login.value.id !== previousLoginSuccess && login.value.accountId) completed(login.value.accountId)
   const temporary = manager.data?.tempLogin
   if (temporary?.phase === 'completed' && temporary.id !== previousTemporarySuccess && temporary.accountId) completed(temporary.accountId)
@@ -118,13 +123,13 @@ onUnmounted(cancelPending)
       <a-form-item v-if="!clientType" label="客户端用途"><a-select v-model:value="selectedClient" aria-label="账号用途" :disabled="locked" :options="implementedAgentClients.map(item=>({value:item.id,label:item.name}))" /></a-form-item>
       <p v-else class="muted">用于 {{ client.name }} · 添加完成后回到实例配置</p>
     </div>
-    <p class="muted login-introduction">为 {{ client.name }} 添加登录身份或连接。选择一种添加方式；供应商密钥在供应商页管理。</p>
+    <p class="muted login-introduction">{{ isClaude ? '为 Claude Code CLI 添加 API Key 或 Bearer 连接。订阅登录与 Desktop 正在单独验收。' : `为 ${client.name} 添加登录身份或连接。选择一种添加方式；供应商密钥在供应商页管理。` }}</p>
     <a-tabs v-model:active-key="method" class="login-methods" :animated="false">
       <a-tab-pane v-if="!isClaude" key="official" :disabled="locked && method !== 'official'"><template #tab><span class="method-label"><DesktopOutlined />官方客户端</span></template></a-tab-pane>
       <a-tab-pane v-if="!isClaude" key="oauth" :disabled="locked && method !== 'oauth'"><template #tab><span class="method-label"><GlobalOutlined />浏览器授权</span></template></a-tab-pane>
-      <a-tab-pane key="token" :disabled="locked && method !== 'token'"><template #tab><span class="method-label"><KeyOutlined />Token</span></template></a-tab-pane>
+      <a-tab-pane key="token" :disabled="locked && method !== 'token'"><template #tab><span class="method-label"><KeyOutlined />{{ isClaude ? 'API 连接' : 'Token' }}</span></template></a-tab-pane>
       <a-tab-pane key="json" :disabled="locked && method !== 'json'"><template #tab><span class="method-label"><CodeOutlined />JSON / 文件</span></template></a-tab-pane>
-      <a-tab-pane key="local" :disabled="locked && method !== 'local'"><template #tab><span class="method-label"><ScanOutlined />扫描本机</span></template></a-tab-pane>
+      <a-tab-pane v-if="!isClaude" key="local" :disabled="locked && method !== 'local'"><template #tab><span class="method-label"><ScanOutlined />扫描本机</span></template></a-tab-pane>
     </a-tabs>
 
     <template v-if="method === 'official' && !isClaude">
@@ -153,7 +158,7 @@ onUnmounted(cancelPending)
 
     <LoginCredentialsPanel v-if="method === 'token' || method === 'json'" :mode="credentialMode" :active="open" :client-type="props.clientType ?? selectedClient" @busy="importing = $event" @imported="imported" />
 
-    <section v-if="method === 'local'" class="local-import-panel">
+    <section v-if="method === 'local' && !isClaude" class="local-import-panel">
       <div class="local-import-mark"><ScanOutlined /></div>
       <h3>发现本机已有账号与供应商</h3>
       <p class="muted">扫描兼容客户端和账号管理工具的本地数据。先查看识别结果，再选择迁入本应用的账号与供应商。</p>

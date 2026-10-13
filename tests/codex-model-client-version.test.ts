@@ -8,6 +8,9 @@ import type { InstanceApplication } from '../src/shared/instances'
 import { readCodexModelClientVersion } from '../src/main/codexModelClientVersion'
 
 const supported = process.platform === 'darwin' || process.platform === 'linux'
+test('Codex model version probes reject another client before accessing its installation',async()=>{
+  await assert.rejects(readCodexModelClientVersion({id:'fixture-claude',clientType:'claude_code',name:'Claude',kind:'cli',path:'/nonexistent-claude-fixture'},new AbortController().signal),/只能选择 Codex/)
+})
 const build = realpathSync(mkdtempSync(join(tmpdir(), 'cml-model-version-test-build-')))
 const binary = join(build, 'version-fixture')
 if (supported) {

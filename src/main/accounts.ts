@@ -82,12 +82,22 @@ export function createAPIAccount(input: AccountInput): StoredAccount {
 }
 
 // Only an explicit edit request reads a credential; list snapshots stay summaries.
+function isAnthropicAccount(account: StoredAccount): boolean {
+  return account.identityService === 'anthropic' || account.protocol === 'anthropic_messages'
+    || account.credentialKind?.startsWith('anthropic_') === true || account.credentialKind === 'claude_ai_oauth'
+}
+function editableAnthropicConnection(account: StoredAccount): boolean {
+  return account.kind === 'api_key' && account.identityService === 'anthropic' && account.protocol === 'anthropic_messages'
+    && ['anthropic_api_key', 'anthropic_bearer', 'gateway'].includes(account.credentialKind ?? '')
+}
+
 export function readAccountKey(store: Store, input: unknown): string {
   const { id, revision } = accountKeyReadSchema.parse(input)
   const account = store.read().accounts.find(item => item.id === id)
   if (!account) throw new Error('账号已删除，请重新打开编辑窗口')
   if ((account.revision ?? 0) !== revision) throw new Error('账号已被修改，请重新打开编辑窗口')
   if (account.kind !== 'api_key') throw new Error('登录账号不支持读取 API Key')
+  if (isAnthropicAccount(account) && !editableAnthropicConnection(account)) throw new Error('此 Anthropic 凭据类型尚未支持连接编辑')
   if (account.providerId || account.providerKeyId) throw new Error('连接由供应商管理，请在供应商页编辑密钥')
   if (!account.credentials.apiKey) throw new Error('账号未配置 API Key，请重新打开编辑窗口')
   return account.credentials.apiKey
@@ -99,12 +109,27 @@ export function editAccount(store: Store, input: unknown, inUse: (id: string) =>
     const account = state.accounts.find(a => a.id === id)
     if (!account) throw new Error('账号已删除')
     if ((account.revision ?? 0) !== revision) throw new Error('账号已被修改，请重新打开编辑窗口')
+    if ((['identityService', 'credentialKind', 'protocol'] as const).some(key => changes[key] !== undefined && changes[key] !== account[key])) {
+      throw new Error('账号的身份服务、凭据类型和接口协议不可更改，请添加对应类型的新连接')
+    }
+    const anthropic = isAnthropicAccount(account)
+    const connectionFields = ['apiKey', 'baseUrl', 'models', 'wireApi', 'integrationType', 'modelContextWindows']
+    if (account.kind !== 'api_key' && connectionFields.some(key => key in changes)) throw new Error('登录账号仅支持修改名称、标签、备注和服务等级')
+    if (anthropic) {
+      if (!editableAnthropicConnection(account) && connectionFields.some(key => key in changes)) throw new Error('此 Anthropic 凭据类型尚未支持连接编辑，仅可修改名称、标签和备注')
+      if (['wireApi', 'integrationType', 'modelContextWindows'].some(key => key in changes)) throw new Error('Claude API 连接仅支持修改地址、模型和密钥，接口协议固定为 Anthropic Messages')
+      if ([changes.apiKey, changes.baseUrl, ...(changes.models ?? [])].some(value => value !== undefined && /[\0\r\n]/.test(value))) throw new Error('Claude 连接配置包含无效字符')
+    }
     const connectionChanged = changes.apiKey !== undefined && changes.apiKey !== account.credentials.apiKey
       || (['baseUrl', 'models', 'wireApi'] as const).some(key => changes[key] !== undefined && JSON.stringify(changes[key]) !== JSON.stringify(account[key]))
     const integrationChanged = changes.integrationType !== undefined && changes.integrationType !== (account.integrationType ?? 'auto')
-    if (account.kind !== 'api_key' && ['apiKey', 'baseUrl', 'models', 'wireApi', 'integrationType', 'modelContextWindows'].some(key => key in changes)) throw new Error('登录账号仅支持修改名称、标签、备注和服务等级')
-    if ((connectionChanged || integrationChanged) && account.providerId) throw new Error('连接由供应商管理，请在供应商页修改，或先解除账号关联')
-    if (connectionChanged && inUse(id)) throw new Error('请先停止使用该账号的本地服务或解除客户端凭据关联，再修改连接信息')
+    if ((connectionChanged || integrationChanged) && (account.providerId || account.providerKeyId)) throw new Error('连接由供应商管理，请在供应商页修改，或先解除账号关联')
+    if (connectionChanged && inUse(id)) throw new Error('请先停止使用该账号的实例、本地服务或解除客户端凭据关联，再修改连接信息')
+    // Retargeting a Claude connection must explicitly supply the destination's
+    // credential. Never reuse a saved secret merely because it is in the vault.
+    if (anthropic && changes.baseUrl !== undefined && providerEndpoint(changes.baseUrl) !== providerEndpoint(account.baseUrl) && changes.apiKey === undefined) {
+      throw new Error('Claude API 地址已更改，请重新填写用于此地址的密钥')
+    }
     if (changes.baseUrl !== undefined && changes.baseUrl !== account.baseUrl
       || changes.apiKey !== undefined && changes.apiKey !== account.credentials.apiKey || integrationChanged) invalidateProviderUsage(account)
     const { apiKey, integrationType, modelContextWindows, ...metadata } = changes

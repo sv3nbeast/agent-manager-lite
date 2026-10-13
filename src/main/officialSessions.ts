@@ -9,9 +9,11 @@ import {setTimeout as delay} from 'node:timers/promises'
 import type {InstanceApplication} from '../shared/instances'
 import {resolveCliRuntime} from './cliResolver'
 import {codexBundledCli} from './codexPrograms'
+import {resolveAgentClientType} from '../shared/agentClients'
 
 export interface SessionProgram {path:string;device:number;inode:number;size:number;mtime:number}
 export function sessionProgram(application:InstanceApplication):SessionProgram{
+  if(resolveAgentClientType(application.clientType)!=='codex')throw new Error('Codex 会话操作只能选择 Codex 程序')
   if(realpathSync(application.path)!==application.path)throw new Error('Codex 程序路径已变化，请重新选择')
   const path=application.kind==='cli'?resolveCliRuntime(application.path).executable:codexBundledCli(application.path),stat=lstatSync(path)
   return {path,device:stat.dev,inode:stat.ino,size:stat.size,mtime:stat.mtimeMs}

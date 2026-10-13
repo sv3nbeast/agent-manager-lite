@@ -23,10 +23,10 @@ export const implementedAgentClients = [{
   id:'codex' as const,name:'Codex',identityService:'openai' as const,
   capabilities:{login:true,nativeAccounts:true,localApi:true,models:true,contextWindow:true,fast:true,
     launchModes:['desktop','cli'] as const,projectDirectoryModes:['cli'] as const}
-}] as const
+},claudeCodeClient] as const
 
 /** Descriptors used by diagnostics and compatibility checks, not creation UI. */
-export const plannedAgentClients = [claudeCodeClient] as const
+export const plannedAgentClients = [] as const
 
 export function getAgentClient(value:unknown) {
   const type=resolveAgentClientType(value)
@@ -43,7 +43,7 @@ export function hasInstanceUpstreamProxy(account:Pick<Account,'egressProxy'>|und
 /** Recommendation for a new draft only; persisted/legacy modes must not be migrated. */
 export function recommendedInstanceConnectionMode(clientType:unknown,account:Pick<Account,'kind'|'egressProxy'>|undefined):'native'|'local_api' {
   const client=getAgentClient(clientType)
-  return client.capabilities.nativeAccounts&&account?.kind==='oauth'?'native':'local_api'
+  return clientType==='claude_code'||client.capabilities.nativeAccounts&&account?.kind==='oauth'?'native':'local_api'
 }
 
 export interface AccountCompatibility {compatible:boolean;reason?:string}
@@ -58,7 +58,7 @@ export function accountCompatibility(clientType:unknown,account:Pick<Account,'ki
     const kind=account.credentialKind as ClaudeCodeCredentialKind|undefined
     if(options.connectionMode==='local_api')return {compatible:false,reason:'Claude Code 当前不支持管理器本地 API 转换，请使用 CLI 原生连接'}
     if(account.kind==='api_key'&&!['anthropic_api_key','anthropic_bearer','gateway'].includes(kind??''))return {compatible:false,reason:'此 API 凭据未声明为 Anthropic Messages 连接'}
-    if(account.kind==='oauth'&&kind!=='claude_ai_oauth')return {compatible:false,reason:'此 OAuth 凭据不属于 Claude AI'}
+    if(account.kind==='oauth')return {compatible:false,reason:'Claude 订阅登录与刷新仍在独立验证；当前请选择 API Key 或 Bearer 连接'}
     if(account.kind==='agent_identity')return {compatible:false,reason:'Agent Identity 仅适用于其所属身份服务，不能用于 Claude Code'}
     if(!['oauth','api_key'].includes(account.kind))return {compatible:false,reason:'Claude Code 凭据类型尚未接入'}
     if(options.model!==undefined&&account.models.length>0&&!account.models.includes(options.model))return {compatible:false,reason:'账号未声明支持当前 Claude 模型'}

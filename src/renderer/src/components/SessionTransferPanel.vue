@@ -13,6 +13,7 @@ useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>!!transfer.value&&['copying','committing','indexing'].includes(transfer.value.status))
 const labels={copying:'正在复制',committing:'正在保存文件',indexing:'正在更新 Codex 会话列表',completed:'复制已完成',cancelled:'操作已取消',failed:'复制失败',recovery_required:'需要处理恢复记录'}
 const bytes=(value:number)=>value<1024?value+' B':value<1024**2?(value/1024).toFixed(1)+' KiB':value<1024**3?(value/1024**2).toFixed(1)+' MiB':(value/1024**3).toFixed(2)+' GiB'
+const codexApplications=(items:InstanceApplication[]|undefined)=>(items??[]).filter(app=>app.clientType===undefined||app.clientType==='codex')
 const progress=computed(()=>transfer.value?.totalBytes?Math.min(100,Math.floor(transfer.value.bytes/transfer.value.totalBytes*100)):0)
 let alive=true,generation=0,polling=false,timer:ReturnType<typeof setInterval>|undefined,observedActive=false
 function apply(state:{transfer?:SessionTransferView;recoveries:SessionTransferRecovery[]}){
@@ -25,8 +26,18 @@ async function poll(){if(polling)return;polling=true;try{apply(await window.mana
 function invalidate(){generation++;preview.value=undefined;clientsClosed.value=false;void window.manager.discardSessionCopy().catch(cause=>{if(alive)error.value=String(cause)})}
 function close(){open.value=false;retryId.value=undefined;invalidate()}
 function begin(id?:string){invalidate();error.value='';retryId.value=id;targetId.value=undefined;applicationId.value=applications.value[0]?.id;open.value=true}
-async function chooseCli(){try{const data=await window.manager.chooseInstanceCli();if(alive){applications.value=data.instanceApplications??[];applicationId.value=applications.value.filter(app=>app.kind==='cli').at(-1)?.id;invalidate()}}catch(cause){error.value=String(cause)}}
-async function chooseApp(){try{const data=await window.manager.chooseInstanceApplication();if(alive){applications.value=data.instanceApplications??[];applicationId.value=applications.value.filter(app=>app.kind!=='cli').at(-1)?.id;invalidate()}}catch(cause){error.value=String(cause)}}
+async function choose(kind:'cli'|'desktop'){
+  const current=generation
+  try{
+    const choice=kind==='cli'?await window.manager.chooseInstanceCli():await window.manager.chooseInstanceApplication()
+    if(!alive||current!==generation||!choice.application)return
+    const items=codexApplications(choice.snapshot.instanceApplications),selected=items.find(app=>app.id===choice.application?.id&&(app.kind==='cli')===(kind==='cli'))
+    if(!selected)throw new Error('请选择用于更新会话列表的 Codex 程序')
+    applications.value=items;applicationId.value=selected.id;invalidate()
+  }catch(cause){if(alive&&current===generation)error.value=String(cause)}
+}
+async function chooseCli(){await choose('cli')}
+async function chooseApp(){await choose('desktop')}
 async function prepare(){
   if(!props.snapshotId||!targetId.value||!applicationId.value)return
   const current=++generation;loading.value=true;error.value=''
@@ -44,7 +55,7 @@ async function confirm(){
 async function cancel(){if(!transfer.value)return;try{apply(await window.manager.cancelSessionTransfer(transfer.value.id))}catch(cause){if(alive)error.value=String(cause)}}
 async function backup(id:string){try{await window.manager.openSessionTransferBackup(id)}catch(cause){error.value=String(cause)}}
 watch(()=>[props.snapshotId,...props.selectedIds],()=>{if(open.value&&!retryId.value)close()})
-onMounted(async()=>{try{const [data,state]=await Promise.all([window.manager.load(),window.manager.sessionTransferState()]);if(alive){applications.value=data.instanceApplications??[];apply(state);timer=setInterval(()=>void poll(),750)}}catch(cause){if(alive)error.value=String(cause)}})
+onMounted(async()=>{try{const [data,state]=await Promise.all([window.manager.load(),window.manager.sessionTransferState()]);if(alive){applications.value=codexApplications(data.instanceApplications);apply(state);timer=setInterval(()=>void poll(),750)}}catch(cause){if(alive)error.value=String(cause)}})
 onUnmounted(()=>{alive=false;generation++;clearInterval(timer);void window.manager.discardSessionCopy().catch(()=>{})})
 </script>
 

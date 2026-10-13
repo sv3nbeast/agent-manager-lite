@@ -279,7 +279,7 @@ try {
   assert.equal(await evaluate('window.manager.startSessionImport({ticket:"invalid",clientsClosed:false}).then(()=>false,()=>true)'),true)
   await evaluate(`Array.from(document.querySelectorAll('.ant-menu-item')).find(el=>el.textContent==='会话管理').click()`)
   for(let i=0;i<50;i++){if(await evaluate('document.querySelector(".sessions-panel .toolbar")?.textContent.includes("读取于")'))break;await delay(50)}
-  assert.equal(await evaluate('document.querySelector("h1").textContent'),'Codex 会话')
+  assert.equal(await evaluate('document.querySelector("h1").textContent'),'会话')
   assert.equal(await evaluate('document.querySelector(".sessions-panel .toolbar").textContent.includes("0 个会话")'),true)
   assert.equal(await evaluate('document.querySelector(".sessions-panel .ant-empty").textContent.includes("没有找到会话")'),true)
   assert.equal(await evaluate('document.querySelector(".session-transfers .transfer-toolbar button").disabled'),true)

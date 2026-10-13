@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { Account } from '../src/shared/types'
-import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardStatus, accountCardTier } from '../src/renderer/src/components/accountCardPresentation'
+import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardStatus, accountCardTier, accountCardType, isSupportedAnthropicAPIAccount } from '../src/renderer/src/components/accountCardPresentation'
 
 function account(changes: Partial<Account> = {}): Account {
   return { id: 'fixture', name: 'alex@example.com', email: 'alex@example.com', kind: 'oauth', baseUrl: 'https://fixture.invalid/v1', models: [], wireApi: 'responses', defaultTier: 'inherit', note: '', tags: [], createdAt: Date.parse('2026-10-03T01:20:00Z'), credentialConfigured: true, ...changes }
@@ -91,4 +91,41 @@ test('display names preserve custom plans, tier choices and unknown dates', () =
   assert.equal(accountCardDate(-1), '未知')
   assert.match(accountCardDate(Date.parse('2026-10-03T01:20:00Z')), /2026.*10.*03/)
   assert.notEqual(accountCardDate(0), '未知')
+})
+
+test('configured Claude API and Bearer resources describe saved configuration without claiming upstream authentication or usage', () => {
+  for (const credentialKind of ['anthropic_api_key', 'anthropic_bearer', 'gateway'] as const) {
+    const connection = account({ kind: 'api_key', identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind,
+      models: ['gateway-model'], providerUsage: { checkedAt: 100, summary: { source: 'deepseek', updatedAt: 100, isValid: true, balance: 100 } } })
+    const status = accountCardStatus(connection)
+    assert.equal(isSupportedAnthropicAPIAccount(connection), true)
+    assert.equal(status.label, 'API 连接已配置')
+    assert.equal(status.tone, 'neutral')
+    assert.match(status.detail, /已保存.*实际访问权限以首次请求结果为准/)
+    assert.doesNotMatch(status.detail, /鉴权成功|登录成功|已同步|待适配器/)
+  }
+})
+
+test('incomplete Claude API connections do not claim a configured connection', () => {
+  const connection = account({ kind: 'api_key', identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind: 'anthropic_bearer', models: ['gateway-model'] })
+  assert.equal(accountCardStatus({ ...connection, credentialConfigured: false }).label, '缺少凭据')
+  for (const changes of [{ models: [] }, { models: [''] }, { models: ['invalid\nmodel'] }, { baseUrl: '' }, { baseUrl: 'https://gateway.invalid?key=invalid' }, { baseUrl: 'https://gateway.invalid/\npath' }]) {
+    assert.equal(accountCardStatus({ ...connection, ...changes }).label, '待完善配置')
+  }
+})
+
+test('Claude OAuth, profile and cloud credentials remain pending without suggesting OpenAI refresh or local API exchange', () => {
+  for (const credentialKind of ['claude_ai_oauth', 'anthropic_profile', 'bedrock', 'vertex', 'foundry'] as const) {
+    const connection = account({ kind: credentialKind === 'claude_ai_oauth' ? 'oauth' : 'api_key', identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind,
+      models: ['gateway-model'], needsTokenExchange: credentialKind === 'claude_ai_oauth' })
+    assert.equal(isSupportedAnthropicAPIAccount(connection), false)
+    const status = accountCardStatus(connection)
+    assert.equal(status.label, '待适配器验证')
+    assert.equal(status.tone, 'warning')
+    assert.doesNotMatch(status.detail, /刷新用量|启动本地 API|API 连接已配置/)
+    assert.match(status.detail, /独立验证/)
+    assert.doesNotMatch(accountCardType(connection), /API Key/)
+  }
+  const inconsistent = account({ kind: 'api_key', identityService: 'anthropic', protocol: 'openai_responses', credentialKind: 'anthropic_api_key', models: ['model'] })
+  assert.equal(accountCardStatus(inconsistent).label, '待适配器验证')
 })

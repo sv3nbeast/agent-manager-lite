@@ -1,0 +1,299 @@
+import test, { after, type TestContext } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { Store } from '../src/main/store'
+import { Instances } from '../src/main/instances'
+import type { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
+import { MacCliRuntime, MacInstanceRuntime } from '../src/main/cliInstanceRuntime'
+import { parseClaudeCodeAccountImport } from '../src/main/claudeCodeAccounts'
+import { createAPIAccount } from '../src/main/accounts'
+
+const supported = process.platform === 'darwin'
+const build = realpathSync(mkdtempSync(join(tmpdir(), 'aml-claude-native-fixture-'))), binary = join(build, 'claude native fixture')
+if (supported) execFileSync('go', ['build', '-o', binary, 'tests/fixtures/claude-client.go'], { cwd: resolve('.'), timeout: 30_000, stdio: 'pipe' })
+after(() => rmSync(build, { recursive: true, force: true }))
+const transcriptName = join('projects', 'fixture-project', '76be7829-ec9e-4577-94f6-e940c775f25f.jsonl')
+
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 5000): Promise<T> {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    const result = read()
+    if (result !== undefined) return result
+    if (Date.now() > end) throw new Error('Claude fixture evidence timeout')
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 30))
+  }
+}
+
+interface Evidence {
+  configDirectory: string; home: string; cwd: string; argv0: string; args: string[]; pid: number
+  apiKey: string; bearer: string; oauth: string; profile: string; model: string; baseUrl: string
+  bedrock: string; openAIKey: string; codexHome: string; projectDirectoryOverride: string; nodeOptions: string
+}
+
+function fixture(t: TestContext, options: { open?: (script: string, launch: () => void) => Promise<void>; missingFlags?: boolean } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml-claude-instances-')))
+  const store = new Store(join(root, 'data'), { encrypt: value => Buffer.from(value), decrypt: value => value.toString() })
+  const executable = join(root, options.missingFlags ? 'claude missing-flags' : "claude 程序 ' $(literal)")
+  copyFileSync(binary, executable)
+  const shellHome = join(root, 'shell-home'); mkdirSync(shellHome)
+  const children: ChildProcess[] = [], managers: Instances[] = []
+  const handoffs: { path: string; mode: number; body: string; script: string }[] = []
+  const cli = new MacCliRuntime(async script => {
+    const environment = script.replace(/\.command$/, '.environment')
+    assert.equal(JSON.parse(readFileSync(join(script, '..', '..', 'home', '.claude.json'), 'utf8')).hasCompletedOnboarding, true)
+    handoffs.push({ path: environment, mode: lstatSync(environment).mode & 0o777, body: readFileSync(environment, 'utf8'), script: readFileSync(script, 'utf8') })
+    const launch = () => {
+      const child = spawn('/bin/bash', [script], {
+        env: { ...process.env, HOME: shellHome, OPENAI_API_KEY: 'inherited-openai-must-not-reach', CODEX_HOME: 'inherited-codex-home', CLAUDE_CONFIG_DIR: 'inherited-claude-directory', ANTHROPIC_API_KEY: 'inherited-anthropic-key', ANTHROPIC_AUTH_TOKEN: 'inherited-bearer', CLAUDE_CODE_OAUTH_TOKEN: 'inherited-oauth', ANTHROPIC_PROFILE: 'inherited-profile', CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_PROJECT_DIR_NAME: 'inherited-project-override', ANTHROPIC_BASE_URL: 'https://inherited.invalid', NODE_OPTIONS: '--inspect=0' },
+        stdio: 'ignore',
+      })
+      children.push(child)
+    }
+    if (options.open) await options.open(script, launch); else launch()
+  })
+  const runtime = new MacInstanceRuntime(undefined, cli)
+  const nativeAccounts = new Proxy({}, { get: (_target, property) => () => assert.fail(`Claude invoked OpenAI native account service ${String(property)}`) }) as NativeInstanceAccounts
+  const create = () => {
+    const instances = new Instances(store, () => assert.fail('Claude must not create the OpenAI local gateway'), async () => assert.fail('Claude must not refresh through the OpenAI token authority'), runtime, nativeAccounts)
+    managers.push(instances)
+    return instances
+  }
+  const instances = create(), application = instances.registerApplication(executable, 'cli', 'claude_code')
+  const api = parseClaudeCodeAccountImport(JSON.stringify({ name: 'Claude fixture API', ANTHROPIC_API_KEY: 'fixture-claude-api-secret', baseUrl: 'http://127.0.0.1:9', models: ['fixture-sonnet'] })).accounts[0]
+  const bearer = parseClaudeCodeAccountImport(JSON.stringify({ name: 'Claude fixture bearer', ANTHROPIC_AUTH_TOKEN: 'fixture-claude-bearer-secret', baseUrl: 'http://127.0.0.1:10', models: ['fixture-haiku'] })).accounts[0]
+  assert.ok(api && bearer)
+  store.transaction(state => { state.accounts.push(api, bearer) })
+  const add = (name = 'Claude API', account = api, extraArgs = ["literal $(no-execution);'汉字"], applicationId = application.id) => {
+    instances.save({ details: { clientType: 'claude_code', name, applicationId, accountId: account.id, connectionMode: 'native', model: account.models[0], defaultTier: 'inherit', extraArgs } })
+    return instances.views().at(-1)!
+  }
+  const start = async (id: string) => {
+    const view = instances.views().find(item => item.id === id)!
+    instances.start(instances.preview({ id, revision: view.revision }).ticket)
+    await instances.settled(id)
+    const updated = instances.views().find(item => item.id === id)!
+    assert.equal(updated.status, 'running', updated.error)
+  }
+  const evidence = (directory: string) => waitFor<Evidence>(() => { try { return JSON.parse(readFileSync(join(directory, 'fixture-claude.json'), 'utf8')) } catch { return } })
+  t.after(async () => {
+    for (const manager of managers.reverse()) await manager.closeAll().catch(() => {})
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    rmSync(root, { recursive: true, force: true })
+  })
+  return { root, store, executable, shellHome, instances, create, application, api, bearer, add, start, evidence, handoffs, children }
+}
+
+test('Claude API and Bearer use concurrent owned native processes and consume a private secret handoff', { skip: !supported }, async t => {
+  const f = fixture(t), first = f.add(), second = f.add('Claude Bearer', f.bearer)
+  const settings = '{"theme":"light","permissions":{"deny":["WebFetch"]}}\n'
+  writeFileSync(join(first.directory, 'settings.json'), settings)
+  const preview = f.instances.preview({ id: first.id, revision: first.revision })
+  assert.equal(preview.clientType, 'claude_code'); assert.equal(preview.identityStatus, 'api_configured')
+  assert.ok(!JSON.stringify(preview).includes(f.api.credentials.apiKey!))
+  await f.start(first.id); await f.start(second.id)
+  const a = await f.evidence(first.directory), b = await f.evidence(second.directory)
+  assert.notEqual(a.pid, b.pid); assert.equal(a.configDirectory, first.directory); assert.equal(b.configDirectory, second.directory)
+  assert.equal(a.apiKey, f.api.credentials.apiKey); assert.equal(a.bearer, '')
+  assert.equal(b.apiKey, ''); assert.equal(b.bearer, f.bearer.credentials.apiKey)
+  for (const result of [a, b]) {
+    assert.equal(result.home, f.shellHome)
+    for (const key of ['oauth', 'profile', 'bedrock', 'openAIKey', 'codexHome', 'projectDirectoryOverride', 'nodeOptions'] as const) assert.equal(result[key], '', key)
+    assert.match(result.argv0, /^--cml-instance=/)
+    assert.deepEqual(result.args.slice(0, 8), ['--setting-sources', 'user', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--model', result.model, "literal $(no-execution);'汉字"])
+  }
+  assert.equal(a.model, 'fixture-sonnet'); assert.equal(b.model, 'fixture-haiku')
+  assert.equal(a.baseUrl, f.api.baseUrl); assert.equal(b.baseUrl, f.bearer.baseUrl)
+  assert.equal(f.handoffs.length, 2)
+  for (const handoff of f.handoffs) {
+    assert.equal(handoff.mode, 0o600); assert.equal(existsSync(handoff.path), false)
+    assert.ok(!handoff.script.includes(f.api.credentials.apiKey!) && !handoff.script.includes(f.bearer.credentials.apiKey!))
+  }
+  for (const instance of [first, second]) {
+    const checkpoint = readFileSync(join(f.store.directory, 'instances', instance.id, 'launch.json'), 'utf8')
+    assert.ok(!checkpoint.includes('secret'))
+    assert.equal(existsSync(join(instance.directory, 'auth.json')), false)
+    assert.equal(existsSync(join(instance.directory, 'config.toml')), false)
+    assert.ok(existsSync(join(instance.directory, transcriptName)))
+  }
+  const transcript = readFileSync(join(first.directory, transcriptName), 'utf8')
+  await f.instances.stop(first.id)
+  assert.throws(() => process.kill(a.pid, 0)); assert.doesNotThrow(() => process.kill(b.pid, 0))
+  assert.equal(readFileSync(join(first.directory, 'settings.json'), 'utf8'), settings)
+  assert.equal(readFileSync(join(first.directory, transcriptName), 'utf8'), transcript)
+  await f.instances.stop(second.id)
+})
+
+test('Claude cards keep their CLI mode and report missing or incompatible connections accurately', {skip:!supported}, t=>{
+  const f=fixture(t),instance=f.add()
+  assert.equal(f.instances.views()[0].identityStatus,'api_configured')
+  f.store.transaction(state=>{state.accounts[0].protocol='openai_responses';state.instanceApplications=[]})
+  assert.equal(f.instances.views()[0].identityStatus,'unknown')
+  assert.equal(f.instances.views()[0].launchMode,'cli')
+  f.store.transaction(state=>{state.accounts=state.accounts.filter(account=>account.id!==instance.accountId)})
+  assert.equal(f.instances.views()[0].identityStatus,'missing')
+  assert.throws(()=>f.instances.preview({id:instance.id,revision:instance.revision}),/连接已删除/)
+})
+
+test('Claude restart recovery retains the live process and preserves its final user settings and sessions', { skip: !supported }, async t => {
+  const f = fixture(t), first = f.add(), second = f.add('Claude peer', f.bearer)
+  await f.start(first.id); await f.start(second.id)
+  const a = await f.evidence(first.directory), b = await f.evidence(second.directory)
+  const transcript = readFileSync(join(first.directory, transcriptName), 'utf8')
+  const finalSettings = '{"theme":"dark","fixtureSettingAfterExit":true}\n'
+  writeFileSync(join(first.directory, 'fixture-write-settings.json'), finalSettings)
+  const reopened = f.create(); await reopened.recover()
+  assert.equal(reopened.views().find(item => item.id === first.id)?.pid, a.pid)
+  assert.equal(reopened.views().find(item => item.id === first.id)?.status, 'error')
+  assert.doesNotThrow(() => process.kill(a.pid, 0)); assert.doesNotThrow(() => process.kill(b.pid, 0))
+  await reopened.stop(first.id)
+  assert.throws(() => process.kill(a.pid, 0)); assert.doesNotThrow(() => process.kill(b.pid, 0))
+  assert.equal(readFileSync(join(first.directory, 'settings.json'), 'utf8'), finalSettings)
+  assert.equal(readFileSync(join(first.directory, transcriptName), 'utf8'), transcript)
+  assert.equal(existsSync(join(f.store.directory, 'instances', first.id, 'launch.json')), false)
+  await reopened.stop(second.id)
+})
+
+test('Claude natural exit is recovered without deleting user configuration or transcript state', { skip: !supported }, async t => {
+  const f = fixture(t), instance = f.add(); await f.start(instance.id)
+  const value = await f.evidence(instance.directory), settings = '{"theme":"dark","keepOnExit":true}\n'
+  writeFileSync(join(instance.directory, 'fixture-write-settings.json'), settings)
+  process.kill(value.pid, 'SIGTERM')
+  await waitFor(() => { try { process.kill(value.pid, 0); return } catch { return true } })
+  const reopened = f.create(); await reopened.recover()
+  assert.equal(reopened.views()[0].status, 'stopped')
+  assert.equal(readFileSync(join(instance.directory, 'settings.json'), 'utf8'), settings)
+  assert.ok(existsSync(join(instance.directory, transcriptName)))
+  assert.equal(existsSync(join(instance.directory, '.claude.json')), true)
+})
+
+test('Claude deferred terminal cancellation revokes the permit and deletes unconsumed credentials', { skip: !supported }, async t => {
+  let scriptText = '', release: (() => void) | undefined
+  const f = fixture(t, { open: async script => { scriptText = readFileSync(script, 'utf8'); await new Promise<void>(resolveOpen => { release = resolveOpen }) } })
+  const instance = f.add(), preview = f.instances.preview({ id: instance.id, revision: 0 })
+  f.instances.start(preview.ticket)
+  await waitFor(() => release)
+  assert.equal(existsSync(f.handoffs[0].path), true)
+  const stopped = f.instances.stop(instance.id); release!(); await stopped
+  assert.equal(f.instances.views()[0].status, 'stopped'); assert.equal(existsSync(f.handoffs[0].path), false)
+  const delayed = spawn('/bin/bash', ['-c', scriptText], { stdio: 'ignore' })
+  const code = await new Promise(resolveExit => delayed.once('close', resolveExit))
+  assert.notEqual(code, 0)
+  assert.equal(existsSync(join(instance.directory, 'fixture-claude.json')), false)
+})
+
+test('Claude terminal failure cleans the secret handoff and keeps the original settings', { skip: !supported }, async t => {
+  const f = fixture(t, { open: async () => { throw new Error('simulated Terminal failure') } }), instance = f.add()
+  const settings = '{"theme":"light"}\n'; writeFileSync(join(instance.directory, 'settings.json'), settings)
+  f.instances.start(f.instances.preview({ id: instance.id, revision: 0 }).ticket); await f.instances.settled(instance.id)
+  assert.equal(f.instances.views()[0].status, 'error')
+  assert.equal(f.handoffs.length, 1); assert.equal(existsSync(f.handoffs[0].path), false)
+  assert.equal(readFileSync(join(instance.directory, 'settings.json'), 'utf8'), settings)
+  assert.equal(existsSync(join(instance.directory, 'fixture-claude.json')), false)
+  assert.equal(existsSync(join(f.store.directory, 'instances', instance.id, 'launch.json')), false)
+})
+
+test('Claude client exiting during startup preserves its files and leaves another instance running', { skip: !supported }, async t => {
+  const f = fixture(t), peer = f.add('Healthy Claude peer', f.bearer), failing = f.add('Early exit', f.api, [])
+  await f.start(peer.id)
+  const peerEvidence = await f.evidence(peer.directory), settings = '{"theme":"light","preserveAfterFailure":true}\n'
+  writeFileSync(join(failing.directory, 'settings.json'), settings)
+  writeFileSync(join(failing.directory, 'fixture-exit-immediately'), 'exit 3')
+  f.instances.start(f.instances.preview({ id: failing.id, revision: 0 }).ticket); await f.instances.settled(failing.id)
+  assert.equal(f.instances.views().find(item => item.id === failing.id)?.status, 'error')
+  assert.doesNotThrow(() => process.kill(peerEvidence.pid, 0))
+  assert.equal(f.instances.views().find(item => item.id === peer.id)?.status, 'running')
+  assert.equal(readFileSync(join(failing.directory, 'settings.json'), 'utf8'), settings)
+  assert.ok(existsSync(join(failing.directory, transcriptName)))
+  assert.ok(f.handoffs.every(handoff => !existsSync(handoff.path)))
+  assert.equal(existsSync(join(f.store.directory, 'instances', failing.id, 'launch.json')), false)
+})
+
+test('Claude preview detects changed settings, account credentials and executable ownership before launch', { skip: !supported }, async t => {
+  for (const change of ['settings', 'account', 'executable'] as const) await t.test(change, async subtest => {
+    const f = fixture(subtest), instance = f.add()
+    const settings = join(instance.directory, 'settings.json'); writeFileSync(settings, '{"theme":"light"}')
+    const preview = f.instances.preview({ id: instance.id, revision: 0 })
+    if (change === 'settings') writeFileSync(settings, '{"theme":"dark"}')
+    if (change === 'account') f.store.transaction(state => { state.accounts[0].credentials.apiKey = 'fixture-account-changed' })
+    if (change === 'executable') { renameSync(f.executable, `${f.executable}.old`); copyFileSync(binary, f.executable) }
+    assert.throws(() => f.instances.start(preview.ticket), /变化|替换/)
+    assert.equal(f.handoffs.length, 0); assert.equal(existsSync(join(instance.directory, 'fixture-claude.json')), false)
+  })
+})
+
+test('Claude upgrade missing a managed isolation flag is blocked before secret handoff', { skip: !supported }, async t => {
+  const f = fixture(t, { missingFlags: true }), instance = f.add()
+  f.instances.start(f.instances.preview({ id: instance.id, revision: 0 }).ticket); await f.instances.settled(instance.id)
+  assert.equal(f.instances.views()[0].status, 'error')
+  assert.match(f.instances.views()[0].error ?? '', /缺少受管参数/)
+  assert.equal(f.handoffs.length, 0); assert.equal(existsSync(join(instance.directory, 'fixture-claude.json')), false)
+})
+
+test('Claude only accepts verified API credential and native CLI boundaries', { skip: !supported }, t => {
+  const f = fixture(t)
+  const oauth = parseClaudeCodeAccountImport(JSON.stringify({ name: 'Pending subscription', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-fixture', models: ['fixture-sonnet'] })).accounts[0]
+  const openai = createAPIAccount({ name: 'OpenAI boundary fixture', note: '', tags: [], apiKey: 'fixture-openai', baseUrl: 'http://127.0.0.1:9/v1', models: ['fixture-sonnet'], wireApi: 'responses', defaultTier: 'inherit' })
+  f.store.transaction(state => { state.accounts.push(oauth, openai) })
+  for (const account of [oauth, openai]) assert.throws(() => f.add(account.name, account), /尚未|兼容|Anthropic|凭据|登录/)
+  assert.throws(() => f.instances.save({ details: { clientType: 'claude_code', name: 'Unsupported local API', applicationId: f.application.id, accountId: f.api.id, connectionMode: 'local_api', model: 'fixture-sonnet', extraArgs: [] } }), /本地 API|直连|支持|尚未/)
+  const script = join(f.root, 'claude.js'); writeFileSync(script, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+  assert.throws(() => {
+    const app = f.instances.registerApplication(script, 'cli', 'claude_code')
+    const view = f.add('Script rejected', f.api, [], app.id)
+    f.instances.preview({ id: view.id, revision: 0 })
+  }, /原生/)
+  assert.throws(() => f.instances.registerApplication(f.executable, 'desktop', 'claude_code'), /Desktop|隔离/)
+  for (const args of [['auth', 'login'], ['setup-token'], ['update'], ['mcp', 'add'], ['-rforeign-session'], ['-mforeign-model'], ['-wother-worktree']]) {
+    assert.throws(() => f.add(`Rejected ${args[0]}`, f.api, args), /参数|命令|覆盖|允许/)
+  }
+  assert.equal(f.handoffs.length, 0)
+})
+
+test('Claude stable launcher upgrades retain the application ID and recover each running executable', { skip: !supported }, async t => {
+  const f = fixture(t), launcher = join(f.root, 'claude-current'), versionTwo = join(f.root, 'claude-version-two')
+  copyFileSync(binary, versionTwo); symlinkSync(f.executable, launcher)
+  const application = f.instances.registerApplication(launcher, 'cli', 'claude_code')
+  const first = f.add('Running old version', f.api, [], application.id), second = f.add('Waiting for upgrade', f.bearer, [], application.id)
+  const stalePreview = f.instances.preview({ id: second.id, revision: 0 })
+  await f.start(first.id)
+  const oldProcess = await f.evidence(first.directory)
+  const firstCheckpoint = JSON.parse(readFileSync(join(f.store.directory, 'instances', first.id, 'launch.json'), 'utf8'))
+  assert.equal(firstCheckpoint.claudeExecutable, f.executable)
+  assert.equal(existsSync(`${versionTwo}.help-probe`), false)
+  rmSync(launcher); symlinkSync(versionTwo, launcher)
+  const detected = f.instances.applications().find(item => item.id === application.id)
+  assert.equal(detected?.id, application.id); assert.equal(detected?.path, versionTwo)
+  assert.equal(f.instances.views().find(item => item.id === second.id)?.applicationId, application.id)
+  assert.throws(() => f.instances.start(stalePreview.ticket), /变化|替换/)
+  await f.start(second.id)
+  const newProcess = await f.evidence(second.directory)
+  assert.equal(existsSync(`${versionTwo}.help-probe`), true)
+  assert.equal(f.instances.views().find(item => item.id === second.id)?.clientVersion, '2.2.0')
+  const reopened = f.create(); await reopened.recover()
+  assert.equal(reopened.views().find(item => item.id === first.id)?.pid, oldProcess.pid)
+  assert.equal(reopened.views().find(item => item.id === second.id)?.pid, newProcess.pid)
+  await reopened.stop(first.id)
+  assert.throws(() => process.kill(oldProcess.pid, 0)); assert.doesNotThrow(() => process.kill(newProcess.pid, 0))
+  await reopened.stop(second.id)
+})
+
+test('Claude recovery locates the saved native process after the stable launcher and old version disappear', { skip: !supported }, async t => {
+  const f = fixture(t), launcher = join(f.root, 'claude-current'), versionTwo = join(f.root, 'claude-version-two')
+  copyFileSync(binary, versionTwo); symlinkSync(f.executable, launcher)
+  const application = f.instances.registerApplication(launcher, 'cli', 'claude_code')
+  const instance = f.add('Surviving upgrade', f.api, [], application.id)
+  rmSync(launcher); symlinkSync(versionTwo, launcher)
+  await f.start(instance.id)
+  const live = await f.evidence(instance.directory)
+  assert.equal(JSON.parse(readFileSync(join(f.store.directory, 'instances', instance.id, 'launch.json'), 'utf8')).claudeExecutable, versionTwo)
+  rmSync(launcher); rmSync(f.executable)
+  const reopened = f.create(); await reopened.recover()
+  assert.equal(reopened.views().find(item => item.id === instance.id)?.pid, live.pid)
+  assert.doesNotThrow(() => process.kill(live.pid, 0))
+  await reopened.stop(instance.id)
+  assert.throws(() => process.kill(live.pid, 0))
+  assert.ok(existsSync(join(instance.directory, transcriptName)))
+})

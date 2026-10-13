@@ -23,9 +23,9 @@ export interface ChatGPTModelsResult extends InstanceModelDefaults {
 }
 export interface ExternalInstanceHome {directory:string;device:number;inode:number;previousTargetName?:string}
 export interface InstanceProfile extends Omit<InstanceInput,'clientType'> { clientType?:AgentClientType; id:string; revision:number; createdAt:number; externalHome?:ExternalInstanceHome }
-export interface InstanceApplication { clientType?:AgentClientType; id:string; name:string; path:string; kind?:'desktop'|'cli'; supportsTempLogin?:boolean }
+export interface InstanceApplication { clientType?:AgentClientType; id:string; name:string; path:string; installationPath?:string; kind?:'desktop'|'cli'; supportsTempLogin?:boolean }
 export interface InstanceWorkingDirectory {id:string;path:string;device:number;inode:number}
-export type InstanceIdentityStatus='native_verified'|'native_unverified'|'local_api'|'missing'|'unknown'
+export type InstanceIdentityStatus='native_verified'|'native_unverified'|'api_configured'|'local_api'|'missing'|'unknown'
 export interface InstanceIdentityView {
   status:InstanceIdentityStatus
   email?:string

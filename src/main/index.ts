@@ -1,3 +1,4 @@
+import {agentClientTypeSchema} from '../shared/agentClients'
 import {NativeProxy} from './nativeProxy'
 import {ProxyResources} from './proxyResources'
 import {ProxyCatalog} from './proxyCatalog'
@@ -490,7 +491,7 @@ async function main(): Promise<void> {
       case 'openSession': {
         const parsed=sessionSelectionSchema.extend({action:z.enum(['location','file','copyId'])}).strict().parse(input)
         const {action,...selection}=parsed,path=await sessions.location(selection)
-        if(action==='copyId')clipboard.writeText(selection.sessionId)
+        if(action==='copyId')clipboard.writeText(sessions.originalSessionId(selection))
         else if(action==='location')shell.showItemInFolder(path)
         else if(await shell.openPath(path))throw new Error('无法打开会话文件，请检查默认应用')
         return
@@ -531,11 +532,14 @@ async function main(): Promise<void> {
       case 'focusInstance': await instances.focus(z.string().uuid().parse(input)); return
       case 'chooseInstanceApplication': {
         const selection=await dialog.showOpenDialog(window,{title:'选择 Codex 或 ChatGPT 桌面应用',properties:['openFile'],filters:[{name:'macOS 应用',extensions:['app']}]})
-        if(!selection.canceled && selection.filePaths[0])instances.registerApplication(selection.filePaths[0]);break
+        const application=!selection.canceled&&selection.filePaths[0]?instances.registerApplication(selection.filePaths[0]):undefined
+        return {application,snapshot:snapshot()}
       }
       case 'chooseInstanceCli': {
-        const selection=await dialog.showOpenDialog(window,{title:'选择原生 Codex CLI 可执行文件',properties:['openFile']})
-        if(!selection.canceled&&selection.filePaths[0])instances.registerApplication(selection.filePaths[0],'cli');break
+        const clientType=agentClientTypeSchema.parse(input??'codex')
+        const selection=await dialog.showOpenDialog(window,{title:clientType==='claude_code'?'选择原生 Claude CLI 可执行文件':'选择原生 Codex CLI 可执行文件',properties:['openFile']})
+        const application=!selection.canceled&&selection.filePaths[0]?instances.registerApplication(selection.filePaths[0],'cli',clientType):undefined
+        return {application,snapshot:snapshot()}
       }
       case 'chooseInstanceWorkingDirectory': {
         const selection=await dialog.showOpenDialog(window,{title:'选择 CLI 工作目录',properties:['openDirectory']})
@@ -649,11 +653,14 @@ async function main(): Promise<void> {
       case 'applyLocalData': {const result=await localDataMigration.apply(input);quotas.schedule();return {...result,snapshot:snapshot()}}
       case 'discardLocalData': localDataMigration.discard(z.string().uuid().parse(input));return
       case 'cancelLocalData': localDataMigration.cancel(z.string().uuid().parse(input));return
-      case 'stageImport': return accountFiles.stage(z.string().max(16 * 1024 * 1024).parse(input))
+      case 'stageImport': {
+        const parsed=z.object({text:z.string().max(16*1024*1024),clientType:agentClientTypeSchema.default('codex')}).strict().parse(typeof input==='string'?{text:input}:input)
+        return accountFiles.stage(parsed.text,undefined,parsed.clientType)
+      }
       case 'discardImport': accountFiles.discard(z.string().uuid().optional().parse(input)); return
       case 'chooseImportFile': {
-        const selectionId=z.string().uuid().optional().parse(input),operation=accountFiles.beginFileSelection(selectionId)
-        const selection = await dialog.showOpenDialog(window, { title: '选择 Codex 账号文件', properties: ['openFile'], filters: [{ name: '账号文件', extensions: ['json', 'jsonl', 'txt'] }] })
+        const parsed=z.object({selectionId:z.string().uuid().optional(),clientType:agentClientTypeSchema.default('codex')}).strict().parse(input===undefined||typeof input==='string'?{selectionId:input}:input),operation=accountFiles.beginFileSelection(parsed.selectionId,parsed.clientType)
+        const selection = await dialog.showOpenDialog(window, { title: parsed.clientType==='claude_code'?'选择 Claude 连接文件':'选择 Codex 账号文件', properties: ['openFile'], filters: [{ name: '账号文件', extensions: ['json', 'jsonl', 'txt'] }] })
         if (selection.canceled || !selection.filePaths[0]) return
         return accountFiles.finishFileSelection(operation,selection.filePaths[0])
       }

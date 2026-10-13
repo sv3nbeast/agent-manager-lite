@@ -10,13 +10,23 @@ useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>!!sync.value&&['preparing','running'].includes(sync.value.status)),labels={preparing:'正在准备同步',ready:'同步预览已就绪',running:'正在同步',completed:'同步已完成',cancelled:'同步已取消',failed:'同步未完成'}
 const progress=computed(()=>sync.value?.totalBytes?Math.min(100,Math.floor(sync.value.bytes/sync.value.totalBytes*100)):0)
 const bytes=(value:number)=>value<1024**2?(value/1024).toFixed(1)+' KiB':value<1024**3?(value/1024**2).toFixed(1)+' MiB':(value/1024**3).toFixed(2)+' GiB'
+const codexApplications=(items:InstanceApplication[]|undefined)=>(items??[]).filter(app=>app.clientType===undefined||app.clientType==='codex')
 let alive=true,generation=0,polling=false,timer:ReturnType<typeof setInterval>|undefined,observed=false
 function apply(state:{sync?:SyncView;recoveries:SyncRecovery[]}){if(!alive)return;sync.value=state.sync;recoveries.value=state.recoveries;if(sync.value?.status==='running')observed=true;else if(observed){observed=false;emit('completed')}}
 async function poll(){if(polling)return;polling=true;try{apply(await window.manager.sessionSyncState())}catch(cause){if(alive)error.value=String(cause)}finally{polling=false}}
 function invalidate(){generation++;preview.value=undefined;clientsClosed.value=false;void window.manager.discardSessionSync().catch(cause=>{if(alive)error.value=String(cause)})}
 function close(){open.value=false;retryId.value=undefined;invalidate()}
-async function begin(id?:string){error.value='';retryId.value=id;targetIds.value=props.targets.map(target=>target.id);preview.value=undefined;clientsClosed.value=false;open.value=true;generation++;try{await window.manager.discardSessionSync();const data=await window.manager.load();if(alive){applications.value=data.instanceApplications??[];applicationId.value=applications.value.find(app=>app.kind==='cli')?.id??applications.value[0]?.id}}catch(cause){if(alive)error.value=String(cause)}}
-async function choose(kind:'cli'|'desktop'){try{const data=kind==='cli'?await window.manager.chooseInstanceCli():await window.manager.chooseInstanceApplication();if(alive){applications.value=data.instanceApplications??[];applicationId.value=applications.value.filter(app=>(app.kind==='cli')===(kind==='cli')).at(-1)?.id;invalidate()}}catch(cause){error.value=String(cause)}}
+async function begin(id?:string){error.value='';retryId.value=id;targetIds.value=props.targets.map(target=>target.id);preview.value=undefined;clientsClosed.value=false;open.value=true;generation++;try{await window.manager.discardSessionSync();const data=await window.manager.load();if(alive){applications.value=codexApplications(data.instanceApplications);applicationId.value=applications.value.find(app=>app.kind==='cli')?.id??applications.value[0]?.id}}catch(cause){if(alive)error.value=String(cause)}}
+async function choose(kind:'cli'|'desktop'){
+  const current=generation
+  try{
+    const choice=kind==='cli'?await window.manager.chooseInstanceCli():await window.manager.chooseInstanceApplication()
+    if(!alive||current!==generation||!choice.application)return
+    const items=codexApplications(choice.snapshot.instanceApplications),selected=items.find(app=>app.id===choice.application?.id&&(app.kind==='cli')===(kind==='cli'))
+    if(!selected)throw new Error('请选择用于更新会话列表的 Codex 程序')
+    applications.value=items;applicationId.value=selected.id;invalidate()
+  }catch(cause){if(alive&&current===generation)error.value=String(cause)}
+}
 async function prepare(){if(!applicationId.value)return;const current=++generation;loading.value=true;error.value='';try{const value=await window.manager.previewSessionSync({targetIds:[...targetIds.value],applicationId:applicationId.value});if(alive&&open.value&&current===generation)preview.value=value;await poll()}catch(cause){if(alive&&current===generation)error.value=String(cause)}finally{if(alive)loading.value=false}}
 async function confirm(){if(!clientsClosed.value||!applicationId.value)return;loading.value=true;error.value='';try{observed=true;if(retryId.value){const task=window.manager.retrySessionSync({id:retryId.value,applicationId:applicationId.value,clientsClosed:true});open.value=false;apply(await task)}else if(preview.value){apply(await window.manager.startSessionSync({ticket:preview.value.ticket,clientsClosed:true}));open.value=false;preview.value=undefined}}catch(cause){if(alive){error.value=String(cause);await poll()}}finally{if(alive)loading.value=false}}
 async function cancel(){if(!sync.value)return;try{apply(await window.manager.cancelSessionSync(sync.value.id));preview.value=undefined}catch(cause){if(alive)error.value=String(cause)}}

@@ -22,3 +22,7 @@ test('instance model defaults reject unsupported clients and arbitrary catalog i
     assert.throws(() => readInstanceModelDefaults(input))
   }
 })
+
+test('Claude does not inherit the Codex model catalog', () => {
+  assert.deepEqual(readInstanceModelDefaults('claude_code'), { models: [], defaultModelId: null })
+})

@@ -16,22 +16,35 @@ export const shellQuote=(value:string)=>"'"+value.replace(/'/g,"'\"'\"'")+"'"
 const marker=(plan:DesktopPlan)=>`--cml-instance=${plan.nonce}`
 export function cliLaunchFiles(plan:DesktopPlan){
   const prefix=join(plan.desktopDirectory,`cli-${plan.nonce}`)
-  return {script:prefix+'.command',permit:prefix+'.permit',claim:prefix+'.claimed',record:prefix+'.process'}
+  return {script:prefix+'.command',permit:prefix+'.permit',claim:prefix+'.claimed',record:prefix+'.process',environment:prefix+'.environment'}
 }
 export function cliLaunchScript(plan:DesktopPlan):string {
-  getInstanceClientAdapter(plan.clientType).validateCliArgs(plan.args)
+  getInstanceClientAdapter(plan.clientType,'cli').validateCliArgs(plan.args)
   const files=cliLaunchFiles(plan),q=shellQuote
   const network=networkRouteEnvironment(plan.networkRoute)
+  const claude=plan.clientType==='claude_code'
   // Claim is atomic. Write the process identity before consuming the permit,
   // so cancellation can revoke a late Terminal launch without a hidden child.
   return ['#!/bin/bash','set -e',`/bin/mkdir ${q(files.claim)} || exit 1`,
     `printf '%s\\n%s\\n' "$$" "$(LC_ALL=C /bin/ps -p $$ -o lstart=)" > ${q(files.record+'.tmp')}`,
     `/bin/mv ${q(files.record+'.tmp')} ${q(files.record)}`,`/bin/rmdir ${q(files.permit)} || exit 1`,
-    'for key in $(compgen -e); do case "$key" in CODEX_*|CML_TEST_*|ELECTRON_*|NODE_*|OPENAI_*|npm_config_*|__CFBundleIdentifier|XPC_SERVICE_NAME) unset "$key";; esac; done',
+    'for key in $(compgen -e); do case "$key" in CODEX_*|CML_TEST_*|ELECTRON_*|NODE_*|OPENAI_*|npm_config_*|__CFBundleIdentifier|XPC_SERVICE_NAME'+(claude?'|CLAUDE_*|ANTHROPIC_*':'')+') unset "$key";; esac; done',
     ...Object.entries(network).map(([key,value])=>`export ${key}=${q(value)}`),
     ...(plan.cliPackage?[`export CODEX_MANAGED_PACKAGE_ROOT=${q(plan.cliPackage.root)}`,`export CODEX_MANAGED_BY_${plan.cliPackage.manager.toUpperCase().replace('-','_')}=1`]:[]),
-    `export CODEX_HOME=${q(plan.directory)}`,`cd -- ${q(plan.workingDirectory)}`,
-    `exec -a ${q(marker(plan))} ${q(plan.executable)} ${plan.args.map(q).join(' ')}`,''].join('\n')
+    ...(claude?[
+      `trap ${q('/bin/rm -f -- '+q(files.environment))} EXIT`,
+      `source ${q(files.environment)}`,
+      `/bin/rm -f -- ${q(files.environment)}`,
+    ]:[`export CODEX_HOME=${q(plan.directory)}`]),
+    `cd -- ${q(plan.workingDirectory)}`,
+    `exec -a ${q(marker(plan))} ${q(plan.executable)} ${[...plan.managedArgs??[],...plan.args].map(q).join(' ')}`,''].join('\n')
+}
+function launchEnvironmentFile(plan:DesktopPlan):string {
+  if(!plan.launchEnvironment||plan.launchEnvironment.CLAUDE_CONFIG_DIR!==plan.directory)throw new Error('Claude 启动凭据尚未准备')
+  return Object.entries(plan.launchEnvironment).map(([key,value])=>{
+    if(!/^[A-Z][A-Z0-9_]*$/.test(key)||/[\0\r\n]/.test(value))throw new Error('Claude 启动环境无效')
+    return `export ${key}=${shellQuote(value)}`
+  }).join('\n')+'\n'
 }
 export async function openCliTerminal(script:string):Promise<void> {
   await exec('/usr/bin/open',['-a','Terminal',script],{timeout:15_000,maxBuffer:4096})
@@ -97,12 +110,16 @@ export class MacCliRuntime implements DesktopRuntime {
     if(!next||next.started!==record.started)return
     throw new Error('CLI 启动进程状态不明确，已保留实例文件')
   }
-  async find(plan:DesktopPlan):Promise<DesktopProcess|undefined>{getInstanceClientAdapter(plan.clientType);this.supported();return this.owned(plan)}
+  async find(plan:DesktopPlan):Promise<DesktopProcess|undefined>{getInstanceClientAdapter(plan.clientType,'cli');this.supported();return this.owned(plan)}
   async launch(plan:DesktopPlan,signal:AbortSignal):Promise<DesktopProcess>{
-    getInstanceClientAdapter(plan.clientType).validateCliArgs(plan.args)
+    getInstanceClientAdapter(plan.clientType,'cli').validateCliArgs(plan.args)
     this.supported();signal.throwIfAborted()
     const files=cliLaunchFiles(plan),script=cliLaunchScript(plan)
     mkdirSync(files.permit,{mode:0o700})
+    if(plan.clientType==='claude_code'){
+      atomic(files.environment,launchEnvironmentFile(plan))
+      delete plan.launchEnvironment
+    }
     atomic(files.script,script);chmodSync(files.script,0o700)
     try{await this.open(files.script)}catch{throw new Error('无法打开 CLI 终端，请检查所选程序和 Terminal 应用')}
     const end=Date.now()+10_000
@@ -120,7 +137,7 @@ export class MacCliRuntime implements DesktopRuntime {
     throw new Error('CLI 未完成启动，请检查终端；本次启动许可将撤销')
   }
   async stop(plan:DesktopPlan):Promise<void>{
-    getInstanceClientAdapter(plan.clientType)
+    getInstanceClientAdapter(plan.clientType,'cli')
     this.supported();const files=cliLaunchFiles(plan)
     let revoked=false
     try{rmdirSync(files.permit);revoked=true}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error}
@@ -136,14 +153,15 @@ export class MacCliRuntime implements DesktopRuntime {
         if(await this.owned(plan,true))throw new Error('CLI 仍在运行，尚未恢复登录配置')
       }
     }
-    rmSync(files.script,{force:true});rmSync(files.record,{force:true});rmSync(files.record+'.tmp',{force:true})
+    rmSync(files.script,{force:true});rmSync(files.record,{force:true});rmSync(files.record+'.tmp',{force:true});rmSync(files.environment,{force:true})
+    delete plan.launchEnvironment
     try{rmdirSync(files.claim)}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error}
   }
   async focus():Promise<void>{throw new Error('CLI 在 Terminal 中运行，请从终端窗口继续会话')}
 }
 export class MacInstanceRuntime implements DesktopRuntime {
   constructor(private readonly desktop:DesktopRuntime=new MacDesktopRuntime(),private readonly cli:DesktopRuntime=new MacCliRuntime()){}
-  private service(plan:DesktopPlan){getInstanceClientAdapter(plan.clientType);return plan.mode==='cli'?this.cli:this.desktop}
+  private service(plan:DesktopPlan){getInstanceClientAdapter(plan.clientType,plan.mode??'desktop');return plan.mode==='cli'?this.cli:this.desktop}
   find(plan:DesktopPlan){return this.service(plan).find(plan)}
   launch(plan:DesktopPlan,signal:AbortSignal){return this.service(plan).launch(plan,signal)}
   stop(plan:DesktopPlan){return this.service(plan).stop(plan)}

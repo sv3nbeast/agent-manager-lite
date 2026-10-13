@@ -11,6 +11,7 @@ useFormFeedback(()=>error.value,{active:()=>editor.value||listOpen.value})
 const running=computed(()=>!!state.value.job&&['preparing','running'].includes(state.value.job.status)),needsProgram=computed(()=>action.value!=='purge'&&recovery.value?.mode!=='discard')
 const titles={trash:'移到废纸篓',restore:'恢复所选会话',purge:'永久删除',recover:'处理恢复任务',import:'导入旧废纸篓'},statuses={preparing:'正在准备预览',ready:'预览已就绪',running:'正在处理',completed:'已完成',cancelled:'已取消',failed:'未完成'}
 const bytes=(n:number)=>n<1024**2?(n/1024).toFixed(1)+' KiB':n<1024**3?(n/1024**2).toFixed(1)+' MiB':(n/1024**3).toFixed(2)+' GiB'
+const codexApplications=(items:InstanceApplication[]|undefined)=>(items??[]).filter(app=>app.clientType===undefined||app.clientType==='codex')
 const progress=computed(()=>state.value.job?.totalBytes?Math.min(100,Math.floor(state.value.job.bytes/state.value.job.totalBytes*100)):0)
 let alive=true,polling=false,observed=false,generation=0,timer:ReturnType<typeof setInterval>|undefined
 function apply(next:TrashState){if(!alive)return;state.value=next;if(next.job?.status==='running')observed=true;else if(observed&&next.job&&['completed','failed','cancelled'].includes(next.job.status)){observed=false;emit('completed');if(listOpen.value)void refresh()}}
@@ -22,9 +23,18 @@ function selectRows(keys:(string|number)[]){if(keys.length>1000){error.value='�
 function invalidate(){generation++;loading.value=false;preview.value=undefined;confirmed.value=false;void window.manager.discardSessionTrash().catch(cause=>{if(alive)error.value=String(cause)})}
 async function begin(kind:typeof action.value,empty=false,item?:TrashRecovery,mode:'resume'|'restore'|'discard'='restore'){
   error.value='';action.value=kind;all.value=empty;recovery.value=item?{record:item,mode}:undefined;closed.value=false;editor.value=true;invalidate()
-  try{const data=await window.manager.load();if(alive){applications.value=data.instanceApplications??[];applicationId.value=applications.value.find(app=>app.kind==='cli')?.id??applications.value[0]?.id}}catch(cause){error.value=String(cause)}
+  try{const data=await window.manager.load();if(alive){applications.value=codexApplications(data.instanceApplications);applicationId.value=applications.value.find(app=>app.kind==='cli')?.id??applications.value[0]?.id}}catch(cause){error.value=String(cause)}
 }
-async function choose(kind:'cli'|'desktop'){try{const data=kind==='cli'?await window.manager.chooseInstanceCli():await window.manager.chooseInstanceApplication();if(alive){applications.value=data.instanceApplications??[];applicationId.value=applications.value.filter(app=>(app.kind==='cli')===(kind==='cli')).at(-1)?.id;invalidate()}}catch(cause){error.value=String(cause)}}
+async function choose(kind:'cli'|'desktop'){
+  const current=generation
+  try{
+    const choice=kind==='cli'?await window.manager.chooseInstanceCli():await window.manager.chooseInstanceApplication()
+    if(!alive||current!==generation||!choice.application)return
+    const items=codexApplications(choice.snapshot.instanceApplications),selected=items.find(app=>app.id===choice.application?.id&&(app.kind==='cli')===(kind==='cli'))
+    if(!selected)throw new Error('请选择用于更新会话列表的 Codex 程序')
+    applications.value=items;applicationId.value=selected.id;invalidate()
+  }catch(cause){if(alive&&current===generation)error.value=String(cause)}
+}
 function closeEditor(){editor.value=false;invalidate()}
 async function prepare(){
   const current=++generation;loading.value=true;error.value=''

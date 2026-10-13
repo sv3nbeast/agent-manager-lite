@@ -124,7 +124,7 @@ app.on('browser-window-created',(_event,window)=>{
         console.log('Session copy UI passed: real selection/preview/closed-client confirmation, actual copied rollout and official CLI indexing; source unchanged, no login data copied.')
         const failedTarget=join(directory,'retry-copy-target');mkdirSync(failedTarget)
         pickerPath=failedTarget;const destination=await run('window.manager.chooseClientConfig()')
-        pickerPath=realpathSync('/usr/bin/false');const badApp=(await run('window.manager.chooseInstanceCli()')).instanceApplications.find(item=>item.path===pickerPath)
+        pickerPath=realpathSync('/usr/bin/false');const badApp=(await run('window.manager.chooseInstanceCli()')).application;assert.equal(badApp?.path,pickerPath)
         const fresh=await run(`window.manager.scanSessions({runId:crypto.randomUUID(),targetId:'dd0c896c-522d-4d6a-a9af-3a6a3e10e2fd'})`)
         const retryPreview=await run(`window.manager.previewSessionCopy(${JSON.stringify({snapshotId:fresh.snapshotId,sessionIds:[id],targetId:destination.id,applicationId:badApp.id})})`)
         await run(`window.manager.startSessionCopy(${JSON.stringify({ticket:retryPreview.ticket,clientsClosed:true})})`)

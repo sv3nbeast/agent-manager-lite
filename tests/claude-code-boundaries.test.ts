@@ -11,8 +11,8 @@ import { claudeCodeCapabilitySchema, claudeCodeCredentialCompatibility, claudeCo
 import { accountCompatibility } from '../src/shared/agentClients'
 import { assertImplementedClient, getClientAdapterRegistration, listClientAdapterRegistrations } from '../src/main/clientAdapterRegistry'
 
-test('Claude CLI and Desktop remain separate planned application boundaries', () => {
-  assert.equal(claudeCodeClient.status, 'planned')
+test('Claude CLI and Desktop keep separate application acceptance boundaries', () => {
+  assert.equal(claudeCodeClient.status, 'implemented')
   assert.equal(claudeCodeDesktopClient.status, 'planned')
   assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli'])
   assert.deepEqual(claudeCodeDesktopClient.capabilities.launchModes, ['desktop'])
@@ -54,7 +54,7 @@ test('CLI verification executes only a selected canonical binary and remains fai
   const found = detectClaudeCodeApplications({ home: root, path: bin, platform: 'darwin' })
   assert.equal(found.length, 1)
   assert.deepEqual(await probeClaudeCodeCliVersion(found[0].path, { runner: async () => '2.1.295 (Claude Code)' }), { state: 'verified', version: '2.1.295' })
-  assert.equal((await probeClaudeCodeCliCapabilities(found[0].path, { runner: async () => '--print --model --resume --session-id --settings --add-dir' })).state, 'verified')
+  assert.equal((await probeClaudeCodeCliCapabilities(found[0].path, { runner: async () => '--print --model --resume --session-id --settings --add-dir --setting-sources --strict-mcp-config --mcp-config' })).state, 'verified')
   assert.equal((await probeClaudeCodeCliCapabilities(found[0].path, { runner: async () => '--help --model' })).state, 'blocked')
   const login = await probeClaudeCodeLoginStatus(found[0].path, join(root, 'instance', 'claude'), { runner: async () => '{"loggedIn":true,"authMethod":"oauth","accessToken":"must-not-return"}' })
   assert.deepEqual(login, { state: 'verified', authenticated: true, method: 'oauth' })
@@ -145,10 +145,11 @@ test('Claude credential compatibility never treats OpenAI credential kinds as An
   assert.deepEqual(discoverClaudeCodeCandidates({ home: '/missing', path: '', platform: 'win32' }), { cli: [], desktop: [] })
 })
 
-test('planned Claude registrations are inspectable but cannot enter the common lifecycle', () => {
+test('Claude CLI registration is independent from the planned Desktop lifecycle', () => {
   const registrations = listClientAdapterRegistrations().filter(item => item.clientType === 'claude_code')
   assert.deepEqual(registrations.map(item => item.applicationKinds), [['cli'], ['desktop']])
-  assert.equal(getClientAdapterRegistration('claude_code', 'cli')?.readiness, 'pending')
-  assert.throws(() => assertImplementedClient('claude_code', 'cli'), /尚未通过登录、配置、隔离和会话边界验收/)
+  assert.equal(getClientAdapterRegistration('claude_code', 'cli')?.readiness, 'verified')
+  assert.equal(assertImplementedClient('claude_code','cli').status,'implemented')
+  assert.throws(() => assertImplementedClient('claude_code', 'desktop'), /尚未通过登录、配置、隔离和会话边界验收/)
   assert.equal(assertImplementedClient('codex').clientType, 'codex')
 })

@@ -124,7 +124,7 @@ const api: ManagerAPI = {
   attachExistingInstance: input => ipcRenderer.invoke('manager:invoke','attachExistingInstance',input),
   cancelInstanceCopy: id => ipcRenderer.invoke('manager:invoke','cancelInstanceCopy',id),
   chooseInstanceApplication: () => ipcRenderer.invoke('manager:invoke','chooseInstanceApplication'),
-  chooseInstanceCli: () => ipcRenderer.invoke('manager:invoke','chooseInstanceCli'),
+  chooseInstanceCli: (clientType='codex') => ipcRenderer.invoke('manager:invoke','chooseInstanceCli',clientType),
   chooseInstanceWorkingDirectory: () => ipcRenderer.invoke('manager:invoke','chooseInstanceWorkingDirectory'),
   listInstanceWorkingDirectories: () => ipcRenderer.invoke('manager:invoke','listInstanceWorkingDirectories'),
   removeInstance: input => ipcRenderer.invoke('manager:invoke','removeInstance',input),

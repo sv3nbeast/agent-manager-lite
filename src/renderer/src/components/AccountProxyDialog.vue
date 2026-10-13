@@ -107,7 +107,8 @@ onBeforeUnmount(() => { alive = false; saveId.value = ''; void cancelTest() })
   <a-modal :open="open" title="账号网络代理" :footer="null" destroy-on-close @cancel="close">
     <div class="account-proxy-dialog">
       <p class="proxy-account-name">{{ current?.name || account?.name }}</p>
-      <p class="proxy-help">用于管理器为此账号发起的登录交换、令牌刷新、用量查询和本地 API。外部浏览器与官方临时客户端登录沿用自身网络；原生模式目前请通过本地 API 接入。</p>
+      <p v-if="current?.identityService==='anthropic'" class="proxy-help">用于绑定此连接的 Claude CLI 实例，启动时应用代理设置。正在运行的实例需停止后重新启动才能应用新设置。</p>
+      <p v-else class="proxy-help">用于管理器为此账号发起的登录交换、令牌刷新、用量查询、本地 API 和受管原生实例。外部浏览器与官方临时客户端登录沿用自身网络。</p>
       <div class="proxy-saved-summary"><span>当前设置</span><strong>{{ summary }}</strong></div>
       <a-alert v-if="current?.egressProxy?.invalid" type="warning" message="已保存的代理配置无效，请填写新地址或更换连接方式。" class="proxy-alert" />
       <a-alert v-if="!current" type="warning" message="此账号已移出列表，请关闭窗口后重新选择。" class="proxy-alert" />

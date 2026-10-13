@@ -6,12 +6,14 @@ import { join } from 'node:path'
 import { claudeCodeClientType, claudeCodeClient } from '../src/shared/claudeCode'
 import { claudeCodeEnvironment, claudeCodeConfigPaths, detectClaudeCodeApplications, projectClaudeCodeConfig, validateClaudeCodeCliArgs } from '../src/main/claudeCodeInstanceAdapter'
 
-test('Claude Code foundation stays planned and declares its independent protocol', () => {
+test('Claude CLI declares API-only runtime capabilities independently from Desktop', () => {
   assert.equal(claudeCodeClientType, 'claude_code')
-  assert.equal(claudeCodeClient.status, 'planned')
+  assert.equal(claudeCodeClient.status, 'implemented')
   assert.equal(claudeCodeClient.protocol, 'anthropic_messages')
   assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli'])
   assert.equal(claudeCodeClient.capabilities.localApi, false)
+  assert.equal(claudeCodeClient.capabilities.login, false)
+  assert.equal(claudeCodeClient.capabilities.contextWindow, false)
 })
 
 test('Claude Code detection is read-only, canonical and does not execute candidates', t => {
@@ -48,4 +50,11 @@ test('policy rejects arguments that escape instance config or workspace', () => 
   for (const args of [['--settings', '/tmp/settings.json'], ['--plugin-dir', '/tmp/plugin'], ['--mcp-config', '/tmp/mcp.json'], ['--strict-mcp-config'], ['--setting-sources', 'project'], ['--resume', '/tmp/other.jsonl'], ['--continue'], ['--desktop'], ['--cloud', 'other'], ['--from-pr', '123'], ['--worktree', 'other'], ['--add-dir=/tmp/other'], ['--model', 'opus'], ['--model=opus']]) assert.throws(() => validateClaudeCodeCliArgs(args), /参数|模型/)
   assert.doesNotThrow(() => validateClaudeCodeCliArgs(['--print', 'hello']))
   assert.throws(() => claudeCodeConfigPaths('relative'), /绝对路径/)
+})
+
+test('managed CLI accepts only verified foreground options and treats their values as data', () => {
+  for(const args of [[],['--print','hello'],['--append-system-prompt','auth'],['--system-prompt=desktop','--output-format','json','--print','explain the code'],['--','--background is a literal prompt']])assert.doesNotThrow(()=>validateClaudeCodeCliArgs(args))
+  for(const args of [['--bg'],['--background'],['--environment','remote'],['--teleport'],['--remote-control'],['--future-mode'],['-pd'],['--print=true'],['--output-format'],['--system-prompt','--settings'],['--system-prompt='],['--print','hello','world'],['auth'],['--print','gateway'],['--','attach'],['purge'],['agents'],['respawn']])assert.throws(()=>validateClaudeCodeCliArgs(args),/参数|子命令/)
+  assert.throws(()=>validateClaudeCodeCliArgs(['future-service'],['future-service']),/子命令/)
+  assert.doesNotThrow(()=>validateClaudeCodeCliArgs(['--system-prompt','future-service'],['future-service']))
 })

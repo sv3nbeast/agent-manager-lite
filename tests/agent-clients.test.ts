@@ -49,7 +49,7 @@ test('only an absent client field resolves as legacy Codex; capability declarati
   assert.equal(resolveAgentClientType(undefined),'codex')
   assert.equal(resolveAgentClientType('codex'),'codex')
   for(const unknown of [null,'','claude','claude-desktop','unknown',false,0,{}])assert.throws(()=>resolveAgentClientType(unknown),/尚未接入/)
-  assert.deepEqual(implementedAgentClients.map(client=>client.id),['codex'])
+  assert.deepEqual(implementedAgentClients.map(client=>client.id),['codex','claude_code'])
   assert.deepEqual(getAgentClient('codex').capabilities.projectDirectoryModes,['cli'])
   assert.deepEqual(getAgentClient('codex').capabilities.launchModes,['desktop','cli'])
 })

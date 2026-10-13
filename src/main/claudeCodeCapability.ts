@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto'
-import { lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { claudeCodeAcceptanceSchema, claudeCodeCliAcceptance, claudeCodeDesktopAcceptance, type ClaudeCodeAcceptance } from '../shared/claudeCode'
 import { detectClaudeCodeApplications, type ClaudeCodeDetectionOptions, type ClaudeCodeApplication } from './claudeCodeInstanceAdapter'
 import { detectClaudeCodeDesktopApplications, type ClaudeCodeDesktopApplication } from './claudeCodeDesktopAdapter'
 
-const maxHashBytes = 128 * 1024 * 1024
+// Official native distributions include the runtime and already exceed
+// 128 MiB. Stream the executable so a normal upstream update does not require
+// a manager release or allocate a binary-sized buffer in the main process.
+const maxHashBytes = 1024 * 1024 * 1024
 
 export interface ClaudeExecutableIdentity {
   path: string
@@ -36,10 +39,25 @@ function regularExecutable(path: string): { canonical: string; stat: Stats } {
 export function captureClaudeExecutableIdentity(path: string): ClaudeExecutableIdentity {
   const { canonical, stat } = regularExecutable(path)
   if (!Number.isSafeInteger(stat.size) || stat.size > maxHashBytes) throw new Error('Claude Code 程序文件过大，无法验证身份')
-  return {
-    path: canonical, device: stat.dev, inode: stat.ino, size: stat.size,
-    mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
-    sha256: createHash('sha256').update(readFileSync(canonical)).digest('hex'),
+  const descriptor = openSync(canonical, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const sameFile = (candidate: Stats) => candidate.isFile() && candidate.dev === stat.dev && candidate.ino === stat.ino && candidate.size === stat.size && candidate.mtimeMs === stat.mtimeMs && candidate.ctimeMs === stat.ctimeMs
+    if (!sameFile(fstatSync(descriptor))) throw new Error('Claude Code 程序身份在读取时发生变化')
+    const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(1024 * 1024)
+    let offset = 0
+    while (offset < stat.size) {
+      const count = readSync(descriptor, buffer, 0, Math.min(buffer.length, stat.size - offset), offset)
+      if (!count) throw new Error('Claude Code 程序在读取时被截断')
+      hash.update(buffer.subarray(0, count)); offset += count
+    }
+    if (!sameFile(fstatSync(descriptor)) || !sameFile(lstatSync(canonical))) throw new Error('Claude Code 程序身份在读取时发生变化')
+    return {
+      path: canonical, device: stat.dev, inode: stat.ino, size: stat.size,
+      mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+      sha256: hash.digest('hex'),
+    }
+  } finally {
+    closeSync(descriptor)
   }
 }
 

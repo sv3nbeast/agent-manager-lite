@@ -1,4 +1,4 @@
-import type { Account } from '../../../shared/types'
+import { accountInputSchema, type Account } from '../../../shared/types'
 
 export interface AccountCardStatus {
   label: string
@@ -17,6 +17,11 @@ export function isAnthropicAccountRecord(account: Account): boolean {
   return isAnthropicAccount(account)
 }
 
+export function isSupportedAnthropicAPIAccount(account: Account): boolean {
+  return account.kind === 'api_key' && account.identityService === 'anthropic' && account.protocol === 'anthropic_messages'
+    && ['anthropic_api_key', 'anthropic_bearer', 'gateway'].includes(account.credentialKind ?? '')
+}
+
 /**
  * Account.kind only describes the credential container.  The identity service
  * and credential kind determine the label shown to users, otherwise a Claude
@@ -30,6 +35,9 @@ export function accountCardType(account: Account): string {
     if (account.credentialKind === 'anthropic_bearer') return 'Anthropic · Bearer'
     if (account.credentialKind === 'anthropic_profile') return 'Claude · Profile'
     if (account.credentialKind === 'gateway') return 'Anthropic · Gateway'
+    if (account.credentialKind === 'bedrock') return 'Claude · Amazon Bedrock'
+    if (account.credentialKind === 'vertex') return 'Claude · Vertex AI'
+    if (account.credentialKind === 'foundry') return 'Claude · Microsoft Foundry'
     return 'Anthropic · API Key'
   }
   if (account.kind === 'oauth') return 'ChatGPT · OAuth'
@@ -64,9 +72,19 @@ export function accountCardPlan(account: Account): string {
 }
 
 export function accountCardStatus(account: Account): AccountCardStatus {
+  if (isAnthropicAccount(account)) {
+    if (!isSupportedAnthropicAPIAccount(account)) return { label: '待适配器验证', tone: 'warning', detail: account.kind === 'oauth'
+      ? 'Claude 订阅登录、凭据刷新与隔离仍在独立验证中。'
+      : '此 Claude 凭据类型的登录、配置和隔离仍在独立验证中。' }
+    if (!account.credentialConfigured) return { label: '缺少凭据', tone: 'error', detail: '请编辑 Claude 连接，填写对应的 API Key 或 Bearer Token。' }
+    if (!accountInputSchema.shape.baseUrl.safeParse(account.baseUrl).success || !accountInputSchema.shape.models.safeParse(account.models).success
+      || [account.baseUrl, ...account.models].some(value => /[\0\r\n]/.test(value))) {
+      return { label: '待完善配置', tone: 'warning', detail: '请编辑 Claude 连接，填写有效的 API 地址和模型列表。' }
+    }
+    return { label: 'API 连接已配置', tone: 'neutral', detail: '已保存 Claude Code CLI 所需的 API 凭据、地址和模型；实际访问权限以首次请求结果为准。' }
+  }
   if (account.needsTokenExchange) return { label: '待验证', tone: 'warning', detail: '刷新令牌尚待验证，刷新用量或启动本地 API 时交换凭据。' }
   if (!account.credentialConfigured) return { label: '缺少凭据', tone: 'error', detail: '尚未保存可用凭据，请编辑账号。' }
-  if (isAnthropicAccount(account)) return { label: '待适配器验证', tone: 'warning', detail: 'Anthropic 登录、配置、隔离和会话边界尚未完成验证；不会调用 OpenAI / ChatGPT 用量接口。' }
   if (account.kind === 'api_key') {
     const usage = account.providerUsage
     if (usage?.error) return { label: '查询失败', tone: usage.unavailable ? 'neutral' : 'error', detail: `${usage.error}${usage.summary ? '；用量区域保留上次成功结果。' : ''}` }

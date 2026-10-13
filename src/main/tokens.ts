@@ -58,6 +58,7 @@ export class TokenAuthority {
     const state=this.store.read(),account = state.accounts.find(a => a.id === id)
     if (!account) return Promise.reject(new Error('账号已删除'))
     if (this.controller.signal.aborted) return Promise.reject(new Error('应用正在退出'))
+    if(account.identityService==='anthropic')return account.kind==='api_key'?Promise.resolve(account):Promise.reject(new Error('Claude 订阅凭据刷新尚未接入；不能使用 OpenAI 授权端点'))
     if(state.clientAuthorities?.some(binding=>binding.accountId===id)){
       // Persisted links must fail closed even before the resolver is installed
       // after restart; never fall back to rotating the copied refresh token.

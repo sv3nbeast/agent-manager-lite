@@ -12,6 +12,7 @@ useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>state.value&&['preparing','running'].includes(state.value.status)),percent=computed(()=>state.value?.totalBytes?Math.min(100,Math.floor(state.value.bytes/state.value.totalBytes*100)):0)
 const labels={preparing:'正在准备',ready:'预览已就绪',running:'正在处理',completed:'已完成',failed:'操作失败',cancelled:'已取消'}
 const bytes=(n:number)=>n<1024**2?(n/1024).toFixed(1)+' KiB':n<1024**3?(n/1024**2).toFixed(1)+' MiB':(n/1024**3).toFixed(2)+' GiB'
+const codexApplications=(items:InstanceApplication[]|undefined)=>(items??[]).filter(app=>app.clientType===undefined||app.clientType==='codex')
 let alive=true,generation=0,polling=false,timer:ReturnType<typeof setInterval>|undefined,seenRunning=false
 function apply(value?:ArchiveProgress){if(!alive)return;state.value=value;if(value?.status==='running')seenRunning=true;else if(seenRunning){seenRunning=false;if(value?.operation==='import')emit('completed')}}
 async function poll(){if(polling)return;polling=true;try{apply(await window.manager.sessionArchiveState())}catch(cause){if(alive)error.value=String(cause)}finally{polling=false}}
@@ -24,8 +25,18 @@ async function begin(kind:'export'|'import'){
     if(alive&&current===generation){preview.value=result;importIds.value=result?.items.map(item=>item.id)??[];if(!result)open.value=false;await poll()}
   }catch(cause){if(alive&&current===generation)error.value=String(cause)}finally{if(alive)loading.value=false}
 }
-async function chooseCli(){try{const data=await window.manager.chooseInstanceCli();applications.value=data.instanceApplications??[];applicationId.value=applications.value.filter(app=>app.kind==='cli').at(-1)?.id;invalidate()}catch(cause){error.value=String(cause)}}
-async function chooseApp(){try{const data=await window.manager.chooseInstanceApplication();applications.value=data.instanceApplications??[];applicationId.value=applications.value.filter(app=>app.kind!=='cli').at(-1)?.id;invalidate()}catch(cause){error.value=String(cause)}}
+async function choose(kind:'cli'|'desktop'){
+  const current=generation
+  try{
+    const choice=kind==='cli'?await window.manager.chooseInstanceCli():await window.manager.chooseInstanceApplication()
+    if(!alive||current!==generation||!choice.application)return
+    const items=codexApplications(choice.snapshot.instanceApplications),selected=items.find(app=>app.id===choice.application?.id&&(app.kind==='cli')===(kind==='cli'))
+    if(!selected)throw new Error('请选择用于更新会话列表的 Codex 程序')
+    applications.value=items;applicationId.value=selected.id;invalidate()
+  }catch(cause){if(alive&&current===generation)error.value=String(cause)}
+}
+async function chooseCli(){await choose('cli')}
+async function chooseApp(){await choose('desktop')}
 async function prepareImport(){
   if(!preview.value||!targetId.value||!applicationId.value)return
   const current=++generation;loading.value=true;error.value=''
@@ -42,7 +53,7 @@ async function confirm(){
 async function cancel(){if(state.value){try{apply(await window.manager.cancelSessionArchive(state.value.id))}catch(cause){error.value=String(cause)}}}
 function selected(keys:(string|number)[]){importIds.value=keys.map(String);invalidate()}
 watch(()=>[props.snapshotId,...props.selectedIds],()=>{if(open.value&&mode.value==='export')void hide()})
-onMounted(async()=>{try{applications.value=(await window.manager.load()).instanceApplications??[];await poll();if(alive)timer=setInterval(()=>void poll(),750)}catch(cause){if(alive)error.value=String(cause)}})
+onMounted(async()=>{try{const data=await window.manager.load();if(!alive)return;applications.value=codexApplications(data.instanceApplications);await poll();if(alive)timer=setInterval(()=>void poll(),750)}catch(cause){if(alive)error.value=String(cause)}})
 onUnmounted(()=>{alive=false;generation++;clearInterval(timer);void window.manager.discardSessionArchive().catch(()=>{})})
 </script>
 <template>

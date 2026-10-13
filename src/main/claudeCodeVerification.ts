@@ -20,7 +20,8 @@ export interface ClaudeCodeVersionProbe {
 
 export interface ClaudeCodeCliCapabilities {
   state: ClaudeCodeVerificationState
-  flags: Record<'print' | 'model' | 'resume' | 'sessionId' | 'settings' | 'addDir', boolean>
+  flags: Record<'print' | 'model' | 'resume' | 'sessionId' | 'settings' | 'addDir' | 'settingSources' | 'strictMcpConfig' | 'mcpConfig', boolean>
+  advertisedCommands?: string[]
   reason?: string
 }
 
@@ -111,18 +112,33 @@ export async function probeClaudeCodeCliVersion(executable: string, options: { t
 }
 
 async function runCliHelp(executable: string, timeoutMs: number): Promise<string> {
-  try {
-    const result = await execFile(executable, ['--help'], {
-      timeout: Math.min(Math.max(timeoutMs, 250), 30_000),
-      maxBuffer: MAX_VERSION_OUTPUT,
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
-      windowsHide: true,
-    })
-    return result.stdout + result.stderr
-  } catch (error) {
-    const candidate = error as { stdout?: unknown; stderr?: unknown }
-    return `${typeof candidate.stdout === 'string' ? candidate.stdout : ''}${typeof candidate.stderr === 'string' ? candidate.stderr : ''}`
+  const result = await execFile(executable, ['--help'], {
+    timeout: Math.min(Math.max(timeoutMs, 250), 30_000),
+    maxBuffer: MAX_VERSION_OUTPUT,
+    env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+    windowsHide: true,
+  })
+  // A flag banner printed before an error or timeout cannot certify a usable
+  // binary. Let the capability probe return a sanitized blocked state.
+  return result.stdout + result.stderr
+}
+
+function parseAdvertisedCommands(help: string): string[] | undefined {
+  // Keep only command/alias identifiers from the dedicated table. Wrapped
+  // descriptions, option rows and later sections must never become commands.
+  const lines = help.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/)
+  const start = lines.findIndex(line => /^Commands:\s*$/i.test(line))
+  if (start < 0) return undefined
+  const commands = new Set<string>()
+  for (const line of lines.slice(start + 1)) {
+    if (/^\S/.test(line)) break
+    const match = line.match(/^ {2}([a-z][a-z0-9-]*(?:\|[a-z][a-z0-9-]*)*)(?=\s|$)/)
+    if (!match) continue
+    const names = match[1].split('|')
+    if (names.some(name => name.length > 64)) continue
+    for (const name of names) commands.add(name)
   }
+  return [...commands]
 }
 
 /**
@@ -131,12 +147,17 @@ async function runCliHelp(executable: string, timeoutMs: number): Promise<string
  * an incompatible release is blocked before it can write an instance home.
  */
 export async function probeClaudeCodeCliCapabilities(executable: string, options: { timeoutMs?: number; runner?: (executable: string) => Promise<string> } = {}): Promise<ClaudeCodeCliCapabilities> {
-  if (!stableExecutable(executable)) return { state: 'blocked', flags: { print: false, model: false, resume: false, sessionId: false, settings: false, addDir: false }, reason: 'Claude Code CLI 路径不是稳定的普通可执行文件' }
-  const output = options.runner ? await options.runner(executable) : await runCliHelp(executable, options.timeoutMs ?? 5000)
+  const missing = { print: false, model: false, resume: false, sessionId: false, settings: false, addDir: false, settingSources: false, strictMcpConfig: false, mcpConfig: false }
+  if (!stableExecutable(executable)) return { state: 'blocked', flags: missing, reason: 'Claude Code CLI 路径不是稳定的普通可执行文件' }
+  let output: string
+  try { output = options.runner ? await options.runner(executable) : await runCliHelp(executable, options.timeoutMs ?? 5000) }
+  catch { return { state: 'blocked', flags: missing, reason: 'Claude Code CLI 能力探针失败' } }
   const has = (flag: string) => new RegExp(`(?:^|[\\s,])${flag.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}(?:[=\\s,]|$)`, 'm').test(output)
-  const flags = { print: has('--print'), model: has('--model'), resume: has('--resume'), sessionId: has('--session-id'), settings: has('--settings'), addDir: has('--add-dir') }
+  const flags = { print: has('--print'), model: has('--model'), resume: has('--resume'), sessionId: has('--session-id'), settings: has('--settings'), addDir: has('--add-dir'), settingSources: has('--setting-sources'), strictMcpConfig: has('--strict-mcp-config'), mcpConfig: has('--mcp-config') }
+  const advertisedCommands = parseAdvertisedCommands(output)
+  const commandFields = advertisedCommands === undefined ? {} : { advertisedCommands }
   const required = Object.entries(flags).filter(([, value]) => !value).map(([key]) => key)
-  return required.length ? { state: 'blocked', flags, reason: `Claude Code CLI 缺少受管参数：${required.join(', ')}` } : { state: 'verified', flags }
+  return required.length ? { state: 'blocked', flags, ...commandFields, reason: `Claude Code CLI 缺少受管参数：${required.join(', ')}` } : { state: 'verified', flags, ...commandFields }
 }
 
 /**
@@ -144,22 +165,53 @@ export async function probeClaudeCodeCliCapabilities(executable: string, options
  * `auth status --json` command.  The JSON body is reduced to two safe fields;
  * tokens, email addresses and provider metadata never leave this function.
  */
-export async function probeClaudeCodeLoginStatus(executable: string, configDirectory: string, options: { timeoutMs?: number; runner?: (executable: string, configDirectory: string) => Promise<string> } = {}): Promise<ClaudeCodeLoginProbe> {
+export async function probeClaudeCodeLoginStatus(executable: string, configDirectory: string, options: { timeoutMs?: number; environment?: NodeJS.ProcessEnv; runner?: (executable: string, configDirectory: string) => Promise<string> } = {}): Promise<ClaudeCodeLoginProbe> {
   if (!stableExecutable(executable)) return { state: 'blocked', reason: 'Claude Code CLI 路径不是稳定的普通可执行文件' }
   if (!isAbsolute(configDirectory)) return { state: 'blocked', reason: 'Claude Code 登录探针需要绝对配置目录' }
   try {
+    // Deliberately copy only explicitly supplied authentication variables;
+    // the manager's own shell must never choose this instance's identity.
+    const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '', HOME: options.environment?.HOME ?? process.env.HOME ?? '', CLAUDE_CONFIG_DIR: configDirectory, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1' }
+    for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_PROFILE', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) {
+      if (options.environment?.[name]) environment[name] = options.environment[name]
+    }
+    const boundary = inspectClaudeCodeLoginBoundary(claudeCodeConfigPaths(configDirectory), environment)
+    if (boundary.state === 'blocked') return { state: 'blocked', reason: boundary.reason }
+    if (!options.runner) {
+      try {
+        const stat = lstatSync(configDirectory)
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return { state: 'blocked', reason: 'Claude Code 登录探针需要稳定的普通配置目录' }
+      } catch {
+        return { state: 'pending', authenticated: false, reason: 'Claude Code 配置目录尚未创建' }
+      }
+    }
     const output = options.runner
       ? await options.runner(executable, configDirectory)
-      : (await execFile(executable, ['auth', 'status', '--json'], {
+      : await execFile(executable, ['auth', 'status', '--json'], {
         timeout: Math.min(Math.max(options.timeoutMs ?? 5000, 250), 30_000),
         maxBuffer: MAX_VERSION_OUTPUT,
-        env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CLAUDE_CONFIG_DIR: configDirectory },
+        env: environment,
         windowsHide: true,
-      })).stdout
+      }).then(result => result.stdout, error => {
+        // The official CLI returns exit 1 for a valid logged-out result.
+        // Treat only that well-formed response as a login state, never an
+        // arbitrary failed command's output as successful authentication.
+        const failure = error as { code?: unknown; stdout?: unknown }
+        if (failure.code === 1 && typeof failure.stdout === 'string') {
+          const value = JSON.parse(failure.stdout) as Record<string, unknown>
+          if (value && value.loggedIn === false) return failure.stdout
+        }
+        throw error
+      })
     const value = JSON.parse(output) as Record<string, unknown>
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { state: 'pending', reason: 'Claude Code 登录状态格式尚未适配' }
+    if (typeof value.configDirectory === 'string' && value.configDirectory !== configDirectory && realpathSync(value.configDirectory) !== realpathSync(configDirectory)) return { state: 'blocked', reason: 'Claude Code 登录状态来自其他配置目录' }
     const loggedIn = typeof value.loggedIn === 'boolean' ? value.loggedIn : typeof value.authenticated === 'boolean' ? value.authenticated : undefined
     const rawMethod = typeof value.authMethod === 'string' ? value.authMethod.toLowerCase() : typeof value.method === 'string' ? value.method.toLowerCase() : ''
-    const method: ClaudeCodeLoginProbe['method'] = rawMethod.includes('oauth') ? 'oauth' : rawMethod.includes('api') ? 'api_key' : rawMethod.includes('bearer') || rawMethod.includes('token') ? 'bearer' : rawMethod.includes('profile') ? 'profile' : rawMethod.includes('bedrock') || rawMethod.includes('vertex') || rawMethod.includes('foundry') ? 'cloud' : rawMethod ? 'unknown' : undefined
+    // Current Claude calls ANTHROPIC_AUTH_TOKEN "oauth_token" as well. The
+    // explicitly selected credential channel disambiguates a gateway bearer
+    // from a subscription token; its label alone cannot prove OAuth login.
+    const method: ClaudeCodeLoginProbe['method'] = environment.ANTHROPIC_AUTH_TOKEN && (rawMethod.includes('oauth') || rawMethod.includes('token') || rawMethod.includes('bearer')) ? 'bearer' : rawMethod.includes('oauth') ? 'oauth' : rawMethod.includes('api') ? 'api_key' : rawMethod.includes('bearer') || rawMethod.includes('token') ? 'bearer' : rawMethod.includes('profile') ? 'profile' : rawMethod.includes('bedrock') || rawMethod.includes('vertex') || rawMethod.includes('foundry') ? 'cloud' : rawMethod && rawMethod !== 'none' ? 'unknown' : undefined
     if (loggedIn === undefined) return { state: 'pending', ...(method ? { method } : {}), reason: 'Claude Code 登录状态格式尚未适配' }
     return { state: loggedIn ? 'verified' : 'pending', authenticated: loggedIn, ...(method ? { method } : {}), ...(loggedIn ? {} : { reason: 'Claude Code 当前配置目录未登录' }) }
   } catch (error) {
@@ -268,20 +320,21 @@ function gatesForCli(version: ClaudeCodeVersionProbe, capabilities: ClaudeCodeCl
 }
 
 /**
- * Produce the evidence report used by the future registry.  This report never
- * registers an application, creates config files, or reads credential bodies.
+ * Produce a conservative diagnostic report. Static probes cannot grant runtime
+ * acceptance; this report never registers an application, creates config files,
+ * or reads credential bodies.
  */
 export async function verifyClaudeCodeCli(application: ClaudeCodeApplication, options: { instanceHome: string; runner?: (executable: string) => Promise<string>; helpRunner?: (executable: string) => Promise<string>; loginRunner?: (executable: string, configDirectory: string) => Promise<string>; environment?: NodeJS.ProcessEnv } ): Promise<ClaudeCodeVerificationReport> {
   const version = await probeClaudeCodeCliVersion(application.path, { runner: options.runner })
   const cliCapabilities = await probeClaudeCodeCliCapabilities(application.path, { runner: options.helpRunner })
   const config = claudeCodeConfigPaths(join(options.instanceHome, 'claude'))
   const login = inspectClaudeCodeLoginBoundary(config, options.environment ?? {})
-  const loginProbe = await probeClaudeCodeLoginStatus(application.path, config.configDirectory, { runner: options.loginRunner })
+  const loginProbe = await probeClaudeCodeLoginStatus(application.path, config.configDirectory, { runner: options.loginRunner, environment: options.environment })
   const sessions = inspectClaudeCodeSessions(config.configDirectory)
   const reasons = [
-    'Claude Code 的 ~/.claude.json 仍是配置目录外的全局状态，尚未证明可按实例归属',
-    'Anthropic 登录凭据、Keychain/profile、MCP OAuth 和 API 凭据尚未完成双实例实测',
-    'Claude Code 会话 transcript 格式和 resume 归属尚未接入通用会话提供者',
+    'CLAUDE_CONFIG_DIR 应同时隔离 .claude.json、凭据和会话；仍需当前程序的双实例运行验收，不能只凭版本检测判定',
+    '本探针不验证 API 请求和运行归属；订阅 OAuth、Keychain/profile 与 MCP OAuth 仍需独立验收',
+    'Claude 只读会话索引已接入；会话迁移与管理器一键续接尚未接入',
   ]
   if (version.reason) reasons.unshift(version.reason)
   if (cliCapabilities.reason) reasons.unshift(cliCapabilities.reason)

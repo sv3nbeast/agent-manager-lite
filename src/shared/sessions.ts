@@ -1,4 +1,5 @@
 import {z} from 'zod'
+import type {ClientConfigTarget} from './clientConfig'
 
 export const sessionKindSchema=z.enum(['all','conversation','external','subagent'])
 export type SessionKind=Exclude<z.infer<typeof sessionKindSchema>,'all'>
@@ -14,8 +15,10 @@ export type SessionSelection=z.infer<typeof sessionSelectionSchema>
 export const sessionStatsSchema=z.object({snapshotId:z.string().uuid(),sessionIds:z.array(sessionId).min(1).max(1000)}).strict()
 export interface SessionLocation {targetId:string;name:string;directory:string;running:boolean;archived:boolean;ambiguous:boolean;historicalCopies?:number;historyMode?:'paginated'}
 export interface SessionTokens {input:number;output:number;total:number}
-export interface SessionRecord {id:string;title:string;cwd:string;projectName?:string;updatedAt?:number;kind:SessionKind;locations:SessionLocation[];historyMode?:'paginated'}
-export interface SessionPage {snapshotId:string;scannedAt:number;total:number;page:number;pageSize:number;items:SessionRecord[];warnings:string[];sourceCounts?:Record<string,number>}
+export interface SessionCapabilities {open:boolean;transfer:boolean;archive:boolean;trash:boolean;visibilityRepair:boolean;tokens:boolean;contentSearch:boolean}
+export interface SessionSource extends ClientConfigTarget {clientType:'codex'|'claude_code';readOnly?:boolean}
+export interface SessionRecord {id:string;title:string;cwd:string;projectName?:string;updatedAt?:number;kind:SessionKind;locations:SessionLocation[];historyMode?:'paginated';clientType?:'codex'|'claude_code';sourceSessionId?:string;capabilities?:SessionCapabilities}
+export interface SessionPage {snapshotId:string;scannedAt:number;total:number;page:number;pageSize:number;items:SessionRecord[];warnings:string[];sourceCounts?:Record<string,number>;sources?:SessionSource[]}
 export interface SessionTokenResult {id:string;tokens?:SessionTokens;targetId?:string;error?:string}
 
 export const sessionCopyPreviewSchema=z.object({snapshotId:z.string().uuid(),sessionIds:z.array(sessionId).min(1).max(1000),targetId:z.string().uuid(),applicationId:z.string().min(1).max(100)}).strict()

@@ -1,3 +1,4 @@
+import {claudeCodeInstanceAdapter} from './claudeCodeInstanceAdapter'
 import { createHash } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
 import { createServer } from 'node:net'
@@ -25,7 +26,7 @@ function applications(stored:readonly InstanceApplication[]):InstanceApplication
     .filter(path=>existsSync(path)).map(path=>({clientType:'codex' as const,id:digest('cli:'+realpathSync(path)),name:'Codex CLI',path:realpathSync(path),kind:'cli' as const}))
   // Project legacy records without persisting a migration. Keep unsupported
   // explicit values intact so selection and execution can reject them.
-  return [...new Map([...detected,...cli,...stored].map(app=>[app.path,app])).values()]
+  return [...new Map([...detected,...cli,...stored.filter(app=>app.clientType!=='claude_code')].map(app=>[app.path,app])).values()]
     .map(app=>({...app,clientType:app.clientType===undefined?'codex':app.clientType}))
 }
 
@@ -132,8 +133,11 @@ export const codexInstanceAdapter={client:getAgentClient('codex'),applications,r
   desktopEnvironment:codexDesktopEnvironment,macLaunchArgs:codexMacLaunchArgs,validateCliArgs:validateCodexCliArgs,copiedSessionProvider}
 
 /** Add verified clients here, rather than branching in each lifecycle method. */
-export function getInstanceClientAdapter(clientType:unknown) {
+export function getInstanceClientAdapter(clientType:unknown,applicationKind?:'desktop'|'cli') {
   const type=resolveAgentClientType(clientType)
-  if(type!=='codex')throw new Error('Claude Code 尚未通过登录、配置、隔离和会话边界验收')
+  if(type==='claude_code'){
+    if(applicationKind==='desktop')throw new Error('Claude Desktop 尚未通过登录、配置、隔离和会话边界验收')
+    return claudeCodeInstanceAdapter
+  }
   return codexInstanceAdapter
 }

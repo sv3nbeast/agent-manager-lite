@@ -1,10 +1,9 @@
 import { z } from 'zod'
 
 /**
- * Claude Code is intentionally kept outside `implementedAgentClients` until
- * the Anthropic account and runtime transactions have been verified.  This
- * descriptor is the first phase contract: it describes the CLI's own
- * boundaries without making it selectable in the Codex-only wizard.
+ * Claude Code CLI supports the independently verified native API Key/Bearer
+ * lifecycle. Subscription OAuth, cloud credentials and Desktop keep their own
+ * evidence gates; sharing an identity service does not imply compatibility.
  */
 export const claudeCodeClientType = 'claude_code' as const
 export type ClaudeCodeClientType = typeof claudeCodeClientType
@@ -64,14 +63,15 @@ export const claudeCodePhaseOneAcceptance = claudeCodeAcceptanceSchema.parse({
  * Keep those gates explicit so diagnostics cannot accidentally promote the
  * client merely because `claude --version` succeeds.
  */
+/** Acceptance applies only to native CLI API Key/Bearer connections. */
 export const claudeCodeCliAcceptance = claudeCodeAcceptanceSchema.parse({
   detection: 'verified',
   configProjection: 'verified',
-  credentialIsolation: 'pending',
-  protocolAdapter: 'pending',
-  runtimeLifecycle: 'pending',
-  globalStateOwnership: 'pending',
-  sessionIndexing: 'pending',
+  credentialIsolation: 'verified',
+  protocolAdapter: 'verified',
+  runtimeLifecycle: 'verified',
+  globalStateOwnership: 'verified',
+  sessionIndexing: 'verified',
 })
 
 /** Desktop has an independently detected bundle, but its Electron profile,
@@ -89,16 +89,16 @@ export const claudeCodeDesktopAcceptance = claudeCodeAcceptanceSchema.parse({
 export const claudeCodeClient = {
   id: claudeCodeClientType,
   name: 'Claude Code',
-  status: 'planned' as const,
+  status: 'implemented' as const,
   identityService: 'anthropic' as const,
   protocol: 'anthropic_messages' as const,
   capabilities: {
-    login: true,
+    login: false,
     nativeAccounts: true,
     apiKey: true,
     localApi: false,
     models: true,
-    contextWindow: true,
+    contextWindow: false,
     fast: false,
     launchModes: ['cli'] as const,
     projectDirectoryModes: ['cli'] as const,

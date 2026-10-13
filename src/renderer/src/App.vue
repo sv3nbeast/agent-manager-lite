@@ -102,6 +102,7 @@ watch(page,()=>{kind.value='all';selected.value=[];offset.value=1})
 const apiAccountCount = computed(() => accounts.value.length - identityAccounts.value.length)
 const providers = computed(() => manager.data?.providers ?? [])
 const providerKeyCount = computed(() => providers.value.reduce((count, provider) => count + provider.keys.length, 0))
+const providerResourceCount = computed(() => providerKeyCount.value + accounts.value.filter(account => account.kind === 'api_key' && !account.providerId).length)
 const runningInstanceCount = computed(() => manager.data?.instances?.filter(instance => instance.status === 'running').length ?? 0)
 const providerLibrary = ref<InstanceType<typeof ProviderLibraryView>>()
 const groups = computed(() => manager.data?.groups ?? [])
@@ -248,7 +249,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
           <a-menu-item key="overview"><span class="nav-item-content"><AppstoreOutlined />概览</span></a-menu-item>
           <a-menu-item key="instances"><span class="nav-item-content"><DesktopOutlined />实例</span></a-menu-item>
           <a-menu-item key="accounts"><span class="nav-item-content"><UserOutlined />账号管理 <span class="nav-count">{{ identityAccounts.length }}</span></span></a-menu-item>
-          <a-menu-item key="providers"><span class="nav-item-content"><ApiOutlined />供应商与密钥 <span class="nav-count">{{ providerKeyCount }}</span></span></a-menu-item>
+          <a-menu-item key="providers"><span class="nav-item-content"><ApiOutlined />供应商与密钥 <span class="nav-count">{{ providerResourceCount }}</span></span></a-menu-item>
           <a-menu-item key="config"><span class="nav-item-content"><SettingOutlined />客户端配置</span></a-menu-item>
           <a-menu-item key="gateway"><span class="nav-item-content"><ApiOutlined />本地 API</span></a-menu-item>
           <a-menu-item key="sessions"><span class="nav-item-content"><FileTextOutlined />会话管理</span></a-menu-item>

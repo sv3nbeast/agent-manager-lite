@@ -133,6 +133,7 @@ export interface Account {
 export interface GatewayStatus { running: boolean; port?: number; defaultTier?: string; profileId?: string; error?: string;quotaSyncError?:string }
 export interface CredentialRecoveryStatus { recovered: number; retained: number }
 export interface AppSnapshot { upstreamProxy?:UpstreamProxyView; wakeup?: WakeupView; providerUsageRefresh?:import('./providerUsage').ProviderUsageRefresh; backupRestartRequired?:boolean; proxyResources?:ProxyResourcesView; sshServers?:SshServersView; tempLogin?:TempLoginView;tempLoginCleanup?:TempLoginCleanup;clientSwitches?:ClientSwitchView[];clientAuthorities?:ClientAuthorityView[];localAccess?:LocalAccessView; settings: Settings; accounts: Account[]; groups: AccountGroup[]; providers?: ProviderSummary[]; providerProbe?:ProviderProbeState; instances?:InstanceView[];instanceCopy?:InstanceCopyView; instanceApplications?:InstanceApplication[]; dataDirectory: string; gateway?: GatewayStatus; login?: LoginStatus; quotaRefresh?: RefreshStatus; historyError?: string; credentialRecovery?: CredentialRecoveryStatus }
+export interface InstanceApplicationChoice { application?:InstanceApplication; snapshot:AppSnapshot }
 export interface ImportPreview { entries: { index: number; name: string; kind: Account['kind']; needsVerification?: boolean }[]; errors: string[]; skipped?: number }
 export interface StagedImport { ticket: string; preview: ImportPreview; fileName?: string }
 export interface ManagerAPI {
@@ -257,8 +258,8 @@ export interface ManagerAPI {
   chooseExistingInstanceDirectory():Promise<InstanceCopySource|undefined>
   attachExistingInstance(input:AttachInstanceInput):Promise<AppSnapshot>
   cancelInstanceCopy(id:string):Promise<AppSnapshot>
-  chooseInstanceApplication():Promise<AppSnapshot>
-  chooseInstanceCli():Promise<AppSnapshot>
+  chooseInstanceApplication():Promise<InstanceApplicationChoice>
+  chooseInstanceCli(clientType?:import('./agentClients').AgentClientType):Promise<InstanceApplicationChoice>
   chooseInstanceWorkingDirectory():Promise<InstanceWorkingDirectory|undefined>
   listInstanceWorkingDirectories():Promise<InstanceWorkingDirectory[]>
   removeInstance(input:Pick<InstanceProfile,'id'|'revision'>):Promise<AppSnapshot>

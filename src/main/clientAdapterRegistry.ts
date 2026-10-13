@@ -40,8 +40,8 @@ const registrations: readonly ClientAdapterRegistration[] = [
     applicationKinds: ['cli'],
     identityService: claudeCodeClient.identityService,
     protocol: claudeCodeClient.protocol,
-    readiness: 'pending',
-    reason: 'Claude CLI 的登录凭据、全局状态、协议和会话索引尚未完成实测',
+    readiness: 'verified',
+    reason: 'CLI 支持原生程序与 Anthropic API Key / Bearer；订阅登录、云凭据与 Desktop 分别验收',
   },
   {
     clientType: claudeCodeClientType,
