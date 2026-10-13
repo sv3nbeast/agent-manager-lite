@@ -51,4 +51,6 @@ jobs:
       - name: Verify instance lifetime across manager Quit and reopen
         run: npm run test:desktop:tray
       - name: Verify Claude connections and session boundaries in the manager UI
+        env:
+          CML_CLAUDE_EVIDENCE_DIR: ${{ runner.temp }}/agent-manager-claude-ui
         run: npm run test:desktop:claude-manager
