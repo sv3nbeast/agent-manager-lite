@@ -59,6 +59,7 @@ app.whenReady().then(() => {
 const opened = [], pickerOutcomes = []
 let copiedId = '', lastPage, lastPreview
 const stagedImports = { started: 0, completed: 0, failed: 0 }
+const modelSelections = []
 shell.openPath = async path => { opened.push({ action: 'file', path }); return '' }
 shell.showItemInFolder = path => { opened.push({ action: 'location', path }) }
 clipboard.writeText = value => { copiedId = value }
@@ -131,12 +132,27 @@ app.on('browser-window-created', (_event, window) => {
       const root = 'document.querySelector(' + JSON.stringify(selector) + ').closest(".ant-select")'
       await fill(selector, value)
       const controls = await run(root + '.querySelector("input").getAttribute("aria-controls")')
-      const option = 'Array.from(document.getElementById(' + JSON.stringify(controls) + ')?.closest(".ant-select-dropdown")?.querySelectorAll(".ant-select-item-option")??[]).find(el=>el.getClientRects().length&&el.querySelector(".ant-select-item-option-content")?.textContent===' + JSON.stringify(value) + ')'
-      await wait('!!(' + option + ')')
-      await run('(' + option + ').click()')
       // The hidden search-width mirror contains the typed text before a tag is
       // selected. Check the committed tag and cleared search, not parent text.
       const committed = 'Array.from(' + root + '.querySelectorAll(".ant-select-selection-item-content")).some(el=>el.textContent===' + JSON.stringify(value) + ')&&' + root + '.querySelector("input").value===""'
+      const option = 'Array.from(document.getElementById(' + JSON.stringify(controls) + ')?.closest(".ant-select-dropdown")?.querySelectorAll(".ant-select-item-option-active")??[]).find(el=>el.getClientRects().length&&getComputedStyle(el).visibility!=="hidden"&&el.querySelector(".ant-select-item-option-content")?.textContent===' + JSON.stringify(value) + ')'
+      await wait('(' + committed + ')||!!(' + option + ')')
+      const commitWithEnter = (label, value) => {
+        const select = document.querySelector('[aria-label="' + label + '"]').closest('.ant-select')
+        const input = select.querySelector('input')
+        const before = { search: input.value, tags: Array.from(select.querySelectorAll('.ant-select-selection-item-content')).map(el => el.textContent), documentHasFocus: document.hasFocus() }
+        let action = 'await-blur-commit'
+        // Blur submits tags before its dropdown finishes closing. Clicking or
+        // pressing Enter on that now-selected option would toggle it off.
+        // Check and dispatch in one renderer task, without activating a window.
+        if (before.tags.includes(value)) action = 'already-committed'
+        else if (before.search === value) {
+          for (const type of ['keydown', 'keyup']) input.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }))
+          action = 'enter'
+        }
+        return { label, value, action, before }
+      }
+      modelSelections.push(await run('(' + commitWithEnter.toString() + ')(' + JSON.stringify(label) + ',' + JSON.stringify(value) + ')'))
       await wait(committed)
       await run(root + '.querySelector("input").blur()')
       await wait(committed + '&&!' + root + '.contains(document.activeElement)')
@@ -168,7 +184,7 @@ app.on('browser-window-created', (_event, window) => {
           previewPresent: !!document.querySelector('.credential-preview'),
         }
       }
-      const diagnostic = { syntheticDataOnly: true, waitingFor, stagedImports, ...await run('(' + readFormState.toString() + ')()') }
+      const diagnostic = { syntheticDataOnly: true, waitingFor, stagedImports, modelSelections, ...await run('(' + readFormState.toString() + ')()') }
       fs.writeFileSync(join(evidence, 'claude-ui-failure.json'), JSON.stringify(diagnostic, null, 2), { mode: 0o600 })
       console.error('Claude UI failure diagnostic:', JSON.stringify(diagnostic))
     }
@@ -373,6 +389,7 @@ app.on('browser-window-created', (_event, window) => {
       assert.deepEqual(networkAttempts, [], 'API configuration and previews must not call login/model/token services')
       fs.writeFileSync(join(evidence, 'validation.json'), JSON.stringify({
         passed: true, clients: ['Codex', 'Claude Code'], claudeModes: ['cli'], connections: ['anthropic_api_key', 'anthropic_bearer'],
+        modelSelections,
         identityStatus: 'api_configured', isolatedInstances: 2, sameNativeIdSeparateRows: true, readOnlyHistory: true,
         nativeIdClipboard: true, sourceTranscriptsUnchanged: true, networkRequests: 0, launchedInstances: 0,
         resourceManagement: { apiConnectionsTab: true, configuredStatus: true, quotaUnavailableLabel: true, details: true, metadata: true, endpointModelsCredentials: true, accountProxy: true, recycle: true },
