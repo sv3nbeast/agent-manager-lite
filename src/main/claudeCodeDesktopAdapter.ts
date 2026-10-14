@@ -32,16 +32,15 @@ export interface ClaudeCodeDesktopDetectionOptions {
  * of either flag would make a second instance attach to another instance's
  * profile or make lifecycle recovery signal the wrong process.
  */
-const managedLaunchFlag = /^(?:--user-data-dir|--cml-instance|--remote-debugging-port|--remote-debugging-address|--remote-debugging-pipe|--profile-directory)(?:=|$)/i
+const managedLaunchFlag = /^--?(?:user-data-dir|cml-instance|remote-debugging[^\s=]*|profile-directory)(?:=|$)/i
 
 /**
  * Keep the renderer supplied argument surface deliberately tiny.  These are
- * the only flags used by our repeatable macOS startup probe; extension,
+ * the only flags used by our macOS startup probe; extension,
  * preload, JavaScript, sandbox and remote-debugging switches stay unavailable
  * until each one has its own isolation evidence.
  */
-const verifiedDiagnosticFlags = new Set(['--disable-gpu', '--disable-software-rasterizer'])
-const forbiddenDiagnosticFlag = /^(?:--load-extension|--disable-extensions-except|--extension|--app|--preload|--js-flags|--inspect(?:-brk)?|--remote-debugging-pipe|--no-sandbox|--disable-sandbox|--sandbox-type|--user-data-dir|--cml-instance|--profile-directory|--remote-debugging-port|--remote-debugging-address)(?:=|$)/i
+const verifiedDiagnosticFlags = new Set(['--disable-gpu'])
 
 function safePathValue(name: string, value: string): string {
   if (!isAbsolute(value) || resolve(value) !== value || /[\0\r\n]/.test(value)) {
@@ -104,15 +103,15 @@ export function claudeCodeDesktopInstanceMarker(nonce: string): string {
 }
 
 /**
- * Reject user arguments that could change profile ownership.  Other Chromium
- * switches are preserved for diagnostics and future compatibility, while
- * control characters are never passed to LaunchServices.
+ * Only explicitly verified diagnostic flags reach Desktop. Unknown upstream
+ * options fail closed, including options that can load code or disable the
+ * sandbox without changing either profile argument.
  */
 export function validateClaudeCodeDesktopArgs(args: readonly string[]): void {
   if (!Array.isArray(args) || args.length > 50) throw new Error('Claude Desktop 参数数量无效')
   for (const arg of args) {
     if (typeof arg !== 'string' || /[\0\r\n]/.test(arg)) throw new Error('Claude Desktop 参数包含无效字符')
-    if (forbiddenDiagnosticFlag.test(arg) || !verifiedDiagnosticFlags.has(arg)) throw new Error('Claude Desktop 仅允许已验证的诊断参数，不能覆盖受管隔离设置、加载扩展或运行脚本')
+    if (!verifiedDiagnosticFlags.has(arg)) throw new Error('Claude Desktop 仅允许已验证的诊断参数，不能覆盖受管隔离设置、加载扩展或运行脚本')
   }
 }
 
@@ -161,14 +160,15 @@ export function isClaudeCodeDesktopProcessOwned(plan: Pick<DesktopPlan, 'clientT
   const marker = claudeCodeDesktopInstanceMarker(plan.nonce)
   const args = [...process.args]
   const profileArg = `--user-data-dir=${profile}`
-  const profileClaims = args.filter(arg => /^--user-data-dir(?:=|$)/i.test(arg))
-  const markerClaims = args.filter(arg => /^--cml-instance(?:=|$)/i.test(arg))
+  const profileClaims = args.filter(arg => /^--?user-data-dir(?:=|$)/i.test(arg))
+  const markerClaims = args.filter(arg => /^--?cml-instance(?:=|$)/i.test(arg))
   // Require exactly one claim of each kind and reject every alternate
   // spelling/value.  This avoids signalling an ambiguous process when an
   // Electron wrapper duplicated or rewrote command-line arguments.
   if (profileClaims.length !== 1 || profileClaims[0] !== profileArg) return false
   if (markerClaims.length !== 1 || markerClaims[0] !== marker) return false
   if (args.some(arg => managedLaunchFlag.test(arg) && arg !== profileArg && arg !== marker)) return false
+  if (args.includes('--')) return false
   return true
 }
 

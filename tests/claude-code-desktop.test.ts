@@ -100,11 +100,11 @@ test('Desktop profile validation rejects a parent symlink', t => {
 
 test('Desktop extra arguments are an explicit diagnostic allowlist', () => {
   assert.doesNotThrow(() => validateClaudeCodeDesktopArgs(['--disable-gpu']))
-  assert.doesNotThrow(() => validateClaudeCodeDesktopArgs(['--disable-software-rasterizer']))
   for (const arg of [
     '--load-extension=/tmp/extension', '--disable-extensions-except=/tmp/extension', '--preload=/tmp/hook.js',
     '--js-flags=--jitless', '--inspect=127.0.0.1:9229', '--remote-debugging-pipe', '--no-sandbox',
     '--disable-features=Sandbox', '--lang=en-US', '--unknown-diagnostic-flag', '--disable-gpu=true',
+    '--disable-software-rasterizer', '-user-data-dir=/tmp/other', '--',
   ]) assert.throws(() => validateClaudeCodeDesktopArgs([arg]), /不能覆盖/)
 })
 
@@ -135,4 +135,9 @@ test('Desktop process ownership requires exact executable, profile and nonce', t
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, marker, marker] }), false)
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, '--user-data-dir=/tmp/other', marker] }), false)
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, '--remote-debugging-pipe', marker] }), false)
+  for (const extra of [
+    ['--cml-instance', 'other'], ['-cml-instance=other'], ['--USER-DATA-DIR=/tmp/other'],
+    ['-user-data-dir=/tmp/other'], ['--remote-debugging-future-option=9222'],
+  ]) assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, marker, ...extra] }), false)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', '--', `--user-data-dir=${profile}`, marker] }), false)
 })
