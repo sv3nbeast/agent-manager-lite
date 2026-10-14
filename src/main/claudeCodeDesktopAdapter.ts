@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { claudeCodeApplicationKindSchema, claudeCodeClientType, type ClaudeCodeApplicationKind } from '../shared/claudeCode'
+import type { DesktopPlan } from './instanceRuntime'
+import { applyNetworkRouteEnvironment, managedDesktopNetworkArgs, type InstanceNetworkRoute } from './desktopNetwork'
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
@@ -24,6 +26,21 @@ export interface ClaudeCodeDesktopDetectionOptions {
   roots?: string[]
 }
 
+/**
+ * Flags whose values identify a Chromium/Electron profile or a manager-owned
+ * process.  An instance must own both values.  Allowing a user supplied copy
+ * of either flag would make a second instance attach to another instance's
+ * profile or make lifecycle recovery signal the wrong process.
+ */
+const managedLaunchFlag = /^(?:--user-data-dir|--cml-instance|--remote-debugging-port|--remote-debugging-address|--profile-directory)(?:=|$)/i
+
+function safePathValue(name: string, value: string): string {
+  if (!isAbsolute(value) || resolve(value) !== value || /[\0\r\n]/.test(value)) {
+    throw new Error(`Claude Desktop ${name} 必须是规范化的绝对路径`)
+  }
+  return value
+}
+
 function safeFile(path: string): string | undefined {
   try {
     const original = lstatSync(path)
@@ -42,6 +59,96 @@ function safeDirectory(path: string): string | undefined {
     if (!stat.isDirectory() || stat.isSymbolicLink()) return
     return canonical
   } catch { return }
+}
+
+/**
+ * Validate a manager-owned Electron profile directory before it is placed in
+ * an application argument.  The directory must already exist so a missing or
+ * replaced instance folder cannot be silently recreated outside the manager
+ * root by an upstream Electron version.
+ */
+export function validateClaudeCodeDesktopProfileDirectory(profileDirectory: string): string {
+  const path = safePathValue('profile 目录', profileDirectory)
+  if (!safeDirectory(path)) throw new Error('Claude Desktop profile 必须是已存在的普通目录，不能使用文件或符号链接')
+  return path
+}
+
+/**
+ * Derive the profile location used by a managed instance.  Keeping this in
+ * the adapter makes it harder for a caller to accidentally reuse the CLI
+ * `CLAUDE_CONFIG_DIR` or the user's global Claude Desktop directory.
+ */
+export function claudeCodeDesktopProfileDirectory(instanceDirectory: string): string {
+  const root = safePathValue('实例目录', instanceDirectory)
+  return join(root, 'desktop')
+}
+
+/** A stable marker used to associate an Electron process with one instance. */
+export function claudeCodeDesktopInstanceMarker(nonce: string): string {
+  if (typeof nonce !== 'string' || !nonce || /[\0\r\n\s]/.test(nonce) || nonce.length > 256) {
+    throw new Error('Claude Desktop 实例标识无效')
+  }
+  return `--cml-instance=${nonce}`
+}
+
+/**
+ * Reject user arguments that could change profile ownership.  Other Chromium
+ * switches are preserved for diagnostics and future compatibility, while
+ * control characters are never passed to LaunchServices.
+ */
+export function validateClaudeCodeDesktopArgs(args: readonly string[]): void {
+  if (!Array.isArray(args) || args.length > 50) throw new Error('Claude Desktop 参数数量无效')
+  for (const arg of args) {
+    if (typeof arg !== 'string' || /[\0\r\n]/.test(arg)) throw new Error('Claude Desktop 参数包含无效字符')
+    if (managedLaunchFlag.test(arg)) throw new Error('Claude Desktop 参数不能覆盖受管 profile、实例标识或调试端口')
+  }
+}
+
+/**
+ * Desktop is an Electron application, not a Claude Code CLI process.  Remove
+ * inherited Claude/Anthropic credentials and Electron/Node hooks before
+ * applying the manager's optional credential-free network route.
+ */
+export function claudeCodeDesktopEnvironment(source: NodeJS.ProcessEnv, route?: InstanceNetworkRoute): NodeJS.ProcessEnv {
+  const environment = { ...source }
+  for (const key of Object.keys(environment)) {
+    if (/^(?:CLAUDE_|ANTHROPIC_|CODEX_|OPENAI_|CML_|ELECTRON_|NODE_|npm_config_)/.test(key)
+      || ['__CFBundleIdentifier', 'XPC_SERVICE_NAME'].includes(key)) delete environment[key]
+  }
+  return applyNetworkRouteEnvironment(environment, route)
+}
+
+/**
+ * Build the macOS LaunchServices command for a Desktop instance.  The
+ * profile and marker are always manager-owned and appear after `--args`, so
+ * LaunchServices does not confuse them with its own options.
+ */
+export function claudeCodeDesktopMacLaunchArgs(plan: Pick<DesktopPlan, 'clientType' | 'application' | 'desktopDirectory' | 'nonce' | 'args' | 'networkRoute'>, args: readonly string[] = plan.args): string[] {
+  if (plan.clientType !== claudeCodeClientType) throw new Error('所选程序不是 Claude Desktop')
+  const application = safePathValue('应用', plan.application)
+  const profile = validateClaudeCodeDesktopProfileDirectory(plan.desktopDirectory)
+  const marker = claudeCodeDesktopInstanceMarker(plan.nonce)
+  validateClaudeCodeDesktopArgs(args)
+  const routed = managedDesktopNetworkArgs(args, plan.networkRoute)
+  return ['-n', '-a', application, '--args', `--user-data-dir=${profile}`, marker, ...routed]
+}
+
+export interface ClaudeCodeDesktopProcessOwnership {
+  executable: string
+  args: readonly string[]
+}
+
+/**
+ * Check the two independent ownership claims used during recovery: exact
+ * executable and exact profile/nonce arguments.  A marker alone is not enough
+ * because a stale process can retain it after its profile has been replaced.
+ */
+export function isClaudeCodeDesktopProcessOwned(plan: Pick<DesktopPlan, 'clientType' | 'executable' | 'desktopDirectory' | 'nonce'>, process: ClaudeCodeDesktopProcessOwnership): boolean {
+  if (plan.clientType !== claudeCodeClientType || process.executable !== plan.executable) return false
+  const profile = validateClaudeCodeDesktopProfileDirectory(plan.desktopDirectory)
+  const marker = claudeCodeDesktopInstanceMarker(plan.nonce)
+  const args = [...process.args]
+  return args.includes(marker) && args.includes(`--user-data-dir=${profile}`)
 }
 
 /** Read only the small, stable subset of an XML Info.plist that identifies an app. */

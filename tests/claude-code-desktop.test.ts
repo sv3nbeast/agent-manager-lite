@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { detectClaudeCodeDesktopApplications, inspectClaudeCodeDesktopIsolation, type ClaudeCodeDesktopApplication } from '../src/main/claudeCodeDesktopAdapter'
+import { claudeCodeDesktopEnvironment, claudeCodeDesktopInstanceMarker, claudeCodeDesktopMacLaunchArgs, claudeCodeDesktopProfileDirectory, detectClaudeCodeDesktopApplications, inspectClaudeCodeDesktopIsolation, isClaudeCodeDesktopProcessOwned, validateClaudeCodeDesktopArgs, validateClaudeCodeDesktopProfileDirectory, type ClaudeCodeDesktopApplication } from '../src/main/claudeCodeDesktopAdapter'
 
 const application: ClaudeCodeDesktopApplication = {
   clientType: 'claude_code', applicationKind: 'desktop', kind: 'desktop', id: 'desktop-fixture',
@@ -54,4 +54,61 @@ test('Desktop bundle metadata cannot point to an executable outside its MacOS di
   writeFileSync(plist, metadata('Claude'))
   symlinkSync(join(app, 'Contents', 'escape'), join(app, 'Contents', 'MacOS', 'Claude'))
   assert.deepEqual(detectClaudeCodeDesktopApplications({ roots: [app] }), [])
+})
+
+test('Desktop launch arguments bind one existing profile and one nonce', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml-desktop-launch-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const profile = join(root, 'desktop')
+  mkdirSync(profile)
+  const nonce = 'nonce-fixture'
+  const args = claudeCodeDesktopMacLaunchArgs({
+    clientType: 'claude_code', application: '/Applications/Claude.app', desktopDirectory: profile,
+    nonce, args: ['--disable-gpu'], networkRoute: undefined,
+  })
+  assert.deepEqual(args, ['-n', '-a', '/Applications/Claude.app', '--args', `--user-data-dir=${profile}`, claudeCodeDesktopInstanceMarker(nonce), '--disable-gpu'])
+  assert.equal(claudeCodeDesktopProfileDirectory(root), profile)
+  assert.equal(validateClaudeCodeDesktopProfileDirectory(profile), profile)
+})
+
+test('Desktop launch arguments reject profile, marker and remote debugging overrides', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml-desktop-launch-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const profile = join(root, 'desktop')
+  mkdirSync(profile)
+  for (const arg of ['--user-data-dir=/tmp/other', '--cml-instance=other', '--remote-debugging-port=9222', '--profile-directory=Default']) {
+    assert.throws(() => validateClaudeCodeDesktopArgs([arg]), /不能覆盖/)
+    assert.throws(() => claudeCodeDesktopMacLaunchArgs({ clientType: 'claude_code', application: '/Applications/Claude.app', desktopDirectory: profile, nonce: 'nonce-fixture', args: [arg], networkRoute: undefined }), /不能覆盖/)
+  }
+  const file = join(root, 'file'), link = join(root, 'link')
+  writeFileSync(file, 'file')
+  symlinkSync(profile, link)
+  assert.throws(() => validateClaudeCodeDesktopProfileDirectory(file), /普通目录/)
+  assert.throws(() => validateClaudeCodeDesktopProfileDirectory(link), /普通目录/)
+  assert.throws(() => claudeCodeDesktopMacLaunchArgs({ clientType: 'claude_code', application: '/Applications/Claude.app', desktopDirectory: join(root, 'missing'), nonce: 'nonce-fixture', args: [], networkRoute: undefined }), /普通目录/)
+})
+
+test('Desktop environment drops inherited identity and Electron hooks but preserves safe values', () => {
+  const env = claudeCodeDesktopEnvironment({
+    PATH: '/usr/bin', LANG: 'zh_CN.UTF-8', CLAUDE_CONFIG_DIR: '/tmp/global', CLAUDE_CODE_OAUTH_TOKEN: 'secret',
+    ANTHROPIC_API_KEY: 'secret', ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '--require=/tmp/hook', CML_TEST_SECRET: 'secret',
+    HTTP_PROXY: 'http://proxy.invalid:80',
+  }, { mode: 'direct' })
+  assert.deepEqual(env.PATH, '/usr/bin')
+  assert.deepEqual(env.LANG, 'zh_CN.UTF-8')
+  for (const key of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'CML_TEST_SECRET']) assert.equal(env[key], undefined, key)
+  assert.equal(env.HTTP_PROXY, '')
+  assert.equal(env.NO_PROXY, '*')
+})
+
+test('Desktop process ownership requires exact executable, profile and nonce', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml-desktop-owner-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const profile = join(root, 'desktop')
+  mkdirSync(profile)
+  const plan = { clientType: 'claude_code' as const, executable: '/Applications/Claude.app/Contents/MacOS/Claude', desktopDirectory: profile, nonce: 'nonce-fixture' }
+  const marker = claudeCodeDesktopInstanceMarker(plan.nonce)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, marker] }), true)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${join(root, 'other')}`, marker] }), false)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: '/tmp/other', args: ['Claude', `--user-data-dir=${profile}`, marker] }), false)
 })
