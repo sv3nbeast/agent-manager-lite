@@ -420,7 +420,7 @@ function isClaudeSubscriptionAccount(account: StoredAccount): boolean {
 }
 
 /** Persist a Claude.ai subscription OAuth result without exposing its tokens in the account projection. */
-export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscriptionLoginResult): StoredAccount {
+export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscriptionLoginResult, existingId?: string): StoredAccount {
   const profile: ClaudeSubscriptionProfile | undefined = result.profile
   const accountId = text(profile?.accountId)
   const email = normalizedEmail(profile?.email)
@@ -431,6 +431,7 @@ export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscr
   store.transaction(state => {
     const existing = state.accounts.find(account => {
       if (!isClaudeSubscriptionAccount(account)) return false
+      if (existingId && account.id === existingId) return true
       const existingAccountId = text(account.claudeSubscription?.accountId) ?? text(account.credentials.accountId)
       if (accountId && existingAccountId) return accountId === existingAccountId
       if (accessToken && account.credentials.accessToken === accessToken) return true

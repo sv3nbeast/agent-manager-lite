@@ -172,13 +172,19 @@ async function main(): Promise<void> {
     })
     const profile = await service.profile(refreshed).catch(() => undefined)
     const usage = await service.usage(refreshed).catch(() => undefined)
+    const previousAccountId = before.claudeSubscription?.accountId ?? before.credentials.accountId
+    const previousOrganizationId = before.claudeSubscription?.organizationId
+    if ((profile?.accountId && previousAccountId && profile.accountId !== previousAccountId)
+      || (profile?.organizationId && previousOrganizationId && profile.organizationId !== previousOrganizationId)) {
+      throw new Error('Claude 订阅刷新返回的账号身份不匹配，请重新登录')
+    }
     const result: ClaudeSubscriptionLoginResult = {
       tokens: refreshed,
       ...(profile ? { profile } : {}),
       ...(usage ? { usage } : {}),
       metadata: { ...(profile ? { profile } : {}), ...(usage ? { usage } : {}), ...(refreshed.tokenType ? { tokenType: refreshed.tokenType } : {}), ...(refreshed.scope ? { scope: refreshed.scope } : {}), ...(refreshed.expiresAt ? { expiresAt: refreshed.expiresAt } : {}), retrievedAt: Date.now() }
     }
-    const account = saveClaudeSubscriptionAccount(store, result)
+    const account = saveClaudeSubscriptionAccount(store, result, before.id)
     await projectCredentials(account)
     return account
   })
