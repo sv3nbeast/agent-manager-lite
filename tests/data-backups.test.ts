@@ -156,11 +156,13 @@ test('Claude subscription identity and token metadata survive portable backups w
     saved.baseUrl='https://api.anthropic.com';saved.wireApi='chat_completions';saved.models=['claude-sonnet-4-5']
     saved.credentials={accessToken:'fixture-claude-access',refreshToken:'fixture-claude-refresh',expiresAt:1_800_000_000_000,tokenType:'Bearer',scope:'user:profile user:inference',accountId:'account-fixture'}
     saved.claudeSubscription={accountId:'account-fixture',organizationId:'org-fixture',organizationName:'Example Org',verifiedAt:1_700_000_000_000,profileFetchedAt:1_700_000_000_000,usageFetchedAt:1_700_000_001_000,tokenExpiresAt:1_800_000_000_000,scopes:['user:profile','user:inference']}
+    saved.quota={updatedAt:1_700_000_001_000,windows:[{id:'extra_usage',name:'extra_usage',usedPercent:16,details:{isEnabled:true,monthlyLimit:25,usedCredits:4}}]}
   })
   const payload=exportBackupState(f.store.read(),{})
   const restored=validateBackup(structuredClone(payload)),saved=restored.state.accounts.find(value=>value.id===account.id)!
   assert.deepEqual(saved.credentials,{accessToken:'fixture-claude-access',refreshToken:'fixture-claude-refresh',expiresAt:1_800_000_000_000,tokenType:'Bearer',scope:'user:profile user:inference',accountId:'account-fixture'})
   assert.deepEqual(saved.claudeSubscription,{accountId:'account-fixture',organizationId:'org-fixture',organizationName:'Example Org',verifiedAt:1_700_000_000_000,profileFetchedAt:1_700_000_000_000,usageFetchedAt:1_700_000_001_000,tokenExpiresAt:1_800_000_000_000,scopes:['user:profile','user:inference']})
+  assert.deepEqual(saved.quota?.windows[0]?.details,{isEnabled:true,monthlyLimit:25,usedCredits:4})
   const invalid:[string,(value:any)=>void][]=[
     ['unknown credential field',value=>{value.state.accounts.find((entry:any)=>entry.id===account.id).credentials.authorizationCode='fixture-code'}],
     ['invalid token expiry',value=>{value.state.accounts.find((entry:any)=>entry.id===account.id).credentials.expiresAt='later'}],
