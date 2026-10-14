@@ -148,6 +148,28 @@ test('schema rejects unknown, duplicate and inconsistent data without silently d
   assert.deepEqual(validateBackup(payload),payload)
 })
 
+test('Claude subscription identity and token metadata survive portable backups while unknown credential fields are rejected',async t=>{
+  const f=fixture(t),account=f.add('Claude 订阅账号')
+  f.store.transaction(state=>{
+    const saved=state.accounts.find(value=>value.id===account.id)!
+    saved.kind='oauth';saved.identityService='anthropic';saved.credentialKind='claude_ai_oauth';saved.protocol='anthropic_messages'
+    saved.baseUrl='https://api.anthropic.com';saved.wireApi='chat_completions';saved.models=['claude-sonnet-4-5']
+    saved.credentials={accessToken:'fixture-claude-access',refreshToken:'fixture-claude-refresh',expiresAt:1_800_000_000_000,tokenType:'Bearer',scope:'user:profile user:inference',accountId:'account-fixture'}
+    saved.claudeSubscription={accountId:'account-fixture',organizationId:'org-fixture',organizationName:'Example Org',verifiedAt:1_700_000_000_000,profileFetchedAt:1_700_000_000_000,usageFetchedAt:1_700_000_001_000,tokenExpiresAt:1_800_000_000_000,scopes:['user:profile','user:inference']}
+  })
+  const payload=exportBackupState(f.store.read(),{})
+  const restored=validateBackup(structuredClone(payload)),saved=restored.state.accounts.find(value=>value.id===account.id)!
+  assert.deepEqual(saved.credentials,{accessToken:'fixture-claude-access',refreshToken:'fixture-claude-refresh',expiresAt:1_800_000_000_000,tokenType:'Bearer',scope:'user:profile user:inference',accountId:'account-fixture'})
+  assert.deepEqual(saved.claudeSubscription,{accountId:'account-fixture',organizationId:'org-fixture',organizationName:'Example Org',verifiedAt:1_700_000_000_000,profileFetchedAt:1_700_000_000_000,usageFetchedAt:1_700_000_001_000,tokenExpiresAt:1_800_000_000_000,scopes:['user:profile','user:inference']})
+  const invalid:[string,(value:any)=>void][]=[
+    ['unknown credential field',value=>{value.state.accounts.find((entry:any)=>entry.id===account.id).credentials.authorizationCode='fixture-code'}],
+    ['invalid token expiry',value=>{value.state.accounts.find((entry:any)=>entry.id===account.id).credentials.expiresAt='later'}],
+    ['unknown subscription field',value=>{value.state.accounts.find((entry:any)=>entry.id===account.id).claudeSubscription.refreshToken='fixture-secret'}],
+    ['invalid subscription scope',value=>{value.state.accounts.find((entry:any)=>entry.id===account.id).claudeSubscription.scopes=[42]}],
+  ]
+  for(const [name,change] of invalid)await t.test(name,()=>{const bad=structuredClone(payload);change(bad);assert.throws(()=>validateBackup(bad))})
+})
+
 test('authenticated invalid JSON never exposes decrypted content through the error message',async t=>{
   const f=fixture(t),cipher=await backupCipher(password),nonce=randomBytes(12),header=Buffer.concat([Buffer.from('CMLBACKUP\x01'),cipher.salt,nonce]),c=createCipheriv('aes-256-gcm',cipher.key,nonce)
   t.after(()=>cipher.key.fill(0));c.setAAD(header)
