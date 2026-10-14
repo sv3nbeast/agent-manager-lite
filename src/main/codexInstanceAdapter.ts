@@ -13,6 +13,7 @@ import {codexBundledCli,codexDesktopExecutable} from './codexPrograms'
 import { TomlDocument } from './tomlPatch'
 import {nativeProvider} from './nativeAccountProjection'
 import {applyNetworkRouteEnvironment,managedDesktopNetworkArgs,networkRouteEnvironment,type InstanceNetworkRoute} from './desktopNetwork'
+import {prepareCodexSharedSkills} from './codexSkills'
 
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
@@ -130,7 +131,7 @@ export async function reserveCodexCdpPort():Promise<number> {
 }
 
 export const codexInstanceAdapter={client:getAgentClient('codex'),applications,registerApplication,executable,launchRuntime,validateApplication,validateAccount,
-  desktopEnvironment:codexDesktopEnvironment,macLaunchArgs:codexMacLaunchArgs,validateCliArgs:validateCodexCliArgs,copiedSessionProvider}
+  desktopEnvironment:codexDesktopEnvironment,macLaunchArgs:codexMacLaunchArgs,validateCliArgs:validateCodexCliArgs,copiedSessionProvider,prepareSharedSkills:prepareCodexSharedSkills}
 
 /** Add verified clients here, rather than branching in each lifecycle method. */
 export function getInstanceClientAdapter(clientType:unknown,applicationKind?:'desktop'|'cli') {

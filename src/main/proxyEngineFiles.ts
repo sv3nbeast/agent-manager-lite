@@ -4,7 +4,7 @@ import {open,lstat,chmod,type FileHandle} from 'node:fs/promises'
 import {join} from 'node:path'
 import {createHash} from 'node:crypto'
 import {get} from 'node:https'
-import {Readable,Writable} from 'node:stream'
+import {Readable,Writable,type Transform} from 'node:stream'
 import {pipeline} from 'node:stream/promises'
 import {createGunzip} from 'node:zlib'
 import * as yauzl from 'yauzl'
@@ -68,15 +68,21 @@ function safeEntry(name:string):boolean{
 const allowedName=(name:string)=>/^(?:LICENSE|NOTICE)(?:[.-][A-Za-z0-9._-]{0,63})?$/.test(name)
 export async function extractEngine(path:string,output:string,asset:string,signal:AbortSignal,limit=extractedLimit):Promise<Record<string,string>>{
   const file=await regularFile(path,compressedLimit),files:Record<string,string>={};let total=0
-  async function consume(input:Readable,name?:string,expected?:number){
+  async function consume(input:Readable,name?:string,expected?:number,transform?:Transform){
     const hash=createHash('sha256');let written=0,dest:FileHandle|undefined
     try{
       if(name){if(Object.keys(files).some(other=>other.toLowerCase()===name.toLowerCase()))fail('ENGINE_INSTALL_ARCHIVE');dest=await open(join(output,name),'wx',0o600)}
       const sink=new Writable({write(chunk,_encoding,done){written+=chunk.length;total+=chunk.length;if(total>limit||expected!==undefined&&written>expected){done(new EngineError('ENGINE_INSTALL_TOO_LARGE'));return}hash.update(chunk);if(dest)dest.writeFile(chunk).then(()=>done(),done);else done()}})
-      await pipeline(input,sink,{signal});signal.throwIfAborted()
+      // Install one owner for the entire chain only after the destination is
+      // ready. A separate pipeline ending at Gunzip can finish its writable
+      // side and remove error listeners before a truncated-footer error arrives
+      // on the readable side while the output file is still being opened.
+      if(transform)await pipeline(input,transform,sink,{signal})
+      else await pipeline(input,sink,{signal})
+      signal.throwIfAborted()
       if(expected!==undefined&&written!==expected)fail('ENGINE_INSTALL_ARCHIVE')
       if(dest){await dest.sync();files[name!]=hash.digest('hex')}
-    }finally{input.destroy();await dest?.close()}
+    }finally{input.destroy();transform?.destroy();await dest?.close()}
   }
   try{
     if(asset.endsWith('.zip')){
@@ -96,8 +102,7 @@ export async function extractEngine(path:string,output:string,asset:string,signa
       }
     }else if(asset.endsWith('.gz')&&!asset.endsWith('.tar.gz')){
       const gunzip=createGunzip(),source=Readable.from(fileChunks(file,compressedLimit,signal))
-      const inflating=pipeline(source,gunzip,{signal});void inflating.catch(()=>{})
-      try{await consume(gunzip,'mihomo');await inflating}finally{source.destroy();gunzip.destroy();await inflating.catch(()=>{})}
+      await consume(source,'mihomo',undefined,gunzip)
     }else fail('ENGINE_INSTALL_ARCHIVE')
     const binary=asset.endsWith('.zip')?'mihomo.exe':'mihomo'
     if(!files[binary])fail('ENGINE_INSTALL_ARCHIVE')

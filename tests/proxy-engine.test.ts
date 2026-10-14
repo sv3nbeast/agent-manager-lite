@@ -1,9 +1,10 @@
-import test from 'node:test'
+import test,{type TestContext} from 'node:test'
 import assert from 'node:assert/strict'
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,readdirSync,lstatSync,symlinkSync,appendFileSync,createWriteStream} from 'node:fs'
 import {join} from 'node:path'
 import {tmpdir} from 'node:os'
-import {gzipSync} from 'node:zlib'
+import zlib,{gzipSync,type Gunzip} from 'node:zlib'
+import fsPromises,{type FileHandle} from 'node:fs/promises'
 import {createHash,randomUUID} from 'node:crypto'
 import {Readable} from 'node:stream'
 import {pipeline} from 'node:stream/promises'
@@ -124,4 +125,66 @@ test('archive extraction rejects links, duplicates, traversal, gzip bombs/trunca
   const invalid=join(f.root,'invalid');mkdirSync(invalid);writeFileSync(bomb,f.bytes.subarray(0,-6));await assert.rejects(extractEngine(bomb,invalid,'engine.gz',signal()),/ARCHIVE/)
   const cancel=new AbortController();cancel.abort(new EngineError('ENGINE_INSTALL_CANCELLED'));const canceled=join(f.root,'canceled');mkdirSync(canceled);await assert.rejects(extractEngine(f.archive,canceled,'engine.gz',cancel.signal),/CANCELLED/)
   assert.ok(compressedLimit<512*1024**2)
+})
+
+function extractionLifetime(t:TestContext,options:{beforeOutputOpen?:()=>Promise<void>;afterOutputWrite?:()=>void}={}){
+  const sources:Readable[]=[],inflaters:Gunzip[]=[],files:FileHandle[]=[]
+  const from=Readable.from,gunzip=zlib.createGunzip,open=fsPromises.open
+  t.mock.method(Readable,'from',(iterable:Parameters<typeof Readable.from>[0],settings?:Parameters<typeof Readable.from>[1])=>{
+    const source=from(iterable,settings);sources.push(source);return source
+  })
+  t.mock.method(zlib,'createGunzip',(...args:Parameters<typeof zlib.createGunzip>)=>{
+    const inflater=gunzip(...args);inflaters.push(inflater);return inflater
+  })
+  t.mock.method(fsPromises,'open',async(...args:Parameters<typeof fsPromises.open>)=>{
+    const output=String(args[0]).endsWith('/mihomo')
+    if(output)await options.beforeOutputOpen?.()
+    const file=await open(...args);files.push(file)
+    if(output&&options.afterOutputWrite){
+      const write=file.writeFile.bind(file)
+      t.mock.method(file,'writeFile',async(...input:Parameters<typeof file.writeFile>)=>{await write(...input);options.afterOutputWrite!()})
+    }
+    return file
+  })
+  return {sources,inflaters,files,assertClosed(){
+    assert.equal(sources.length,1);assert.equal(inflaters.length,1)
+    for(const stream of [...sources,...inflaters]){assert.equal(stream.destroyed,true);assert.equal(stream.closed,true)}
+    for(const file of files)assert.equal(file.fd,-1)
+  }}
+}
+
+test('gzip extraction waits for the destination before decoding and contains delayed truncation errors',async t=>{
+  const f=fixture(t),output=join(f.root,'slow-output'),archive=join(f.root,'truncated.gz')
+  mkdirSync(output);writeFileSync(archive,f.bytes.subarray(0,-6))
+  let opening=false,release!:()=>void
+  const gate=new Promise<void>(resolve=>{release=resolve});t.after(()=>release())
+  const lifetime=extractionLifetime(t,{beforeOutputOpen:async()=>{opening=true;await gate}})
+  const rejection=assert.rejects(extractEngine(archive,output,'engine.gz',signal()),/ARCHIVE/)
+  try{
+    await until(()=>opening);await delay(30)
+    // The native inflater can finish its writable side before reporting a
+    // truncated footer on its readable side. Both sides must have one owner.
+    assert.equal(lifetime.inflaters[0].bytesWritten,0)
+  }finally{release()}
+  await rejection;lifetime.assertClosed()
+})
+
+test('gzip output-open failure terminates the unopened stream chain and preserves existing files',async t=>{
+  const f=fixture(t),output=join(f.root,'occupied-output');mkdirSync(output)
+  writeFileSync(join(output,'mihomo'),'keep existing destination')
+  const lifetime=extractionLifetime(t)
+  await assert.rejects(extractEngine(f.archive,output,'engine.gz',signal()),/ARCHIVE/)
+  lifetime.assertClosed();assert.equal(lifetime.inflaters[0].bytesWritten,0)
+  assert.equal(readFileSync(join(output,'mihomo'),'utf8'),'keep existing destination')
+})
+
+test('cancelling active gzip output closes the source, inflater and file handles before returning',async t=>{
+  const f=fixture(t),output=join(f.root,'cancel-output'),archive=join(f.root,'large.gz'),body=Buffer.alloc(1024*1024,42)
+  mkdirSync(output);writeFileSync(archive,gzipSync(body))
+  const cancel=new AbortController(),reason=new EngineError('ENGINE_INSTALL_CANCELLED')
+  const lifetime=extractionLifetime(t,{afterOutputWrite:()=>cancel.abort(reason)})
+  await assert.rejects(extractEngine(archive,output,'engine.gz',cancel.signal),error=>error===reason)
+  lifetime.assertClosed();assert.ok(lifetime.inflaters[0].bytesWritten>0)
+  const written=lstatSync(join(output,'mihomo')).size
+  assert.ok(written>0&&written<body.length)
 })

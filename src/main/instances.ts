@@ -34,8 +34,11 @@ import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopS
 import {readInstanceHistory} from './instanceHistory'
 import {repairSessionProjection} from './sessionProjectionRepair'
 import {readInstanceIdentityStatus} from './instanceIdentityStatus'
+import type {prepareCodexSharedSkills} from './codexSkills'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
+export interface InstanceSkillsServices {prepare:typeof prepareCodexSharedSkills}
+const defaultSkillsServices:InstanceSkillsServices={prepare:codexInstanceAdapter.prepareSharedSkills}
 const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspectCodexDesktopUi,inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
 type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -55,7 +58,8 @@ export class Instances {
   constructor(private readonly store:Store,private readonly gatewayFactory:(profile:InstanceProfile)=>Gateway,
     private readonly prepareAccount:(id:string)=>Promise<StoredAccount>,private readonly runtime:DesktopRuntime=new MacInstanceRuntime(),
     private readonly nativeAccounts?:NativeInstanceAccounts,private readonly now:()=>number=Date.now,private readonly externalBusy:(id:string)=>boolean=()=>false,
-    private readonly systemLanguages:readonly string[]=systemDesktopLanguages(),private readonly speedMenuServices:InstanceSpeedMenuServices=defaultSpeedMenuServices,private readonly nativeProxyService?:NativeProxyService) {this.root=realpathSync(store.directory)}
+    private readonly systemLanguages:readonly string[]=systemDesktopLanguages(),private readonly speedMenuServices:InstanceSpeedMenuServices=defaultSpeedMenuServices,private readonly nativeProxyService?:NativeProxyService,
+    private readonly skillsServices:InstanceSkillsServices=defaultSkillsServices) {this.root=realpathSync(store.directory)}
   applications():InstanceApplication[] {
     const stored=this.store.read().instanceApplications ?? []
     return [...codexInstanceAdapter.applications(stored),...claudeCodeInstanceAdapter.applications(stored)]
@@ -489,6 +493,17 @@ export class Instances {
       run.controller.signal.throwIfAborted()
       let context=this.context(run.profile,run.plan.nonce)
       if(context.fingerprint!==fingerprint)throw new Error('实例配置在凭据准备期间已变化，请重新启动')
+      // Personal skills belong to the local user, while credentials and system
+      // skills stay in each client's home. Rebuild missing entries on every
+      // managed Codex launch, including existing and session-only copies.
+      // Adopted external homes and already-running recovery remain untouched.
+      if(!run.profile.externalHome){
+        let notices:string[]
+        try {notices=this.skillsServices.prepare({directory:run.plan.directory,managerDirectory:this.root}).notices}
+        catch {notices=['本机个人技能未能自动接入，请检查技能目录的权限或链接；已有技能已保留']}
+        const notice=[this.notices.get(run.profile.id),...notices].filter(Boolean).join('；')
+        if(notice)this.notices.set(run.profile.id,notice)
+      }
       if(context.language){
         initializeDesktopLocale(this.localeOptions(run.profile.id,run.plan),context.language.revision)
         context=this.context(run.profile,run.plan.nonce);fingerprint=context.fingerprint;revision=context.view.revision
