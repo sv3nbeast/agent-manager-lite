@@ -113,7 +113,7 @@ export interface LoginStatus {
 export interface ClaudeSubscriptionIdentity {
   [key: string]: unknown
   accountId?: string; organizationId?: string; organizationName?: string
-  verifiedAt: number; profileFetchedAt?: number; usageFetchedAt?: number
+  verifiedAt?: number; profileFetchedAt?: number; usageFetchedAt?: number
   tokenExpiresAt?: number; scopes?: string[]
 }
 /** Public status of the separate Anthropic OAuth flow. Tokens and PKCE state are never exposed. */

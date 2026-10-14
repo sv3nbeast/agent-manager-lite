@@ -407,7 +407,7 @@ function claudeSubscriptionIdentity(result: ClaudeSubscriptionLoginResult, previ
     ...(profile?.accountId ? { accountId: profile.accountId } : {}),
     ...(profile?.organizationId ? { organizationId: profile.organizationId } : {}),
     ...(profile?.organizationName ? { organizationName: profile.organizationName } : {}),
-    verifiedAt: profile?.fetchedAt ?? previous?.verifiedAt ?? result.metadata.retrievedAt,
+    ...(profile?.fetchedAt ? { verifiedAt: profile.fetchedAt } : previous?.verifiedAt ? { verifiedAt: previous.verifiedAt } : {}),
     ...(profile?.fetchedAt ? { profileFetchedAt: profile.fetchedAt } : previous?.profileFetchedAt ? { profileFetchedAt: previous.profileFetchedAt } : {}),
     ...(result.usage?.fetchedAt ? { usageFetchedAt: result.usage.fetchedAt } : previous?.usageFetchedAt ? { usageFetchedAt: previous.usageFetchedAt } : {}),
     ...(result.tokens.expiresAt ? { tokenExpiresAt: result.tokens.expiresAt } : previous?.tokenExpiresAt ? { tokenExpiresAt: previous.tokenExpiresAt } : {}),

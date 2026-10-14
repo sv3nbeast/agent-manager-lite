@@ -62,6 +62,15 @@ test('Claude subscription relogin deduplicates by account identity and preserves
   } finally { rmSync(directory, { recursive: true, force: true }) }
 })
 
+test('Claude subscription without a profile remains pending verification', () => {
+  const { store, directory } = storeFixture()
+  try {
+    const account = saveClaudeSubscriptionAccount(store, result({ profile: undefined, usage: undefined }))
+    assert.equal(account.claudeSubscription?.verifiedAt, undefined)
+    assert.equal(account.claudeSubscription?.profileFetchedAt, undefined)
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
 test('TokenAuthority delegates Claude subscription OAuth to Anthropic authority', async () => {
   const { store, directory } = storeFixture()
   try {
