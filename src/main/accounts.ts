@@ -434,7 +434,14 @@ export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscr
       if (!isClaudeSubscriptionAccount(account)) return false
       if (existingId && account.id === existingId) return true
       const existingAccountId = text(account.claudeSubscription?.accountId) ?? text(account.credentials.accountId)
-      if (accountId && existingAccountId) return accountId === existingAccountId
+      if (accountId && existingAccountId) {
+        if (accountId !== existingAccountId) return false
+        const existingOrganization = text(account.claudeSubscription?.organizationId)
+        const organization = text(profile?.organizationId)
+        // Claude account IDs may be stable across organization memberships.
+        // Never replace an explicitly different organization's credentials.
+        return !organization || !existingOrganization || organization === existingOrganization
+      }
       if (accessToken && account.credentials.accessToken === accessToken) return true
       if (refreshToken && account.credentials.refreshToken === refreshToken) return true
       const existingEmail = normalizedEmail(account.email)
@@ -445,6 +452,12 @@ export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscr
       return Boolean(email && existingEmail && email === existingEmail
         && (!organization || !existingOrganization || organization === existingOrganization))
     })
+    if (existing && existingId) {
+      const savedAccountId = text(existing.claudeSubscription?.accountId) ?? text(existing.credentials.accountId)
+      const savedOrganizationId = text(existing.claudeSubscription?.organizationId)
+      if (accountId && savedAccountId && accountId !== savedAccountId) throw new Error('Claude 订阅刷新返回的账号身份不匹配，请重新登录')
+      if (profile?.organizationId && savedOrganizationId && profile.organizationId !== savedOrganizationId) throw new Error('Claude 订阅刷新返回的组织身份不匹配，请重新登录')
+    }
     const target: StoredAccount = existing ?? {
       id: randomUUID(), kind: 'oauth', identityService: 'anthropic', credentialKind: 'claude_ai_oauth', protocol: 'anthropic_messages',
       name: profile?.name ?? profile?.email ?? 'Claude 订阅账号', email: profile?.email, plan: profile?.plan,
@@ -457,6 +470,7 @@ export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscr
     target.name = profile?.name ?? profile?.email ?? target.name
     target.email = profile?.email ?? target.email
     target.plan = profile?.plan ?? target.plan
+    if (profile?.expiresAt) target.subscriptionActiveUntil = profile.expiresAt
     target.credentials = {
       ...target.credentials,
       accessToken,
@@ -469,9 +483,23 @@ export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscr
     target.claudeSubscription = claudeSubscriptionIdentity(result, target.claudeSubscription)
     if (result.usage) target.quota = claudeSubscriptionQuota(result.usage)
     delete target.error; delete target.errorAt
+    // A successful login or token rotation replaces this account's
+    // credentials. Publish a new generation so a stale refresh failure cannot
+    // be written onto the newly saved identity.
+    target.generation = randomUUID()
     if (!existing) state.accounts.push(target)
     reconcileProviderKeys(state)
     saved = structuredClone(target)
   })
   return saved!
+}
+
+/** Record a safe per-account refresh failure without persisting transport details. */
+export function markClaudeSubscriptionRefreshError(store: Store, id: string, generation?: string): void {
+  store.transaction(state => {
+    const account = state.accounts.find(value => value.id === id)
+    if (!account || !isClaudeSubscriptionAccount(account) || generation !== account.generation) return
+    account.error = 'Claude 订阅刷新失败，请重新登录或稍后重试'
+    account.errorAt = Date.now()
+  })
 }

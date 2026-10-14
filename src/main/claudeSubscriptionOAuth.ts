@@ -338,19 +338,19 @@ export class ClaudeSubscriptionOAuthService {
       return tokenResponse(value, undefined, this.now())
     } catch { throw new Error('Claude 授权响应无效或请求失败，请重试') }
   }
-  async refresh(tokens: ClaudeSubscriptionTokens): Promise<ClaudeSubscriptionTokens> {
+  async refresh(tokens: ClaudeSubscriptionTokens, signal?: AbortSignal): Promise<ClaudeSubscriptionTokens> {
     if (!tokens.refreshToken) throw new Error('Claude 订阅凭据缺少 refresh_token')
     try {
-      const value = await this.request(this.options.tokenEndpoint, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', client_id: this.options.clientId, refresh_token: tokens.refreshToken }) }, '刷新 Claude 订阅登录')
+      const value = await this.request(this.options.tokenEndpoint, { method: 'POST', signal, headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', client_id: this.options.clientId, refresh_token: tokens.refreshToken }) }, '刷新 Claude 订阅登录')
       return tokenResponse(value, tokens, this.now())
     } catch { throw new Error('Claude 订阅刷新失败，请重新登录') }
   }
-  async profile(tokens: ClaudeSubscriptionTokens): Promise<ClaudeSubscriptionProfile> { return normalizedProfile(await this.api(this.options.profileEndpoint, tokens, '读取 Claude 账号资料'), this.now()) }
-  async usage(tokens: ClaudeSubscriptionTokens): Promise<ClaudeSubscriptionUsage> { return normalizedUsage(await this.api(this.options.usageEndpoint, tokens, '读取 Claude 订阅用量', true), this.now()) }
-  private async api(url: string, tokens: ClaudeSubscriptionTokens, operation: string, oauthUsage = false): Promise<Record<string, unknown>> {
+  async profile(tokens: ClaudeSubscriptionTokens, signal?: AbortSignal): Promise<ClaudeSubscriptionProfile> { return normalizedProfile(await this.api(this.options.profileEndpoint, tokens, '读取 Claude 账号资料', false, signal), this.now()) }
+  async usage(tokens: ClaudeSubscriptionTokens, signal?: AbortSignal): Promise<ClaudeSubscriptionUsage> { return normalizedUsage(await this.api(this.options.usageEndpoint, tokens, '读取 Claude 订阅用量', true, signal), this.now()) }
+  private async api(url: string, tokens: ClaudeSubscriptionTokens, operation: string, oauthUsage = false, signal?: AbortSignal): Promise<Record<string, unknown>> {
     if (!tokens.accessToken) throw new Error('Claude 订阅凭据缺少 access_token')
     try {
-      return await this.request(url, { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${tokens.accessToken}`, 'anthropic-version': CLAUDE_SUBSCRIPTION_OAUTH.anthropicVersion, ...(oauthUsage ? { 'anthropic-beta': 'oauth-2025-04-20' } : {}) } }, operation)
+      return await this.request(url, { method: 'GET', signal, headers: { Accept: 'application/json', Authorization: `Bearer ${tokens.accessToken}`, 'anthropic-version': CLAUDE_SUBSCRIPTION_OAUTH.anthropicVersion, ...(oauthUsage ? { 'anthropic-beta': 'oauth-2025-04-20' } : {}) } }, operation)
     } catch { throw new Error(`${operation}失败，请稍后重试`) }
   }
   private async exchange(pending: Pending, code: string): Promise<void> {

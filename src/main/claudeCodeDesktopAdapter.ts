@@ -49,17 +49,17 @@ function safePathValue(name: string, value: string): string {
   return value
 }
 
-function safeFile(path: string): string | undefined {
+function safeFile(path: string, rejectParentSymlink = true): string | undefined {
   try {
     const original = lstatSync(path)
     if (original.isSymbolicLink() || !original.isFile()) return
     const canonical = realpathSync(path), stat = lstatSync(canonical)
-    if (canonical !== path || !stat.isFile() || stat.isSymbolicLink() || !(stat.mode & 0o111)) return
+    if ((rejectParentSymlink && canonical !== path) || !stat.isFile() || stat.isSymbolicLink() || !(stat.mode & 0o111)) return
     return canonical
   } catch { return }
 }
 
-function safeDirectory(path: string): string | undefined {
+function safeDirectory(path: string, rejectParentSymlink = true): string | undefined {
   try {
     const original = lstatSync(path)
     if (!original.isDirectory() || original.isSymbolicLink()) return
@@ -67,7 +67,7 @@ function safeDirectory(path: string): string | undefined {
     // A canonical mismatch means the directory itself or one of its parents
     // is a symlink.  Rejecting both cases prevents an instance profile from
     // being redirected after its path was registered.
-    if (canonical !== path || !stat.isDirectory() || stat.isSymbolicLink()) return
+    if ((rejectParentSymlink && canonical !== path) || !stat.isDirectory() || stat.isSymbolicLink()) return
     return canonical
   } catch { return }
 }
@@ -198,7 +198,11 @@ function candidateRoots(options: ClaudeCodeDesktopDetectionOptions): string[] {
 }
 
 function inspectBundle(path: string): ClaudeCodeDesktopApplication | undefined {
-  const root = safeDirectory(path)
+  // Detection canonicalizes the app path so system aliases such as macOS's
+  // /var -> /private/var do not make a valid installed bundle disappear.
+  // Profile paths remain strict through validateClaudeCodeDesktopProfileDirectory;
+  // this read-only discovery step never registers or launches the bundle.
+  const root = safeDirectory(path, false)
   if (!root || !root.endsWith('.app')) return
   const infoPath = join(root, 'Contents', 'Info.plist'), info = plistValues(infoPath)
   if (!info || info.CFBundleIdentifier !== 'com.anthropic.claudefordesktop') return
@@ -220,7 +224,10 @@ function inspectBundle(path: string): ClaudeCodeDesktopApplication | undefined {
 }
 
 function inspectKnownExecutable(path: string): ClaudeCodeDesktopApplication | undefined {
-  const executable = safeFile(path)
+  // As with bundle discovery, canonicalize benign platform aliases while
+  // keeping instance profile validation strict.  The returned executable is
+  // always the real regular file, never a symlink.
+  const executable = safeFile(path, false)
   if (!executable || !/(?:^|[\\/])claude(?:\.exe)?$/i.test(executable)) return
   const parent = basename(dirname(executable)).toLowerCase()
   if (!parent.includes('claude')) return

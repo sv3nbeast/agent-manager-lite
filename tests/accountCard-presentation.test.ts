@@ -114,8 +114,8 @@ test('incomplete Claude API connections do not claim a configured connection', (
   }
 })
 
-test('Claude OAuth, profile and cloud credentials remain pending without suggesting OpenAI refresh or local API exchange', () => {
-  for (const credentialKind of ['claude_ai_oauth', 'anthropic_profile', 'bedrock', 'vertex', 'foundry'] as const) {
+test('Claude profile and cloud credentials remain pending without suggesting OpenAI refresh or local API exchange', () => {
+  for (const credentialKind of ['anthropic_profile', 'bedrock', 'vertex', 'foundry'] as const) {
     const connection = account({ kind: credentialKind === 'claude_ai_oauth' ? 'oauth' : 'api_key', identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind,
       models: ['gateway-model'], needsTokenExchange: credentialKind === 'claude_ai_oauth' })
     assert.equal(isSupportedAnthropicAPIAccount(connection), false)
@@ -126,6 +126,12 @@ test('Claude OAuth, profile and cloud credentials remain pending without suggest
     assert.match(status.detail, /独立验证/)
     assert.doesNotMatch(accountCardType(connection), /API Key/)
   }
+  const subscription = account({ kind: 'oauth', identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind: 'claude_ai_oauth', needsTokenExchange: true })
+  assert.equal(isSupportedAnthropicAPIAccount(subscription), false)
+  assert.equal(accountCardStatus(subscription).label, '待验证')
+  assert.equal(accountCardStatus(subscription).tone, 'warning')
+  assert.match(accountCardStatus(subscription).detail, /Claude 订阅账号已保存/)
+  assert.doesNotMatch(accountCardType(subscription), /API Key/)
   const inconsistent = account({ kind: 'api_key', identityService: 'anthropic', protocol: 'openai_responses', credentialKind: 'anthropic_api_key', models: ['model'] })
   assert.equal(accountCardStatus(inconsistent).label, '待适配器验证')
 })

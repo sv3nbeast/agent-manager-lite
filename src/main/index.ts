@@ -18,7 +18,7 @@ import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { settingsSchema, accountInputSchema } from '../shared/types'
 import { Store } from './store'
-import { createAPIAccount, importIntoStore, parseAccountImport, saveOAuthAccount, saveClaudeSubscriptionAccount, editAccount, readAccountKey, batchTags, deleteAccounts, importParsedAccounts } from './accounts'
+import { createAPIAccount, importIntoStore, parseAccountImport, saveOAuthAccount, saveClaudeSubscriptionAccount, markClaudeSubscriptionRefreshError, editAccount, readAccountKey, batchTags, deleteAccounts, importParsedAccounts } from './accounts'
 import { saveGroup, deleteGroup, reorderGroups, updateGroupMembers } from './groups'
 import { AccountFiles } from './accountFiles'
 import { LocalDataMigration } from './localDataMigration'
@@ -169,9 +169,9 @@ async function main(): Promise<void> {
       expiresAt: before.credentials.expiresAt,
       tokenType: before.credentials.tokenType,
       scope: before.credentials.scope
-    })
-    const profile = await service.profile(refreshed).catch(() => undefined)
-    const usage = await service.usage(refreshed).catch(() => undefined)
+    }, options.signal)
+    const profile = await service.profile(refreshed, options.signal).catch(() => undefined)
+    const usage = await service.usage(refreshed, options.signal).catch(() => undefined)
     const previousAccountId = before.claudeSubscription?.accountId ?? before.credentials.accountId
     const previousOrganizationId = before.claudeSubscription?.organizationId
     if ((profile?.accountId && previousAccountId && profile.accountId !== previousAccountId)
@@ -753,7 +753,19 @@ async function main(): Promise<void> {
       case 'refreshAllQuotas': quotas.startAll(); break
       case 'cancelQuotaRefresh': quotas.cancel(); break
       case 'refreshSubscription': await quotas.refreshSubscriptionInfo(z.string().uuid().parse(input)); break
-      case 'refreshClaudeSubscription': await tokens.ensure(z.string().uuid().parse(input), { force: true }); break
+      case 'refreshClaudeSubscription': {
+        const id = z.string().uuid().parse(input)
+        const before = store.read().accounts.find(account => account.id === id)
+        try { await tokens.ensure(id, { force: true }) }
+        catch (error) {
+          // The refresh may have replaced the account generation before a
+          // downstream projection failed. Only the generation observed at
+          // request start may receive this safe error marker.
+          markClaudeSubscriptionRefreshError(store, id, before?.generation)
+          throw error
+        }
+        break
+      }
       case 'refreshResetCredits': await quotas.refreshResetCreditsInfo(z.string().uuid().parse(input)); break
       case 'consumeResetCredit': await quotas.consumeResetCredit(z.string().uuid().parse(input)); break
       case 'startGateway': {

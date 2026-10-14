@@ -4,7 +4,7 @@ import { EditOutlined, GlobalOutlined, InfoCircleOutlined, ReloadOutlined } from
 import type { Account } from '../../../shared/types'
 import AccountQuota from './AccountQuota.vue'
 import AccountIconAction from './AccountIconAction.vue'
-import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardProtocol, accountCardStatus, accountCardTier, accountCardType, isAnthropicAccountRecord } from './accountCardPresentation'
+import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardProtocol, accountCardStatus, accountCardTier, accountCardType, claudeSubscriptionMetadata, isAnthropicAccountRecord, isClaudeSubscriptionAccount } from './accountCardPresentation'
 
 const props = defineProps<{
   account: Account
@@ -18,6 +18,7 @@ defineEmits<{ select: [checked: boolean]; edit: []; proxy: []; refresh: []; refr
 const quota = ref<{ openDetails(): void }>()
 const identity = computed(() => accountCardIdentity(props.account, props.connectionLabel))
 const status = computed(() => accountCardStatus(props.account))
+const subscription = computed(() => claudeSubscriptionMetadata(props.account))
 const labels = computed(() => [
   ...props.groups.map(group => ({ key: `group:${group.id}`, name: group.name, type: '分组' })),
   ...props.account.tags.map(tag => ({ key: `tag:${tag}`, name: tag, type: '标签' }))
@@ -32,6 +33,7 @@ function openDetails() { quota.value?.openDetails() }
       <div class="account-identity">
         <strong :title="identity.name">{{ identity.name }}</strong>
         <small v-if="identity.subtitle" :title="identity.subtitle">{{ identity.subtitle }}</small>
+        <small v-if="identity.organization" :title="identity.organization">组织：{{ identity.organization }}</small>
         <p v-if="account.note" class="account-note" :title="account.note">备注：{{ account.note }}</p>
       </div>
       <a-tooltip :title="status.detail" :trigger="['hover', 'focus']"><span class="account-status" :class="`status-${status.tone}`" tabindex="0">{{ status.label }}</span></a-tooltip>
@@ -58,10 +60,16 @@ function openDetails() { quota.value?.openDetails() }
             <div v-if="account.email"><dt>邮箱</dt><dd>{{ account.email }}</dd></div>
             <div><dt>接入类型</dt><dd>{{ identity.type }}</dd></div>
             <div><dt>套餐 / 配置</dt><dd>{{ accountCardPlan(account) }}</dd></div>
+            <template v-if="isClaudeSubscriptionAccount(account)">
+              <div v-if="subscription?.accountId"><dt>Claude 账号 ID</dt><dd>{{ subscription.accountId }}</dd></div>
+              <div v-if="subscription?.organizationId"><dt>组织 ID</dt><dd>{{ subscription.organizationId }}</dd></div>
+              <div v-if="subscription?.organizationName"><dt>组织名称</dt><dd>{{ subscription.organizationName }}</dd></div>
+              <div><dt>身份验证</dt><dd>{{ subscription?.verifiedAt ? `已验证 · ${accountCardDate(subscription.verifiedAt)}` : '待验证' }}</dd></div>
+            </template>
             <div v-if="connectionLabel"><dt>供应商连接</dt><dd>{{ connectionLabel }}</dd></div>
             <div><dt>API 地址</dt><dd>{{ account.baseUrl || '未配置' }}</dd></div>
             <div><dt>接口协议</dt><dd>{{ accountCardProtocol(account) }}</dd></div>
-            <div v-if="!isAnthropicAccountRecord(account)"><dt>默认速度</dt><dd>{{ accountCardTier(account) }}</dd></div>
+            <div><dt>默认速度</dt><dd>{{ accountCardTier(account) }}</dd></div>
             <div><dt>凭据状态</dt><dd>{{ account.needsTokenExchange ? '刷新令牌待验证' : account.credentialConfigured ? '凭据已保存' : '缺少凭据' }}{{ clientMaintained ? ' · 客户端维护登录' : '' }}</dd></div>
             <div><dt>创建时间</dt><dd>{{ accountCardDate(account.createdAt) }}</dd></div>
             <div><dt>分组</dt><dd>{{ groups.map(group => group.name).join(' · ') || '未分组' }}</dd></div>
@@ -75,6 +83,7 @@ function openDetails() { quota.value?.openDetails() }
 
     <footer class="account-actions" aria-label="账号操作">
       <AccountIconAction v-if="!isAnthropicAccountRecord(account)" action-class="account-refresh" :label="refreshing ? '正在刷新用量' : '刷新用量'" :accessible-label="`刷新用量 · ${account.name}`" :loading="refreshing" @click="$emit('refresh')"><ReloadOutlined /></AccountIconAction>
+      <AccountIconAction v-else-if="isClaudeSubscriptionAccount(account)" action-class="account-refresh" :label="refreshing ? '正在刷新订阅' : '刷新订阅'" :accessible-label="`刷新 Claude 订阅 · ${account.name}`" :loading="refreshing" @click="$emit('refreshSubscription')"><ReloadOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-edit" label="编辑账号" :accessible-label="`编辑账号 · ${account.name}`" @click="$emit('edit')"><EditOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-proxy" label="网络代理" :accessible-label="`网络代理 · ${account.name}`" @click="$emit('proxy')"><GlobalOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-details" label="查看详情" :accessible-label="`查看详情 · ${account.name}`" @click="openDetails"><InfoCircleOutlined /></AccountIconAction>

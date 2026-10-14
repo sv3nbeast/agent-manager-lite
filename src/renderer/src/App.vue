@@ -28,6 +28,7 @@ import AccountRecyclePanel from './components/AccountRecyclePanel.vue'
 import WakeupPanel from './components/WakeupPanel.vue'
 import SshServersPanel from './components/SshServersPanel.vue'
 import OverviewAssets from './components/OverviewAssets.vue'
+import { isClaudeSubscriptionAccount } from './components/accountCardPresentation'
 
 const manager = useManager()
 const page = ref('instances')
@@ -39,17 +40,26 @@ const selected = ref<string[]>([])
 const addOpen = ref(false)
 const importOpen = ref(false)
 const loginOpen = ref(false)
+const subscriptionLoginOpen = ref(false)
 const localDataOpen = ref(false)
 const loginRequest = ref<InstanceLoginRequest>()
 const loginResult = ref<InstanceLoginResult>()
+const refreshingSubscriptions = reactive(new Set<string>())
 let migrationAccountIds = new Set<string>()
 function openAccountLogin(request?:InstanceLoginRequest) {
+  subscriptionLoginOpen.value = false
   loginRequest.value = request
+  loginOpen.value = true
+}
+function openClaudeSubscriptionLogin() {
+  loginRequest.value = undefined
+  subscriptionLoginOpen.value = true
   loginOpen.value = true
 }
 function accountLoginCompleted(id?:string) {
   const request = loginRequest.value
   loginOpen.value = false
+  subscriptionLoginOpen.value = false
   if (request && id) loginResult.value = {...request, accountId:id}
   loginRequest.value = undefined
 }
@@ -63,7 +73,7 @@ async function migrationChanged(snapshot:AppSnapshot) {
   const id = snapshot.accounts.find(account => !migrationAccountIds.has(account.id) && account.kind !== 'api_key')?.id
   if (loginRequest.value && id) accountLoginCompleted(id)
 }
-watch(page, value => { if (value !== 'instances') loginRequest.value = undefined })
+watch(page, value => { if (value !== 'instances') { loginRequest.value = undefined; subscriptionLoginOpen.value = false } })
 const editingAccount = ref<Account>()
 const proxyAccount = ref<Account>()
 const accountProxyOpen = ref(false)
@@ -124,12 +134,33 @@ let refreshTimer: ReturnType<typeof setInterval>
 onMounted(async () => { await manager.load(); refreshTimer = setInterval(() => { if (!manager.loading) void manager.refresh() }, 2000) })
 onUnmounted(() => clearInterval(refreshTimer))
 async function refreshQuotas(ids: string[]) { await manager.execute(() => window.manager.refreshQuotas(ids)) }
-async function refreshSubscription(id: string) { await manager.execute(() => window.manager.refreshSubscription(id)) }
+async function refreshSubscription(id: string) {
+  if (refreshingSubscriptions.has(id)) return
+  refreshingSubscriptions.add(id)
+  const account = accounts.value.find(value => value.id === id)
+  try {
+    if (account && isClaudeSubscriptionAccount(account)) {
+      const refreshClaudeSubscription = (window.manager as unknown as { refreshClaudeSubscription?: (accountId: string) => Promise<AppSnapshot> }).refreshClaudeSubscription
+      if (!refreshClaudeSubscription) { message.error('Claude 订阅刷新服务尚未接入'); return }
+      await manager.execute(() => refreshClaudeSubscription(id))
+      return
+    }
+    await manager.execute(() => window.manager.refreshSubscription(id))
+  } finally {
+    refreshingSubscriptions.delete(id)
+  }
+}
 async function refreshResetCredits(id: string) { await manager.execute(() => window.manager.refreshResetCredits(id)) }
 async function consumeResetCredit(id: string) { await manager.execute(() => window.manager.consumeResetCredit(id)) }
 async function refreshSelected() {
-  if (!selected.value.length) { if(pageAccounts.value.length) await refreshQuotas(pageAccounts.value.map(a=>a.id)); return }
-  const ids = accounts.value.filter(a => selected.value.includes(a.id)).map(a => a.id)
+  const eligible = (account: Account) => account.identityService !== 'anthropic' && account.protocol !== 'anthropic_messages' && !account.credentialKind?.startsWith('anthropic_') && account.credentialKind !== 'claude_ai_oauth'
+  if (!selected.value.length) {
+    const ids = pageAccounts.value.filter(eligible).map(a => a.id)
+    if (ids.length) await refreshQuotas(ids)
+    else if (pageAccounts.value.length) message.info('Anthropic 账号的独立用量适配器尚未接入')
+    return
+  }
+  const ids = accounts.value.filter(a => selected.value.includes(a.id) && eligible(a)).map(a => a.id)
   if (!ids.length) { message.info('请选择账号'); return }
   await refreshQuotas(ids)
 }
@@ -275,7 +306,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
               </div>
             </template>
             <section v-if="page === 'accounts' || page === 'connections'" :id="page === 'connections' ? 'api-connections-panel' : undefined" :role="page === 'connections' ? 'tabpanel' : undefined" :aria-labelledby="page === 'connections' ? 'api-connections-tab' : undefined">
-              <div v-if="page === 'accounts'" class="page-heading"><div><h1>你的账号</h1><p>管理登录身份、套餐用量与兼容的客户端。</p></div><a-space><a-button @click="page = 'providers'">管理供应商</a-button><a-button @click="importOpen = true"><ImportOutlined />导入</a-button><a-button type="primary" @click="openAccountLogin()"><PlusOutlined />添加账号</a-button></a-space></div>
+              <div v-if="page === 'accounts'" class="page-heading"><div><h1>你的账号</h1><p>管理登录身份、套餐用量与兼容的客户端。</p></div><a-space><a-button @click="page = 'providers'">管理供应商</a-button><a-button @click="importOpen = true"><ImportOutlined />导入</a-button><a-button @click="openClaudeSubscriptionLogin">添加 Claude 订阅</a-button><a-button type="primary" @click="openAccountLogin()"><PlusOutlined />添加账号</a-button></a-space></div>
               <p v-else class="connection-view-description">连接保留独立名称、分组、标签和服务等级；绑定供应商后共享其地址、模型与密钥。</p>
               <a-alert v-if="manager.data?.quotaRefresh?.running || manager.data?.quotaRefresh?.subscriptionPending" type="info" class="error-banner"><template #message><template v-if="manager.data.quotaRefresh.running">正在刷新用量 {{ manager.data.quotaRefresh.completed }} / {{ manager.data.quotaRefresh.total }}</template><template v-else>正在更新订阅信息 {{ manager.data.quotaRefresh.subscriptionPending }} 个</template> <a-button type="link" size="small" @click="cancelQuotaRefresh">取消刷新</a-button></template></a-alert>
               <div v-if="page === 'accounts' && apiAccountCount" class="account-provider-notice">{{ apiAccountCount }} 个 API 连接在供应商工作区管理<a-button type="link" size="small" @click="viewConnections()">查看 API 连接</a-button></div>
@@ -293,14 +324,14 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
                 <a-button v-if="filtered.length || selected.length" @click="exportAccounts">导出{{ selected.length ? '所选' : '筛选结果' }}（含凭据）</a-button>
               </div>
               <a-empty v-if="page === 'connections' && !pageAccounts.length" description="还没有 API 连接"><a-button @click="page = 'providers'">前往供应商库添加</a-button></a-empty>
-              <div v-else-if="!pageAccounts.length" class="empty-panel"><div class="empty-icon"><UserOutlined /></div><h2>添加你的第一个账号</h2><p>登录 ChatGPT，或导入已有的登录凭据。<br>账号凭据保存在本机系统加密存储中。</p><a-space><a-button v-if="page === 'accounts'" type="primary" @click="openAccountLogin()"><PlusOutlined />添加账号</a-button><a-button @click="importOpen = true">导入账号</a-button><a-button @click="openMigration()">扫描本机数据</a-button></a-space><div class="empty-footnote"><SafetyCertificateOutlined />独立存储，不自动改写现有客户端</div></div>
+              <div v-else-if="!pageAccounts.length" class="empty-panel"><div class="empty-icon"><UserOutlined /></div><h2>添加你的第一个账号</h2><p>登录账号，或导入已有的登录凭据。<br>账号凭据保存在本机系统加密存储中。</p><a-space><a-button v-if="page === 'accounts'" type="primary" @click="openAccountLogin()"><PlusOutlined />添加账号</a-button><a-button v-if="page === 'accounts'" @click="openClaudeSubscriptionLogin">添加 Claude 订阅</a-button><a-button @click="importOpen = true">导入账号</a-button><a-button @click="openMigration()">扫描本机数据</a-button></a-space><div class="empty-footnote"><SafetyCertificateOutlined />独立存储，不自动改写现有客户端</div></div>
               <a-empty v-else-if="!filtered.length" description="没有匹配的账号" />
               <div v-else class="account-grid">
                 <AccountCard v-for="account in visible" :key="account.id" :account="account"
                   :selected="selected.includes(account.id)" :groups="memberships.get(account.id) ?? []"
                   :client-maintained="!!manager.data?.clientAuthorities?.some(entry => entry.accountId === account.id)"
                   :connection-label="account.kind === 'api_key' ? connectionContext(account) : undefined"
-                  :refreshing="!!manager.data?.quotaRefresh?.running"
+                  :refreshing="!!manager.data?.quotaRefresh?.running || refreshingSubscriptions.has(account.id)"
                   @select="toggleAccount(account.id, $event)" @edit="openAccount(account)" @proxy="openAccountProxy(account)"
                   @refresh="refreshQuotas([account.id])" @refresh-subscription="refreshSubscription(account.id)"
                   @refresh-reset-credits="refreshResetCredits(account.id)" @consume-reset-credit="consumeResetCredit(account.id)" />
@@ -364,7 +395,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
           </a-spin>
         </main>
       </section>
-      <LoginDialog v-model:open="loginOpen" :client-type="loginRequest?.clientType" @completed="accountLoginCompleted" @scan-local="openMigration(true)" />
+      <LoginDialog v-model:open="loginOpen" :client-type="loginRequest?.clientType" :subscription-only="subscriptionLoginOpen" @completed="accountLoginCompleted" @scan-local="openMigration(true)" />
       <LocalDataMigrationDialog :open="localDataOpen" @close="localDataOpen = false" @changed="migrationChanged" />
       <AccountEditor v-model:open="addOpen" :account="editingAccount" @edit-provider="editConnectionProvider" />
       <AccountProxyDialog v-model:open="accountProxyOpen" :account="proxyAccount" />

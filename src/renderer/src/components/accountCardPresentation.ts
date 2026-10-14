@@ -6,6 +6,28 @@ export interface AccountCardStatus {
   detail: string
 }
 
+/** Safe, non-secret identity fields projected by Claude subscription OAuth. */
+export interface ClaudeSubscriptionAccountView {
+  accountId?: string
+  organizationId?: string
+  organizationName?: string
+  verifiedAt?: number
+  scopes?: string[]
+}
+
+export function claudeSubscriptionMetadata(account: Account): ClaudeSubscriptionAccountView | undefined {
+  const value = (account as Account & { claudeSubscription?: unknown }).claudeSubscription
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const source = value as Record<string, unknown>
+  return {
+    ...(typeof source.accountId === 'string' && source.accountId.trim() ? { accountId: source.accountId.trim() } : {}),
+    ...(typeof source.organizationId === 'string' && source.organizationId.trim() ? { organizationId: source.organizationId.trim() } : {}),
+    ...(typeof source.organizationName === 'string' && source.organizationName.trim() ? { organizationName: source.organizationName.trim() } : {}),
+    ...(typeof source.verifiedAt === 'number' && Number.isFinite(source.verifiedAt) && source.verifiedAt > 0 ? { verifiedAt: source.verifiedAt } : {}),
+    ...(Array.isArray(source.scopes) ? { scopes: source.scopes.filter((scope): scope is string => typeof scope === 'string' && scope.trim().length > 0).slice(0, 32) } : {}),
+  }
+}
+
 function isAnthropicAccount(account: Account): boolean {
   return account.identityService === 'anthropic'
     || account.protocol === 'anthropic_messages'
@@ -15,6 +37,10 @@ function isAnthropicAccount(account: Account): boolean {
 
 export function isAnthropicAccountRecord(account: Account): boolean {
   return isAnthropicAccount(account)
+}
+
+export function isClaudeSubscriptionAccount(account: Account): boolean {
+  return account.kind === 'oauth' && account.identityService === 'anthropic' && account.credentialKind === 'claude_ai_oauth'
 }
 
 export function isSupportedAnthropicAPIAccount(account: Account): boolean {
@@ -30,14 +56,15 @@ export function isSupportedAnthropicAPIAccount(account: Account): boolean {
  */
 export function accountCardType(account: Account): string {
   if (isAnthropicAccount(account)) {
+    if (isClaudeSubscriptionAccount(account)) return 'Claude · 订阅账号'
     if (account.kind === 'oauth') return 'Claude · OAuth'
     if (account.kind === 'agent_identity') return 'Anthropic · Agent Identity'
+    if (account.credentialKind === 'bedrock') return 'Claude · Bedrock'
+    if (account.credentialKind === 'vertex') return 'Claude · Vertex'
+    if (account.credentialKind === 'foundry') return 'Claude · Foundry'
     if (account.credentialKind === 'anthropic_bearer') return 'Anthropic · Bearer'
     if (account.credentialKind === 'anthropic_profile') return 'Claude · Profile'
     if (account.credentialKind === 'gateway') return 'Anthropic · Gateway'
-    if (account.credentialKind === 'bedrock') return 'Claude · Amazon Bedrock'
-    if (account.credentialKind === 'vertex') return 'Claude · Vertex AI'
-    if (account.credentialKind === 'foundry') return 'Claude · Microsoft Foundry'
     return 'Anthropic · API Key'
   }
   if (account.kind === 'oauth') return 'ChatGPT · OAuth'
@@ -54,6 +81,7 @@ export function accountCardIdentity(account: Account, connectionLabel?: string) 
   const name = account.name.trim() || account.email?.trim() || '未命名账号'
   const email = account.email?.trim()
   const type = accountCardType(account)
+  const subscription = isClaudeSubscriptionAccount(account) ? claudeSubscriptionMetadata(account) : undefined
   const subtitle = account.kind === 'api_key'
     ? connectionLabel?.trim() || account.baseUrl || type
     : email && email.toLocaleLowerCase() !== name.toLocaleLowerCase() ? email : ''
@@ -61,7 +89,7 @@ export function accountCardIdentity(account: Account, connectionLabel?: string) 
   const initials = words.length > 1
     ? [Array.from(words[0])[0], Array.from(words[words.length - 1])[0]].join('')
     : Array.from(name.split('@')[0]).slice(0, 2).join('')
-  return { name, subtitle, type, initials: initials.toLocaleUpperCase() }
+  return { name, subtitle, organization: subscription?.organizationName || '', type, initials: initials.toLocaleUpperCase() }
 }
 
 export function accountCardPlan(account: Account): string {
@@ -73,6 +101,12 @@ export function accountCardPlan(account: Account): string {
 
 export function accountCardStatus(account: Account): AccountCardStatus {
   if (isAnthropicAccount(account)) {
+    if (isClaudeSubscriptionAccount(account)) {
+      const subscription = claudeSubscriptionMetadata(account)
+      if (account.error) return { label: '查询失败', tone: 'error', detail: `${account.error}${subscription ? '；已保留上次身份摘要。' : ''}` }
+      if (!subscription?.verifiedAt) return { label: '待验证', tone: 'warning', detail: 'Claude 订阅账号已保存，尚未完成身份验证；验证后显示组织、套餐和有效期。' }
+      return { label: '订阅已验证', tone: 'success', detail: `Claude 订阅账号已验证${subscription.organizationName ? `，组织：${subscription.organizationName}` : ''}。` }
+    }
     if (!isSupportedAnthropicAPIAccount(account)) return { label: '待适配器验证', tone: 'warning', detail: account.kind === 'oauth'
       ? 'Claude 订阅登录、凭据刷新与隔离仍在独立验证中。'
       : '此 Claude 凭据类型的登录、配置和隔离仍在独立验证中。' }
@@ -85,6 +119,7 @@ export function accountCardStatus(account: Account): AccountCardStatus {
   }
   if (account.needsTokenExchange) return { label: '待验证', tone: 'warning', detail: '刷新令牌尚待验证，刷新用量或启动本地 API 时交换凭据。' }
   if (!account.credentialConfigured) return { label: '缺少凭据', tone: 'error', detail: '尚未保存可用凭据，请编辑账号。' }
+  if (isAnthropicAccount(account)) return { label: '待适配器验证', tone: 'warning', detail: 'Anthropic 登录、配置、隔离和会话边界尚未完成验证；不会调用 OpenAI / ChatGPT 用量接口。' }
   if (account.kind === 'api_key') {
     const usage = account.providerUsage
     if (usage?.error) return { label: '查询失败', tone: usage.unavailable ? 'neutral' : 'error', detail: `${usage.error}${usage.summary ? '；用量区域保留上次成功结果。' : ''}` }
