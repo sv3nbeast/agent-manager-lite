@@ -69,7 +69,7 @@ function openDetails() { quota.value?.openDetails() }
             <div v-if="connectionLabel"><dt>供应商连接</dt><dd>{{ connectionLabel }}</dd></div>
             <div><dt>API 地址</dt><dd>{{ account.baseUrl || '未配置' }}</dd></div>
             <div><dt>接口协议</dt><dd>{{ accountCardProtocol(account) }}</dd></div>
-            <div><dt>默认速度</dt><dd>{{ accountCardTier(account) }}</dd></div>
+            <div v-if="!isAnthropicAccountRecord(account)"><dt>默认速度</dt><dd>{{ accountCardTier(account) }}</dd></div>
             <div><dt>凭据状态</dt><dd>{{ account.needsTokenExchange ? '刷新令牌待验证' : account.credentialConfigured ? '凭据已保存' : '缺少凭据' }}{{ clientMaintained ? ' · 客户端维护登录' : '' }}</dd></div>
             <div><dt>创建时间</dt><dd>{{ accountCardDate(account.createdAt) }}</dd></div>
             <div><dt>分组</dt><dd>{{ groups.map(group => group.name).join(' · ') || '未分组' }}</dd></div>

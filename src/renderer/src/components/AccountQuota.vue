@@ -9,7 +9,7 @@ import {
 } from '../accountQuotaPresentation'
 import CreditQuota from './CreditQuota.vue'
 import ProviderUsageDetails from './ProviderUsageDetails.vue'
-import { accountCardStatus, claudeSubscriptionMetadata, isAnthropicAccountRecord, isClaudeSubscriptionAccount } from './accountCardPresentation'
+import { accountCardStatus, claudeSubscriptionMetadata, isAnthropicAccountRecord, isClaudeSubscriptionAccount, isSupportedAnthropicAPIAccount } from './accountCardPresentation'
 
 const props = defineProps<{ account: Account; refreshing: boolean }>()
 defineEmits<{ refresh: []; refreshSubscription: []; refreshResetCredits: []; consumeResetCredit: [] }>()
@@ -36,7 +36,9 @@ const hasSupplement = computed(() => isClaudeSubscription.value || !isAnthropic.
   || props.account.quota?.spendLimit || props.account.quota?.credits || props.account.quota?.resetCreditsAvailable !== undefined))
 const notice = computed(() => {
   if (isClaudeSubscription.value) return ''
-  if (isAnthropic.value) return 'Claude Code 用量与登录状态等待 Anthropic 适配器验证'
+  if (isAnthropic.value) return isSupportedAnthropicAPIAccount(props.account)
+    ? 'Claude Code 用量查询尚未接入'
+    : 'Claude Code 用量与登录状态等待 Anthropic 适配器验证'
   if (props.account.kind === 'api_key') {
     if (provider.value?.isValid === false) return provider.value.windows?.length ? '服务商报告用量已耗尽'
       : provider.value.source === 'deepseek' ? '服务商报告余额不足' : '服务商报告密钥不可用'
