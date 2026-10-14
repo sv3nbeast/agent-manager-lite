@@ -109,6 +109,19 @@ export interface LoginStatus {
   id?: string; method?: 'browser' | 'device'; status: 'idle' | 'starting' | 'waiting' | 'exchanging' | 'success' | 'error' | 'cancelled'
   userCode?: string; verificationUrl?: string; expiresAt?: number; error?: string; accountId?: string
 }
+/** Non-secret identity and observation metadata for a Claude.ai subscription. */
+export interface ClaudeSubscriptionIdentity {
+  [key: string]: unknown
+  accountId?: string; organizationId?: string; organizationName?: string
+  verifiedAt: number; profileFetchedAt?: number; usageFetchedAt?: number
+  tokenExpiresAt?: number; scopes?: string[]
+}
+/** Public status of the separate Anthropic OAuth flow. Tokens and PKCE state are never exposed. */
+export interface ClaudeSubscriptionLoginStatus {
+  id?: string; status: LoginStatus['status']; authorizationUrl?: string; redirectUri?: string
+  expiresAt?: number; accountId?: string; error?: string
+  metadata?: { profile?: Record<string, unknown>; usage?: Record<string, unknown>; tokenType?: string; scope?: string; expiresAt?: number; retrievedAt?: number }
+}
 export interface RefreshStatus { running: boolean; total: number; completed: number; failed: number; cancelled: boolean; subscriptionPending?: number }
 export interface Account {
   egressProxy?:AccountProxyView
@@ -116,6 +129,7 @@ export interface Account {
   baseUrl: string; models: string[]; wireApi: 'responses' | 'chat_completions'
   /** Explicit client protocol / identity metadata. Missing means legacy Codex. */
   protocol?: AccountProtocol; identityService?: AccountIdentityService; credentialKind?: AccountCredentialKind
+  claudeSubscription?: ClaudeSubscriptionIdentity
   integrationType?: IntegrationType
   modelContextWindows?: Record<string, number>
   defaultTier: DefaultTier; note: string; tags: string[]; createdAt: number
@@ -132,7 +146,7 @@ export interface Account {
 }
 export interface GatewayStatus { running: boolean; port?: number; defaultTier?: string; profileId?: string; error?: string;quotaSyncError?:string }
 export interface CredentialRecoveryStatus { recovered: number; retained: number }
-export interface AppSnapshot { upstreamProxy?:UpstreamProxyView; wakeup?: WakeupView; providerUsageRefresh?:import('./providerUsage').ProviderUsageRefresh; backupRestartRequired?:boolean; proxyResources?:ProxyResourcesView; sshServers?:SshServersView; tempLogin?:TempLoginView;tempLoginCleanup?:TempLoginCleanup;clientSwitches?:ClientSwitchView[];clientAuthorities?:ClientAuthorityView[];localAccess?:LocalAccessView; settings: Settings; accounts: Account[]; groups: AccountGroup[]; providers?: ProviderSummary[]; providerProbe?:ProviderProbeState; instances?:InstanceView[];instanceCopy?:InstanceCopyView; instanceApplications?:InstanceApplication[]; dataDirectory: string; gateway?: GatewayStatus; login?: LoginStatus; quotaRefresh?: RefreshStatus; historyError?: string; credentialRecovery?: CredentialRecoveryStatus }
+export interface AppSnapshot { upstreamProxy?:UpstreamProxyView; wakeup?: WakeupView; providerUsageRefresh?:import('./providerUsage').ProviderUsageRefresh; backupRestartRequired?:boolean; proxyResources?:ProxyResourcesView; sshServers?:SshServersView; tempLogin?:TempLoginView;tempLoginCleanup?:TempLoginCleanup;clientSwitches?:ClientSwitchView[];clientAuthorities?:ClientAuthorityView[];localAccess?:LocalAccessView; settings: Settings; accounts: Account[]; groups: AccountGroup[]; providers?: ProviderSummary[]; providerProbe?:ProviderProbeState; instances?:InstanceView[];instanceCopy?:InstanceCopyView; instanceApplications?:InstanceApplication[]; dataDirectory: string; gateway?: GatewayStatus; login?: LoginStatus; claudeLogin?: ClaudeSubscriptionLoginStatus; quotaRefresh?: RefreshStatus; historyError?: string; credentialRecovery?: CredentialRecoveryStatus }
 export interface InstanceApplicationChoice { application?:InstanceApplication; snapshot:AppSnapshot }
 export interface ImportPreview { entries: { index: number; name: string; kind: Account['kind']; needsVerification?: boolean }[]; errors: string[]; skipped?: number }
 export interface StagedImport { ticket: string; preview: ImportPreview; fileName?: string }
@@ -326,18 +340,23 @@ export interface ManagerAPI {
   stopGateway(): Promise<AppSnapshot>
   copyGatewayKey(): Promise<void>
   startLogin(method: 'browser' | 'device'): Promise<AppSnapshot>
+  startClaudeLogin(): Promise<AppSnapshot>
   startTempLogin(input:StartTempLogin):Promise<AppSnapshot>
   cancelTempLogin(id:string):Promise<AppSnapshot>
   openTempLoginURL(id:string):Promise<void>
   copyTempLoginURL(id:string):Promise<void>
   cleanupTempLogin():Promise<AppSnapshot>
   cancelLogin(): Promise<AppSnapshot>
+  cancelClaudeLogin(): Promise<AppSnapshot>
   openLogin(): Promise<void>
+  openClaudeLogin(): Promise<void>
   completeLogin(callbackUrl: string): Promise<AppSnapshot>
+  completeClaudeLogin(input: string): Promise<AppSnapshot>
   refreshQuotas(ids: string[]): Promise<AppSnapshot>
   refreshAllQuotas(): Promise<AppSnapshot>
   cancelQuotaRefresh(): Promise<AppSnapshot>
   refreshSubscription(accountId: string): Promise<AppSnapshot>
+  refreshClaudeSubscription(accountId: string): Promise<AppSnapshot>
   refreshResetCredits(accountId: string): Promise<AppSnapshot>
   consumeResetCredit(accountId: string): Promise<AppSnapshot>
   queryHistory(query: HistoryQuery): Promise<HistoryPage>

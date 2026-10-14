@@ -18,7 +18,7 @@ import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { settingsSchema, accountInputSchema } from '../shared/types'
 import { Store } from './store'
-import { createAPIAccount, importIntoStore, parseAccountImport, saveOAuthAccount, editAccount, readAccountKey, batchTags, deleteAccounts, importParsedAccounts } from './accounts'
+import { createAPIAccount, importIntoStore, parseAccountImport, saveOAuthAccount, saveClaudeSubscriptionAccount, editAccount, readAccountKey, batchTags, deleteAccounts, importParsedAccounts } from './accounts'
 import { saveGroup, deleteGroup, reorderGroups, updateGroupMembers } from './groups'
 import { AccountFiles } from './accountFiles'
 import { LocalDataMigration } from './localDataMigration'
@@ -65,6 +65,7 @@ import { WakeupScheduler } from './wakeupScheduler'
 import { applyLaunchAtLogin } from './loginItem'
 import { shouldHideOnClose, shouldPreserveInstancesOnQuit } from './trayPolicy'
 import { SshServers } from './ssh'
+import { ClaudeSubscriptionOAuthService, type ClaudeSubscriptionLoginResult } from './claudeSubscriptionOAuth'
 
 const development = !app.isPackaged
 const isolatedTest = Boolean(process.env.CML_TEST_DATA_DIR && (development || process.argv.includes('--cml-smoke-test')))
@@ -141,6 +142,46 @@ async function main(): Promise<void> {
   const agents: AgentIdentityService = new AgentIdentityService(store, taskDecryptor(binary), accountNetwork.request, projectCredentials)
   let credentialRecovery = recoverAgentTasks(runtimeRoot, store, agents)
   const tokens = new TokenAuthority(store, accountNetwork.request, projectCredentials)
+  const claudeSubscriptionLogin = new ClaudeSubscriptionOAuthService({
+    request: accountNetwork.request,
+    open: url => shell.openExternal(url),
+    save: async result => {
+      const account = saveClaudeSubscriptionAccount(store, result)
+      await projectCredentials(account)
+      return account.id
+    }
+  })
+  tokens.setClaudeSubscriptionAuthority(async (id, options) => {
+    const before = store.read().accounts.find(account => account.id === id)
+    if (!before) throw new Error('账号已删除')
+    if (before.identityService !== 'anthropic' || before.kind !== 'oauth' || before.credentialKind !== 'claude_ai_oauth') throw new Error('账号不是 Claude 订阅 OAuth')
+    if (options.rejectedToken && before.credentials.accessToken !== options.rejectedToken) return before
+    if (!options.force && before.credentials.expiresAt !== undefined && before.credentials.expiresAt > Date.now() + 300_000) return before
+    if (!before.credentials.refreshToken) throw new Error('Claude 订阅凭据缺少 refresh_token，请重新登录')
+    // Use a short-lived service bound to this account so every refresh/profile/
+    // usage request is routed through its configured upstream proxy.
+    const service = new ClaudeSubscriptionOAuthService({
+      request: (url, init, operation) => accountNetwork.request(url, init, operation, before)
+    })
+    const refreshed = await service.refresh({
+      accessToken: before.credentials.accessToken ?? '',
+      refreshToken: before.credentials.refreshToken,
+      expiresAt: before.credentials.expiresAt,
+      tokenType: before.credentials.tokenType,
+      scope: before.credentials.scope
+    })
+    const profile = await service.profile(refreshed).catch(() => undefined)
+    const usage = await service.usage(refreshed).catch(() => undefined)
+    const result: ClaudeSubscriptionLoginResult = {
+      tokens: refreshed,
+      ...(profile ? { profile } : {}),
+      ...(usage ? { usage } : {}),
+      metadata: { ...(profile ? { profile } : {}), ...(usage ? { usage } : {}), ...(refreshed.tokenType ? { tokenType: refreshed.tokenType } : {}), ...(refreshed.scope ? { scope: refreshed.scope } : {}), ...(refreshed.expiresAt ? { expiresAt: refreshed.expiresAt } : {}), retrievedAt: Date.now() }
+    }
+    const account = saveClaudeSubscriptionAccount(store, result)
+    await projectCredentials(account)
+    return account
+  })
   const clientAuthority=new ClientAuthority(store,clientConfigs,clientIdentities,tokens,projectCredentials,id=>instances?.inUse(id)??false)
   const nativeAccounts=new NativeInstanceAccounts(store,tokens,(id,targetId)=>instances.usesNativeAccountOutside(id,targetId)||clientAuthority.busy(id),projectCredentials)
   instances=new Instances(store,()=>{
@@ -189,13 +230,13 @@ async function main(): Promise<void> {
   } })
   const upstreamProxies=new UpstreamProxies(store,accountNetwork,()=>
     store.read().accounts.some(account=>accountBusyWithWakeups(account.id))||quotas.busy()||
-    providerUsageQueries.snapshot().running||providerProbes.snapshot().running||['starting','waiting','exchanging'].includes(login.current().status)||
+    providerUsageQueries.snapshot().running||providerProbes.snapshot().running||['starting','waiting','exchanging'].includes(login.current().status)||['starting','waiting','exchanging'].includes(claudeSubscriptionLogin.current().status)||
     [...commands.values()].some(command=>!['saveUpstreamProxy','load','probeUpstreamProxy','cancelUpstreamProxyProbe'].includes(command)))
   const tempLogin=new OfficialTempLogin(store,()=>instances.applications(),undefined,accountBusy,()=>quotas.schedule())
   tempLogin.scheduleCleanup()
   quotas.schedule()
   wakeups.start()
-  const snapshot = () => ({ ...store.snapshot(),sshServers:sshServers.view(),wakeup:wakeups.view(),backupRestartRequired:dataBackups?.restartRequired??false,tempLogin:tempLogin.current(),tempLoginCleanup:tempLogin.cleanupStatus(),clientAuthorities:clientAuthority.views(),clientSwitches:clientSwitches.views(), localAccess:localAccess.view(),instances:instances.views(),instanceCopy:instances.copyView(),instanceApplications:instances.applications(),providerProbe:providerProbes.snapshot(),providerUsageRefresh:providerUsageQueries.snapshot(), gateway: gateway.current(), login: login.current(), quotaRefresh: quotas.current(), historyError: history.error, credentialRecovery })
+  const snapshot = () => ({ ...store.snapshot(),sshServers:sshServers.view(),wakeup:wakeups.view(),backupRestartRequired:dataBackups?.restartRequired??false,tempLogin:tempLogin.current(),tempLoginCleanup:tempLogin.cleanupStatus(),clientAuthorities:clientAuthority.views(),clientSwitches:clientSwitches.views(), localAccess: localAccess.view(),instances:instances.views(),instanceCopy:instances.copyView(),instanceApplications:instances.applications(),providerProbe:providerProbes.snapshot(),providerUsageRefresh:providerUsageQueries.snapshot(), gateway: gateway.current(), login: login.current(), claudeLogin: claudeSubscriptionLogin.current(), quotaRefresh: quotas.current(), historyError: history.error, credentialRecovery })
   let exiting = false
   let tray: Tray | undefined
   let refreshTrayMenu: (() => void) | undefined
@@ -204,7 +245,7 @@ async function main(): Promise<void> {
     if([...commands.values()].some(command=>!['restoreDataBackup','load','cancelDataBackup'].includes(command)))throw new Error('其他操作正在进行，请等待完成后重新恢复')
     const local=localAccess.view(),copy=instances.copyView(),sync=sessionSync.view(),transfer=sessionTransfers.view(),trash=sessionTrash.state()
     if(gateway.current().running||local.running||local.starting||local.singleStarting||instances.views().some(value=>instances.inUse(value.id))||copy&&['scanning','copying'].includes(copy.status)||wakeups.running())throw new Error('请先停止本地 API 和所有实例，并处理实例复制或待恢复事项')
-    if(providerUsageQueries.snapshot().running||quotas.busy()||providerProbes.snapshot().running||tempLogin.current().running||['starting','waiting','exchanging'].includes(login.current().status)||store.read().accounts.some(a=>tokens.busy(a.id)||agents.busy(a.id)||clientAuthority.busy(a.id)||accountProxies.busy(a.id)))throw new Error('请先完成或取消登录、用量查询与凭据刷新')
+    if(providerUsageQueries.snapshot().running||quotas.busy()||providerProbes.snapshot().running||tempLogin.current().running||['starting','waiting','exchanging'].includes(login.current().status)||['starting','waiting','exchanging'].includes(claudeSubscriptionLogin.current().status)||store.read().accounts.some(a=>tokens.busy(a.id)||agents.busy(a.id)||clientAuthority.busy(a.id)||accountProxies.busy(a.id)))throw new Error('请先完成或取消登录、用量查询与凭据刷新')
     if(proxySubscriptions.list().some(job=>job.phase==='fetching'))throw new Error('请等待现有网络配置更新结束')
     if(sessionTransfers.active()||sessionTrash.active()||['preparing','running'].includes(sync.sync?.status??'')||['preparing','running'].includes(sessionArchives.view()?.status??'')||sync.recoveries.length||transfer.recoveries.length||trash.recoveries.length)throw new Error('请先完成会话操作并处理待恢复事项')
   })
@@ -284,8 +325,9 @@ async function main(): Promise<void> {
     const subscriptionStop=proxySubscriptions.stop()
     proxyCatalog.stop()
     login.cancel()
+    claudeSubscriptionLogin.cancel()
     historyExport?.abort()
-    Promise.allSettled([localDataMigration.stop(),dataBackups.stop(),chatgptModels.stop(),providerModels.stop(),upstreamProxies.stop(),subscriptionStop,wakeups.stop(),proxyEngine.stop(),accountProxies.stop(),accountNetwork.stop(),tempLogin.stop(),quotas.stop(), tokens.stop(), clientAuthority.stop(), agents.stop(), localAccess.stop(), instances.closeAll(),providerProbes.stop(),providerUsageQueries.stop(), accountFiles.stop(), accountRecycle.stop(), sessionArchives.stop(), sessionTransfers.stop(), sessionSync.stop(), sessionTrash.stop(), exportTask]).finally(async () => {await proxyTunnels.stop();history.close();app.quit()})
+    Promise.allSettled([localDataMigration.stop(),dataBackups.stop(),chatgptModels.stop(),providerModels.stop(),upstreamProxies.stop(),subscriptionStop,wakeups.stop(),proxyEngine.stop(),accountProxies.stop(),accountNetwork.stop(),tempLogin.stop(),claudeSubscriptionLogin.stop(),quotas.stop(), tokens.stop(), clientAuthority.stop(), agents.stop(), localAccess.stop(), instances.closeAll(),providerProbes.stop(),providerUsageQueries.stop(), accountFiles.stop(), accountRecycle.stop(), sessionArchives.stop(), sessionTransfers.stop(), sessionSync.stop(), sessionTrash.stop(), exportTask]).finally(async () => {await proxyTunnels.stop();history.close();app.quit()})
   })
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({ applicationName: productName })
@@ -691,13 +733,21 @@ async function main(): Promise<void> {
         if(tempLogin.current().running)throw new Error('请先完成或取消当前官方客户端登录')
         await login.start(z.enum(['browser', 'device']).parse(input));break
       }
+      case 'startClaudeLogin': {
+        if (tempLogin.current().running || ['starting','waiting','exchanging'].includes(login.current().status)) throw new Error('请先完成或取消当前其他登录')
+        await claudeSubscriptionLogin.start(); break
+      }
       case 'cancelLogin': login.cancel(); break
+      case 'cancelClaudeLogin': claudeSubscriptionLogin.cancel(); break
       case 'openLogin': await login.open(); return
+      case 'openClaudeLogin': await claudeSubscriptionLogin.openAuthorization(); return
       case 'completeLogin': await login.complete(z.string().min(1).max(8192).parse(input)); break
+      case 'completeClaudeLogin': await claudeSubscriptionLogin.complete(z.string().min(1).max(16_384).parse(input)); break
       case 'refreshQuotas': quotas.start(z.array(z.string().uuid()).max(10000).parse(input)); break
       case 'refreshAllQuotas': quotas.startAll(); break
       case 'cancelQuotaRefresh': quotas.cancel(); break
       case 'refreshSubscription': await quotas.refreshSubscriptionInfo(z.string().uuid().parse(input)); break
+      case 'refreshClaudeSubscription': await tokens.ensure(z.string().uuid().parse(input), { force: true }); break
       case 'refreshResetCredits': await quotas.refreshResetCreditsInfo(z.string().uuid().parse(input)); break
       case 'consumeResetCredit': await quotas.consumeResetCredit(z.string().uuid().parse(input)); break
       case 'startGateway': {

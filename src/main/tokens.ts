@@ -39,9 +39,12 @@ export class TokenAuthority {
   private readonly pending = new Map<string, Promise<StoredAccount>>()
   private readonly controller = new AbortController()
   private external?: (id:string,options:{force?:boolean;rejectedToken?:string})=>Promise<StoredAccount>
+  private claudeSubscription?: (id:string,options:{force?:boolean;rejectedToken?:string})=>Promise<StoredAccount>
   constructor(private readonly store: Store, private readonly request: JSONRequest = requestJSON,
     private readonly project: (account: StoredAccount) => void | Promise<void> = () => {}) {}
   setExternalAuthority(resolve:(id:string,options:{force?:boolean;rejectedToken?:string})=>Promise<StoredAccount>):void {this.external=resolve}
+  /** Install the Anthropic subscription authority. It must own the Claude token endpoint. */
+  setClaudeSubscriptionAuthority(resolve:(id:string,options:{force?:boolean;rejectedToken?:string})=>Promise<StoredAccount>):void {this.claudeSubscription=resolve}
   busy(id:string):boolean {return this.pending.has(id)}
   ensure(id: string, options: { force?: boolean; rejectedToken?: string } = {}): Promise<StoredAccount> {
     if(this.store.read().clientSwitches?.some(record=>record.status!=='committed'&&(record.accountId===id||record.previousAccountId===id)))return Promise.reject(new Error('客户端切换尚未完成，请先恢复；凭据刷新已暂停'))
@@ -58,6 +61,12 @@ export class TokenAuthority {
     const state=this.store.read(),account = state.accounts.find(a => a.id === id)
     if (!account) return Promise.reject(new Error('账号已删除'))
     if (this.controller.signal.aborted) return Promise.reject(new Error('应用正在退出'))
+    if (account.identityService === 'anthropic' && account.kind === 'oauth' && account.credentialKind === 'claude_ai_oauth') {
+      if (!this.claudeSubscription) return Promise.reject(new Error('Claude 订阅凭据刷新尚未就绪，请重新登录或稍后重试'))
+      const operation = Promise.resolve().then(() => this.claudeSubscription!(id, options)).finally(() => this.pending.delete(id))
+      this.pending.set(id, operation)
+      return operation
+    }
     if(account.identityService==='anthropic')return account.kind==='api_key'?Promise.resolve(account):Promise.reject(new Error('Claude 订阅凭据刷新尚未接入；不能使用 OpenAI 授权端点'))
     if(state.clientAuthorities?.some(binding=>binding.accountId===id)){
       // Persisted links must fail closed even before the resolver is installed

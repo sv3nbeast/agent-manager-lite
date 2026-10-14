@@ -12,6 +12,7 @@ import { parseQuota, parseSubscriptionTimestamp } from './quota'
 import { projectSubscriptionClaim } from './subscriptionClaims'
 import { providerModelContextWindows } from './providerModelContext'
 import { importedAuthRefresh } from './authRefreshMetadata'
+import type { ClaudeSubscriptionLoginResult, ClaudeSubscriptionProfile, ClaudeSubscriptionUsage } from './claudeSubscriptionOAuth'
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('账号必须是 JSON 对象')
@@ -377,4 +378,98 @@ export function saveOAuthAccount(store: Store, tokens: Tokens): StoredAccount {
     }
   })
   return result!
+}
+
+const CLAUDE_SUBSCRIPTION_MODELS = ['claude-sonnet-4-5', 'claude-opus-4-1', 'claude-3-5-haiku-latest']
+
+function claudeSubscriptionQuota(usage: ClaudeSubscriptionUsage, now = Date.now()): Quota {
+  const windows = usage.windows.slice(0, 100).map(window => ({
+    id: window.id,
+    name: window.id,
+    ...(window.utilization !== undefined ? { usedPercent: Math.max(0, Math.min(100, window.utilization)) } : {}),
+    ...(window.resetsAt !== undefined ? { resetsAt: window.resetsAt } : {}),
+    ...(window.utilization !== undefined ? { limitReached: window.utilization >= 100, allowed: window.utilization < 100 } : {})
+  }))
+  const limitReached = windows.some(window => window.limitReached === true)
+  return { updatedAt: usage.fetchedAt || now, windows, ...(windows.length ? { limitReached, allowed: !limitReached } : {}) }
+}
+
+function normalizedEmail(value?: string): string | undefined {
+  const textValue = text(value)
+  return textValue?.toLowerCase()
+}
+
+function claudeSubscriptionIdentity(result: ClaudeSubscriptionLoginResult, previous?: StoredAccount['claudeSubscription']): StoredAccount['claudeSubscription'] {
+  const profile = result.profile
+  const scopes = result.tokens.scope?.split(/\s+/).map(value => value.trim()).filter(Boolean).slice(0, 100)
+  return {
+    ...previous,
+    ...(profile?.accountId ? { accountId: profile.accountId } : {}),
+    ...(profile?.organizationId ? { organizationId: profile.organizationId } : {}),
+    ...(profile?.organizationName ? { organizationName: profile.organizationName } : {}),
+    verifiedAt: profile?.fetchedAt ?? previous?.verifiedAt ?? result.metadata.retrievedAt,
+    ...(profile?.fetchedAt ? { profileFetchedAt: profile.fetchedAt } : previous?.profileFetchedAt ? { profileFetchedAt: previous.profileFetchedAt } : {}),
+    ...(result.usage?.fetchedAt ? { usageFetchedAt: result.usage.fetchedAt } : previous?.usageFetchedAt ? { usageFetchedAt: previous.usageFetchedAt } : {}),
+    ...(result.tokens.expiresAt ? { tokenExpiresAt: result.tokens.expiresAt } : previous?.tokenExpiresAt ? { tokenExpiresAt: previous.tokenExpiresAt } : {}),
+    ...(scopes?.length ? { scopes } : previous?.scopes ? { scopes: previous.scopes } : {})
+  }
+}
+
+function isClaudeSubscriptionAccount(account: StoredAccount): boolean {
+  return account.kind === 'oauth' && account.identityService === 'anthropic' && account.credentialKind === 'claude_ai_oauth'
+}
+
+/** Persist a Claude.ai subscription OAuth result without exposing its tokens in the account projection. */
+export function saveClaudeSubscriptionAccount(store: Store, result: ClaudeSubscriptionLoginResult): StoredAccount {
+  const profile: ClaudeSubscriptionProfile | undefined = result.profile
+  const accountId = text(profile?.accountId)
+  const email = normalizedEmail(profile?.email)
+  const accessToken = text(result.tokens.accessToken)
+  const refreshToken = text(result.tokens.refreshToken)
+  if (!accessToken) throw new Error('Claude 订阅登录缺少访问令牌')
+  let saved: StoredAccount | undefined
+  store.transaction(state => {
+    const existing = state.accounts.find(account => {
+      if (!isClaudeSubscriptionAccount(account)) return false
+      const existingAccountId = text(account.claudeSubscription?.accountId) ?? text(account.credentials.accountId)
+      if (accountId && existingAccountId) return accountId === existingAccountId
+      if (accessToken && account.credentials.accessToken === accessToken) return true
+      if (refreshToken && account.credentials.refreshToken === refreshToken) return true
+      const existingEmail = normalizedEmail(account.email)
+      const existingOrganization = text(account.claudeSubscription?.organizationId)
+      const organization = text(profile?.organizationId)
+      // Email remains a useful fallback when a profile response omits its
+      // account id. Never merge two explicitly different organizations.
+      return Boolean(email && existingEmail && email === existingEmail
+        && (!organization || !existingOrganization || organization === existingOrganization))
+    })
+    const target: StoredAccount = existing ?? {
+      id: randomUUID(), kind: 'oauth', identityService: 'anthropic', credentialKind: 'claude_ai_oauth', protocol: 'anthropic_messages',
+      name: profile?.name ?? profile?.email ?? 'Claude 订阅账号', email: profile?.email, plan: profile?.plan,
+      baseUrl: 'https://api.anthropic.com', models: [...CLAUDE_SUBSCRIPTION_MODELS], wireApi: 'chat_completions',
+      defaultTier: 'inherit', note: '', tags: [], createdAt: Date.now(), credentials: {}
+    }
+    target.kind = 'oauth'; target.identityService = 'anthropic'; target.credentialKind = 'claude_ai_oauth'; target.protocol = 'anthropic_messages'
+    target.baseUrl = 'https://api.anthropic.com'; target.wireApi = 'chat_completions'
+    if (!target.models.length) target.models = [...CLAUDE_SUBSCRIPTION_MODELS]
+    target.name = profile?.name ?? profile?.email ?? target.name
+    target.email = profile?.email ?? target.email
+    target.plan = profile?.plan ?? target.plan
+    target.credentials = {
+      ...target.credentials,
+      accessToken,
+      ...(refreshToken ? { refreshToken } : target.credentials.refreshToken ? { refreshToken: target.credentials.refreshToken } : {}),
+      ...(accountId ? { accountId } : target.credentials.accountId ? { accountId: target.credentials.accountId } : {}),
+      ...(result.tokens.expiresAt ? { expiresAt: result.tokens.expiresAt } : {}),
+      ...(result.tokens.tokenType ? { tokenType: result.tokens.tokenType } : {}),
+      ...(result.tokens.scope ? { scope: result.tokens.scope } : {})
+    }
+    target.claudeSubscription = claudeSubscriptionIdentity(result, target.claudeSubscription)
+    if (result.usage) target.quota = claudeSubscriptionQuota(result.usage)
+    delete target.error; delete target.errorAt
+    if (!existing) state.accounts.push(target)
+    reconcileProviderKeys(state)
+    saved = structuredClone(target)
+  })
+  return saved!
 }
