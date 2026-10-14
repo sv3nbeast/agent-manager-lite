@@ -158,17 +158,27 @@ function field(source: Record<string, unknown>, keys: string[]): string | undefi
   for (const key of keys) if (typeof source[key] === 'string' && source[key].trim()) return source[key].trim()
   return undefined
 }
+function subscriptionPlan(organizationType?: string): string | undefined {
+  switch (organizationType?.toLowerCase()) {
+    case 'claude_max': return 'max'
+    case 'claude_pro': return 'pro'
+    case 'claude_team': return 'team'
+    case 'claude_enterprise': return 'enterprise'
+    default: return undefined
+  }
+}
 function normalizedProfile(value: Record<string, unknown>, fetchedAt: number): ClaudeSubscriptionProfile {
   const organization = value.organization && typeof value.organization === 'object' && !Array.isArray(value.organization) ? value.organization as Record<string, unknown> : {}
   const account = value.account && typeof value.account === 'object' && !Array.isArray(value.account) ? value.account as Record<string, unknown> : {}
   const details = metadata(value)
+  const organizationType = field(value, ['organizationType', 'organization_type']) ?? field(organization, ['organizationType', 'organization_type'])
   return {
     accountId: field(value, ['accountId', 'account_id', 'account_uuid', 'uuid']) ?? field(account, ['id', 'uuid', 'account_id']),
     organizationId: field(value, ['organizationId', 'organization_id', 'organization_uuid', 'orgId', 'org_id']) ?? field(organization, ['id', 'uuid', 'organization_id']),
     organizationName: field(value, ['organizationName', 'organization_name']) ?? field(organization, ['name']),
     email: field(value, ['email', 'emailAddress', 'email_address']) ?? field(account, ['email', 'email_address']),
     name: field(value, ['name', 'displayName', 'display_name']) ?? field(account, ['name']),
-    plan: field(value, ['plan', 'planType', 'plan_type', 'subscription_plan']),
+    plan: field(value, ['plan', 'planType', 'plan_type', 'subscription_plan']) ?? subscriptionPlan(organizationType),
     expiresAt: expiry(value.expiresAt ?? value.expires_at ?? value.subscriptionExpiresAt ?? value.subscription_expires_at, fetchedAt),
     fetchedAt,
   }
@@ -180,7 +190,13 @@ function normalizedUsage(value: Record<string, unknown>, fetchedAt: number): Cla
     const row = raw as Record<string, unknown>
     const utilization = typeof row.utilization === 'number' && Number.isFinite(row.utilization) && row.utilization >= 0 && row.utilization <= 100 ? row.utilization : undefined
     const resetsAt = expiry(row.resetsAt ?? row.resets_at, fetchedAt)
-    if (utilization !== undefined || resetsAt !== undefined) windows.push({ id, ...(utilization !== undefined ? { utilization } : {}), ...(resetsAt !== undefined ? { resetsAt } : {}) })
+    const details: Record<string, unknown> = {}
+    if (id === 'extra_usage') {
+      if (typeof row.is_enabled === 'boolean') details.isEnabled = row.is_enabled
+      if (typeof row.monthly_limit === 'number' && Number.isFinite(row.monthly_limit) && row.monthly_limit >= 0 || row.monthly_limit === null) details.monthlyLimit = row.monthly_limit
+      if (typeof row.used_credits === 'number' && Number.isFinite(row.used_credits) && row.used_credits >= 0 || row.used_credits === null) details.usedCredits = row.used_credits
+    }
+    if (utilization !== undefined || resetsAt !== undefined || Object.keys(details).length) windows.push({ id, ...(utilization !== undefined ? { utilization } : {}), ...(resetsAt !== undefined ? { resetsAt } : {}), ...(Object.keys(details).length ? { details } : {}) })
   }
   return { windows, fetchedAt }
 }
@@ -330,11 +346,11 @@ export class ClaudeSubscriptionOAuthService {
     } catch { throw new Error('Claude 订阅刷新失败，请重新登录') }
   }
   async profile(tokens: ClaudeSubscriptionTokens): Promise<ClaudeSubscriptionProfile> { return normalizedProfile(await this.api(this.options.profileEndpoint, tokens, '读取 Claude 账号资料'), this.now()) }
-  async usage(tokens: ClaudeSubscriptionTokens): Promise<ClaudeSubscriptionUsage> { return normalizedUsage(await this.api(this.options.usageEndpoint, tokens, '读取 Claude 订阅用量'), this.now()) }
-  private async api(url: string, tokens: ClaudeSubscriptionTokens, operation: string): Promise<Record<string, unknown>> {
+  async usage(tokens: ClaudeSubscriptionTokens): Promise<ClaudeSubscriptionUsage> { return normalizedUsage(await this.api(this.options.usageEndpoint, tokens, '读取 Claude 订阅用量', true), this.now()) }
+  private async api(url: string, tokens: ClaudeSubscriptionTokens, operation: string, oauthUsage = false): Promise<Record<string, unknown>> {
     if (!tokens.accessToken) throw new Error('Claude 订阅凭据缺少 access_token')
     try {
-      return await this.request(url, { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${tokens.accessToken}`, 'anthropic-version': CLAUDE_SUBSCRIPTION_OAUTH.anthropicVersion } }, operation)
+      return await this.request(url, { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${tokens.accessToken}`, 'anthropic-version': CLAUDE_SUBSCRIPTION_OAUTH.anthropicVersion, ...(oauthUsage ? { 'anthropic-beta': 'oauth-2025-04-20' } : {}) } }, operation)
     } catch { throw new Error(`${operation}失败，请稍后重试`) }
   }
   private async exchange(pending: Pending, code: string): Promise<void> {

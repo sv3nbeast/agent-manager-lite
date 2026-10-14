@@ -388,6 +388,7 @@ function claudeSubscriptionQuota(usage: ClaudeSubscriptionUsage, now = Date.now(
     name: window.id,
     ...(window.utilization !== undefined ? { usedPercent: Math.max(0, Math.min(100, window.utilization)) } : {}),
     ...(window.resetsAt !== undefined ? { resetsAt: window.resetsAt } : {}),
+    ...(window.details ? { details: structuredClone(window.details) } : {}),
     ...(window.utilization !== undefined ? { limitReached: window.utilization >= 100, allowed: window.utilization < 100 } : {})
   }))
   const limitReached = windows.some(window => window.limitReached === true)

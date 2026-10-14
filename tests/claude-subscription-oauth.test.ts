@@ -78,3 +78,32 @@ test('Claude subscription manual code accepts code#state and metadata sanitizer 
   const safe = safeClaudeSubscriptionMetadata({ account: { email: 'a@b.invalid', access_token: 'secret' }, refresh_token: 'secret2', nested: [{ authorizationCode: 'secret3', ok: true }] })
   assert.deepEqual(safe, { account: { email: 'a@b.invalid' }, nested: [{ ok: true }] })
 })
+
+test('Claude subscription profile maps organization type and usage keeps all OAuth windows', async () => {
+  const headers: Record<string, string> = {}
+  const service = new ClaudeSubscriptionOAuthService({ request: async (url, init) => {
+    if (url.includes('/profile')) return {
+      account: { uuid: 'account-2', email: 'profile@example.invalid' },
+      organization: { uuid: 'org-2', name: 'Max org', organization_type: 'claude_max' },
+    }
+    if (url.includes('/usage')) {
+      new Headers(init?.headers).forEach((value, key) => { headers[key] = value })
+      return {
+        five_hour: { utilization: 11, resets_at: '2030-01-01T00:00:00Z' },
+        seven_day: { utilization: 22, resets_at: '2030-01-02T00:00:00Z' },
+        seven_day_sonnet: { utilization: 33, resets_at: '2030-01-03T00:00:00Z' },
+        extra_usage: { is_enabled: true, monthly_limit: 25, used_credits: 4, utilization: 16 },
+      }
+    }
+    throw new Error('unexpected endpoint')
+  } })
+  const profile = await service.profile({ accessToken: 'access-profile' })
+  assert.equal(profile.accountId, 'account-2')
+  assert.equal(profile.organizationId, 'org-2')
+  assert.equal(profile.plan, 'max')
+  const usage = await service.usage({ accessToken: 'access-profile' })
+  assert.deepEqual(usage.windows.map(window => window.id), ['five_hour', 'seven_day', 'seven_day_sonnet', 'extra_usage'])
+  assert.equal(usage.windows.find(window => window.id === 'seven_day_sonnet')?.utilization, 33)
+  assert.deepEqual(usage.windows.find(window => window.id === 'extra_usage')?.details, { isEnabled: true, monthlyLimit: 25, usedCredits: 4 })
+  assert.equal(headers['anthropic-beta'], 'oauth-2025-04-20')
+})

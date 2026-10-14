@@ -95,7 +95,7 @@ export interface AccountGroup extends GroupInput { id: string; sortOrder: number
 export const groupMembersSchema = z.object({
   id: z.string().uuid(), ids: accountIdsSchema, mode: z.enum(['add', 'remove', 'move', 'replace'])
 }).strict()
-export interface QuotaWindow { id: string; name: string; usedPercent?: number; resetsAt?: number; durationSeconds?: number; allowed?: boolean; limitReached?: boolean }
+export interface QuotaWindow { id: string; name: string; usedPercent?: number; resetsAt?: number; durationSeconds?: number; allowed?: boolean; limitReached?: boolean; details?: Record<string, unknown> }
 export interface CreditUsage {
   unlimited?: boolean; remaining?: number; balance?: number; limit?: number; used?: number
   remainingPercent?: number; resetsAt?: number
