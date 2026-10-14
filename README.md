@@ -116,6 +116,8 @@ npx electron-builder --mac --arm64 --publish never
 
 Codex 和 Claude Code 客户端需单独安装，本项目不附带官方客户端。Codex 桌面语言、普通 / Fast 和 Ultra 按实际功能结构独立检测，启动预览会显示各项状态。仅版本号或资源名称变化时可自动兼容；内部接口变化仍可能需要适配。Ultra 和 Fast 还取决于模型及服务商能力。
 
+Ultra 按模型目录提供，是客户端的推理与任务委派预设，与 Ultra Fast 速度等级独立。新版客户端可能将 Ultra 映射为模型声明的 API 推理档位（例如 `xhigh`），同时启用主动任务委派；仅看请求中的 `reasoning.effort` 不能判断是否降档。管理器保留这一原生行为。
+
 macOS 已安装官方原生 Claude CLI 时，可运行 `npm run test:claude-code:runtime` 进行本地模拟服务验收；测试使用临时目录和合成凭据，不需要付费 API 账号。`npm run test:claude-code:interactive` 验证首次交互启动（另需 Python 3），`npm run test:desktop:claude-manager` 验证管理器界面。
 
 ## 许可证与来源

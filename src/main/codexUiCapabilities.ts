@@ -166,18 +166,22 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     return [edit(auth.init,`${text(auth.init)}||${account}?.authMethod===\`apikey\`||${host}===\`local\`&&${account}?.authMethod===null&&${account}?.requiresAuth===!1`),edit(queryPending,`${text(queryPending)}&&!(${custom})`),edit(needsData,`(${text(needsData)}||(${custom}))`),edit(controlLoading,`${text(controlLoading)}&&${accessObject?`${permitted}==null`:`!${permitted}`}`),edit(guard,fallback),edit(requirements,optionalRequirements),...(access?[edit(access.consequent.arguments[0],`${data}??{requirements:null}`)]:[])]
   })
   transaction('ultra',()=>{
-    const settings=one(functionsWith('enabledReasoningEfforts','new Set','persistent').filter(fn=>nodes(fn,n=>n.type==='NewExpression'&&n.callee.name==='Set'&&n.arguments[0]?.type==='ArrayExpression'&&text(n.arguments[0]).includes('enabledReasoningEfforts')&&n.arguments[0].elements.some((e:Node)=>literal(e)==='persistent')).length===1))
-    const values=one(nodes(settings,n=>n.type==='NewExpression'&&n.callee.name==='Set'&&n.arguments[0]?.type==='ArrayExpression'&&text(n.arguments[0]).includes('enabledReasoningEfforts')&&n.arguments[0].elements.some((e:Node)=>literal(e)==='persistent'))).arguments[0]
-    if(values.elements.some((e:Node)=>literal(e)==='ultra'))throw new Error('native ultra shape')
+    // Lazy module initializers can nest the settings atom in several callbacks.
+    // Match the unique Set expression itself: wrapper/function ownership is a
+    // bundler detail, and no bindings move across scopes in this edit.
+    const values=one(functions.flatMap(fn=>nodes(fn,n=>n.type==='NewExpression'&&n.callee.name==='Set'&&n.arguments.length===1&&n.arguments[0].type==='ArrayExpression'&&n.arguments[0].elements.some((e:Node)=>e?.type==='SpreadElement'&&nodes(e,n=>property(n)==='enabledReasoningEfforts').length===1)&&n.arguments[0].elements.some((e:Node)=>literal(e)==='persistent')))).arguments[0]
+    const levels=values.elements.some((e:Node)=>literal(e)==='ultra')?[]:[edit(values,text(values).slice(0,-1)+',`ultra`]')]
     const catalogue=one(functionsWith('includeUltraReasoningEffort','hasModelSupportingUltraReasoningEffort','supportedReasoningEfforts.filter'))
     const availability=one(nodes(catalogue,n=>n.type==='VariableDeclarator'&&n.init?.type==='LogicalExpression'&&n.init.operator==='&&'&&text(n.init.right).includes('supportedReasoningEfforts')&&text(n.init.right).includes('ultra'))).init
     const filtered=one(nodes(catalogue,n=>n.type==='ConditionalExpression'&&property(n.consequent)==='supportedReasoningEfforts'&&text(n.alternate).includes('supportedReasoningEfforts.filter')&&text(n.alternate).includes('ultra')))
     const gates:Node[]=[]
-    for(const fn of functionsWith('536305374','ultra').filter(fn=>['thinkingEffort','reasoningEffort','includeUltraReasoningEffort'].some(term=>text(fn).includes(term))))
+    // Persistence mutations also live inside lazy initializer callbacks. Include
+    // those owned calls once without requiring their owner to be module-level.
+    for(const fn of functions.filter(fn=>['536305374','ultra'].every(term=>text(fn).includes(term))&&['thinkingEffort','reasoningEffort','includeUltraReasoningEffort'].some(term=>text(fn).includes(term))))
       gates.push(...nodes(fn,n=>n.type==='CallExpression'&&n.arguments.length===2&&literal(n.arguments[1])==='536305374'&&(n.callee.type==='Identifier'||property(n.callee)==='get')))
     const unique=[...new Map(gates.map(n=>[n.start,n])).values()]
     if(unique.length<3||unique.length>12)throw new Error('ultra persistence roles')
-    return [edit(values,text(values).slice(0,-1)+',`ultra`]'),edit(availability,text(availability.right)),edit(filtered,text(filtered.consequent)),...unique.map(gate=>edit(gate,'!0'))]
+    return [...levels,edit(availability,text(availability.right)),edit(filtered,text(filtered.consequent)),...unique.map(gate=>edit(gate,'!0'))]
   })
   return {features,replacements}
 }

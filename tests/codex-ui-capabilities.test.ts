@@ -97,6 +97,43 @@ test('nested functions do not create a duplicate module-level feature role',t=>{
   assert.equal(result.featureSupport!.locale.supported,true)
 })
 
+test('Ultra settings and persistence survive nested lazy initialization',()=>{
+  const nested=source.split('\n').map(line=>{
+    if(line.startsWith('function initLevels'))return 'function initLevels(){return (()=>()=>new Set([...readSetting(settings.enabledReasoningEfforts),`persistent`]))()()}'
+    if(line.startsWith('function updateReasoning'))return 'function updateReasoning(e,t){return (()=>({mutationFn:()=>{if(!t.sameIdentity||t.thinkingEffort===`ultra`&&!e.get(flag,`536305374`))return null;return t.thinkingEffort}}))().mutationFn()}'
+    return line
+  }).join('\n')
+  const {detected,body}=patches(nested,['ultra'])
+  assert.equal(detected.features.ultra.supported,true)
+  const roles=body.split('\n').filter(line=>/function (initLevels|catalogue|savedReasoning|updateReasoning|startReasoning)/.test(line)).join('\n')
+  const api=new Function('readSetting','settings','flag',roles+';return {initLevels,catalogue,savedReasoning,updateReasoning,startReasoning};')(()=>['high','max'],{enabledReasoningEfforts:[]},{})
+  const enabled=api.initLevels(),falseGate=Object.assign(()=>false,{get:()=>false})
+  assert.deepEqual([...enabled],['high','max','persistent','ultra'])
+  const data=api.catalogue({includeUltraReasoningEffort:false,enabledReasoningEfforts:enabled,models:[{model:'supported',supportedReasoningEfforts:[{reasoningEffort:'max'},{reasoningEffort:'ultra'}]},{model:'limited',supportedReasoningEfforts:[{reasoningEffort:'high'}]}]})
+  assert.deepEqual(data.models.map((m:any)=>m.supportedReasoningEfforts.map((e:any)=>e.reasoningEffort)),[['max','ultra'],['high']])
+  assert.equal(api.savedReasoning(falseGate,'ultra'),'ultra')
+  assert.equal(api.updateReasoning(falseGate,{sameIdentity:true,thinkingEffort:'ultra'}),'ultra')
+  assert.equal(api.updateReasoning(falseGate,{sameIdentity:false,thinkingEffort:'ultra'}),null,'identity boundary must remain intact')
+  assert.equal(api.startReasoning(falseGate,{thinkingEffort:'ultra'}),'ultra')
+})
+
+test('ambiguous or missing reasoning settings discard every Ultra edit',()=>{
+  for(const body of [source+'\nfunction duplicate(){return ()=>new Set([...readSetting(settings.enabledReasoningEfforts),`persistent`])}',source.replace('settings.enabledReasoningEfforts','settings.otherSetting')]){
+    const detected=detectCodexUiCapabilities(body)
+    assert.equal(detected.features.ultra.supported,false)
+    assert.deepEqual(detected.replacements.ultra,[])
+    assert.equal(detected.features.locale.supported,true)
+    assert.equal(detected.features.speed.supported,true)
+  }
+})
+
+test('clients already enabling Ultra keep their setting while remaining persistence gates are adapted',()=>{
+  const input=source.replace('`persistent`])','`persistent`,`ultra`])'),{detected,body}=patches(input,['ultra'])
+  assert.equal(detected.features.ultra.supported,true)
+  assert.equal(body.split('\n').find(line=>line.startsWith('function initLevels')),input.split('\n').find(line=>line.startsWith('function initLevels')))
+  assert.equal(body.includes('e.get(flag,`536305374`)'),false)
+})
+
 test('the legacy speed-menu entry point uses semantic capabilities for future versions',t=>{
   const f=fixture(t,source,'2030.1.7'),result=inspectCodexSpeedMenu({...f.options,enhancements:'speed-locale'},f.reader)
   assert.equal(result.supported,true,result.reason)

@@ -2,7 +2,7 @@
 // disposable history. Never attach to a user's existing renderer or vault.
 const assert=require('node:assert/strict')
 const {createServer}=require('node:http')
-const {execFileSync}=require('node:child_process')
+const {execFileSync,spawn}=require('node:child_process')
 const {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,readdirSync,statSync}=require('node:fs')
 const {tmpdir}=require('node:os')
 const {join}=require('node:path')
@@ -13,6 +13,7 @@ const {inspectCodexDesktopUi,prepareCodexSpeedMenu,readCodexSpeedMenuStatus}=req
 const {MacDesktopRuntime}=require('../src/main/instanceRuntime.ts')
 const {reserveCodexCdpPort}=require('../src/main/codexInstanceAdapter.ts')
 const {builtInCatalog,buildModelCatalog}=require('../src/main/modelCatalog.ts')
+const {codexBundledCli}=require('../src/main/codexPrograms.ts')
 
 async function main(){
   assert.equal(process.platform,'darwin','native desktop smoke requires macOS')
@@ -25,15 +26,22 @@ async function main(){
   const features=inspection.features??[]
   const supports=feature=>features.includes(feature)&&inspection.featureSupport?.[feature]?.supported===true
   console.log(JSON.stringify({stage:'capabilities',version:inspection.version,features,featureSupport:inspection.featureSupport,reason:inspection.reason}))
+  for(const feature of (process.env.CML_CODEX_UI_REQUIRE??'').split(',').filter(Boolean))assert.ok(supports(feature),`required capability was not detected: ${feature}`)
   const root=mkdtempSync(join(realpathSync(tmpdir()),'cml-native-ui-')),directory=join(root,'home'),desktopDirectory=join(root,'desktop')
   mkdirSync(directory,{mode:0o700});mkdirSync(desktopDirectory,{mode:0o700})
   const runtime=new MacDesktopRuntime(),nonce=randomUUID(),cdpPort=await reserveCodexCdpPort()
-  let socket,plan;const requests=[]
+  let socket,plan,capture=async()=>{};const requests=[]
   const server=createServer((req,res)=>{
     res.setHeader('content-type','application/json')
     if(req.method==='GET'){res.end(JSON.stringify({object:'list',data:[{id:'gpt-6.1-sol',object:'model',owned_by:'fixture'}]}));return}
     let body='';req.on('data',chunk=>body+=chunk);req.on('end',()=>{
-      const input=JSON.parse(body||'{}');requests.push({model:input.model,serviceTier:input.service_tier,reasoningEffort:input.reasoning?.effort})
+      const input=JSON.parse(body||'{}')
+      // A continued thread carries earlier mode messages in its history. The
+      // latest developer mode message determines the active delegation policy.
+      const multiAgentMode=(JSON.stringify(input.input)??'').match(/<multi_agent_mode>[\s\S]*?<\/multi_agent_mode>/g)?.at(-1)??null
+      const lastUserText=(input.input??[]).filter(item=>item.role==='user').at(-1)?.content
+      const prompt=typeof lastUserText==='string'?lastUserText:(lastUserText??[]).map(part=>part.text??'').join('\n')
+      requests.push({model:input.model,serviceTier:input.service_tier,reasoningEffort:input.reasoning?.effort,multiAgentMode,prompt:prompt.trim()})
       const id='resp_'+randomUUID(),item={id:'msg_'+randomUUID(),type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'Compatibility check complete.',annotations:[]}]}
       const response={id,object:'response',created_at:Math.floor(Date.now()/1000),status:'completed',model:input.model,output:[item],usage:{input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0},output_tokens_details:{reasoning_tokens:0}}}
       if(!input.stream){res.end(JSON.stringify(response));return}
@@ -49,6 +57,22 @@ async function main(){
     writeFileSync(join(directory,'catalog.json'),JSON.stringify(catalog))
     writeFileSync(join(directory,'.codex-global-state.json'),JSON.stringify({'electron-saved-workspace-roots':[root],'electron-active-workspace-roots':[root],'electron-persisted-atom-state':{'electron:onboarding-override':'app','electron:onboarding-projectless-completed':true}}))
     writeFileSync(join(directory,'config.toml'),`model="gpt-6.1-sol"\nmodel_provider="fixture"\nmodel_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.fixture]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nexperimental_bearer_token="fixture-only-key"\n`)
+    let nativeUltra
+    if(supports('ultra')){
+      const reference=join(root,'native-reference');mkdirSync(reference,{mode:0o700})
+      writeFileSync(join(reference,'config.toml'),readFileSync(join(directory,'config.toml')))
+      const before=requests.length
+      const cli=spawn(codexBundledCli(application),['exec','--json','--ephemeral','--ignore-rules','--skip-git-repo-check','--sandbox','read-only','-c','model_reasoning_effort="ultra"','Reply with one sentence. Do not use tools.'],{cwd:root,env:{PATH:process.env.PATH,TMPDIR:process.env.TMPDIR,LANG:'en_US.UTF-8',CODEX_HOME:reference},stdio:['ignore','pipe','pipe']})
+      let output='';cli.stdout.on('data',chunk=>output+=chunk);cli.stderr.on('data',chunk=>output+=chunk)
+      const timeout=setTimeout(()=>cli.kill('SIGKILL'),30000)
+      try{
+        const code=await new Promise((resolve,reject)=>{cli.once('error',reject);cli.once('close',resolve)})
+        assert.equal(code,0,output);assert.equal(requests.length,before+1,'native Ultra reference must send exactly one request')
+        nativeUltra=requests[before]
+        assert.ok(nativeUltra.multiAgentMode,'native Ultra reference must expose its delegation mode')
+        console.log(JSON.stringify({stage:'native-ultra-reference',request:nativeUltra}))
+      }finally{clearTimeout(timeout);if(cli.exitCode===null)cli.kill('SIGKILL')}
+    }
     const hook=prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce})
     if(features.length)assert.ok(hook,inspection.reason)
     else assert.equal(hook,undefined,inspection.reason)
@@ -67,7 +91,7 @@ async function main(){
     const call=async(method,params={})=>{const messageId=++id;const result=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(messageId);reject(new Error('native CDP command timeout'))},10000);pending.set(messageId,v=>{clearTimeout(timer);resolve(v)});socket.send(JSON.stringify({id:messageId,method,params}))});if(result.error)throw new Error(result.error.message);return result.result}
     const evaluate=async expression=>(await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true})).result.value
     const wait=async expression=>{const deadline=Date.now()+60000;let value;while(!(value=await evaluate(expression))){assert.ok(Date.now()<deadline,'native UI timeout: '+expression);await delay(100)}return value}
-    const capture=async name=>{
+    capture=async name=>{
       const evidence=process.env.CML_CODEX_UI_EVIDENCE
       if(evidence){mkdirSync(evidence,{recursive:true});const result=await call('Page.captureScreenshot',{format:'png'});writeFileSync(join(evidence,name),Buffer.from(result.data,'base64'))}
     }
@@ -121,10 +145,11 @@ async function main(){
       await call('Input.insertText',{text})
       await click('Array.from(document.querySelectorAll("button")).find(b=>{const label=(b.getAttribute("aria-label")||"").trim();return !b.disabled&&/^(发送|Send|Submit)$/i.test(label)})||document.querySelector("button[type=submit]:not([disabled])")')
       const deadline=Date.now()+60000
-      while(requests.length===before){assert.ok(Date.now()<deadline,'native request was not sent');await delay(100)}
+      let request
+      while(!(request=requests.slice(before).find(request=>request.prompt===text))){assert.ok(Date.now()<deadline,'native request was not sent: '+JSON.stringify(requests.slice(before)));await delay(100)}
       await wait('document.body.innerText.includes("Compatibility check complete.")')
       await delay(1500)
-      return requests[before]
+      return request
     }
     if(supports('speed')){
       await chooseSpeed(false)
@@ -137,7 +162,7 @@ async function main(){
       await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
       await chooseSpeed(true)
       await key('Escape');await key('Escape')
-      accelerated=await send(supports('ultra')?'Reply with one sentence for the Fast and Ultra compatibility test.':'Reply with one sentence for the Fast compatibility test.')
+      accelerated=await send('Reply with one sentence for the Fast compatibility test.')
       assert.equal(accelerated.serviceTier,'priority',JSON.stringify(requests))
     }else console.log('Fast capability was not detected; only the default request was verified')
     if(supports('ultra')){
@@ -150,18 +175,47 @@ async function main(){
         await key('ArrowRight');await delay(150)
       }
       await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
-      await key('Enter');await delay(500)
       await capture('codex-ultra-menu.png')
+      await key('Enter');await delay(500)
       await key('Escape')
+      const ultra=await send('Reply with one sentence for the Ultra reasoning compatibility test.')
+      // Ultra is a native execution preset: current clients use the model's
+      // multi_agent_reasoning_effort on the wire and enable proactive delegation.
+      // Compare against the unmodified bundled CLI instead of forcing the UI
+      // label into the Responses reasoning.effort field.
+      assert.equal(ultra.reasoningEffort,nativeUltra.reasoningEffort,JSON.stringify(requests))
+      assert.equal(ultra.multiAgentMode,nativeUltra.multiAgentMode)
+      assert.notEqual(ultra.multiAgentMode,standard.multiAgentMode)
+      assert.equal(ultra.serviceTier,supports('speed')?'priority':standard.serviceTier,JSON.stringify(requests))
+      // Recent configurations are recorded on submission in newer clients.
+      // Verify the persisted selection after a real turn, then reload the UI
+      // and send again without selecting Ultra a second time.
       const saved=JSON.parse(readFileSync(join(directory,'.codex-global-state.json'),'utf8'))
       const recent=saved['electron-persisted-atom-state']['composer-recent-model-configurations-v1']
       assert.equal(recent[0].model,'gpt-6.1-sol')
       assert.equal(recent[0].reasoningEffort,'ultra')
+      await call('Page.reload')
+      // The desktop router restores the home screen after a page reload.
+      // Reopen the same persisted thread before checking its reasoning preset.
+      const thread='Array.from(document.querySelectorAll("span")).find(el=>el.children.length===0&&el.textContent==="Reply with one sentence for the standard compatibility test.")'
+      await wait(`!!(${thread})`)
+      await click(thread)
+      await wait('document.body.innerText.includes("Reply with one sentence for the Ultra reasoning compatibility test.")')
+      await wait('Array.from(document.querySelectorAll("button")).some(b=>b.innerText.includes("6.1 Sol"))')
+      await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
+      await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
+      await capture('codex-ultra-restored.png')
+      await key('Escape')
+      const restored=await send('Reply with one sentence after restoring the Ultra reasoning selection.')
+      assert.equal(restored.reasoningEffort,nativeUltra.reasoningEffort,JSON.stringify(requests))
+      assert.equal(restored.multiAgentMode,nativeUltra.multiAgentMode)
+      assert.equal(restored.serviceTier,ultra.serviceTier,JSON.stringify(requests))
     }else console.log('Ultra capability was not detected; Ultra-specific controls were skipped')
     await capture('codex-verified.png')
     console.log(JSON.stringify({stage:'verified',version:inspection.version,features,language:await evaluate('document.documentElement.lang'),requests}))
     console.log(`Native Codex smoke passed for detected capabilities: ${features.join(', ')||'none (official UI)'}`)
   }catch(error){
+    await capture('codex-failure.png').catch(()=>{})
     const evidence=process.env.CML_CODEX_UI_EVIDENCE
     if(evidence){
       mkdirSync(evidence,{recursive:true});const logs=[]

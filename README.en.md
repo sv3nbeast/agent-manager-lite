@@ -116,6 +116,8 @@ npx electron-builder --mac --arm64 --publish never
 
 Install Codex and Claude Code clients separately; this project does not bundle the official clients. Codex desktop language, Standard/Fast and Ultra are detected independently from the installed client's resources and shown in the launch preview. Compatible resource structures can survive client updates without adding a version entry; changed interfaces still require adaptation. Passing source tests does not establish compatibility with every client version or live account environment.
 
+Ultra is a reasoning and task delegation preset offered according to the model catalog, independent of the Ultra Fast speed tier. Newer clients may map Ultra to the model's declared API reasoning effort (such as `xhigh`) while enabling proactive task delegation. The request's `reasoning.effort` alone does not establish a downgrade; the manager preserves the native behavior.
+
 With the official native Claude CLI installed on macOS, run `npm run test:claude-code:runtime` for acceptance against a local mock service. It uses temporary directories and synthetic credentials and does not require a paid API account. Run `npm run test:claude-code:interactive` to verify first interactive startup (Python 3 required), and `npm run test:desktop:claude-manager` to check the manager UI.
 
 ## License and attribution
