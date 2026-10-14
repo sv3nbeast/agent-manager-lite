@@ -88,6 +88,26 @@ test('Desktop launch arguments reject profile, marker and remote debugging overr
   assert.throws(() => claudeCodeDesktopMacLaunchArgs({ clientType: 'claude_code', application: '/Applications/Claude.app', desktopDirectory: join(root, 'missing'), nonce: 'nonce-fixture', args: [], networkRoute: undefined }), /普通目录/)
 })
 
+test('Desktop profile validation rejects a parent symlink', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml-desktop-parent-link-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const actual = join(root, 'actual'), profile = join(actual, 'desktop'), alias = join(root, 'alias')
+  mkdirSync(profile, { recursive: true })
+  symlinkSync(actual, alias, 'dir')
+  assert.throws(() => validateClaudeCodeDesktopProfileDirectory(join(alias, 'desktop')), /普通目录/)
+  assert.throws(() => claudeCodeDesktopMacLaunchArgs({ clientType: 'claude_code', application: '/Applications/Claude.app', desktopDirectory: join(alias, 'desktop'), nonce: 'nonce-fixture', args: [], networkRoute: undefined }), /普通目录/)
+})
+
+test('Desktop extra arguments are an explicit diagnostic allowlist', () => {
+  assert.doesNotThrow(() => validateClaudeCodeDesktopArgs(['--disable-gpu']))
+  assert.doesNotThrow(() => validateClaudeCodeDesktopArgs(['--disable-software-rasterizer']))
+  for (const arg of [
+    '--load-extension=/tmp/extension', '--disable-extensions-except=/tmp/extension', '--preload=/tmp/hook.js',
+    '--js-flags=--jitless', '--inspect=127.0.0.1:9229', '--remote-debugging-pipe', '--no-sandbox',
+    '--disable-features=Sandbox', '--lang=en-US', '--unknown-diagnostic-flag', '--disable-gpu=true',
+  ]) assert.throws(() => validateClaudeCodeDesktopArgs([arg]), /不能覆盖/)
+})
+
 test('Desktop environment drops inherited identity and Electron hooks but preserves safe values', () => {
   const env = claudeCodeDesktopEnvironment({
     PATH: '/usr/bin', LANG: 'zh_CN.UTF-8', CLAUDE_CONFIG_DIR: '/tmp/global', CLAUDE_CODE_OAUTH_TOKEN: 'secret',
@@ -111,4 +131,8 @@ test('Desktop process ownership requires exact executable, profile and nonce', t
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, marker] }), true)
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${join(root, 'other')}`, marker] }), false)
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: '/tmp/other', args: ['Claude', `--user-data-dir=${profile}`, marker] }), false)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, `--user-data-dir=${profile}`, marker] }), false)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, marker, marker] }), false)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, '--user-data-dir=/tmp/other', marker] }), false)
+  assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, '--remote-debugging-pipe', marker] }), false)
 })
