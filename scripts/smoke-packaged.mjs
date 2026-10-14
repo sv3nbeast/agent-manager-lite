@@ -51,7 +51,7 @@ const directory = mkdtempSync(join(tmpdir(),'cml-packaged-'))
 const env = { ...process.env,CML_TEST_DATA_DIR:directory }
 delete env.ELECTRON_RUN_AS_NODE
 // Keep test-window frame callbacks running while Codex or another app is foreground.
-const child = spawn(binary,['--cml-smoke-test','--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling','--remote-debugging-port=0','--remote-debugging-address=127.0.0.1'],{env,stdio:'ignore',detached:true})
+const child = spawn(binary,['--cml-smoke-test','--user-data-dir='+directory,'--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling','--remote-debugging-port=0','--remote-debugging-address=127.0.0.1'],{env,stdio:'ignore',detached:true})
 let socket, timer
 const kill = () => { try { process.kill(-child.pid,'SIGKILL') } catch {} }
 try {
