@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -31,8 +31,8 @@
     "test:packaged": "node scripts/smoke-packaged.mjs",
     "build:proxy": "node scripts/build-proxy.mjs",
     "build": "npm run build:icons && npm run typecheck && electron-vite build",
-    "build:mac": "npm run build:proxy && npm run build && electron-builder --mac",
-    "build:unpack": "npm run build:proxy && npm run build && electron-builder --dir",
+    "build:mac": "npm run check:packaging && npm run build:proxy && npm run build && electron-builder --mac",
+    "build:unpack": "npm run check:packaging && npm run build:proxy && npm run build && electron-builder --dir",
     "test:proxy:vendor": "cd sidecars/codex-proxy/third_party/CLIProxyAPI && go test ./internal/translator/openai/openai/responses ./internal/translator/codex/openai/responses ./internal/translator/codex/openai/chat-completions ./sdk/api/handlers/openai ./internal/runtime/executor",
     "test:native-cli": "tsx scripts/smoke-native-cli.ts",
     "test:claude-code": "tsx --test --test-concurrency=4 tests/claude-code-*.test.ts",
@@ -66,10 +66,14 @@
     "test:native-proxy": "tsx scripts/smoke-native-proxy.ts",
     "test:claude-code:runtime": "tsx scripts/smoke-claude-code.ts",
     "test:desktop:claude-manager": "node scripts/run-desktop-smoke.cjs --claude-manager",
-    "test:claude-code:interactive": "tsx scripts/smoke-claude-code-interactive.ts"
+    "test:claude-code:interactive": "tsx scripts/smoke-claude-code-interactive.ts",
+    "check:packaging": "node scripts/check-packaging-dependencies.mjs"
   },
   "dependencies": {
     "acorn": "8.15.0",
+    "buffer-crc32": "1.0.0",
+    "eslint-visitor-keys": "5.0.1",
+    "pend": "1.2.0",
     "toml-eslint-parser": "1.0.3",
     "undici": "7.30.0",
     "yaml": "2.9.1",

@@ -27,6 +27,57 @@ const archive = join(bundle, 'Resources/app.asar')
 const shippedPackage = JSON.parse(extractFile(archive, 'package.json').toString('utf8'))
 assert.equal(shippedPackage.name, 'codex-manager-lite', 'Package identity is separate from the display brand')
 assert.equal(shippedPackage.version, sourcePackage.version, 'Shipped package version must match the release source')
+const missingRootDeclarations = Object.keys(sourcePackage.dependencies || {}).filter(name => !Object.hasOwn(shippedPackage.dependencies || {}, name))
+assert.equal(missingRootDeclarations.length, 0, `Packaged package.json omitted runtime dependencies: ${missingRootDeclarations.join(', ')}`)
+// Walk the runtime dependency graph inside the actual app.asar. electron-builder
+// can produce a syntactically valid archive while omitting a transitive package
+// (for example yauzl -> pend); catching that here gives a useful packaging error
+// before Electron opens a blocking native main-process error dialog.
+const archivedPackageCache = new Map([['', shippedPackage]])
+const readArchivedPackage = packagePath => {
+  if (archivedPackageCache.has(packagePath)) return archivedPackageCache.get(packagePath)
+  let content
+  try { content = extractFile(archive, `${packagePath}/package.json`) } catch {
+    archivedPackageCache.set(packagePath, null)
+    return null
+  }
+  const value = JSON.parse(content.toString('utf8'))
+  archivedPackageCache.set(packagePath, value)
+  return value
+}
+const resolveArchivedDependency = (fromPath, name) => {
+  let ancestor = fromPath
+  while (true) {
+    const candidate = `${ancestor ? `${ancestor}/` : ''}node_modules/${name}`
+    const packageJson = readArchivedPackage(candidate)
+    if (packageJson) return { path: candidate, packageJson }
+    const marker = ancestor.lastIndexOf('/node_modules/')
+    if (marker < 0) {
+      if (!ancestor) break
+      ancestor = ''
+    } else ancestor = ancestor.slice(0, marker)
+  }
+  return null
+}
+const missingPackagedDependencies = []
+const pendingPackagedPackages = [{ path: '', packageJson: shippedPackage }]
+const checkedPackagedPackages = new Set()
+while (pendingPackagedPackages.length) {
+  const current = pendingPackagedPackages.pop()
+  if (checkedPackagedPackages.has(current.path)) continue
+  checkedPackagedPackages.add(current.path)
+  const optional = new Set(Object.keys(current.packageJson.optionalDependencies || {}))
+  const dependencies = { ...(current.packageJson.dependencies || {}), ...(current.packageJson.optionalDependencies || {}) }
+  for (const [name, range] of Object.entries(dependencies)) {
+    const resolved = resolveArchivedDependency(current.path, name)
+    if (!resolved) {
+      if (!optional.has(name)) missingPackagedDependencies.push(`${current.path || '<root>'} -> ${name}@${range}`)
+      continue
+    }
+    pendingPackagedPackages.push(resolved)
+  }
+}
+assert.equal(missingPackagedDependencies.length, 0, `Packaged runtime dependency closure is incomplete: ${missingPackagedDependencies.join(', ')}. Rebuild with a complete, non-symlinked node_modules tree.`)
 const shippedMain = extractFile(archive, 'out/main/index.js').toString('utf8')
 // This verifies key addressing in the shipped code; it does not access or
 // claim integration coverage of the user's real vault or system Keychain.
@@ -51,19 +102,112 @@ const directory = mkdtempSync(join(tmpdir(),'cml-packaged-'))
 const env = { ...process.env,CML_TEST_DATA_DIR:directory }
 delete env.ELECTRON_RUN_AS_NODE
 // Keep test-window frame callbacks running while Codex or another app is foreground.
-const child = spawn(binary,['--cml-smoke-test','--user-data-dir='+directory,'--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling','--remote-debugging-port=0','--remote-debugging-address=127.0.0.1'],{env,stdio:'ignore',detached:true})
-let socket, timer
-const kill = () => { try { process.kill(-child.pid,'SIGKILL') } catch {} }
+// Electron's default main-process error dialog blocks startup and used to hide the
+// useful error behind a later DevToolsActivePort ENOENT. Capture only this detached
+// test process's pipes so the failure points at the original application error.
+const startupTimeoutMs = 45_000
+const rendererTimeoutMs = 10_000
+const outputLimitBytes = 128 * 1024
+const startupEvidence = join(evidenceDirectory,'packaged-startup-failure.log')
+const capture = () => ({ chunks: [], bytes: 0, truncated: false })
+const appendOutput = (target, chunk) => {
+  const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+  const remaining = outputLimitBytes - target.bytes
+  if (remaining <= 0) { target.truncated = true; return }
+  target.chunks.push(value.subarray(0, remaining))
+  target.bytes += Math.min(value.length, remaining)
+  if (value.length > remaining) target.truncated = true
+}
+const outputText = target => `${Buffer.concat(target.chunks).toString('utf8')}${target.truncated ? '\n[… output truncated …]\n' : ''}`
+const errorText = error => {
+  if (error instanceof Error) return `${error.name}: ${error.message}${error.stack && error.stack !== error.message ? `\n${error.stack}` : ''}`
+  if (error && typeof error === 'object') { try { return JSON.stringify(error) } catch {} }
+  return String(error)
+}
+
+let child
 try {
-  timer = setTimeout(() => { kill() },45_000)
+  child = spawn(binary,['--cml-smoke-test','--user-data-dir='+directory,'--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling','--enable-logging=stderr','--log-level=0','--remote-debugging-port=0','--remote-debugging-address=127.0.0.1'],{env,stdio:['ignore','pipe','pipe'],detached:true})
+} catch (error) {
+  rmSync(directory,{recursive:true,force:true})
+  throw new Error(`Unable to spawn packaged application: ${errorText(error)}`)
+}
+const launch = { error: null, exit: null, close: null, stdout: capture(), stderr: capture() }
+child.stdout?.on('data', chunk => appendOutput(launch.stdout, chunk))
+child.stderr?.on('data', chunk => appendOutput(launch.stderr, chunk))
+child.once('error', error => { launch.error = error })
+child.once('exit', (code, signal) => { launch.exit = { code, signal } })
+child.once('close', (code, signal) => { launch.close = { code, signal } })
+let socket
+const kill = (signal = 'SIGKILL') => {
+  // detached:true gives this smoke process its own process group. Signalling the
+  // group cleans up Electron's renderer/helper children without matching or
+  // interrupting an already-running user installation by bundle name.
+  if (!child?.pid || child.pid === process.pid) return
+  try { process.kill(-child.pid, signal) } catch (error) {
+    if (error?.code !== 'ESRCH') console.error(`Unable to stop packaged smoke process group: ${errorText(error)}`)
+  }
+}
+const startupDiagnostics = (reason, cause = undefined) => {
+  let activePort = '<missing>'
   const active = join(directory,'DevToolsActivePort')
-  for (let i=0;!existsSync(active) && i<100;i++) { if(child.exitCode!==null) throw new Error(`Packaged application exited: ${child.exitCode}`); await delay(100) }
-  const port = Number(readFileSync(active,'utf8').split('\n')[0])
+  try { if (existsSync(active)) activePort = readFileSync(active,'utf8') } catch (error) { activePort = `<unreadable: ${errorText(error)}>` }
+  const details = [
+    `reason: ${reason}`,
+    `binary: ${binary}`,
+    `userDataDir: ${directory}`,
+    `pid: ${child?.pid ?? '<none>'}`,
+    `spawn error: ${launch.error ? errorText(launch.error) : '<none>'}`,
+    `exit: ${launch.exit ? JSON.stringify(launch.exit) : '<running>'}`,
+    `close: ${launch.close ? JSON.stringify(launch.close) : '<open>'}`,
+    `DevToolsActivePort: ${activePort}`,
+    cause ? `cause: ${errorText(cause)}` : '',
+    '--- stdout ---', outputText(launch.stdout),
+    '--- stderr ---', outputText(launch.stderr),
+  ].filter(Boolean).join('\n') + '\n'
+  let evidenceError
+  try { writeFileSync(startupEvidence, details, { encoding: 'utf8', mode: 0o600 }) } catch (error) { evidenceError = error }
+  const saved = evidenceError ? `Unable to save startup evidence: ${errorText(evidenceError)}` : `Startup evidence: ${startupEvidence}`
+  return new Error(`Packaged application startup failed (${reason}). ${saved}\n${details}`)
+}
+const launchStopped = () => launch.error || launch.exit || child.exitCode !== null || child.signalCode !== null
+const waitForClose = async timeoutMs => {
+  if (launch.close) return
+  await Promise.race([
+    new Promise(resolve => child.once('close', resolve)),
+    delay(timeoutMs),
+  ])
+}
+try {
+  const active = join(directory,'DevToolsActivePort')
+  const startupDeadline = Date.now() + startupTimeoutMs
+  while (!existsSync(active)) {
+    if (launch.error) throw startupDiagnostics('spawn-error', launch.error)
+    if (launchStopped()) throw startupDiagnostics('app-exit-before-devtools', launch.exit ?? launch.error)
+    if (Date.now() >= startupDeadline) throw startupDiagnostics('startup-timeout')
+    await delay(100)
+  }
+  let activeContents
+  try { activeContents = readFileSync(active,'utf8') } catch (error) { throw startupDiagnostics('devtools-port-read-error', error) }
+  const port = Number(activeContents.split('\n')[0])
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) throw startupDiagnostics('invalid-devtools-port', new Error(`Invalid port contents: ${JSON.stringify(activeContents)}`))
   let page
-  for(let i=0;!page && i<100;i++) { page = (await (await fetch(`http://127.0.0.1:${port}/json/list`, {signal:AbortSignal.timeout(5000)})).json()).find(p=>p.type==='page' && p.url.startsWith('file:')); if(!page) await delay(100) }
-  assert.ok(page,'Packaged renderer did not open')
+  let lastRendererError
+  const rendererDeadline = Date.now() + rendererTimeoutMs
+  while (!page) {
+    if (launchStopped()) throw startupDiagnostics('app-exit-before-renderer', launch.exit ?? launch.error)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, {signal:AbortSignal.timeout(5000)})
+      page = (await response.json()).find(p=>p.type==='page' && p.url.startsWith('file:'))
+    } catch (error) { lastRendererError = error }
+    if (page) break
+    if (Date.now() >= rendererDeadline) throw startupDiagnostics('renderer-timeout', lastRendererError)
+    await delay(100)
+  }
   socket = new WebSocket(page.webSocketDebuggerUrl)
-  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true})})
+  try {
+    await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true})})
+  } catch (error) { throw startupDiagnostics('devtools-websocket-error', error) }
   let id = 0
   const pending = new Map()
   socket.addEventListener('close',()=>{for(const task of pending.values())task.reject(new Error('Packaged debug session closed'));pending.clear()})
@@ -317,7 +461,9 @@ try {
   assert.equal(existsSync(join(directory,'state.vault')),false)
   console.log('Packaged macOS smoke passed: Agent Manager Lite display brand and retained legacy identities; upstream proxy settings/invalid IPC; default instance entry and four-step Codex wizard; isolated renderer/preload, SQLite, TOML/Fast/Provider secret projection, provider library/probe/local pool/session navigation, encrypted backup UI and IPC validation, model catalog configuration and independent Go catalog validation; no existing vault or Keychain access')
 } finally {
-  socket?.close();clearTimeout(timer);kill()
-  if(child.exitCode===null && child.signalCode===null) await new Promise(resolve=>child.once('close',resolve))
+  socket?.close()
+  kill('SIGTERM')
+  await waitForClose(2_000)
+  if (!launch.close) { kill('SIGKILL'); await waitForClose(2_000) }
   rmSync(directory,{recursive:true,force:true})
 }

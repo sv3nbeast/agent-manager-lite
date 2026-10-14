@@ -37,6 +37,8 @@ jobs:
         run: npm ci
       - name: Install pinned Electron runtime
         run: npm run setup:electron
+      - name: Check packaged runtime dependencies
+        run: npm run check:packaging
       - name: Build Go sidecar
         run: npm run build:proxy
       - name: Test Go sidecar
