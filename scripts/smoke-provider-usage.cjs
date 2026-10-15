@@ -5,6 +5,7 @@ const directory = process.env.CML_TEST_DATA_DIR
 assert.ok(directory && fs.realpathSync(directory).startsWith(fs.realpathSync(tmpdir()) + sep) && basename(directory).startsWith('codex-manager-ui-'))
 assert.equal(fs.existsSync(join(directory, 'state.vault')), false)
 require('./test-vault.cjs').installTestVault(safeStorage)
+console.log('provider usage smoke: ephemeral vault installed')
 let upstream, mode = 'ok', pending, count = 0
 const requestPaths = []
 // Test-only destination rewrite. Product code still chooses official hosts and
@@ -19,10 +20,12 @@ global.fetch=(input,init)=>{
 }
 app.on('will-quit', () => { upstream?.closeAllConnections(); upstream?.close() })
 const timer = setTimeout(() => { console.error('Provider quota UI exceeded 75 seconds'); app.exit(1) }, 75000)
-const output = resolve('docs/evidence/compact-cards/provider-usage'); fs.mkdirSync(output, { recursive: true })
+const output = resolve('.local/key-model-debug/provider-usage'); fs.mkdirSync(output, { recursive: true })
 app.on('browser-window-created', (_event, window) => {
+  console.log('provider usage smoke: window created')
   window.webContents.setBackgroundThrottling(false)
   window.webContents.once('did-finish-load', async () => {
+    console.log('provider usage smoke: renderer loaded')
     const run = code => window.webContents.executeJavaScript(`(async()=>(${code}))()`)
     const wait = async expression => { const end = Date.now() + 12000; while (!await run(expression)) { assert.ok(Date.now() < end, 'UI timeout: ' + expression); await new Promise(resolve => setTimeout(resolve, 25)) } }
     const click = async (selector, text) => { const expr = `Array.from(document.querySelectorAll(${JSON.stringify(selector)})).find(el=>el.getClientRects().length&&!el.disabled&&el.textContent.replace(/\\s/g,'')===${JSON.stringify(text.replace(/\s/g, ''))})`; await wait(`!!(${expr})`); await run(`(${expr}).click()`) }
@@ -66,20 +69,27 @@ app.on('browser-window-created', (_event, window) => {
       await wait(`Array.from(document.querySelectorAll('.ant-menu-item')).some(el=>el.textContent.includes('账号管理'))`)
       await run(`Array.from(document.querySelectorAll('.ant-menu-item')).find(el=>el.textContent.includes('账号管理')).click()`)
       upstream = createServer((req, res) => {
+        try {
+        // Loopback-origin discovery is separate from authenticated quota
+        // requests. The root is not a quota API and exposes no data.
+        if(req.method==='GET' && req.url==='/') {
+          console.log('provider usage smoke: non-API root request rejected', {method:req.method,path:'/',authorizationPresent:typeof req.headers.authorization==='string'})
+          res.writeHead(404).end();return
+        }
         count++
         requestPaths.push(req.url)
         if(req.url==='/official/zhipu/api/monitor/usage/quota/limit'){
-          assert.equal(req.headers.authorization,'fixture-zhipu-secret')
+          assert.ok(req.headers.authorization==='fixture-zhipu-secret','Zhipu quota request requires raw-key authentication')
           json(res,{success:true,data:{level:'Fixture Pro',limits:[{type:'TOKENS_LIMIT',usage:100,currentValue:25,nextResetTime:1791600000000},{type:'TOKENS_LIMIT',percentage:50,nextResetTime:1791000000000}]}});return
         }
-        assert.match(req.headers.authorization, /^Bearer fixture-/)
+        assert.ok(typeof req.headers.authorization==='string' && /^Bearer fixture-/.test(req.headers.authorization),'Quota request requires fixture Bearer authentication')
         if(req.url==='/official/deepseek/user/balance'){
-          assert.equal(req.headers.authorization,'Bearer fixture-deepseek-secret')
+          assert.ok(req.headers.authorization==='Bearer fixture-deepseek-secret','DeepSeek quota request requires its own fixture credential')
           if(mode==='empty-deepseek'){json(res,{is_available:false,balance_infos:[{currency:'CNY',total_balance:'0'}]});return}
           json(res,{is_available:true,balance_infos:[{currency:'USD',total_balance:'5'},{currency:'CNY',total_balance:'12.5',granted_balance:'2.5',topped_up_balance:'10'}]});return
         }
         if(req.url==='/official/minimax/v1/token_plan/remains'){
-          assert.equal(req.headers.authorization,'Bearer fixture-minimax-secret')
+          assert.ok(req.headers.authorization==='Bearer fixture-minimax-secret','MiniMax quota request requires its own fixture credential')
           json(res,{base_resp:{status_code:0},model_remains:[{model_name:'MiniMax-M-fixture',current_interval_total_count:200,current_interval_usage_count:150,current_weekly_total_count:1000,current_weekly_usage_count:0,end_time:1791000000000,weekly_end_time:1791600000000}]});return
         }
         if (req.url === '/sub/v1/usage') {
@@ -92,9 +102,18 @@ app.on('browser-window-created', (_event, window) => {
         if (req.url === '/new/v1/dashboard/billing/usage') { json(res, { total_usage: 250 }); return }
         if (req.url === '/new/v1/api/usage/token/') { json(res, { data: { expires_at: 1791000000 } }); return }
         res.writeHead(404).end()
+        } catch (error) {
+          // The HTTP callback runs outside the async UI test's catch. Fail this
+          // isolated test process without Electron's uncaught-error dialog.
+          console.error('Provider quota fixture failed', { method:req.method,path:new URL(req.url,'http://fixture.invalid').pathname,authorizationPresent:typeof req.headers.authorization==='string' }, error)
+          clearTimeout(timer)
+          res.destroy()
+          app.exit(1)
+        }
       })
       await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve))
       const base = `http://127.0.0.1:${upstream.address().port}`
+      console.log('provider usage smoke: creating quota fixtures')
       for (const [name, path, apiKey] of [['Sub2API 测试账号', '/sub/v1', 'fixture-sub-secret'], ['New API 测试账号', '/new/v1', 'fixture-new-secret'], ['未支持的服务商', '/unknown', 'fixture-unknown-secret']]) {
         await run(`window.manager.addAccount(${JSON.stringify({ name, baseUrl: base + path, apiKey, models: ['fixture-model'] })})`)
       }
@@ -103,6 +122,7 @@ app.on('browser-window-created', (_event, window) => {
       await wait(`!!document.querySelector('.provider-library')`)
       await run('document.getElementById("api-connections-tab").click()')
       await wait('document.querySelectorAll(".account-card .account-quota-summary").length===3')
+      console.log('provider usage smoke: opening accounts')
       assert.equal(count, 0, 'rendering new API accounts must not probe automatically')
       assert.equal(await run('document.querySelectorAll(".account-card")[0].textContent.includes("尚未查询")'), true)
       await auditCards('unqueried-light')
@@ -112,6 +132,7 @@ app.on('browser-window-created', (_event, window) => {
       await wait('document.querySelectorAll(".account-quota-summary")[2].textContent.includes("未知")')
       await auditCards('currency-and-unknown-light')
       await capture('api-connections-light.png')
+      console.log('provider usage smoke: initial usage complete')
       const snapshot = await run('window.manager.load()')
       assert.equal(JSON.stringify(snapshot).includes('fixture-sub-secret'), false)
       assert.equal(snapshot.quotaRefresh.total, 3); assert.equal(snapshot.quotaRefresh.failed, 1)
@@ -244,7 +265,7 @@ app.on('browser-window-created', (_event, window) => {
       assert.deepEqual(requestPaths,['/sub/v1/dashboard/billing/subscription'])
       assert.equal((await run('window.manager.load()')).accounts[0].providerUsage.unavailable,true)
       await run('document.getElementById("provider-library-tab").click()');await click('.provider-detail button','编辑供应商')
-      await click('.provider-advanced-settings .ant-collapse-header','高级设置 · 协议、额度与模型能力')
+      await click('.provider-advanced-settings .ant-collapse-header','高级设置 · 额度与共享能力默认值')
       await wait('!!document.querySelector("[aria-label=供应商额度查询方式]")');await chooseIntegration('供应商额度查询方式','Sub2API')
       await click('.ant-drawer-open button','保存供应商');await wait('!document.querySelector(".ant-drawer-open")')
       current=await run('window.manager.load()');assert.equal(current.accounts[0].integrationType,'sub2api');assert.equal(current.accounts[0].providerUsage,undefined)
