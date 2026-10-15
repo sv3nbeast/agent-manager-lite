@@ -265,6 +265,14 @@ app.on('browser-window-created', (_event, window) => {
       await next(1)
       assert.equal(await run('!!document.querySelector("[aria-label=资源类型]")'), true)
       assert.equal(await run('document.querySelector("[aria-label=资源类型]").textContent.includes("供应商密钥")'), true)
+      // A previously created Claude subscription is a valid default for a
+      // fresh CLI wizard. Select the provider resource explicitly for these
+      // API/Bearer cases so this smoke covers both resource branches instead
+      // of depending on whichever account was created first.
+      if (kind !== 'subscription') {
+        await click('[aria-label="资源类型"] .ant-radio-wrapper', '供应商密钥')
+        await wait('document.querySelector("[aria-label=资源类型]").textContent.includes("供应商密钥") && document.querySelector(".instance-add-provider")')
+      }
       console.log('Claude smoke resource step', name, await run('({resource:document.querySelector("[aria-label=资源类型]")?.textContent,providerButton:!!document.querySelector(".instance-add-provider"),body:document.querySelector(".instance-step[data-step=\\"1\\"]")?.textContent.slice(0,500)})'))
       await clickElement('.instance-add-provider')
       await wait(visible('.instance-provider-dialog') + '.length===1')
