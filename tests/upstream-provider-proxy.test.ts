@@ -130,7 +130,7 @@ test('mismatched or ambiguous linked accounts cannot silently choose a route by 
   assert.equal(fallback.proxy,undefined);assert.equal(fallback.id,key.id)
 })
 
-test('mixed protocol keys keep their linked proxy identity for discovery and direct chat probes',async t=>{
+test('mixed protocol keys keep their linked proxy identity for discovery, usage and direct chat probes',async t=>{
   const f=fixture(t),seen:Array<{path:string;key:string;model?:string}>=[];let globalHits=0
   const global=await server(t,(_req,res)=>{globalHits++;res.end('{}')})
   const proxy=await server(t,(req,res)=>{
@@ -139,6 +139,7 @@ test('mixed protocol keys keep their linked proxy identity for discovery and dir
       const body=raw?JSON.parse(raw):{}
       seen.push({path,key,...(body.model?{model:body.model}:{})})
       if(path.endsWith('/models'))res.end(JSON.stringify({data:[{id:key.includes('anthropic')?'custom-claude':'custom-gemini'}]}))
+      else if(path.endsWith('/usage'))res.end(JSON.stringify({remaining:key.includes('anthropic')?7:11,unit:'USD'}))
       else if(path.endsWith('/messages')) {
         assert.equal(req.headers['anthropic-version'],'2023-06-01');assert.equal(body.service_tier,undefined)
         res.end(JSON.stringify({content:[{type:'text',text:'Messages proxy reply'}],stop_reason:'end_turn'}))
@@ -146,7 +147,7 @@ test('mixed protocol keys keep their linked proxy identity for discovery and dir
     })
   })
   f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:global}})
-  mutateProvider(f.store,{action:'create',details:{name:'Mixed provider',baseUrl:'http://mixed-provider.invalid/v1',models:['wrong-provider-model']},
+  mutateProvider(f.store,{action:'create',details:{name:'Mixed provider',baseUrl:'http://mixed-provider.invalid/v1',models:['wrong-provider-model'],integrationType:'sub2api'},
     initialKey:{name:'Anthropic',apiKey:'fixture-anthropic-key',models:['custom-claude'],protocol:'anthropic_messages',credentialKind:'anthropic_api_key',createConnection:true}})
   let provider=f.store.read().providers![0]
   mutateProvider(f.store,{action:'addKey',id:provider.id,revision:provider.revision,name:'Chat',apiKey:'fixture-chat-key',models:['custom-gemini'],protocol:'openai_chat_completions',credentialKind:'openai_api_key',createConnection:true})
@@ -159,9 +160,9 @@ test('mixed protocol keys keep their linked proxy identity for discovery and dir
     assert.equal(account.id,linked.id);assert.deepEqual(account.proxy,linked.proxy);assert.deepEqual(account.models,key.models)
     assert.equal(account.protocol,key.protocol)
   }
-  const models=new ProviderModels(f.store,3000,f.network.fetchUpstream)
+  const models=new ProviderModels(f.store,3000,f.network.fetchUpstream),usage=new ProviderUsageQueries(f.store,f.network.request)
   const probes=new ProviderProbes(f.store,binary,join(f.root,'probes'),{models:3000,chat:3000},f.network.fetchUpstream)
-  t.after(async()=>{await models.stop();await probes.stop()})
+  t.after(async()=>{await models.stop();await probes.stop();await usage.stop()})
   for(const target of targets)await models.fetch({requestId:randomUUID(),baseUrl:provider.baseUrl,savedKey:target})
   probes.start({mode:'chat',targets,serviceTier:'priority'});await probes.settled()
   assert.equal(probes.snapshot().succeeded,2,JSON.stringify(probes.snapshot()))
@@ -170,6 +171,14 @@ test('mixed protocol keys keep their linked proxy identity for discovery and dir
     {path:'/v1/models',key:'Bearer fixture-chat-key'},
     {path:'/v1/messages',key:'fixture-anthropic-key',model:'custom-claude'},
     {path:'/v1/chat/completions',key:'Bearer fixture-chat-key',model:'custom-gemini'},
+  ])
+  seen.length=0
+  usage.start({providerId:provider.id,revision:provider.revision,keyIds:provider.keys.map(key=>key.id)});await usage.settled()
+  assert.equal(usage.snapshot().failed,0)
+  assert.deepEqual(f.store.read().providers![0].keys.map(key=>key.usage?.summary?.remaining),[7,11])
+  assert.deepEqual(seen.sort((a,b)=>a.key.localeCompare(b.key)),[
+    {path:'/v1/usage',key:'Bearer fixture-anthropic-key'},
+    {path:'/v1/usage',key:'Bearer fixture-chat-key'},
   ])
   assert.equal(globalHits,0)
 })

@@ -2,6 +2,7 @@
 // modelProviderUsageService.ts. See THIRD_PARTY_NOTICES.md for provenance.
 import { accountInputSchema } from '../shared/types'
 import type { ProviderUsage, ProviderUsageWindow } from '../shared/providerUsage'
+import { supportsProviderUsageQuery } from '../shared/providerUsage'
 import type { StoredAccount } from './store'
 import { HTTPError, JSONResponseError, object, requestJSON, type JSONRequest } from './network'
 
@@ -152,14 +153,15 @@ export function invalidateProviderUsage(account: StoredAccount): void {
 }
 
 export function sameUsageAccount(current: StoredAccount | undefined, account: StoredAccount): current is StoredAccount {
-  return !!current && account.identityService !== 'anthropic' && current.identityService !== 'anthropic' && current.kind === 'api_key' && current.generation === account.generation
+  return !!current && supportsProviderUsageQuery(account) && supportsProviderUsageQuery(current) && current.generation === account.generation
+    && current.credentialKind === account.credentialKind
     && current.baseUrl === account.baseUrl && current.credentials.apiKey === account.credentials.apiKey
     && (current.integrationType ?? 'auto') === (account.integrationType ?? 'auto')
     && (current.providerUsageRevision ?? 0) === (account.providerUsageRevision ?? 0)
 }
 
 export async function queryProviderUsage(account: StoredAccount, signal: AbortSignal, request: JSONRequest = requestJSON): Promise<ProviderUsage> {
-  if (account.identityService === 'anthropic' || account.protocol === 'anthropic_messages') throw new ProviderUsageUnavailable()
+  if (!supportsProviderUsageQuery(account)) throw new ProviderUsageUnavailable()
   const base = new URL(accountInputSchema.shape.baseUrl.parse(account.baseUrl))
   const integrationType = accountInputSchema.shape.integrationType.parse(account.integrationType) ?? 'auto'
   if (!account.credentials.apiKey) throw new Error('账号缺少 API Key')
@@ -167,6 +169,8 @@ export async function queryProviderUsage(account: StoredAccount, signal: AbortSi
   const get = async (path: string, rawAuth = false) => {
     combined.throwIfAborted()
     const url = new URL(base); url.pathname = path
+    // Billing authentication belongs to the provider integration. Anthropic
+    // Messages may use x-api-key for model calls; Sub2API/New API use Bearer here.
     const value = await request(url.toString(), {
       headers: { Accept: 'application/json', Authorization: rawAuth ? account.credentials.apiKey! : `Bearer ${account.credentials.apiKey}` }, signal: combined
     }, '查询服务商额度', account)

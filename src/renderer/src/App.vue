@@ -4,6 +4,7 @@ import { theme, message, Modal } from 'ant-design-vue'
 import zhCN from 'ant-design-vue/es/locale/zh_CN'
 import { AppstoreOutlined, UserOutlined, DesktopOutlined, ApiOutlined, FileTextOutlined, SettingOutlined, PlusOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined, SearchOutlined, DeleteOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import { settingsSchema, type Account, type AppSnapshot, type Settings, type TierMode } from '../../shared/types'
+import { supportsAccountQuotaQuery } from '../../shared/providerUsage'
 import { useManager } from './store'
 import { useFormFeedback, validationErrors } from './formFeedback'
 import type { InstanceLoginRequest, InstanceLoginResult } from './instanceOnboarding'
@@ -153,11 +154,11 @@ async function refreshSubscription(id: string) {
 async function refreshResetCredits(id: string) { await manager.execute(() => window.manager.refreshResetCredits(id)) }
 async function consumeResetCredit(id: string) { await manager.execute(() => window.manager.consumeResetCredit(id)) }
 async function refreshSelected() {
-  const eligible = (account: Account) => account.identityService !== 'anthropic' && account.protocol !== 'anthropic_messages' && !account.credentialKind?.startsWith('anthropic_') && account.credentialKind !== 'claude_ai_oauth'
+  const eligible = supportsAccountQuotaQuery
   if (!selected.value.length) {
     const ids = pageAccounts.value.filter(eligible).map(a => a.id)
     if (ids.length) await refreshQuotas(ids)
-    else if (pageAccounts.value.length) message.info('Anthropic 账号的独立用量适配器尚未接入')
+    else if (pageAccounts.value.length) message.info('Claude 订阅账号请使用账号卡片中的刷新订阅')
     return
   }
   const ids = accounts.value.filter(a => selected.value.includes(a.id) && eligible(a)).map(a => a.id)

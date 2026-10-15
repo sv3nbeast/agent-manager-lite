@@ -99,6 +99,15 @@ export function accountCardPlan(account: Account): string {
   return ({ free: 'Free', plus: 'Plus', pro: 'Pro', team: 'Team', business: 'Business', enterprise: 'Enterprise' } as Record<string, string>)[plan.toLowerCase()] || plan
 }
 
+function providerUsageStatus(account: Account): AccountCardStatus {
+  const usage = account.providerUsage
+  if (usage?.error) return { label: '查询失败', tone: usage.unavailable ? 'neutral' : 'error', detail: `${usage.error}${usage.summary ? '；用量区域保留上次成功结果。' : ''}` }
+  if (usage?.summary?.isValid === false) return { label: '额度不可用', tone: 'warning', detail: '服务商报告当前密钥或额度不可用，具体原因见用量详情。' }
+  return usage?.summary
+    ? { label: '额度已同步', tone: 'success', detail: '已取得服务商额度信息；此状态不代表所有模型都可调用。' }
+    : { label: usage ? '额度未知' : '尚未查询', tone: 'neutral', detail: '尚未取得可展示的服务商额度。' }
+}
+
 export function accountCardStatus(account: Account): AccountCardStatus {
   if (isAnthropicAccount(account)) {
     if (isClaudeSubscriptionAccount(account)) {
@@ -115,19 +124,12 @@ export function accountCardStatus(account: Account): AccountCardStatus {
       || [account.baseUrl, ...account.models].some(value => /[\0\r\n]/.test(value))) {
       return { label: '待完善配置', tone: 'warning', detail: '请编辑 Claude 连接，填写有效的 API 地址和模型列表。' }
     }
-    return { label: 'API 连接已配置', tone: 'neutral', detail: '已保存 Claude Code CLI 所需的 API 凭据、地址和模型；实际访问权限以首次请求结果为准。' }
+    if (account.providerUsage) return providerUsageStatus(account)
+    return { label: 'API 连接已配置', tone: 'neutral', detail: '已保存 Claude 所需的 API 凭据、地址和模型；实际访问权限以首次请求结果为准。' }
   }
   if (account.needsTokenExchange) return { label: '待验证', tone: 'warning', detail: '刷新令牌尚待验证，刷新用量或启动本地 API 时交换凭据。' }
   if (!account.credentialConfigured) return { label: '缺少凭据', tone: 'error', detail: '尚未保存可用凭据，请编辑账号。' }
-  if (isAnthropicAccount(account)) return { label: '待适配器验证', tone: 'warning', detail: 'Anthropic 登录、配置、隔离和会话边界尚未完成验证；不会调用 OpenAI / ChatGPT 用量接口。' }
-  if (account.kind === 'api_key') {
-    const usage = account.providerUsage
-    if (usage?.error) return { label: '查询失败', tone: usage.unavailable ? 'neutral' : 'error', detail: `${usage.error}${usage.summary ? '；用量区域保留上次成功结果。' : ''}` }
-    if (usage?.summary?.isValid === false) return { label: '额度不可用', tone: 'warning', detail: '服务商报告当前密钥或额度不可用，具体原因见用量详情。' }
-    return usage?.summary
-      ? { label: '额度已同步', tone: 'success', detail: '已取得服务商额度信息；此状态不代表所有模型都可调用。' }
-      : { label: usage ? '额度未知' : '尚未查询', tone: 'neutral', detail: '尚未取得可展示的服务商额度。' }
-  }
+  if (account.kind === 'api_key') return providerUsageStatus(account)
   if (account.error) return { label: '查询失败', tone: 'error', detail: `${account.error}${account.quota ? '；用量区域保留上次成功结果。' : ''}` }
   const quota = account.quota
   if (!quota) return { label: '尚未查询', tone: 'neutral', detail: '凭据已保存，尚未查询上游用量。' }

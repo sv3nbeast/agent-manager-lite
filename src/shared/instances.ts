@@ -39,7 +39,7 @@ export interface ExternalInstanceHome {directory:string;device:number;inode:numb
 export interface InstanceProfile extends Omit<InstanceInput,'clientType'> { clientType?:AgentClientType; id:string; revision:number; createdAt:number; externalHome?:ExternalInstanceHome }
 export interface InstanceApplication { clientType?:AgentClientType; id:string; name:string; path:string; installationPath?:string; kind?:'desktop'|'cli'; supportsTempLogin?:boolean }
 export interface InstanceWorkingDirectory {id:string;path:string;device:number;inode:number}
-export type InstanceIdentityStatus='native_verified'|'native_unverified'|'api_configured'|'client_login'|'local_api'|'missing'|'unknown'
+export type InstanceIdentityStatus='native_verified'|'native_unverified'|'api_configured'|'subscription_configured'|'client_login'|'local_api'|'missing'|'unknown'
 export interface InstanceIdentityView {
   status:InstanceIdentityStatus
   email?:string
@@ -82,7 +82,7 @@ export interface InstanceLaunchPreview {
   ultraAvailable?:boolean
   ultraReason?:string
   clientVersion?:string
-  network?:{mode:'inherit'|'direct'|'proxy';source:'settings';proxy?:AccountProxyView}
+  network?:{mode:'inherit'|'direct'|'proxy';source:'settings'|'account';proxy?:AccountProxyView}
   identityStatus:InstanceIdentityStatus
   identityEmail?:string
   identityAccountId?:string

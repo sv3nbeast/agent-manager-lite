@@ -94,6 +94,13 @@ export function claudeCodeDesktopProfileDirectory(instanceDirectory: string): st
   return join(root, 'desktop')
 }
 
+/** Native third-party deployment uses its own sibling profile. The launch
+ * argument remains the stable base directory so process recovery is unchanged. */
+export function claudeDesktopRuntimeDirectory(plan: Pick<DesktopPlan, 'desktopDirectory' | 'claudeDesktopConnection'>): string {
+  const base = validateClaudeCodeDesktopProfileDirectory(plan.desktopDirectory)
+  return plan.claudeDesktopConnection === 'api' ? validateClaudeCodeDesktopProfileDirectory(`${base}-3p`) : base
+}
+
 /** A stable marker used to associate an Electron process with one instance. */
 export function claudeCodeDesktopInstanceMarker(nonce: string): string {
   if (typeof nonce !== 'string' || !nonce || /[\0\r\n\s]/.test(nonce) || nonce.length > 256) {
@@ -134,10 +141,10 @@ export function claudeCodeDesktopEnvironment(source: NodeJS.ProcessEnv, route?: 
  * profile and marker are always manager-owned and appear after `--args`, so
  * LaunchServices does not confuse them with its own options.
  */
-export function claudeCodeDesktopMacLaunchArgs(plan: Pick<DesktopPlan, 'clientType' | 'application' | 'desktopDirectory' | 'nonce' | 'args' | 'networkRoute'> & Partial<Pick<DesktopPlan,'directory'|'launchEnvironment'>>, args: readonly string[] = plan.args): string[] {
+export function claudeCodeDesktopMacLaunchArgs(plan: Pick<DesktopPlan, 'clientType' | 'application' | 'desktopDirectory' | 'nonce' | 'args' | 'networkRoute'> & Partial<Pick<DesktopPlan,'directory'|'launchEnvironment'|'claudeDesktopConnection'>>, args: readonly string[] = plan.args): string[] {
   if (plan.clientType !== claudeCodeClientType) throw new Error('所选程序不是 Claude Desktop')
   const application = safePathValue('应用', plan.application)
-  const profile = validateClaudeCodeDesktopProfileDirectory(plan.desktopDirectory)
+  const profile = claudeDesktopRuntimeDirectory(plan)
   const marker = claudeCodeDesktopInstanceMarker(plan.nonce)
   validateClaudeCodeDesktopArgs(args)
   // Claude accepts its native egress configuration, not external Chromium
@@ -162,10 +169,11 @@ export function claudeDesktopLaunchEnvironment(plan:Pick<DesktopPlan,'directory'
 
 /** ps does not quote paths containing spaces. Our launcher owns the complete
  * argv shape, so consume the exact known executable/profile prefix first. */
-export function isClaudeDesktopCommandOwned(plan:Pick<DesktopPlan,'clientType'|'executable'|'desktopDirectory'|'nonce'>,command:string):boolean {
-  const prefix=`${plan.executable} --user-data-dir=${plan.desktopDirectory} `
+export function isClaudeDesktopCommandOwned(plan:Pick<DesktopPlan,'clientType'|'executable'|'desktopDirectory'|'nonce'|'claudeDesktopConnection'>,command:string):boolean {
+  const profile=claudeDesktopRuntimeDirectory(plan)
+  const prefix=`${plan.executable} --user-data-dir=${profile} `
   if(!command.startsWith(prefix))return false
-  return isClaudeCodeDesktopProcessOwned(plan,{executable:plan.executable,args:[`--user-data-dir=${plan.desktopDirectory}`,...command.slice(prefix.length).split(/\s+/)]})
+  return isClaudeCodeDesktopProcessOwned(plan,{executable:plan.executable,args:[`--user-data-dir=${profile}`,...command.slice(prefix.length).split(/\s+/)]})
 }
 
 export interface ClaudeCodeDesktopProcessOwnership {
@@ -178,9 +186,9 @@ export interface ClaudeCodeDesktopProcessOwnership {
  * executable and exact profile/nonce arguments.  A marker alone is not enough
  * because a stale process can retain it after its profile has been replaced.
  */
-export function isClaudeCodeDesktopProcessOwned(plan: Pick<DesktopPlan, 'clientType' | 'executable' | 'desktopDirectory' | 'nonce'>, process: ClaudeCodeDesktopProcessOwnership): boolean {
+export function isClaudeCodeDesktopProcessOwned(plan: Pick<DesktopPlan, 'clientType' | 'executable' | 'desktopDirectory' | 'nonce'|'claudeDesktopConnection'>, process: ClaudeCodeDesktopProcessOwnership): boolean {
   if (plan.clientType !== claudeCodeClientType || process.executable !== plan.executable) return false
-  const profile = validateClaudeCodeDesktopProfileDirectory(plan.desktopDirectory)
+  const profile = claudeDesktopRuntimeDirectory(plan)
   const marker = claudeCodeDesktopInstanceMarker(plan.nonce)
   const args = [...process.args]
   const profileArg = `--user-data-dir=${profile}`
@@ -318,7 +326,7 @@ export function inspectClaudeCodeDesktopIsolation(application: ClaudeCodeDesktop
   const checks: ClaudeCodeDesktopBoundaryCheck[] = [
     { id: 'profile', status: profileStatus, title: '独立数据目录', detail: profileReason },
     { id: 'login', status: 'pending', title: '登录方式', detail: '在各实例的原生客户端内登录；目录检查不能判断账号是否登录。CLI OAuth 不作为桌面登录凭据。', documentationUrl: `${desktopDocs}#coming-from-the-cli` },
-    { id: 'configuration', status: 'pending', title: '配置与 API 连接', detail: '使用独立 HOME、Code 配置与临时目录。第三方推理配置与 API 连接尚未接入管理器。', documentationUrl: 'https://code.claude.com/docs/en/llm-gateway-connect#desktop-app' },
+    { id: 'configuration', status: 'pending', title: '配置与 API 连接', detail: '使用独立 HOME、Code 配置与临时目录；API 连接使用客户端原生第三方推理配置，启动时核实实际能力与资料目录。', documentationUrl: 'https://code.claude.com/docs/en/llm-gateway-connect#desktop-app' },
     { id: 'credentials', status: 'pending', title: '登录凭据隔离', detail: '客户端在自己的 profile 中保存 Cookie 与加密登录状态；不导入默认客户端或 CLI 登录。此检查不读取凭据。' },
     { id: 'sessions', status: 'pending', title: '配置与会话边界', detail: '受管启动隔离 Desktop 会话与 CLI 配置；Desktop 会话暂不进入管理器索引、复制或修复。', documentationUrl: `${desktopDocs}#shared-configuration` },
     { id: 'lifecycle', status: 'verified', title: '启动与恢复', detail: 'macOS 原生双实例启动、聚焦、独立停止和恢复已验证；每次启动仍检查应用身份及实际 profile。' },

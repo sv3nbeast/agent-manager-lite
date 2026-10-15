@@ -116,7 +116,7 @@ async function save() {
           if (JSON.stringify(values[key]) !== JSON.stringify(original[key])) Object.assign(changes, { [key]: values[key] })
         }
         if (values.apiKey.trim() && values.apiKey.trim() !== loadedKey.value) changes.apiKey = values.apiKey
-        if (!isAnthropic.value && values.integrationType !== (original.integrationType ?? 'auto')) changes.integrationType = values.integrationType
+        if (values.integrationType !== (original.integrationType ?? 'auto')) changes.integrationType = values.integrationType
       }
     }
     return window.manager.editAccount({ id: original.id, revision: original.revision ?? 0, changes })
@@ -181,7 +181,7 @@ function editProvider() {
         <ModelContextWindowsField :key="account?.id ?? 'new-api'" v-model="form.modelContextWindows" :models="connectionModels" :inherited-windows="managedConnection ? linkedProvider?.modelContextWindows : undefined" :active="open" />
       </a-form-item>
       <a-form-item v-if="!isAnthropic" label="服务等级" extra="服务运行期间保存的等级修改，在停止并重新启动后应用。"><a-select v-model:value="form.defaultTier" :options="[{ label: account?.providerId ? '继承供应商设置' : '继承全局设置', value: 'inherit' }, { label: '跟随请求', value: 'follow' }, { label: 'Standard', value: 'standard' }, { label: 'Fast', value: 'fast' }, {label:'Auto',value:'auto'}, {label:'Flex',value:'flex'}]" /></a-form-item>
-      <a-form-item v-if="(!account || account.kind === 'api_key') && !managedConnection && !isAnthropic" label="额度查询方式" extra="仅影响自定义服务商的额度查询；官方服务商仍使用专用接口。更改后请重新刷新用量。"><a-select v-model:value="form.integrationType" aria-label="账号额度查询方式" :options="integrationTypeOptions" /></a-form-item>
+      <a-form-item v-if="(!account || account.kind === 'api_key') && !managedConnection && (!isAnthropic || editableAnthropic)" label="额度查询方式" extra="独立于模型接口协议；官方服务商仍使用专用接口。更改后请重新刷新用量。"><a-select v-model:value="form.integrationType" aria-label="账号额度查询方式" :options="integrationTypeOptions" /></a-form-item>
       <a-form-item label="标签" extra="输入后按回车，可添加多个标签"><a-select v-model:value="form.tags" mode="tags" :token-separators="[',']" /></a-form-item>
       <a-form-item label="备注"><a-textarea v-model:value="form.note" :maxlength="2000" :rows="3" /></a-form-item>
     </a-form>

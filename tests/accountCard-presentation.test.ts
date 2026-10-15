@@ -93,16 +93,25 @@ test('display names preserve custom plans, tier choices and unknown dates', () =
   assert.notEqual(accountCardDate(0), '未知')
 })
 
-test('configured Claude API and Bearer resources describe saved configuration without claiming upstream authentication or usage', () => {
+test('configured Claude API and Bearer resources describe saved configuration without claiming upstream authentication', () => {
   for (const credentialKind of ['anthropic_api_key', 'anthropic_bearer', 'gateway'] as const) {
     const connection = account({ kind: 'api_key', identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind,
-      models: ['gateway-model'], providerUsage: { checkedAt: 100, summary: { source: 'deepseek', updatedAt: 100, isValid: true, balance: 100 } } })
+      models: ['gateway-model'] })
     const status = accountCardStatus(connection)
     assert.equal(isSupportedAnthropicAPIAccount(connection), true)
     assert.equal(status.label, 'API 连接已配置')
     assert.equal(status.tone, 'neutral')
     assert.match(status.detail, /已保存.*实际访问权限以首次请求结果为准/)
     assert.doesNotMatch(status.detail, /鉴权成功|登录成功|已同步|待适配器/)
+    const measured = accountCardStatus({ ...connection, providerUsage: { checkedAt: 100, summary: { source: 'sub2api', updatedAt: 100, isValid: true, remaining: 100 } } })
+    assert.equal(measured.label, '额度已同步')
+    assert.match(measured.detail, /不代表所有模型都可调用/)
+    const unavailable = accountCardStatus({ ...connection, providerUsage: { checkedAt: 100, unavailable: true, error: '服务商未提供可识别的额度接口' } })
+    assert.equal(unavailable.label, '查询失败')
+    assert.equal(unavailable.tone, 'neutral')
+    const failed = accountCardStatus({ ...connection, providerUsage: { checkedAt: 101, summary: { source: 'sub2api', updatedAt: 100, remaining: 100 }, error: 'HTTP 429' } })
+    assert.equal(failed.label, '查询失败')
+    assert.match(failed.detail, /上次成功结果/)
   }
 })
 

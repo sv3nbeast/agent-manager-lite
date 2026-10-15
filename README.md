@@ -8,7 +8,7 @@
 
 **创建实例 → 选择客户端 → 选择连接或客户端内登录 → 配置项目 → 启动**
 
-当前支持 **Codex** 桌面和 CLI、在客户端内登录的 **Claude Desktop（macOS）**，以及使用 API 连接的 **Claude Code 官方原生 CLI（macOS）**。更多 Agent 客户端与编辑器正在规划与评估，见下方「接入方向」。
+当前支持 **Codex** 桌面和 CLI、在客户端内登录或使用 API / 第三方连接的 **Claude Desktop（macOS）**，以及使用 API、Bearer 或订阅账号的 **Claude Code 官方原生 CLI（macOS）**。更多 Agent 客户端与编辑器正在规划与评估，见下方「接入方向」。
 
 ## 软件界面
 
@@ -25,9 +25,9 @@
 
 ## 功能
 
-- **独立实例**：在统一向导先选择 Codex 或 Claude，再选择「桌面应用」或「CLI 终端」，自动生成可修改的名称，只列出兼容账号和已支持的设置；预览配置后启动和停止。Claude Desktop 在自己的客户端中登录。
+- **独立实例**：在统一向导先选择 Codex 或 Claude，再选择「桌面应用」或「CLI 终端」，自动生成可修改的名称，只列出兼容账号和已支持的设置；预览配置后启动和停止。Claude Desktop 可在客户端内登录，也可选择 API / 第三方连接进入原生 Code / Cowork。
 - **Codex 个人技能**：启动受管的桌面或 CLI 实例时，自动补齐本机 `~/.codex/skills` 中的个人技能入口，已有实例和会话副本同样适用。逐目录链接到原技能，更新随源目录生效；实例中已有的同名目录、文件或链接保留，系统技能独立维护。直接托管的外部目录继续使用其自身技能配置。
-- **账号管理**：ChatGPT 浏览器或设备码登录，导入账号，管理标签、分组、用量窗口、订阅到期信息和账号回收站。可添加 Claude 订阅账号并刷新身份、套餐和用量；Claude Code CLI 可添加 API Key / Bearer 连接。到期日和用量以上游实际返回为准。
+- **账号管理**：ChatGPT 浏览器或设备码登录，导入账号，管理标签、分组、用量窗口、订阅到期信息和账号回收站。可添加 Claude 订阅账号并刷新身份、套餐和用量；Claude Code CLI 可使用订阅账号、API Key / Bearer 连接，Desktop API 连接复用共享供应商密钥。到期日和用量以上游实际返回为准。
 - **供应商与密钥**：供应商保存共享地址，每把密钥独立保存模型与 API 协议。同一供应商可同时管理 GPT、Claude 或其他模型的密钥；Responses、Chat Completions 和 Anthropic Messages 按实际协议配置，不按模型名称判断客户端。密钥编辑支持从 API 获取模型、「全部清除」和「全部加入」；接口测试为每把密钥分别选择模型，使用对应协议和代理发送请求。修改模型只同步该密钥关联的连接，使用中的连接需先停止实例。旧供应商模型保留为原密钥的兼容配置，新密钥单独配置。
 - **模型与配置**：按客户端能力选择模型。Codex 支持推理档位、上下文窗口预设或自定义值；每条 API 连接可按模型设置上下文并继承供应商默认值。Claude Code CLI 使用所选连接声明的模型，不套用 Codex 的上下文和速度配置。
 - **普通 / Fast**：受支持的 Codex 桌面实例可在原有速度菜单中选择；本地 API 支持服务等级配置和实际出站等级记录。可用性取决于客户端版本、模型和服务商。
@@ -41,7 +41,7 @@
 
 ### Claude Desktop
 
-单独安装 macOS 官方 Claude Desktop，在创建实例时选择 **Claude → 桌面应用** 和已安装的应用，然后在打开的客户端内登录、选择模型与项目。Chat、Code 和 Cowork 的可用性取决于账号套餐及客户端版本。浏览器登录后若未返回目标实例，可使用实例卡片的「完成登录」把该次登录产生的 Claude 回调链接交给它；登录结果以客户端显示为准。API / 第三方连接暂未接入 Desktop。
+单独安装 macOS 官方 Claude Desktop，在创建实例时选择 **Claude → 桌面应用** 和已安装的应用，然后在打开的客户端内登录、选择模型与项目。Chat、Code 和 Cowork 的可用性取决于账号套餐及客户端版本。浏览器登录后若未返回目标实例，可使用实例卡片的「完成登录」把该次登录产生的 Claude 回调链接交给它；登录结果以客户端显示为准。API / 第三方连接使用 Claude Desktop 原生 3p 配置进入 Code / Cowork；Claude.ai 浏览器登录仍使用客户端内登录方式。
 
 每个实例分别保存桌面 profile、Cookie、客户端配置和本地历史，停止后保留这些数据；同一 Claude 账号的云端历史仍可同步到多个实例。实例共用当前 macOS 用户的系统钥匙串服务，各自保存加密状态文件；管理器保持该服务可用，不读取或复制钥匙串凭据。客户端自定义环境及临时目录设置保留，配置隔离不是文件系统沙箱。管理器暂不索引、复制或迁移 Desktop 会话，历史在对应客户端中管理。
 
@@ -49,11 +49,11 @@ Desktop 使用「设置」中的默认网络：已配置的代理通过实例专
 
 ### Claude 订阅账号
 
-在「账号 → 添加账号 → Claude 订阅」通过官方授权页面添加账号，支持粘贴回调链接或一次性授权码，保存并刷新身份、组织、套餐及上游提供的用量。此授权使用 Claude Code 的 OAuth 范围，与 Desktop 的浏览器会话不同，不会自动登录 Desktop。受管 CLI 的订阅凭据启动仍未接入；CLI 实例继续选择 API Key / Bearer 连接。
+在「账号 → 添加账号 → Claude 订阅」通过官方授权页面添加账号，支持粘贴回调链接或一次性授权码，保存并刷新身份、组织、套餐及上游提供的用量。此授权使用 Claude Code 的 OAuth 范围，与 Desktop 的浏览器会话不同，不会自动登录 Desktop。受管 Claude CLI 实例可使用管理器刷新后的订阅访问凭据；刷新令牌留在管理器安全存储，不写入实例。
 
 ### Claude Code CLI
 
-需要单独安装 **macOS 官方原生 Claude CLI**。在创建实例时选择 **Claude → CLI 终端**，添加或选择 API Key、Bearer Token，或兼容 Anthropic Messages 协议的网关连接，填写服务地址和可用模型。界面中的「API 连接已配置」表示凭据已配置，不代表上游已接受该凭据。Bedrock / Vertex / Foundry 等云模式和 npm 包装启动器尚未接入。
+需要单独安装 **macOS 官方原生 Claude CLI**。在创建实例时选择 **Claude → CLI 终端**，添加或选择订阅账号、API Key、Bearer Token，或兼容 Anthropic Messages 协议的网关连接，填写服务地址和可用模型。界面中的「API 连接已配置」表示凭据已配置，不代表上游已接受该凭据。Bedrock / Vertex / Foundry 等云模式和 npm 包装启动器尚未接入。
 
 每个实例拥有独立的 Claude 配置、全局状态和会话目录，停止实例后保留用户设置与历史。首次启动会初始化欢迎流程，项目信任、API Key 确认和工具权限仍由 Claude 提示。用户可选的配置来源限定为该实例的 user 设置；项目与 local settings 中的环境变量和 hooks 不参与启动，MCP 使用受控的空配置。系统或组织管理策略仍由 Claude 执行。项目 `CLAUDE.md` 仍可读取，项目代码继续使用原目录；配置隔离不是文件系统沙箱。
 
@@ -79,7 +79,7 @@ CLI 验收使用真实 **Claude CLI 2.1.295** 进程连接本地模拟服务，�
 
 1. 安装并打开 Agent Manager Lite，准备本机 Codex 桌面应用 / CLI、Claude Desktop 或官方原生 Claude CLI。
 2. 在「实例」创建实例并选择客户端。需要 API 或管理器账号的客户端可选择已有连接，也可在向导中添加。
-3. Codex 可登录 ChatGPT 或使用 API 连接；Claude Code CLI 选择 API Key / Bearer，填写 Anthropic Messages 地址和模型；Claude Desktop 启动后在客户端内登录。
+3. Codex 可登录 ChatGPT 或使用 API 连接；Claude Code CLI 选择 API Key / Bearer，填写 Anthropic Messages 地址和模型；Claude Desktop 可启动后在客户端内登录，或选择已保存的 API / 第三方连接。
 4. 检查启动预览后启动；Codex 还可选择会话来源。桌面模型与项目在对应客户端中选择，CLI 在 Terminal 中运行。
 
 新建 ChatGPT 账号实例默认使用「原生账号登录」，客户端读取真实登录身份，具体账号功能由套餐、工作区与客户端版本决定。HTTP、HTTPS、SOCKS5、SOCKS5H 代理可与原生账号登录同时使用。Codex 的 API 密钥和 Agent Identity 默认走「本地 API」；ChatGPT OAuth 账号使用本地 API 时，管理器会保留本地网关并在启动期间投影真实账号身份，停止实例后恢复原配置。纯 API 连接没有可供客户端显示的 ChatGPT OAuth 身份。已有实例保留当前接入方式，可停止后在编辑中切换。若切换后 Codex 历史列表未显示，可在「会话 → 修复可见性」选择该实例，按实例接入方式预览修复。

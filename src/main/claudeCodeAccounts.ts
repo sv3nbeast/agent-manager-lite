@@ -128,6 +128,30 @@ function importedName(source: Record<string, unknown>, index: number, kind: stri
   return text(source.name) ?? text(source.account_name) ?? text(source.profileName) ?? email
     ?? (kind === 'claude_ai_oauth' ? 'Claude OAuth 账号' : `Anthropic ${index + 1}`)
 }
+function oauthMetadata(source: Record<string, unknown>): Pick<StoredAccount['credentials'], 'expiresAt' | 'scope' | 'tokenType'> {
+  const expiries: number[] = [], scopes: string[] = []
+  for (const container of nested(source)) {
+    for (const name of ['expiresAt', 'expires_at']) {
+      const raw = container[name]
+      if (raw === undefined || raw === null) continue
+      let value = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN
+      if (!Number.isFinite(value) && typeof raw === 'string') value = Date.parse(raw)
+      if (!Number.isFinite(value) || value <= 0) throw new Error('Claude OAuth 到期时间格式无效')
+      expiries.push(value < 10_000_000_000 ? value * 1000 : value)
+    }
+    for (const name of ['scope', 'scopes']) {
+      const raw = container[name]
+      if (raw === undefined || raw === null) continue
+      const parts = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/\s+/) : []
+      if (!parts.length || parts.some(value => typeof value !== 'string' || !/^[a-zA-Z0-9:_-]+$/.test(value))) throw new Error('Claude OAuth 授权范围格式无效')
+      scopes.push([...new Set(parts)].sort().join(' '))
+    }
+  }
+  if (new Set(expiries).size > 1) throw new Error('Claude OAuth 到期时间来源冲突')
+  const scope = unique(scopes, 'Claude OAuth 授权范围')
+  const tokenType = take(source, ['tokenType', 'token_type'], 'Claude OAuth 令牌类型')
+  return { ...(expiries.length ? { expiresAt: expiries[0] } : {}), ...(scope ? { scope } : {}), ...(tokenType ? { tokenType } : {}) }
+}
 function accountFor(sourceValue: unknown, index: number): StoredAccount {
   const raw = typeof sourceValue === 'string' ? sourceValue.trim() : undefined
   const source = raw ? {} : object(sourceValue)
@@ -171,7 +195,7 @@ function accountFor(sourceValue: unknown, index: number): StoredAccount {
   const account: StoredAccount = {
     ...metadata, id: randomUUID(), kind: explicitOAuth ? 'oauth' : 'api_key', email,
     baseUrl, models, wireApi: 'chat_completions', protocol, identityService, credentialKind,
-    createdAt: Date.now(), credentials: explicitOAuth ? { accessToken: oauth, refreshToken: refresh } : { apiKey: secret },
+    createdAt: Date.now(), credentials: explicitOAuth ? { accessToken: oauth, refreshToken: refresh, ...oauthMetadata(source) } : { apiKey: secret },
     source: sourceWithoutSecrets(source),
   }
   return account

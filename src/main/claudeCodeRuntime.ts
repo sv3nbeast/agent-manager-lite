@@ -7,7 +7,8 @@ import type { DesktopPlan } from './instanceRuntime'
 import { directory, readBounded } from './clientConfig'
 import { claudeCodeAuthEnvironment, claudeCodeConfigPaths, claudeCodeInstanceAdapter, validateClaudeCodeCliArgs } from './claudeCodeInstanceAdapter'
 import { captureClaudeExecutableIdentity, validateClaudeExecutableIdentity, type ClaudeExecutableIdentity } from './claudeCodeCapability'
-import { probeClaudeCodeCliCapabilities, probeClaudeCodeCliVersion } from './claudeCodeVerification'
+import { probeClaudeCodeCliCapabilities, probeClaudeCodeCliVersion, probeClaudeCodeLoginStatus } from './claudeCodeVerification'
+import { isClaudeSubscriptionAccount } from './claudeCodeSubscription'
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const nativeHeaders = new Set(['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca', '7f454c46'])
@@ -20,9 +21,9 @@ export interface ClaudeRuntimeContext {
   plan: DesktopPlan
 }
 
-export function claudeConnectionStatus(profile:InstanceProfile,account:StoredAccount|undefined):'api_configured'|'missing'|'unknown' {
+export function claudeConnectionStatus(profile:InstanceProfile,account:StoredAccount|undefined):'api_configured'|'subscription_configured'|'missing'|'unknown' {
   if(!account)return 'missing'
-  try {claudeCodeInstanceAdapter.validateAccount(profile,account);return 'api_configured'}catch{return 'unknown'}
+  try {claudeCodeInstanceAdapter.validateAccount(profile,account);return isClaudeSubscriptionAccount(account)?'subscription_configured':'api_configured'}catch{return 'unknown'}
 }
 
 /** Only the native launcher has verified process ownership; never execute an npm script to discover it. */
@@ -71,7 +72,8 @@ export function claudeRuntimeContext(profile: InstanceProfile, account: StoredAc
     return [path, stat.dev, stat.ino]
   })
   return { account, plan, identity, fingerprint: hash([profile, identity, settings, directories, account.id, account.kind,
-    account.identityService, account.credentialKind, account.protocol, account.baseUrl, account.models, account.credentials.apiKey, proxy]) }
+    account.identityService, account.credentialKind, account.protocol, account.baseUrl, account.models, account.credentials.apiKey,
+    account.credentials.accountId, account.claudeSubscription?.accountId, account.claudeSubscription?.organizationId, proxy]) }
 }
 
 export function claudeLaunchPreview(context: ClaudeRuntimeContext): Omit<InstanceLaunchPreview, 'ticket'> {
@@ -80,7 +82,7 @@ export function claudeLaunchPreview(context: ClaudeRuntimeContext): Omit<Instanc
     clientType: 'claude_code', instanceId: '', name: '', application: plan.application, executable: plan.executable,
     directory: plan.directory, desktopDirectory: plan.desktopDirectory, workingDirectory: plan.workingDirectory,
     args: [...plan.args], accountName: account.name, providerName: account.name, model: '', tierSource: 'client',
-    connectionMode: 'native', launchMode: 'cli', identityStatus: 'api_configured',
+    connectionMode: 'native', launchMode: 'cli', identityStatus: isClaudeSubscriptionAccount(account)?'subscription_configured':'api_configured',
   }
 }
 
@@ -99,13 +101,26 @@ export async function prepareClaudeLaunch(context: ClaudeRuntimeContext, model: 
   const paths = claudeCodeConfigPaths(context.plan.directory)
   context.plan.launchEnvironment = {
     CLAUDE_CONFIG_DIR: paths.configDirectory,
+    // Anthropic's separate profile store must not select the shell user's
+    // organization/credentials ahead of this instance's subscription file.
+    ANTHROPIC_CONFIG_DIR: join(paths.configDirectory, 'anthropic'),
     ANTHROPIC_BASE_URL: context.account.baseUrl,
     ANTHROPIC_MODEL: model,
-    ...claudeCodeAuthEnvironment(context.account),
+    ...isClaudeSubscriptionAccount(context.account)?{}:claudeCodeAuthEnvironment(context.account),
   }
   // Project instructions remain readable; project login hooks and MCP cannot
   // silently replace the instance connection. User-selectable sources are limited
   // to instance settings; Claude still enforces system/organization policies.
   context.plan.managedArgs = ['--setting-sources', 'user', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--model', model]
   return version.version!
+}
+
+/** Validate the current CLI's native credential contract, independent of version numbers. */
+export async function verifyClaudeSubscriptionLaunch(plan: DesktopPlan, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
+  const status = await probeClaudeCodeLoginStatus(plan.executable, plan.directory, { environment: plan.launchEnvironment })
+  signal.throwIfAborted()
+  if (status.state !== 'verified' || !status.authenticated || status.method !== 'oauth') {
+    throw new Error('当前 Claude CLI 未识别实例订阅登录，请更新官方原生 CLI 后重试')
+  }
 }

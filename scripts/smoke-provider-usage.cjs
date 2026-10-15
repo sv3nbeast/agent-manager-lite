@@ -19,8 +19,8 @@ global.fetch=(input,init)=>{
   return originalFetch(input,init)
 }
 app.on('will-quit', () => { upstream?.closeAllConnections(); upstream?.close() })
-const timer = setTimeout(() => { console.error('Provider quota UI exceeded 75 seconds'); app.exit(1) }, 75000)
-const output = resolve('.local/key-model-debug/provider-usage'); fs.mkdirSync(output, { recursive: true })
+const timer = setTimeout(() => { console.error('Provider quota UI exceeded 90 seconds'); app.exit(1) }, 90000)
+const output = resolve('.local/claude-connection-modes/provider-usage'); fs.mkdirSync(output, { recursive: true })
 app.on('browser-window-created', (_event, window) => {
   console.log('provider usage smoke: window created')
   window.webContents.setBackgroundThrottling(false)
@@ -284,7 +284,8 @@ app.on('browser-window-created', (_event, window) => {
       current=await run('window.manager.load()');const accountCount=current.accounts.length
       for(let i=0;i<12;i++){
         provider=(await run('window.manager.load()')).providers[0]
-        await run(`window.manager.mutateProvider(${JSON.stringify({action:'addKey',id:provider.id,revision:provider.revision,name:`独立密钥 ${i+1}`,apiKey:`fixture-library-secret-${i}`})})`)
+        const connection=i<3?{protocol:'anthropic_messages',credentialKind:['anthropic_api_key','anthropic_bearer','gateway'][i],models:['fixture-messages-model']}:{}
+        await run(`window.manager.mutateProvider(${JSON.stringify({action:'addKey',id:provider.id,revision:provider.revision,name:`独立密钥 ${i+1}`,apiKey:`fixture-library-secret-${i}`,...connection})})`)
       }
       await run('document.getElementById("provider-library-tab").click()')
       await wait('document.querySelectorAll(".provider-key-table tbody tr[data-row-key]").length===10')
@@ -320,6 +321,59 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(finalVault.providers[0].keys[12].usage.summary.remaining,16.5)
       assert.equal(finalVault.accounts.length,accountCount)
       assert.equal(fs.readFileSync(join(directory,'state.vault')).includes(Buffer.from('fixture-library-secret')),false)
+      // Messages and OpenAI keys share the supplier's billing contract. Exercise
+      // both standalone account cards and mixed-protocol library keys in the UI.
+      for(const [index,credentialKind] of ['anthropic_api_key','anthropic_bearer','gateway'].entries()){
+        await run(`window.manager.addAccount(${JSON.stringify({name:`Anthropic Sub2API ${index+1}`,baseUrl:base+'/sub/v1',apiKey:`fixture-messages-${index}`,
+          models:['fixture-other-model'],wireApi:'chat_completions',identityService:'anthropic',protocol:'anthropic_messages',credentialKind,integrationType:index?'sub2api':'auto'})})`)
+      }
+      await run(`window.manager.addAccount(${JSON.stringify({name:'Anthropic 未支持的服务商',baseUrl:base+'/unknown',apiKey:'fixture-messages-unknown',
+        models:['fixture-other-model'],wireApi:'chat_completions',identityService:'anthropic',protocol:'anthropic_messages',credentialKind:'anthropic_api_key'})})`)
+      await run('document.getElementById("api-connections-tab").click()')
+      await click('button[aria-label="重新加载账号"]','');await wait('document.querySelectorAll(".account-card").length===10')
+      assert.equal(await run('Array.from(document.querySelectorAll(".account-card")).slice(6).every(card=>card.querySelector(".account-refresh") && card.textContent.includes("尚未查询额度"))'),true)
+      mode='ok';requestPaths.length=0
+      await click('.toolbar button','刷新全部用量')
+      await wait('!(await window.manager.load()).quotaRefresh.running')
+      current=await run('window.manager.load()')
+      assert.equal(current.quotaRefresh.total,10);assert.equal(current.quotaRefresh.failed,2)
+      assert.deepEqual(current.accounts.slice(6,9).map(account=>account.providerUsage.summary.remaining),[16.5,16.5,16.5])
+      assert.equal(current.accounts[9].providerUsage.unavailable,true)
+      assert.ok(current.accounts.slice(6).every(account=>account.protocol==='anthropic_messages' && account.quota===undefined))
+      await wait('Array.from(document.querySelectorAll(".account-card")).slice(6,9).every(card=>card.textContent.includes("16.5 USD") && card.textContent.includes("额度已同步"))')
+      await wait('document.querySelector(".account-card:nth-child(10)").textContent.includes("此服务商暂不支持额度查询")')
+      await run('document.querySelector(".account-card:nth-child(7)").scrollIntoView({block:"start"})')
+      await auditCards('anthropic-provider-usage');await capture('anthropic-provider-usage.png')
+      await openAccountDetails(7)
+      assert.equal(await run('document.querySelector(".account-quota-details .provider-usage").textContent.includes("16.5 USD")'),true)
+      await closeAccountDetails()
+      // Changing only the billing integration must retain Messages config and
+      // expose actual unsupported responses instead of falling through to /usage.
+      await clickSelector('.account-card:nth-child(7) footer button.account-edit')
+      await wait('!!document.querySelector("[aria-label=账号额度查询方式]")')
+      await chooseIntegration('账号额度查询方式','New API')
+      await click('.ant-drawer-open button','保存账号');await wait('!document.querySelector(".ant-drawer-open")')
+      current=await run('window.manager.load()')
+      assert.equal(current.accounts[6].integrationType,'new_api');assert.equal(current.accounts[6].protocol,'anthropic_messages')
+      requestPaths.length=0;await clickSelector('.account-card:nth-child(7) footer button.account-refresh')
+      await wait('!(await window.manager.load()).quotaRefresh.running')
+      assert.deepEqual(requestPaths,['/sub/v1/dashboard/billing/subscription'])
+      assert.equal((await run('window.manager.load()')).accounts[6].providerUsage.unavailable,true)
+      await clickSelector('.account-card:nth-child(7) footer button.account-edit')
+      await wait('!!document.querySelector("[aria-label=账号额度查询方式]")')
+      await chooseIntegration('账号额度查询方式','Sub2API')
+      await click('.ant-drawer-open button','保存账号');await wait('!document.querySelector(".ant-drawer-open")')
+      requestPaths.length=0;await clickSelector('.account-card:nth-child(7) footer button.account-refresh')
+      await wait('document.querySelector(".account-card:nth-child(7)").textContent.includes("16.5 USD")')
+      assert.deepEqual(requestPaths,['/sub/v1/usage'])
+      mode='error';await clickSelector('.account-card:nth-child(7) footer button.account-refresh')
+      await wait('document.querySelector(".account-card:nth-child(7)").textContent.includes("上次成功结果")')
+      assert.equal(await run('document.querySelector(".account-card:nth-child(7)").textContent.includes("16.5 USD")'),true)
+      await openAccountDetails(7)
+      assert.equal(await run('document.querySelector(".account-quota-details .provider-usage").textContent.includes("HTTP 429")'),true)
+      assert.equal(await run('document.body.textContent.includes("fixture-messages-")'),false)
+      await closeAccountDetails()
+      console.log('Anthropic provider usage passed: API Key/Bearer/gateway account cards and mixed library keys use Sub2API billing, bulk/manual refresh, details/history, real unsupported responses and billing edits retain the Messages contract.')
       console.log('Provider quota UI passed: automatic and manual protocols, actual account/provider editors, linked/disabled setting, no cross-protocol fallback, selection change invalidation, detachment and vault persistence; official provider windows, cancellation and prior Sub2API/New API checks. Temporary AES-GCM; no real keychain/accounts.')
       console.log('Provider library quota passed: independent keys, 13 keys across pages, selected-key details, bulk progress and cancellation, failure retains prior balance, encrypted persistence, no account creation or credential disclosure.')
       clearTimeout(timer); app.quit()

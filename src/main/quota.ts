@@ -9,6 +9,7 @@ import { bulkRefreshIds, groupRefreshMinutes } from './groups'
 import { ProviderUsageUnavailable, queryProviderUsage, sameUsageAccount } from './providerUsage'
 import { parseCreditUsage, quotaField, quotaNumber } from './quotaDetails'
 import { subscriptionFromToken } from './subscriptionClaims'
+import { supportsAccountQuotaQuery } from '../shared/providerUsage'
 
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 const ACCOUNT_CHECK_URL = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27'
@@ -210,9 +211,9 @@ export class QuotaService {
     const state = this.store.read(), now = Date.now()
     const alive = new Set<string>()
     // API keys enter automatic refresh only after an explicit successful query.
-    // Anthropic credentials have a separate usage contract. Keep them out of
-    // the ChatGPT/OpenAI refresh queue until that adapter is verified.
-    for (const account of state.accounts.filter(a => a.identityService !== 'anthropic' && (a.kind !== 'api_key' || a.providerUsage?.summary && !a.providerUsage.unavailable))) {
+    // Subscription credentials retain their identity-specific usage contract.
+    for (const account of state.accounts.filter(a => supportsAccountQuotaQuery(a)
+      && (a.kind !== 'api_key' || a.providerUsage?.summary && !a.providerUsage.unavailable))) {
       const minutes = groupRefreshMinutes(account.id, state.groups, state.settings.refreshMinutes)
       if (minutes <= 0) continue
       alive.add(account.id)
@@ -224,21 +225,27 @@ export class QuotaService {
     const next = Math.min(...[...this.scheduled.values()].map(item => item.due))
     this.timer = setTimeout(() => {
       if (!this.status.running && !this.suspended()) {
-        const ids = [...this.scheduled].filter(([, item]) => item.due <= Date.now()).map(([id]) => id)
+        const eligible = new Set(this.store.read().accounts.filter(supportsAccountQuotaQuery).map(account => account.id))
+        const ids = [...this.scheduled].filter(([id, item]) => eligible.has(id) && item.due <= Date.now()).map(([id]) => id)
         if (ids.length) this.start(ids)
       }
       this.schedule()
     }, Math.max(1000, next - now))
     this.timer.unref()
   }
-  startAll(): void { this.start(bulkRefreshIds(this.store.read())) }
+  startAll(): void {
+    const state = this.store.read(), eligible = new Set(state.accounts.filter(supportsAccountQuotaQuery).map(account => account.id))
+    this.start(bulkRefreshIds(state).filter(id => eligible.has(id)))
+  }
   start(ids: string[]): void {
     if (this.stopping) throw new Error('应用正在退出')
     if (this.status.running) throw new Error('用量刷新正在进行')
     const wanted = new Set(ids)
     const accounts = this.store.read().accounts.filter(a => wanted.has(a.id))
     if (accounts.length !== wanted.size) throw new Error('部分账号不存在，请重新加载')
-    if (accounts.some(account => account.identityService === 'anthropic')) throw new Error('Anthropic 账号的用量查询尚未接入独立适配器')
+    if (accounts.some(account => !supportsAccountQuotaQuery(account))) {
+      throw new Error('此凭据类型不支持服务商额度查询；Claude 订阅账号请使用刷新订阅')
+    }
     for (const account of accounts) {
       const scheduled = this.scheduled.get(account.id)
       if (scheduled) scheduled.due = Date.now() + scheduled.minutes * 60_000

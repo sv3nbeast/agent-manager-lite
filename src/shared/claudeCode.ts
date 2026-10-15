@@ -1,9 +1,10 @@
 import { z } from 'zod'
 
 /**
- * Claude Code CLI supports the independently verified native API Key/Bearer
- * lifecycle. Subscription OAuth, cloud credentials and Desktop keep their own
- * evidence gates; sharing an identity service does not imply compatibility.
+ * Claude Code CLI supports independently verified native API Key/Bearer and
+ * subscription OAuth lifecycles. Desktop keeps separate native-profile and
+ * third-party connection gates; cloud credentials remain out of scope.
+ * Sharing an identity service does not imply compatibility.
  */
 export const claudeCodeClientType = 'claude_code' as const
 export type ClaudeCodeClientType = typeof claudeCodeClientType
@@ -80,7 +81,7 @@ export const claudeCodeDesktopAcceptance = claudeCodeAcceptanceSchema.parse({
   detection: 'verified',
   configProjection: 'verified',
   credentialIsolation: 'verified',
-  protocolAdapter: 'pending',
+  protocolAdapter: 'verified',
   runtimeLifecycle: 'verified',
   globalStateOwnership: 'verified',
   sessionIndexing: 'pending',
@@ -169,6 +170,10 @@ export function claudeCodeCredentialCompatibility(input: ClaudeCodeCredentialInp
  */
 export const claudeCodeOwnedEnvironment = [
   'CLAUDE_CONFIG_DIR',
+  'ANTHROPIC_CONFIG_DIR',
+  'CLAUDE_SECURESTORAGE_CONFIG_DIR',
+  'CLAUDE_CODE_HOST_CREDS_FILE',
+  'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
   'CLAUDE_CODE_PROJECT_DIR_NAME',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',

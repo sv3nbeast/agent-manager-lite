@@ -66,6 +66,7 @@ import { applyLaunchAtLogin } from './loginItem'
 import { shouldHideOnClose, shouldPreserveInstancesOnQuit } from './trayPolicy'
 import { SshServers } from './ssh'
 import { ClaudeSubscriptionOAuthService, type ClaudeSubscriptionLoginResult } from './claudeSubscriptionOAuth'
+import { ensureClaudeSubscriptionAccount } from './claudeSubscriptionAuthority'
 
 const development = !app.isPackaged
 const isolatedTest = Boolean(process.env.CML_TEST_DATA_DIR && (development || process.argv.includes('--cml-smoke-test')))
@@ -152,39 +153,7 @@ async function main(): Promise<void> {
     }
   })
   tokens.setClaudeSubscriptionAuthority(async (id, options) => {
-    const before = store.read().accounts.find(account => account.id === id)
-    if (!before) throw new Error('账号已删除')
-    if (before.identityService !== 'anthropic' || before.kind !== 'oauth' || before.credentialKind !== 'claude_ai_oauth') throw new Error('账号不是 Claude 订阅 OAuth')
-    if (options.rejectedToken && before.credentials.accessToken !== options.rejectedToken) return before
-    if (!options.force && before.credentials.expiresAt !== undefined && before.credentials.expiresAt > Date.now() + 300_000) return before
-    if (!before.credentials.refreshToken) throw new Error('Claude 订阅凭据缺少 refresh_token，请重新登录')
-    // Use a short-lived service bound to this account so every refresh/profile/
-    // usage request is routed through its configured upstream proxy.
-    const service = new ClaudeSubscriptionOAuthService({
-      request: (url, init, operation) => accountNetwork.request(url, init, operation, before)
-    })
-    const refreshed = await service.refresh({
-      accessToken: before.credentials.accessToken ?? '',
-      refreshToken: before.credentials.refreshToken,
-      expiresAt: before.credentials.expiresAt,
-      tokenType: before.credentials.tokenType,
-      scope: before.credentials.scope
-    }, options.signal)
-    const profile = await service.profile(refreshed, options.signal).catch(() => undefined)
-    const usage = await service.usage(refreshed, options.signal).catch(() => undefined)
-    const previousAccountId = before.claudeSubscription?.accountId ?? before.credentials.accountId
-    const previousOrganizationId = before.claudeSubscription?.organizationId
-    if ((profile?.accountId && previousAccountId && profile.accountId !== previousAccountId)
-      || (profile?.organizationId && previousOrganizationId && profile.organizationId !== previousOrganizationId)) {
-      throw new Error('Claude 订阅刷新返回的账号身份不匹配，请重新登录')
-    }
-    const result: ClaudeSubscriptionLoginResult = {
-      tokens: refreshed,
-      ...(profile ? { profile } : {}),
-      ...(usage ? { usage } : {}),
-      metadata: { ...(profile ? { profile } : {}), ...(usage ? { usage } : {}), ...(refreshed.tokenType ? { tokenType: refreshed.tokenType } : {}), ...(refreshed.scope ? { scope: refreshed.scope } : {}), ...(refreshed.expiresAt ? { expiresAt: refreshed.expiresAt } : {}), retrievedAt: Date.now() }
-    }
-    const account = saveClaudeSubscriptionAccount(store, result, before.id)
+    const account = await ensureClaudeSubscriptionAccount(store, accountNetwork.request, id, options)
     await projectCredentials(account)
     return account
   })

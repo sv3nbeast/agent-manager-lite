@@ -2,14 +2,14 @@
 import { computed, ref } from 'vue'
 import { CalendarOutlined } from '@ant-design/icons-vue'
 import type { Account } from '../../../shared/types'
-import { providerUsageNames } from '../../../shared/providerUsage'
+import { providerUsageNames, supportsProviderUsageQuery } from '../../../shared/providerUsage'
 import {
   availableResetCount, creditSummary, formatQuotaAmount, formatQuotaDate, primaryQuotaWindows,
   providerWindowPresentation, quotaWindowPresentation, sanitizedCredits, validQuotaTimestamp
 } from '../accountQuotaPresentation'
 import CreditQuota from './CreditQuota.vue'
 import ProviderUsageDetails from './ProviderUsageDetails.vue'
-import { accountCardStatus, claudeSubscriptionMetadata, isAnthropicAccountRecord, isClaudeSubscriptionAccount, isSupportedAnthropicAPIAccount } from './accountCardPresentation'
+import { accountCardStatus, claudeSubscriptionMetadata, isAnthropicAccountRecord, isClaudeSubscriptionAccount } from './accountCardPresentation'
 
 const props = defineProps<{ account: Account; refreshing: boolean }>()
 defineEmits<{ refresh: []; refreshSubscription: []; refreshResetCredits: []; consumeResetCredit: [] }>()
@@ -20,25 +20,25 @@ defineExpose({ openDetails })
 const drawerContainer = () => document.querySelector('.app-shell') ?? document.body
 const isAnthropic = computed(() => isAnthropicAccountRecord(props.account))
 const isClaudeSubscription = computed(() => isClaudeSubscriptionAccount(props.account))
+const isProviderAPI = computed(() => supportsProviderUsageQuery(props.account))
+const unsupportedAnthropic = computed(() => isAnthropic.value && !isClaudeSubscription.value && !isProviderAPI.value)
 const anthropicStatus = computed(() => accountCardStatus(props.account))
 const subscription = computed(() => claudeSubscriptionMetadata(props.account))
 const provider = computed(() => props.account.providerUsage?.summary)
-const windows = computed(() => isClaudeSubscription.value ? (props.account.quota?.windows ?? []).map(quotaWindowPresentation) : isAnthropic.value ? [] : props.account.kind === 'api_key'
+const windows = computed(() => isClaudeSubscription.value ? (props.account.quota?.windows ?? []).map(quotaWindowPresentation) : unsupportedAnthropic.value ? [] : props.account.kind === 'api_key'
   ? (provider.value?.windows ?? []).map(providerWindowPresentation)
   : (props.account.quota?.windows ?? []).map(quotaWindowPresentation))
 const highlightedWindows = computed(() => isClaudeSubscription.value ? primaryQuotaWindows(props.account.quota?.windows ?? []).map(quotaWindowPresentation) : props.account.kind === 'api_key' ? windows.value.slice(0, 2)
   : primaryQuotaWindows(props.account.quota?.windows ?? []).map(quotaWindowPresentation))
 const additionalWindowCount = computed(() => windows.value.length - highlightedWindows.value.length)
-const updatedAt = computed(() => isClaudeSubscription.value ? props.account.quota?.updatedAt : isAnthropic.value ? undefined : props.account.kind === 'api_key' ? provider.value?.updatedAt : props.account.quota?.updatedAt)
-const hasHistory = computed(() => isClaudeSubscription.value ? !!props.account.quota : isAnthropic.value ? false : props.account.kind === 'api_key' ? !!provider.value : !!props.account.quota)
-const queryError = computed(() => isClaudeSubscription.value ? props.account.error : isAnthropic.value ? undefined : props.account.kind === 'api_key' ? props.account.providerUsage?.error : props.account.error)
+const updatedAt = computed(() => isClaudeSubscription.value ? props.account.quota?.updatedAt : unsupportedAnthropic.value ? undefined : props.account.kind === 'api_key' ? provider.value?.updatedAt : props.account.quota?.updatedAt)
+const hasHistory = computed(() => isClaudeSubscription.value ? !!props.account.quota : unsupportedAnthropic.value ? false : props.account.kind === 'api_key' ? !!provider.value : !!props.account.quota)
+const queryError = computed(() => isClaudeSubscription.value ? props.account.error : unsupportedAnthropic.value ? undefined : props.account.kind === 'api_key' ? props.account.providerUsage?.error : props.account.error)
 const hasSupplement = computed(() => isClaudeSubscription.value || !isAnthropic.value && props.account.kind !== 'api_key' && (props.account.kind === 'oauth'
   || props.account.quota?.spendLimit || props.account.quota?.credits || props.account.quota?.resetCreditsAvailable !== undefined))
 const notice = computed(() => {
   if (isClaudeSubscription.value) return ''
-  if (isAnthropic.value) return isSupportedAnthropicAPIAccount(props.account)
-    ? 'Claude Code 用量查询尚未接入'
-    : 'Claude Code 用量与登录状态等待 Anthropic 适配器验证'
+  if (unsupportedAnthropic.value) return '此凭据类型的用量查询尚未接入'
   if (props.account.kind === 'api_key') {
     if (provider.value?.isValid === false) return provider.value.windows?.length ? '服务商报告用量已耗尽'
       : provider.value.source === 'deepseek' ? '服务商报告余额不足' : '服务商报告密钥不可用'
@@ -63,10 +63,10 @@ const resetStatus = (status: string | undefined) => ({ available: '可使用', r
 </script>
 
 <template>
-  <section class="account-quota-summary" :aria-label="isAnthropic ? 'Anthropic 账号状态' : account.kind === 'api_key' ? '服务商额度摘要' : '账号用量摘要'">
+  <section class="account-quota-summary" :aria-label="isProviderAPI ? '服务商额度摘要' : isAnthropic ? 'Anthropic 账号状态' : '账号用量摘要'">
     <div class="quota-main-panel">
       <div class="quota-summary-heading">
-        <span>{{ isClaudeSubscription ? 'Claude 订阅' : isAnthropic ? 'Anthropic 用量' : account.kind === 'api_key' ? '服务商额度' : '用量' }}</span>
+        <span>{{ isClaudeSubscription ? 'Claude 订阅' : isProviderAPI ? '服务商额度' : isAnthropic ? 'Anthropic 用量' : '用量' }}</span>
         <small v-if="validQuotaTimestamp(updatedAt)" :title="`${formatQuotaDate(updatedAt, true)} 更新${queryError ? ' · 上次成功结果' : ''}`">{{ formatQuotaDate(updatedAt) }} 更新</small>
       </div>
       <p v-if="account.needsTokenExchange && !isClaudeSubscription" class="quota-notice quota-info">凭据待验证，刷新用量后确认</p>
@@ -86,9 +86,9 @@ const resetStatus = (status: string | undefined) => ({ available: '可使用', r
         </div>
       </div>
       <p v-else-if="isClaudeSubscription" class="quota-empty">{{ account.quota ? '上游未返回用量窗口' : '订阅身份已保存，尚未查询用量' }}</p>
-      <p v-else-if="isAnthropic" class="quota-empty">Anthropic 额度查询尚未接入</p>
+      <p v-else-if="unsupportedAnthropic" class="quota-empty">此凭据类型的用量查询尚未接入</p>
       <p v-else-if="account.kind !== 'api_key'" class="quota-empty">{{ account.quota ? '上游未返回用量窗口' : '尚未查询用量' }}</p>
-      <template v-if="account.kind === 'api_key' && !isAnthropic">
+      <template v-if="isProviderAPI">
         <div v-if="provider" class="quota-supplement-row provider-balance"><span>{{ (provider.windows?.length ?? 0) > 1 ? '最低窗口剩余' : '剩余额度' }}</span><strong>{{ providerBalance }}</strong></div>
         <p v-else class="quota-empty">{{ account.providerUsage ? '当前额度未知' : '尚未查询额度' }}</p>
       </template>
@@ -104,8 +104,8 @@ const resetStatus = (status: string | undefined) => ({ available: '可使用', r
 
   <a-drawer :open="detailsOpen" :width="480" title="账号与用量详情" :get-container="drawerContainer" destroy-on-close @close="detailsOpen = false">
     <div class="account-quota-details">
-        <div class="quota-detail-title"><h3>{{ isClaudeSubscription ? 'Claude 订阅身份' : isAnthropic ? 'Anthropic 账号状态' : account.kind === 'api_key' ? '服务商额度' : '用量窗口' }}</h3><a-button v-if="!isAnthropic" size="small" :loading="refreshing" @click="$emit('refresh')">刷新用量</a-button></div>
-        <a-alert v-if="isAnthropic && !isClaudeSubscription" type="info" :message="anthropicStatus.label" :description="`${anthropicStatus.detail} Anthropic 额度查询尚未接入，请在供应商处查看用量。`" show-icon />
+        <div class="quota-detail-title"><h3>{{ isClaudeSubscription ? 'Claude 订阅身份' : isProviderAPI ? '服务商额度' : isAnthropic ? 'Anthropic 账号状态' : '用量窗口' }}</h3><a-button v-if="isProviderAPI || !isAnthropic" size="small" :loading="refreshing" @click="$emit('refresh')">刷新用量</a-button></div>
+        <a-alert v-if="unsupportedAnthropic" type="info" :message="anthropicStatus.label" :description="`${anthropicStatus.detail} 请在对应服务商处查看用量。`" show-icon />
       <section v-else-if="isClaudeSubscription" class="quota-detail-section claude-subscription-details">
         <div class="quota-detail-title"><h3>Claude 订阅身份</h3><a-button size="small" :disabled="refreshing" @click="$emit('refreshSubscription')">刷新订阅</a-button></div>
         <a-alert :type="subscription?.verifiedAt ? 'success' : 'warning'" :message="anthropicStatus.label" :description="anthropicStatus.detail" show-icon />

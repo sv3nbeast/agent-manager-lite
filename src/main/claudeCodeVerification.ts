@@ -172,7 +172,7 @@ export async function probeClaudeCodeLoginStatus(executable: string, configDirec
     // Deliberately copy only explicitly supplied authentication variables;
     // the manager's own shell must never choose this instance's identity.
     const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '', HOME: options.environment?.HOME ?? process.env.HOME ?? '', CLAUDE_CONFIG_DIR: configDirectory, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1' }
-    for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_PROFILE', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) {
+    for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_CONFIG_DIR', 'ANTHROPIC_PROFILE', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) {
       if (options.environment?.[name]) environment[name] = options.environment[name]
     }
     const boundary = inspectClaudeCodeLoginBoundary(claudeCodeConfigPaths(configDirectory), environment)
@@ -211,7 +211,7 @@ export async function probeClaudeCodeLoginStatus(executable: string, configDirec
     // Current Claude calls ANTHROPIC_AUTH_TOKEN "oauth_token" as well. The
     // explicitly selected credential channel disambiguates a gateway bearer
     // from a subscription token; its label alone cannot prove OAuth login.
-    const method: ClaudeCodeLoginProbe['method'] = environment.ANTHROPIC_AUTH_TOKEN && (rawMethod.includes('oauth') || rawMethod.includes('token') || rawMethod.includes('bearer')) ? 'bearer' : rawMethod.includes('oauth') ? 'oauth' : rawMethod.includes('api') ? 'api_key' : rawMethod.includes('bearer') || rawMethod.includes('token') ? 'bearer' : rawMethod.includes('profile') ? 'profile' : rawMethod.includes('bedrock') || rawMethod.includes('vertex') || rawMethod.includes('foundry') ? 'cloud' : rawMethod && rawMethod !== 'none' ? 'unknown' : undefined
+    const method: ClaudeCodeLoginProbe['method'] = environment.ANTHROPIC_AUTH_TOKEN && (rawMethod.includes('oauth') || rawMethod.includes('token') || rawMethod.includes('bearer')) ? 'bearer' : rawMethod.includes('oauth') || rawMethod === 'claude.ai' ? 'oauth' : rawMethod.includes('api') ? 'api_key' : rawMethod.includes('bearer') || rawMethod.includes('token') ? 'bearer' : rawMethod.includes('profile') ? 'profile' : rawMethod.includes('bedrock') || rawMethod.includes('vertex') || rawMethod.includes('foundry') ? 'cloud' : rawMethod && rawMethod !== 'none' ? 'unknown' : undefined
     if (loggedIn === undefined) return { state: 'pending', ...(method ? { method } : {}), reason: 'Claude Code 登录状态格式尚未适配' }
     return { state: loggedIn ? 'verified' : 'pending', authenticated: loggedIn, ...(method ? { method } : {}), ...(loggedIn ? {} : { reason: 'Claude Code 当前配置目录未登录' }) }
   } catch (error) {

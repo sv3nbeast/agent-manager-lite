@@ -1,4 +1,18 @@
 import { z } from 'zod'
+import type { Account } from './types'
+
+/** Provider billing uses its own API contract, independent of model protocol. */
+export function supportsProviderUsageQuery(account: Pick<Account, 'kind' | 'credentialKind'>): boolean {
+  return account.kind === 'api_key' && (account.credentialKind === undefined
+    || ['openai_api_key', 'anthropic_api_key', 'anthropic_bearer', 'gateway'].includes(account.credentialKind))
+}
+
+/** Accounts handled by the common quota queue; Claude OAuth uses subscription refresh. */
+export function supportsAccountQuotaQuery(account: Pick<Account, 'kind' | 'identityService' | 'protocol' | 'credentialKind'>): boolean {
+  return account.kind === 'api_key' ? supportsProviderUsageQuery(account)
+    : account.identityService !== 'anthropic' && account.protocol !== 'anthropic_messages'
+      && !account.credentialKind?.startsWith('anthropic_') && account.credentialKind !== 'claude_ai_oauth'
+}
 
 export const integrationTypeSchema = z.enum(['auto', 'sub2api', 'new_api'])
 export type IntegrationType = z.infer<typeof integrationTypeSchema>

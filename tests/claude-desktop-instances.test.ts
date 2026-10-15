@@ -16,6 +16,21 @@ import { exportBackupState, validateBackup } from '../src/main/dataBackupState'
 import { DataBackups } from '../src/main/dataBackups'
 import { readBackupArchive } from '../src/main/dataBackupArchive'
 
+const gatewaySchemaSource = `const schemas=${JSON.stringify(['inferenceProvider','inferenceCredentialKind','inferenceGatewayBaseUrl','inferenceGatewayApiKey','inferenceGatewayAuthScheme','inferenceModels','modelDiscoveryEnabled','disableDeploymentModeChooser'].map(flatKey => ({ flatKey, support: { enabled: { scopes: ['3p'] } } })))}; const proxy={flatKey:'egressProxyUrl',appBehaviorOnly:true,support:{enabled:{scopes:['1p','3p']}}}; const contracts=['configLibrary','_meta.json','appliedId','deploymentMode','claude_desktop_config.json','-3p','egressProxyPacUrl','proxy-server','proxy-pac-url'];`
+
+function writeGatewayArchive(path: string): void {
+  const files: any = { files: {} }, bodies: Buffer[] = []
+  let offset = 0
+  for (const [entry, content] of [['package.json', JSON.stringify({ name: '@ant/desktop', main: './native.js' })], ['native.js', gatewaySchemaSource]]) {
+    const body = Buffer.from(content), parts = entry.split('/'); let parent = files
+    for (const part of parts.slice(0, -1)) parent = parent.files[part] ??= { files: {} }
+    parent.files[parts.at(-1)!] = { size: body.length, offset: String(offset) }; bodies.push(body); offset += body.length
+  }
+  const json = Buffer.from(JSON.stringify(files)), header = Buffer.alloc(8 + Math.ceil(json.length / 4) * 4), size = Buffer.alloc(8)
+  header.writeUInt32LE(header.length - 4); header.writeUInt32LE(json.length, 4); json.copy(header, 8)
+  size.writeUInt32LE(4); size.writeUInt32LE(header.length, 4); writeFileSync(path, Buffer.concat([size, header, ...bodies]))
+}
+
 const desktopTest=(name:string,run:(t:TestContext)=>void|Promise<void>)=>test(name,{skip:process.platform!=='darwin'},run)
 
 class DesktopFixture implements DesktopRuntime {
@@ -55,7 +70,7 @@ function fixture(t: TestContext,proxyService?:NativeProxyService) {
   writeFileSync(join(bundle, 'Contents', 'Info.plist'), '<plist><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>Claude</string><key>CFBundleName</key><string>Claude</string><key>CFBundleShortVersionString</key><string>2.1.0</string></dict></plist>')
   const executable = join(bundle, 'Contents', 'MacOS', 'Claude')
   writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
-  writeFileSync(join(bundle, 'Contents', 'Resources', 'app.asar'), 'fixture bundle; never executed')
+  writeGatewayArchive(join(bundle, 'Contents', 'Resources', 'app.asar'))
   const store = new Store(join(root, 'data'), { encrypt: value => Buffer.from(value), decrypt: value => value.toString() })
   const runtime = new DesktopFixture(), managers: Instances[] = []
   const create = () => {
@@ -73,6 +88,12 @@ function fixture(t: TestContext,proxyService?:NativeProxyService) {
     instances.save({ details: { clientType: 'claude_code', launchMode: 'desktop', name, applicationId: application.id, connectionMode: 'client_login', accountId: '', model: '', extraArgs: [] } })
     return instances.views().at(-1)!
   }
+  const addApi = (name = 'Claude Desktop API', baseUrl = 'https://gateway.fixture.invalid/v1') => {
+    const account = parseClaudeCodeAccountImport(JSON.stringify({ name: 'Desktop API key', ANTHROPIC_API_KEY: `desktop-key-${randomUUID()}`, baseUrl, models: ['claude-sonnet-4-5', 'claude-haiku-4-5'], protocol: 'anthropic_messages', credentialKind: 'anthropic_api_key' })).accounts[0]
+    store.transaction(state => state.accounts.push(account))
+    instances.save({ details: { clientType: 'claude_code', launchMode: 'desktop', name, applicationId: application.id, connectionMode: 'native', accountId: account.id, model: 'claude-haiku-4-5', extraArgs: [] } })
+    return { instance: instances.views().at(-1)!, account }
+  }
   const start = async (instance: InstanceView) => {
     instances.start(instances.preview({ id: instance.id, revision: instance.revision }).ticket)
     await instances.settled(instance.id)
@@ -86,7 +107,7 @@ function fixture(t: TestContext,proxyService?:NativeProxyService) {
     for (const manager of managers.reverse()) await manager.closeAll().catch(() => {})
     rmSync(root, { recursive: true, force: true })
   })
-  return { root, bundle, executable, store, runtime, create, instances, application, add, start, checkpoint }
+  return { root, bundle, executable, store, runtime, create, instances, application, add, addApi, start, checkpoint }
 }
 
 test('client login permits no manager identity only for Claude Desktop and preserves legacy CLI defaults', () => {
@@ -118,7 +139,10 @@ desktopTest('Desktop creation and preview need no account, and concurrent launch
     assert.deepEqual(plan.launchEnvironment, { CLAUDE_CONFIG_DIR: instance.directory, HOME: home, CFFIXED_USER_HOME: home,CLAUDE_CODE_TMPDIR:join(home,'tmp') })
     assert.equal(lstatSync(home).mode & 0o777, 0o700)
     assert.equal(lstatSync(join(home,'tmp')).mode & 0o777,0o700)
-    assert.equal(plan.desktopDirectory, instance.desktopDirectory)
+    // The view exposes the API profile's `desktop-3p` directory for native
+    // connections, while a client-login plan always launches the base
+    // `desktop` profile. Keep this assertion tied to the persisted layout.
+    assert.equal(plan.desktopDirectory, join(dirname(instance.directory), 'desktop'))
     assert.equal(plan.mode, 'desktop')
     const saved = JSON.parse(readFileSync(f.checkpoint(instance), 'utf8'))
     assert.equal(saved.launchMode, 'desktop'); assert.equal(saved.claudeExecutable, f.executable)
@@ -132,6 +156,102 @@ desktopTest('Desktop creation and preview need no account, and concurrent launch
   await f.instances.stop(first.id)
   assert.equal(f.runtime.children.size, 1)
   assert.equal(f.instances.views().find(instance => instance.id === second.id)?.status, 'running')
+})
+
+desktopTest('Desktop native API instances save, preview, launch and recover through the unified manager', async t => {
+  const f = fixture(t), { instance, account } = f.addApi()
+  const preview = f.instances.preview({ id: instance.id, revision: instance.revision })
+  assert.equal(preview.connectionMode, 'native')
+  assert.equal(preview.launchMode, 'desktop')
+  assert.equal(preview.identityStatus, 'api_configured')
+  assert.equal(preview.accountName, account.name)
+  assert.equal(preview.model, 'claude-haiku-4-5')
+  assert.equal(preview.desktopDirectory, instance.desktopDirectory)
+  assert.equal(preview.network?.source, 'account')
+  await f.start(instance)
+  const plan = f.runtime.plans[0], gatewayDir = join(dirname(instance.directory), 'desktop-3p'), library = join(gatewayDir, 'configLibrary')
+  assert.equal(plan.claudeDesktopConnection, 'api')
+  assert.equal(plan.directory, instance.directory)
+  assert.equal(plan.desktopDirectory, join(dirname(instance.directory), 'desktop'))
+  assert.equal(existsSync(join(gatewayDir, 'claude_desktop_config.json')), true)
+  const meta = JSON.parse(readFileSync(join(library, '_meta.json'), 'utf8'))
+  const config = JSON.parse(readFileSync(join(library, `${meta.appliedId}.json`), 'utf8'))
+  assert.equal(config.inferenceProvider, 'gateway')
+  assert.equal(config.inferenceGatewayBaseUrl, 'https://gateway.fixture.invalid')
+  assert.deepEqual(config.inferenceModels, [{ name: 'claude-haiku-4-5' }, { name: 'claude-sonnet-4-5' }])
+  const checkpoint = JSON.parse(readFileSync(f.checkpoint(instance), 'utf8'))
+  assert.equal(checkpoint.connectionMode, 'native')
+  assert.equal(checkpoint.launchMode, 'desktop')
+  assert.equal(readFileSync(f.checkpoint(instance), 'utf8').includes(account.credentials.apiKey!), false)
+  const restarted = f.create(); await restarted.recover()
+  const recovered = restarted.views().find(value => value.id === instance.id)!
+  assert.equal(recovered.status, 'running', recovered.error)
+  assert.equal(restarted.runtime.plans.at(-1)?.claudeDesktopConnection, 'api')
+  await restarted.stop(instance.id)
+  assert.equal(existsSync(join(gatewayDir, 'configLibrary')), true, 'stopping keeps native Desktop data for recovery')
+})
+
+desktopTest('Desktop API preview rejects changed key and account proxy before creating or launching an instance', async t => {
+  const f = fixture(t), { instance, account } = f.addApi()
+  const preview = f.instances.preview({ id: instance.id, revision: instance.revision })
+  f.store.transaction(state => {
+    const current = state.accounts.find(value => value.id === account.id)!; current.credentials.apiKey = 'rotated-before-launch'; current.revision = (current.revision ?? 0) + 1
+  })
+  assert.throws(() => f.instances.start(preview.ticket), /配置或网络设置已变化/)
+  await f.instances.settled(instance.id)
+  assert.equal(f.runtime.plans.length, 0)
+  assert.equal(f.instances.views()[0].status, 'stopped')
+  assert.equal(existsSync(join(dirname(instance.directory), 'desktop-3p')), false)
+
+  // A fresh preview binds the account-level proxy as well as the credential.
+  const refreshed = f.instances.views()[0], next = f.instances.preview({ id: refreshed.id, revision: refreshed.revision })
+  f.store.transaction(state => { state.accounts.find(value => value.id === account.id)!.proxy = { mode: 'custom', url: 'https://proxy.fixture.invalid:8443' } })
+  assert.throws(() => f.instances.start(next.ticket), /配置或网络设置已变化/)
+  await f.instances.settled(instance.id)
+  assert.equal(f.runtime.plans.length, 0)
+  assert.equal(f.instances.views()[0].status, 'stopped')
+})
+
+desktopTest('Desktop API account proxies are projected into the native gateway entry', async t => {
+  const leases: Array<{ live: boolean; stops: number }> = []
+  const f = fixture(t, { async acquire(proxy) {
+    assert.equal(proxy, 'https://proxy.fixture.invalid:8443/')
+    const lease = { live: true, stops: 0 }
+    leases.push(lease)
+    return { url: 'http://127.0.0.1:29204', alive: () => lease.live, stop: async () => { lease.live = false; lease.stops++ } }
+  } })
+  const { instance, account } = f.addApi()
+  f.store.transaction(state => { state.accounts.find(value => value.id === account.id)!.proxy = { mode: 'custom', url: 'https://proxy.fixture.invalid:8443' } })
+  await f.start(instance)
+  const gatewayDir = join(dirname(instance.directory), 'desktop-3p'), library = join(gatewayDir, 'configLibrary')
+  const meta = JSON.parse(readFileSync(join(library, '_meta.json'), 'utf8'))
+  const config = JSON.parse(readFileSync(join(library, `${meta.appliedId}.json`), 'utf8'))
+  assert.equal(config.egressProxyUrl, 'http://127.0.0.1:29204')
+  assert.equal(config.inferenceGatewayBaseUrl, 'https://gateway.fixture.invalid')
+  assert.equal(leases.length, 1)
+  await f.instances.stop(instance.id)
+  assert.equal(leases[0].stops, 1)
+})
+
+desktopTest('Desktop API to client-login switch restores login mode while retaining the isolated third-party profile', async t => {
+  const f = fixture(t), { instance, account } = f.addApi()
+  await f.start(instance); await f.instances.stop(instance.id)
+  const persisted = join(dirname(instance.directory), 'desktop-3p', 'configLibrary')
+  assert.equal(existsSync(persisted), true)
+  const current = f.instances.views().find(value => value.id === instance.id)!
+  f.instances.save({ id: instance.id, revision: current.revision, details: { clientType: 'claude_code', launchMode: 'desktop', name: current.name, applicationId: f.application.id, connectionMode: 'client_login', accountId: '', model: '', extraArgs: [] } })
+  const login = f.instances.views().find(value => value.id === instance.id)!
+  const preview = f.instances.preview({ id: login.id, revision: login.revision })
+  assert.equal(preview.connectionMode, 'client_login')
+  assert.equal(preview.identityStatus, 'client_login')
+  assert.equal(preview.accountName, '在 Claude Desktop 内登录')
+  await f.start(login)
+  assert.equal(f.runtime.plans.at(-1)?.claudeDesktopConnection, undefined)
+  assert.equal(existsSync(persisted), true)
+  // Releasing a projection removes its secret-bearing entry and metadata;
+  // the isolated third-party library directory itself remains for future use.
+  assert.equal(existsSync(join(persisted, '_meta.json')), false)
+  assert.equal(f.store.read().accounts.some(value => value.id === account.id), true)
 })
 
 desktopTest('Desktop stop and natural exit preserve login, configuration and transcripts without Codex cleanup', async t => {
@@ -367,8 +487,10 @@ desktopTest('Desktop and CLI cannot reuse a saved instance or silently cross app
   assert.throws(() => f.instances.save({ id: cli.id, revision: cli.revision, details: desktopDetails }), /创建新实例/)
   assert.throws(() => f.instances.save({ id: desktop.id, revision: desktop.revision, details: cliDetails }), /创建新实例/)
   assert.throws(() => f.instances.save({ details: { ...desktopDetails, applicationId: cliApp.id } }), /运行方式/)
-  assert.throws(() => f.instances.save({ details: { ...cliDetails, launchMode: 'desktop', applicationId: f.application.id } }), /客户端内登录/)
-  assert.equal(f.store.read().instances?.length, 2)
+  // A provider key is valid for a Claude Desktop third-party connection;
+  // changing the installed application creates a separate Desktop profile.
+  f.instances.save({ details: { ...cliDetails, launchMode: 'desktop', name: 'CLI cross-mode replacement', applicationId: f.application.id } })
+  assert.equal(f.store.read().instances?.length, 3)
   assert.equal(f.store.read().instances?.find(value => value.id === cli.id)?.launchMode, undefined)
   await assert.rejects(f.instances.completeDesktopLogin(cli.id, 'claude://complete'), /Claude Desktop/)
 })

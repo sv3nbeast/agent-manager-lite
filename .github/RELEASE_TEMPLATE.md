@@ -10,11 +10,11 @@ DMG and ZIP packages are available for macOS Apple Silicon (arm64), with `SHA256
 
 ## 客户端支持 / Client support
 
-支持 Codex 桌面 / CLI、macOS Claude Desktop 的独立实例和客户端内登录，以及 macOS 官方原生 Claude Code CLI 的 API Key、Bearer 和兼容 Anthropic Messages 网关连接；客户端需单独安装。Claude 订阅账号可在账号页添加、刷新身份和用量，其 Claude Code OAuth 范围不能替代 Desktop 登录，受管 CLI 的订阅凭据启动尚未接入。云模式和 npm 包装启动器仍未接入。
+支持 Codex 桌面 / CLI、macOS Claude Desktop 的独立实例和客户端内登录或 API / 第三方连接，以及 macOS 官方原生 Claude Code CLI 的 API Key、Bearer 和 Claude 订阅 OAuth 连接；客户端需单独安装。Anthropic Messages 网关可用于 Desktop API 与 CLI，额度查询按协议进入供应商链路。云模式和 npm 包装启动器仍未接入。
 
 Desktop 分别保存实例 Cookie、配置、加密状态文件与本地历史，共用当前 macOS 用户的系统钥匙串服务；同账号的云端历史仍可同步。Desktop 遵循管理器设置中的默认网络（代理、直连或继承），Code 用户自定义环境可覆盖默认网络。Desktop 会话在客户端中管理，管理器暂不索引或迁移；CLI 会话管理只读。Codex 菜单和语言适配取决于客户端版本，Fast / Ultra 还取决于模型和服务商。
 
-Codex desktop / CLI, independent Claude Desktop instances on macOS with sign-in inside the client, and the official native Claude Code CLI on macOS are supported. CLI connections use API Keys, Bearer tokens or gateways compatible with Anthropic Messages. Install clients separately. Claude subscription accounts can be added and refreshed for identity and usage; their Claude Code OAuth scopes do not replace Desktop sign-in, and subscription credentials are not integrated into managed CLI launches. Cloud modes and npm wrapper launchers remain unintegrated.
+Codex desktop / CLI, independent Claude Desktop instances on macOS with sign-in inside the client or API / third-party connections, and the official native Claude Code CLI on macOS are supported. CLI connections use API Keys, Bearer tokens or Claude subscription OAuth; Anthropic Messages gateways can be used by Desktop API and CLI connections. Install clients separately. Provider models, protocols and tests are selected per key, and Anthropic usage checks follow the configured protocol. Cloud modes and npm wrapper launchers remain unintegrated.
 
 Desktop instances keep separate cookies, configuration, encrypted state files and local history while sharing the current macOS user's system Keychain service. Cloud history for the same account can still sync. Desktop follows the default network in manager Settings (proxy, direct or inherit); custom Code environments can override that default. Manage Desktop sessions inside the client; the manager does not index or migrate them. CLI session management is read-only. Codex menu and language integration depends on the client version; Fast / Ultra also depend on the model and provider.
 

@@ -88,7 +88,7 @@ test('Claude edits cannot change identity, auth kind or Anthropic Messages proto
   const f = fixture(t)
   for (const changes of [
     { identityService: 'openai' }, { credentialKind: 'anthropic_bearer' }, { credentialKind: 'claude_ai_oauth' }, { protocol: 'openai_responses' },
-    { wireApi: 'responses' }, { integrationType: 'auto' }, { modelContextWindows: { 'model-a': 200000 } },
+    { wireApi: 'responses' }, { modelContextWindows: { 'model-a': 200000 } },
   ]) {
     const before = f.disk()
     assert.throws(() => editAccount(f.store, { id: f.account.id, revision: 0, changes }), /不可更改|Anthropic Messages/)
@@ -98,6 +98,24 @@ test('Claude edits cannot change identity, auth kind or Anthropic Messages proto
   f.store.transaction(state => { state.accounts = [openAI] })
   assert.throws(() => editAccount(f.store, { id: openAI.id, revision: 0, changes: { identityService: 'anthropic', protocol: 'anthropic_messages', credentialKind: 'anthropic_api_key' } }), /不可更改/)
   assert.equal(f.current().identityService, 'openai')
+})
+
+test('Claude quota integration edits invalidate measurements without changing model protocol, credentials or running-instance config', t => {
+  const f = fixture(t)
+  f.store.transaction(state => { state.accounts[0].providerUsage = { checkedAt: 1, summary: { source: 'sub2api', updatedAt: 1, remaining: 8 } } })
+  const original = f.current()
+  editAccount(f.store, { id: f.account.id, revision: 0, changes: { integrationType: 'sub2api' } }, () => true)
+  const changed = f.current()
+  assert.equal(changed.integrationType, 'sub2api')
+  assert.equal(changed.providerUsage, undefined)
+  assert.equal(changed.providerUsageRevision, 1)
+  assert.equal(changed.protocol, original.protocol)
+  assert.equal(changed.identityService, original.identityService)
+  assert.equal(changed.credentialKind, original.credentialKind)
+  assert.equal(changed.wireApi, original.wireApi)
+  assert.deepEqual(changed.credentials, original.credentials)
+  assert.deepEqual(changed.models, original.models)
+  assert.deepEqual(claudeCodeAuthEnvironment(changed), claudeCodeAuthEnvironment(original))
 })
 
 test('Claude subscription and unverified credentials remain metadata-only with no credential reads', t => {

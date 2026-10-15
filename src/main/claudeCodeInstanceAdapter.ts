@@ -10,6 +10,7 @@ import type { DesktopPlan } from './instanceRuntime'
 import { accountCompatibility } from '../shared/agentClients'
 import { claudeCodeClient, claudeCodeClientType, claudeCodeOwnedEnvironment, type ClaudeCodeOwnedEnvironment } from '../shared/claudeCode'
 import { detectClaudeCodeDesktopApplications, claudeCodeDesktopMacLaunchArgs, validateClaudeCodeDesktopArgs } from './claudeCodeDesktopAdapter'
+import { assertClaudeSubscriptionDestination } from './claudeCodeSubscription'
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const execFile = promisify(execFileCallback)
@@ -221,7 +222,7 @@ export function releaseClaudeGlobalStateLock(lock: ClaudeGlobalStateLock): void 
   } catch {/* A missing, malformed, or changed-owner lock is preserved. */}
 }
 
-type ClaudeCodeAccount = Pick<Account,'kind'|'identityService'|'credentialKind'|'wireApi'|'models'|'protocol'> & { credentials?: { apiKey?: string; accessToken?: string } }
+type ClaudeCodeAccount = Pick<Account,'kind'|'identityService'|'credentialKind'|'wireApi'|'models'|'protocol'> & { baseUrl?: string; credentials?: { apiKey?: string; accessToken?: string; refreshToken?: string } }
 
 export function claudeCodeAuthEnvironment(account: ClaudeCodeAccount): Pick<ClaudeCodeProjection,'environment'>['environment'] {
   if(account.identityService!=='anthropic')throw new Error('Claude Code 账号必须属于 Anthropic 身份服务')
@@ -234,7 +235,7 @@ export function claudeCodeAuthEnvironment(account: ClaudeCodeAccount): Pick<Clau
     return {ANTHROPIC_API_KEY:key}
   }
   const token=account.credentials?.accessToken
-  if(account.kind==='oauth'&&account.credentialKind==='claude_ai_oauth'&&typeof token === 'string'&&token.trim())return {CLAUDE_CODE_OAUTH_TOKEN:token}
+  if(account.kind==='oauth'&&account.credentialKind==='claude_ai_oauth'&&typeof token === 'string'&&token.trim()&&!/[\0\r\n]/.test(token))return {CLAUDE_CODE_OAUTH_TOKEN:token}
   throw new Error('Claude Code 账号没有可用的 Anthropic 登录凭据')
 }
 
@@ -251,7 +252,7 @@ function safeAuthLabel(value: unknown, kind: 'method' | 'provider'): string | un
   if (!normalized) return undefined
   if (kind === 'method') {
     if (normalized === 'oauth_token') return undefined
-    if (normalized.includes('oauth')) return 'oauth'
+    if (normalized.includes('oauth') || normalized === 'claude.ai') return 'oauth'
     if (normalized.includes('api') || normalized === 'apikey') return 'api_key'
     if (normalized.includes('bearer') || normalized.includes('token')) return 'bearer'
     if (normalized.includes('profile')) return 'profile'
@@ -355,8 +356,9 @@ export function projectClaudeCodeConfig(input: ClaudeCodeProjectionInput): Claud
 export function claudeCodeEnvironment(source: NodeJS.ProcessEnv, projection: Pick<ClaudeCodeProjection, 'environment'>): NodeJS.ProcessEnv {
   const environment = { ...source }
   for (const key of claudeCodeOwnedEnvironment) delete environment[key]
+  delete environment.USE_LOCAL_OAUTH; delete environment.USE_STAGING_OAUTH
   for (const key of Object.keys(environment)) {
-    if (/^(?:ANTHROPIC_|CLAUDE_CODE_(?:USE_|OAUTH_|PROVIDER_|API_|PROJECT_|SIMPLE|SAFE_MODE|SUBPROCESS_))/.test(key)) delete environment[key]
+    if (/^(?:ANTHROPIC_|CLAUDE_SECURESTORAGE_|CLAUDE_CODE_(?:USE_|OAUTH_|PROVIDER_|API_|PROJECT_|HOST_|SUBSCRIPTION_|RATE_LIMIT_|SIMPLE|SAFE_MODE|SUBPROCESS_))/.test(key)) delete environment[key]
   }
   Object.assign(environment, projection.environment)
   return environment
@@ -434,7 +436,7 @@ export const claudeCodeInstanceAdapter = {
     if(profile.clientType!==claudeCodeClientType||application.clientType!==claudeCodeClientType)throw new Error('实例客户端与所选程序不兼容')
     if(application.kind==='desktop'){
       if(process.platform!=='darwin')throw new Error('Claude Desktop 实例当前支持 macOS')
-      if(profile.connectionMode!=='client_login')throw new Error('Claude Desktop 请使用客户端内登录，API 连接和 CLI 订阅凭据不能替代桌面登录')
+      if(profile.connectionMode!=='client_login'&&profile.connectionMode!=='native')throw new Error('Claude Desktop 请选择客户端内登录或原生 API 连接')
       if(profile.workingDirectoryId)throw new Error('Claude Desktop 项目请在客户端内选择')
       validateClaudeCodeDesktopArgs(profile.extraArgs)
       return
@@ -442,9 +444,14 @@ export const claudeCodeInstanceAdapter = {
     if(profile.connectionMode==='client_login')throw new Error('客户端内登录仅用于 Claude Desktop')
     validateClaudeCodeCliArgs(profile.extraArgs)
   },
-  validateAccount(profile: Pick<InstanceProfile,'clientType'|'connectionMode'|'model'>, account: ClaudeCodeAccount): void {
-    const result=accountCompatibility(profile.clientType,account,{connectionMode:profile.connectionMode??'local_api',model:profile.model})
+  validateAccount(profile: Pick<InstanceProfile,'clientType'|'connectionMode'|'model'> & Partial<Pick<InstanceProfile,'launchMode'>>, account: ClaudeCodeAccount): void {
+    const result=accountCompatibility(profile.clientType,account,{connectionMode:profile.connectionMode??'local_api',model:profile.model,launchMode:profile.launchMode})
     if(!result.compatible)throw new Error(result.reason)
+    if(account.kind==='oauth'){
+      assertClaudeSubscriptionDestination({baseUrl:account.baseUrl??''})
+      const {accessToken,refreshToken}=account.credentials??{}
+      if([accessToken,refreshToken].some(token=>typeof token==='string'&&token.trim()&&!/[\0\r\n]/.test(token)))return
+    }
     claudeCodeAuthEnvironment(account)
   },
   copiedSessionProvider() { throw new Error('Claude Code 会话格式尚未与 Codex 兼容，暂不能复制或转换会话') },

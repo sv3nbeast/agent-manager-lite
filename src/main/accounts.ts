@@ -118,7 +118,7 @@ export function editAccount(store: Store, input: unknown, inUse: (id: string) =>
     if (account.kind !== 'api_key' && connectionFields.some(key => key in changes)) throw new Error('登录账号仅支持修改名称、标签、备注和服务等级')
     if (anthropic) {
       if (!editableAnthropicConnection(account) && connectionFields.some(key => key in changes)) throw new Error('此 Anthropic 凭据类型尚未支持连接编辑，仅可修改名称、标签和备注')
-      if (['wireApi', 'integrationType', 'modelContextWindows'].some(key => key in changes)) throw new Error('Claude API 连接仅支持修改地址、模型和密钥，接口协议固定为 Anthropic Messages')
+      if (['wireApi', 'modelContextWindows'].some(key => key in changes)) throw new Error('Claude API 连接仅支持修改地址、模型、密钥和额度查询方式，接口协议固定为 Anthropic Messages')
       if ([changes.apiKey, changes.baseUrl, ...(changes.models ?? [])].some(value => value !== undefined && /[\0\r\n]/.test(value))) throw new Error('Claude 连接配置包含无效字符')
     }
     const connectionChanged = changes.apiKey !== undefined && changes.apiKey !== account.credentials.apiKey

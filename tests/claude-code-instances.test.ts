@@ -4,7 +4,7 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { Store } from '../src/main/store'
+import { Store, type StoredAccount } from '../src/main/store'
 import { Instances } from '../src/main/instances'
 import type { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
 import { MacCliRuntime, MacInstanceRuntime } from '../src/main/cliInstanceRuntime'
@@ -33,7 +33,7 @@ interface Evidence {
   bedrock: string; openAIKey: string; codexHome: string; projectDirectoryOverride: string; nodeOptions: string
 }
 
-function fixture(t: TestContext, options: { open?: (script: string, launch: () => void) => Promise<void>; missingFlags?: boolean } = {}) {
+function fixture(t: TestContext, options: { open?: (script: string, launch: () => void) => Promise<void>; missingFlags?: boolean; ensure?: (id: string, store: Store) => Promise<StoredAccount> } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml-claude-instances-')))
   const store = new Store(join(root, 'data'), { encrypt: value => Buffer.from(value), decrypt: value => value.toString() })
   const executable = join(root, options.missingFlags ? 'claude missing-flags' : "claude 程序 ' $(literal)")
@@ -57,7 +57,7 @@ function fixture(t: TestContext, options: { open?: (script: string, launch: () =
   const runtime = new MacInstanceRuntime(undefined, cli)
   const nativeAccounts = new Proxy({}, { get: (_target, property) => () => assert.fail(`Claude invoked OpenAI native account service ${String(property)}`) }) as NativeInstanceAccounts
   const create = () => {
-    const instances = new Instances(store, () => assert.fail('Claude must not create the OpenAI local gateway'), async () => assert.fail('Claude must not refresh through the OpenAI token authority'), runtime, nativeAccounts)
+    const instances = new Instances(store, () => assert.fail('Claude must not create the OpenAI local gateway'), async id => options.ensure ? options.ensure(id, store) : assert.fail('Claude must not refresh through the OpenAI token authority'), runtime, nativeAccounts)
     managers.push(instances)
     return instances
   }
@@ -124,6 +124,138 @@ test('Claude API and Bearer use concurrent owned native processes and consume a 
   assert.equal(readFileSync(join(first.directory, 'settings.json'), 'utf8'), settings)
   assert.equal(readFileSync(join(first.directory, transcriptName), 'utf8'), transcript)
   await f.instances.stop(second.id)
+})
+
+test('Claude subscription launch refreshes before projection, updates live and keeps refresh tokens in the vault', { skip: !supported }, async t => {
+  let refreshed = 0
+  const f = fixture(t, { ensure: async (id, store) => {
+    refreshed++
+    store.transaction(state => {
+      const account = state.accounts.find(value => value.id === id)!
+      account.credentials = { ...account.credentials, accessToken: 'refreshed-subscription-access', refreshToken: 'rotated-vault-refresh', expiresAt: Date.now() + 3600_000 }
+      account.generation = 'refreshed-generation'
+    })
+    return store.read().accounts.find(value => value.id === id)!
+  } })
+  const subscription = parseClaudeCodeAccountImport(JSON.stringify({ name: 'Synthetic subscription', accessToken: 'expired-subscription-access', refreshToken: 'vault-only-refresh', expiresAt: Date.now() - 1, models: ['fixture-sonnet'], scopes: ['user:profile', 'user:inference'] })).accounts[0]
+  f.store.transaction(state => { state.accounts.push(subscription) })
+  const instance = f.add('Subscription', subscription), peer = f.add('API peer', f.api)
+  const preview = f.instances.preview({ id: instance.id, revision: instance.revision })
+  assert.equal(preview.identityStatus, 'subscription_configured')
+  assert.equal(JSON.stringify(preview).includes('subscription-access'), false)
+  await f.start(instance.id); await f.start(peer.id)
+  assert.equal(refreshed, 1)
+  const evidence = await f.evidence(instance.directory), credentialFile = join(instance.directory, '.credentials.json')
+  assert.equal(evidence.oauth, ''); assert.equal(evidence.apiKey, ''); assert.equal(evidence.bearer, '')
+  let credentials = readFileSync(credentialFile, 'utf8')
+  assert.equal(JSON.parse(credentials).claudeAiOauth.accessToken, 'refreshed-subscription-access')
+  assert.equal(JSON.parse(credentials).claudeAiOauth.refreshToken, null)
+  assert.equal(lstatSync(credentialFile).mode & 0o777, 0o600)
+  for (const secret of ['vault-only-refresh', 'rotated-vault-refresh', 'expired-subscription-access']) assert.equal(credentials.includes(secret), false)
+  for (const handoff of f.handoffs) assert.equal(handoff.body.includes('subscription-access') || handoff.script.includes('subscription-access'), false)
+  const checkpoint = readFileSync(join(f.store.directory, 'instances', instance.id, 'launch.json'), 'utf8')
+  assert.equal(checkpoint.includes('subscription-access') || checkpoint.includes('refresh'), false)
+  f.store.transaction(state => { state.accounts.find(value => value.id === subscription.id)!.credentials.accessToken = 'live-subscription-access' })
+  await f.instances.updateCredentials(f.store.read().accounts.find(value => value.id === subscription.id)!)
+  credentials = readFileSync(credentialFile, 'utf8')
+  assert.equal(JSON.parse(credentials).claudeAiOauth.accessToken, 'live-subscription-access')
+  const peerEvidence = await f.evidence(peer.directory)
+  await f.instances.stop(instance.id)
+  assert.equal(existsSync(credentialFile), false)
+  assert.doesNotThrow(() => process.kill(peerEvidence.pid, 0))
+  assert.equal(f.store.read().accounts.find(value => value.id === subscription.id)!.credentials.refreshToken, 'rotated-vault-refresh')
+})
+
+test('Claude subscription cancellation while refreshing leaves no native credential or late process', { skip: !supported }, async t => {
+  let release!: () => void, started!: () => void
+  const refreshing = new Promise<void>(resolveRefresh => { started = resolveRefresh }), pending = new Promise<void>(resolvePending => { release = resolvePending })
+  const f = fixture(t, { ensure: async (id, store) => { started(); await pending; return store.read().accounts.find(value => value.id === id)! } })
+  const subscription = parseClaudeCodeAccountImport(JSON.stringify({ accessToken: 'synthetic-subscription-access', refreshToken: 'synthetic-vault-refresh', models: ['fixture-sonnet'] })).accounts[0]
+  f.store.transaction(state => { state.accounts.push(subscription) })
+  const instance = f.add('Cancelled subscription', subscription)
+  f.instances.start(f.instances.preview({ id: instance.id, revision: instance.revision }).ticket)
+  await refreshing
+  const stop = f.instances.stop(instance.id); release(); await stop
+  assert.equal(f.handoffs.length, 0)
+  assert.equal(existsSync(join(instance.directory, '.credentials.json')), false)
+  assert.equal(existsSync(join(instance.directory, 'fixture-claude.json')), false)
+})
+
+test('Claude subscription startup failure removes only its projection and preserves an existing native login', { skip: !supported }, async t => {
+  const f = fixture(t, { ensure: async (id, store) => store.read().accounts.find(value => value.id === id)!, open: async () => { throw new Error('synthetic Terminal failure') } })
+  const subscription = parseClaudeCodeAccountImport(JSON.stringify({ accessToken: 'synthetic-subscription-access', models: ['fixture-sonnet'] })).accounts[0]
+  f.store.transaction(state => { state.accounts.push(subscription) })
+  const instance = f.add('Failed subscription', subscription)
+  f.instances.start(f.instances.preview({ id: instance.id, revision: instance.revision }).ticket); await f.instances.settled(instance.id)
+  assert.equal(f.instances.views().find(value => value.id === instance.id)!.status, 'error')
+  assert.equal(existsSync(join(instance.directory, '.credentials.json')), false)
+  await f.instances.stop(instance.id)
+  const preserved = '{"claudeAiOauth":{"accessToken":"independent-user-login"}}'
+  writeFileSync(join(instance.directory, '.credentials.json'), preserved, { mode: 0o600 })
+  const current = f.instances.views().find(value => value.id === instance.id)!
+  f.instances.start(f.instances.preview({ id: instance.id, revision: current.revision }).ticket); await f.instances.settled(instance.id)
+  assert.equal(readFileSync(join(instance.directory, '.credentials.json'), 'utf8'), preserved)
+  assert.match(f.instances.views().find(value => value.id === instance.id)!.error ?? '', /已有独立登录|登录凭据|已保留/)
+})
+
+test('Claude subscription recovery resumes renewal for an owned process without a vanished relay', { skip: !supported }, async t => {
+  let refreshes = 0
+  const f = fixture(t, { ensure: async (id, store) => {
+    store.transaction(state => { const account = state.accounts.find(value => value.id === id)!; account.credentials.accessToken = `recovery-access-${++refreshes}`; account.generation = `recovery-generation-${refreshes}` })
+    return store.read().accounts.find(value => value.id === id)!
+  } })
+  const subscription = parseClaudeCodeAccountImport(JSON.stringify({ accessToken: 'synthetic-initial-access', refreshToken: 'synthetic-vault-refresh', models: ['fixture-sonnet'] })).accounts[0]
+  f.store.transaction(state => { state.accounts.push(subscription) })
+  const instance = f.add('Recovered subscription', subscription); await f.start(instance.id)
+  const original = await f.evidence(instance.directory), recovered = f.create()
+  await recovered.recover()
+  assert.equal(recovered.views().find(value => value.id === instance.id)!.status, 'running')
+  assert.equal(recovered.views().find(value => value.id === instance.id)!.pid, original.pid)
+  assert.deepEqual(recovered.accountIds(), [subscription.id])
+  assert.equal(JSON.parse(readFileSync(join(instance.directory, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, 'recovery-access-2')
+  f.store.transaction(state => { const account = state.accounts.find(value => value.id === subscription.id)!; account.credentials.accessToken = 'recovery-access-3'; account.generation = 'recovery-generation-3' })
+  await recovered.updateCredentials(f.store.read().accounts.find(value => value.id === subscription.id)!)
+  assert.equal(JSON.parse(readFileSync(join(instance.directory, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, 'recovery-access-3')
+  await recovered.stop(instance.id)
+  assert.equal(existsSync(join(instance.directory, '.credentials.json')), false)
+})
+
+for (const change of ['organization', 'settings', 'proxy'] as const) test(`Claude subscription refuses live projection and recovery after ${change} changes`, { skip: !supported }, async t => {
+  const f = fixture(t, { ensure: async (id, store) => store.read().accounts.find(value => value.id === id)! })
+  const subscription = parseClaudeCodeAccountImport(JSON.stringify({ accessToken: 'synthetic-initial-access', refreshToken: 'synthetic-vault-refresh', models: ['fixture-sonnet'] })).accounts[0]
+  f.store.transaction(state => { state.accounts.push(subscription) })
+  const instance = f.add('Boundary subscription', subscription); await f.start(instance.id)
+  await f.evidence(instance.directory)
+  const path = join(instance.directory, '.credentials.json'), original = readFileSync(path, 'utf8')
+  if (change === 'settings') writeFileSync(join(instance.directory, 'settings.json'), '{"theme":"changed"}')
+  else f.store.transaction(state => {
+    const account = state.accounts.find(value => value.id === subscription.id)!
+    if (change === 'organization') account.claudeSubscription = { ...account.claudeSubscription, organizationId: 'other-organization' }
+    else account.proxy = { mode: 'direct' }
+    account.credentials.accessToken = 'must-not-project-after-change'
+  })
+  await assert.rejects(f.instances.updateCredentials(f.store.read().accounts.find(value => value.id === subscription.id)!), /身份或配置已变化/)
+  assert.equal(readFileSync(path, 'utf8'), original)
+  const recovered = f.create(); await recovered.recover()
+  assert.equal(recovered.views().find(value => value.id === instance.id)!.status, 'error')
+  assert.equal(readFileSync(path, 'utf8'), original)
+  await recovered.stop(instance.id)
+})
+
+test('Claude subscription ignores a late credential projection after replacement and stop', { skip: !supported }, async t => {
+  const f = fixture(t, { ensure: async (id, store) => store.read().accounts.find(value => value.id === id)! })
+  const subscription = parseClaudeCodeAccountImport(JSON.stringify({ accessToken: 'synthetic-initial-access', models: ['fixture-sonnet'] })).accounts[0]
+  f.store.transaction(state => { state.accounts.push(subscription) })
+  const instance = f.add('Late update subscription', subscription); await f.start(instance.id)
+  await f.evidence(instance.directory)
+  const path = join(instance.directory, '.credentials.json'), old = f.store.read().accounts.find(value => value.id === subscription.id)!
+  const late = f.instances.updateCredentials(old)
+  f.store.transaction(state => { const account = state.accounts.find(value => value.id === subscription.id)!; account.credentials.accessToken = 'new-generation-access'; account.generation = 'new-generation' })
+  const current = f.store.read().accounts.find(value => value.id === subscription.id)!
+  await Promise.all([late, f.instances.updateCredentials(current)])
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).claudeAiOauth.accessToken, 'new-generation-access')
+  await f.instances.stop(instance.id); await f.instances.updateCredentials(old); await f.instances.updateCredentials(current)
+  assert.equal(existsSync(path), false)
 })
 
 test('Claude cards keep their CLI mode and report missing or incompatible connections accurately', {skip:!supported}, t=>{
@@ -232,12 +364,16 @@ test('Claude upgrade missing a managed isolation flag is blocked before secret h
   assert.equal(f.handoffs.length, 0); assert.equal(existsSync(join(instance.directory, 'fixture-claude.json')), false)
 })
 
-test('Claude only accepts verified API credential and native CLI boundaries', { skip: !supported }, t => {
+test('Claude rejects unsupported OAuth identities and non-native CLI boundaries', { skip: !supported }, t => {
   const f = fixture(t)
   const oauth = parseClaudeCodeAccountImport(JSON.stringify({ name: 'Pending subscription', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-fixture', models: ['fixture-sonnet'] })).accounts[0]
   const openai = createAPIAccount({ name: 'OpenAI boundary fixture', note: '', tags: [], apiKey: 'fixture-openai', baseUrl: 'http://127.0.0.1:9/v1', models: ['fixture-sonnet'], wireApi: 'responses', defaultTier: 'inherit' })
   f.store.transaction(state => { state.accounts.push(oauth, openai) })
-  for (const account of [oauth, openai]) assert.throws(() => f.add(account.name, account), /尚未|兼容|Anthropic|凭据|登录/)
+  assert.equal(f.add(oauth.name, oauth).identityStatus, 'subscription_configured')
+  assert.throws(() => f.add(openai.name, openai), /尚未|兼容|Anthropic|凭据|登录/)
+  const badOAuth = { ...oauth, credentialKind: 'openai_oauth' as const }
+  f.store.transaction(state => { state.accounts = state.accounts.map(account => account.id === oauth.id ? badOAuth : account) })
+  assert.throws(() => f.add('Wrong OAuth service', badOAuth), /尚未|兼容|Anthropic|凭据|登录/)
   assert.throws(() => f.instances.save({ details: { clientType: 'claude_code', name: 'Unsupported local API', applicationId: f.application.id, accountId: f.api.id, connectionMode: 'local_api', model: 'fixture-sonnet', extraArgs: [] } }), /本地 API|直连|支持|尚未/)
   const script = join(f.root, 'claude.js'); writeFileSync(script, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   assert.throws(() => {

@@ -9,7 +9,7 @@ test('Claude capability report scopes Desktop to native macOS login', () => {
   const report = inspectClaudeCodeCapabilities({ platform: 'linux', home: '/tmp/aml-empty-home', path: '' })
   assert.equal(report.cliAcceptance.configProjection, 'verified')
   assert.equal(report.desktopAcceptance.configProjection, 'verified')
-  assert.equal(report.desktopAcceptance.protocolAdapter, 'pending')
+  assert.equal(report.desktopAcceptance.protocolAdapter, 'verified')
   assert.equal(report.desktopAcceptance.sessionIndexing, 'pending')
   assert.equal(claudeCodeCanRegisterDesktop('darwin'), true)
   assert.equal(claudeCodeCanRegisterDesktop('linux'), false)

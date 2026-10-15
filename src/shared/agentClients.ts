@@ -46,7 +46,7 @@ export function recommendedInstanceConnectionMode(clientType:unknown,account:Pic
 }
 
 export interface AccountCompatibility {compatible:boolean;reason?:string}
-export interface AccountCompatibilityOptions {connectionMode:'local_api'|'native'|'client_login';model?:string}
+export interface AccountCompatibilityOptions {connectionMode:'local_api'|'native'|'client_login';model?:string;launchMode?:'desktop'|'cli'}
 /** Static capability check; live credential ownership, proxies and refresh locks stay in their services. */
 export function accountCompatibility(clientType:unknown,account:Pick<Account,'kind'|'wireApi'|'models'|'identityService'|'credentialKind'|'protocol'>,options:AccountCompatibilityOptions):AccountCompatibility {
   if(options.connectionMode==='client_login')return {compatible:false,reason:'Claude Desktop 在客户端内独立登录，不绑定管理器中的 API 或 CLI 订阅凭据'}
@@ -56,9 +56,10 @@ export function accountCompatibility(clientType:unknown,account:Pick<Account,'ki
     if(account.identityService!=='anthropic')return {compatible:false,reason:'Claude Code 只能使用 Anthropic 身份或兼容网关凭据，不能复用 OpenAI 账号'}
     if(account.protocol!=='anthropic_messages')return {compatible:false,reason:'Claude Code 需要 Anthropic Messages 协议，不能复用 OpenAI 协议账号'}
     const kind=account.credentialKind as ClaudeCodeCredentialKind|undefined
-    if(options.connectionMode==='local_api')return {compatible:false,reason:'Claude Code 当前不支持管理器本地 API 转换，请使用 CLI 原生连接'}
+    if(options.connectionMode==='local_api')return {compatible:false,reason:'Claude 当前不支持管理器本地 API 转换，请使用原生连接'}
     if(account.kind==='api_key'&&!['anthropic_api_key','anthropic_bearer','gateway'].includes(kind??''))return {compatible:false,reason:'此 API 凭据未声明为 Anthropic Messages 连接'}
-    if(account.kind==='oauth')return {compatible:false,reason:'Claude 订阅登录与刷新仍在独立验证；当前请选择 API Key 或 Bearer 连接'}
+    if(account.kind==='oauth'&&kind!=='claude_ai_oauth')return {compatible:false,reason:'Claude CLI 需要 Claude 订阅 OAuth 凭据'}
+    if(account.kind==='oauth'&&options.launchMode==='desktop')return {compatible:false,reason:'Claude Desktop 订阅请在客户端内登录；API / 第三方连接请选择供应商密钥'}
     if(account.kind==='agent_identity')return {compatible:false,reason:'Agent Identity 仅适用于其所属身份服务，不能用于 Claude Code'}
     if(!['oauth','api_key'].includes(account.kind))return {compatible:false,reason:'Claude Code 凭据类型尚未接入'}
     if(options.model!==undefined&&account.models.length>0&&!account.models.includes(options.model))return {compatible:false,reason:'账号未声明支持当前 Claude 模型'}

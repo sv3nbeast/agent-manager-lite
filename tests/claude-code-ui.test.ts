@@ -159,7 +159,7 @@ test('inline Claude connection saves models and authentication on the key and re
   assert.equal(f.created.length, 2)
 })
 
-test('selecting Claude then CLI lists only compatible API resources', async t => {
+test('selecting Claude then CLI lists compatible API and subscription resources', async t => {
   const calls: unknown[] = []
   const f = await component(t, 'InstancesView', {}, {
     listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
@@ -172,12 +172,12 @@ test('selecting Claude then CLI lists only compatible API resources', async t =>
   assert.equal(f.state.form.applicationId, 'claude-cli')
   assert.equal(f.state.form.connectionMode, 'native')
   assert.equal(f.state.resourceKind, 'provider')
-  assert.deepEqual(f.state.availableAccounts.map((account: { id: string }) => account.id), ['claude-key'])
+  assert.deepEqual(f.state.availableAccounts.map((account: { id: string }) => account.id), ['claude-key', 'claude-oauth'])
   assert.equal(f.state.form.accountId, 'claude-key')
   assert.equal(f.state.form.model, 'gateway-model')
   assert.deepEqual(f.state.modelChoices, ['gateway-model'])
   assert.equal(f.state.historyMode, 'empty')
-  assert.equal(f.state.modeName('native', 'claude_code'), '直接 API')
+  assert.match(f.state.modeName('native', 'claude_code'), /API/)
   await f.state.chooseCli()
   assert.deepEqual(calls, ['claude_code'])
   f.state.historyMode = 'copy'
@@ -187,6 +187,68 @@ test('selecting Claude then CLI lists only compatible API resources', async t =>
   assert.equal(f.state.form.applicationId, 'codex-app')
   assert.equal(f.state.historyMode, 'empty')
   assert.equal(f.state.availableAccounts.some((account: { id: string }) => account.id === 'claude-key'), false)
+})
+
+test('Claude CLI separates subscription OAuth accounts from Anthropic API connections', async t => {
+  const snapshot = data()
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, snapshot)
+  f.state.edit(); f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
+
+  // Claude CLI starts on the provider path so an API key can be selected. The
+  // account path deliberately contains only subscription identities.
+  assert.equal(f.state.resourceKind, 'provider')
+  f.state.resourceKind = 'account'; f.state.resetResource(); await nextTick()
+  assert.deepEqual(f.state.identityAccounts.map((account: { id: string }) => account.id), ['claude-oauth'])
+  assert.equal(f.state.form.accountId, 'claude-oauth')
+  assert.equal(f.state.form.model, 'subscription-model')
+  assert.equal(f.state.selectedAccount.credentialKind, 'claude_ai_oauth')
+  assert.match(f.state.connectionDescription, /Claude CLI 使用所选订阅账号/)
+  assert.equal(f.state.modeName('native', 'claude_code', 'oauth'), '订阅账号')
+  assert.equal(f.state.connectionProblem, '')
+  assert.equal(f.state.supplierChoices.some((choice: { label: string }) => choice.label.includes('Claude subscription')), false)
+})
+
+test('Claude Desktop can switch from client login to a selected Anthropic third-party key', async t => {
+  const snapshot = data()
+  snapshot.accounts = structuredClone(snapshot.accounts)
+  const provider = {
+    id: randomUUID(), revision: 0, name: 'Claude Desktop gateway', baseUrl: 'https://desktop-gateway.invalid',
+    wireApi: 'chat_completions', models: [], defaultTier: 'inherit', createdAt: 1, updatedAt: 1,
+    keys: [{ id: randomUUID(), name: 'Desktop bearer', protocol: 'anthropic_messages', credentialKind: 'anthropic_bearer', models: ['desktop-model'], accountIds: ['claude-key'], createdAt: 1, updatedAt: 1 }],
+  }
+  snapshot.providers = [provider] as AppSnapshot['providers']
+  Object.assign(snapshot.accounts.find(account => account.id === 'claude-key')!, { providerId: provider.id, providerKeyId: provider.keys[0].id, models: ['desktop-model'] })
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, snapshot)
+  f.state.edit(); f.state.selectClient('claude_code'); await nextTick()
+  assert.equal(f.state.launchMode, 'desktop')
+  assert.equal(f.state.form.connectionMode, 'client_login')
+  assert.equal(f.state.isClaudeDesktopLogin, true)
+  assert.deepEqual(f.state.supplierChoices, [])
+
+  f.state.form.connectionMode = 'native'; f.state.changeDesktopConnectionMode(); await nextTick()
+  assert.equal(f.state.form.connectionMode, 'native')
+  assert.equal(f.state.isClaudeDesktopLogin, false)
+  assert.equal(f.state.resourceKind, 'provider')
+  assert.equal(f.state.supplierChoices.length, 1)
+  assert.equal(f.state.supplierChoices[0].key.credentialKind, 'anthropic_bearer')
+  f.state.selectSupplier(f.state.supplierChoices[0].value); await nextTick()
+  assert.equal(f.state.form.accountId, 'claude-key')
+  assert.equal(f.state.form.model, 'desktop-model')
+  assert.match(f.state.connectionDescription, /Claude Desktop.*第三方/)
+  assert.match(f.state.modeName('native', 'claude_code', 'api_key'), /API/)
+  assert.equal(f.state.connectionProblem, '')
+
+  // Returning to client login clears the API resource. A Desktop subscription
+  // must be performed in the official client and cannot reuse the CLI account.
+  f.state.form.connectionMode = 'client_login'; f.state.changeDesktopConnectionMode(); await nextTick()
+  assert.equal(f.state.isClaudeDesktopLogin, true)
+  assert.equal(f.state.form.accountId, '')
+  assert.equal(f.state.form.model, '')
+  assert.deepEqual(f.state.supplierChoices, [])
 })
 
 test('CLI picker selects its exact result across detection order, cancellation and selecting a registered program again', async t => {
@@ -272,7 +334,7 @@ test('Claude Desktop wizard creates and previews a client-login instance without
   assert.deepEqual(f.state.availableAccounts, [])
   assert.equal(f.state.previewNetworkLabel({ mode: 'inherit', source: 'settings' }), '管理器设置 · 继承系统网络')
   assert.equal(f.state.previewNetworkLabel({ mode: 'direct', source: 'settings' }), '管理器设置 · 直连')
-  assert.equal(f.state.previewNetworkLabel({ mode: 'proxy', source: 'settings', proxy: { protocol: 'SOCKS5', server: 'proxy.invalid', port: 1080, authenticated: true, password: 'must-not-display' } }), '管理器默认代理 · SOCKS5 · proxy.invalid:1080 · 已配置认证')
+  assert.equal(f.state.previewNetworkLabel({ mode: 'proxy', source: 'settings', proxy: { protocol: 'SOCKS5', server: 'proxy.invalid', port: 1080, authenticated: true, password: 'must-not-display' } }), '管理器设置 · SOCKS5 · proxy.invalid:1080 · 已配置认证')
   await f.state.nextStep(); assert.equal(f.state.step, 1)
   await f.state.nextStep(); assert.equal(f.state.step, 2)
   f.state.args = '--no-sandbox'

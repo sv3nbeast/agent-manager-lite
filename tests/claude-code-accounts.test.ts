@@ -215,7 +215,11 @@ test('unmarked generic keys and explicitly declared Anthropic bearer exports rem
   ]) assert.equal(parseClaudeCodeAccountImport(JSON.stringify(source)).accounts.length, 0)
 })
 
-test('Anthropic accounts are excluded from the OpenAI provider usage cache', () => {
+test('Anthropic API keys use the provider usage cache while subscription OAuth stays separate', () => {
   const account = parseClaudeCodeAccountImport(JSON.stringify({ ANTHROPIC_API_KEY: 'sk-ant-usage-fixture' })).accounts[0]
-  assert.equal(sameUsageAccount(account, account), false)
+  assert.equal(sameUsageAccount(account, account), true)
+  const subscription = { ...account, kind: 'oauth' as const, credentialKind: 'claude_ai_oauth' as const,
+    credentials: { accessToken: 'fixture-oauth', refreshToken: 'fixture-refresh' } }
+  assert.equal(sameUsageAccount(subscription, subscription), false)
+  assert.equal(sameUsageAccount(subscription, account), false)
 })

@@ -7,14 +7,14 @@ import type {CodexSpeedMenuHook} from './codexSpeedMenu'
 import {CodexSpeedMenuCdpSession,markCodexSpeedMenuCdpFailure} from './codexSpeedMenuCdp'
 import type {AgentClientType} from '../shared/agentClients'
 import {getInstanceClientAdapter,codexDesktopEnvironment,reserveCodexCdpPort} from './codexInstanceAdapter'
-import {claudeCodeDesktopEnvironment,claudeDesktopLaunchEnvironment,isClaudeDesktopCommandOwned} from './claudeCodeDesktopAdapter'
+import {claudeCodeDesktopEnvironment,claudeDesktopLaunchEnvironment,claudeDesktopRuntimeDirectory,isClaudeDesktopCommandOwned} from './claudeCodeDesktopAdapter'
 import {sendClaudeDesktopLoginUrl,validateClaudeDesktopLoginUrl} from './claudeDesktopLogin'
 import {prepareClaudeDesktopKeychain} from './claudeDesktopKeychain'
 import {prepareClaudeDesktopNetwork} from './claudeDesktopNetwork'
 
 const exec=promisify(execFile)
 interface LaunchedDesktopChild {child:ChildProcess;exited:boolean;executable:string;profile:string}
-export interface DesktopPlan { clientType?:AgentClientType; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';managedArgs?:string[];launchEnvironment?:Record<string,string>;cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
+export interface DesktopPlan { clientType?:AgentClientType;claudeDesktopConnection?:'api'; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';managedArgs?:string[];launchEnvironment?:Record<string,string>;cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
 export interface DesktopProcess { pid:number; started:string }
 export interface DesktopRuntime {
   find(plan:DesktopPlan):Promise<DesktopProcess|undefined>
@@ -134,7 +134,8 @@ export class MacDesktopRuntime implements DesktopRuntime {
             if(!await this.find(plan))throw new Error('Claude Desktop 在初始化时退出')
             try {
               const files=await exec('/usr/sbin/lsof',['-p',String(child.pid),'-Fn'],{encoding:'utf8',timeout:3000,maxBuffer:2*1024*1024})
-              observed=files.stdout.split('\n').some(line=>line.startsWith(`n${plan.desktopDirectory}/`))
+              const expectedDirectory=claudeDesktopRuntimeDirectory(plan)
+              observed=files.stdout.split('\n').some(line=>line.startsWith(`n${expectedDirectory}/`))
             }catch{/* Initialization may not have opened its profile yet. */}
             if(observed)break
             await delay(200)

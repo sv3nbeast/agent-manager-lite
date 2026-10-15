@@ -28,7 +28,7 @@ export function cliLaunchScript(plan:DesktopPlan):string {
   return ['#!/bin/bash','set -e',`/bin/mkdir ${q(files.claim)} || exit 1`,
     `printf '%s\\n%s\\n' "$$" "$(LC_ALL=C /bin/ps -p $$ -o lstart=)" > ${q(files.record+'.tmp')}`,
     `/bin/mv ${q(files.record+'.tmp')} ${q(files.record)}`,`/bin/rmdir ${q(files.permit)} || exit 1`,
-    'for key in $(compgen -e); do case "$key" in CODEX_*|CML_TEST_*|ELECTRON_*|NODE_*|OPENAI_*|npm_config_*|__CFBundleIdentifier|XPC_SERVICE_NAME'+(claude?'|CLAUDE_*|ANTHROPIC_*':'')+') unset "$key";; esac; done',
+    'for key in $(compgen -e); do case "$key" in CODEX_*|CML_TEST_*|ELECTRON_*|NODE_*|OPENAI_*|npm_config_*|__CFBundleIdentifier|XPC_SERVICE_NAME'+(claude?'|CLAUDE_*|ANTHROPIC_*|USE_LOCAL_OAUTH|USE_STAGING_OAUTH':'')+') unset "$key";; esac; done',
     ...Object.entries(network).map(([key,value])=>`export ${key}=${q(value)}`),
     ...(plan.cliPackage?[`export CODEX_MANAGED_PACKAGE_ROOT=${q(plan.cliPackage.root)}`,`export CODEX_MANAGED_BY_${plan.cliPackage.manager.toUpperCase().replace('-','_')}=1`]:[]),
     ...(claude?[

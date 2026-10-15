@@ -9,6 +9,8 @@ import { captureClaudeExecutableIdentity, type ClaudeExecutableIdentity } from '
 import { detectClaudeCodeDesktopApplications } from './claudeCodeDesktopAdapter'
 import type { DesktopPlan } from './instanceRuntime'
 import { proxyAddressView } from './proxyPolicy'
+import type { StoredAccount } from './store'
+import { assertClaudeDesktopGatewayCapability, claudeDesktopGatewayFingerprint, prepareClaudeDesktopGateway, validateClaudeDesktopGatewayAccount } from './claudeDesktopGateway'
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 // Electron exposes app.asar as a virtual directory through node:fs. Bundle
@@ -25,6 +27,7 @@ export interface ClaudeDesktopRuntimeContext {
   temporaryDirectory: string
   upstreamProxy?: string
   version?: string
+  account?: StoredAccount
 }
 
 function directoryIdentity(path: string, optional = false): DirectoryIdentity | null {
@@ -46,7 +49,7 @@ function bundleResourcesIdentity(application: string): unknown {
 
 function settingsIdentity(plan: DesktopPlan,home:string): unknown {
   const isolatedEnvironment:Record<string,string>={HOME:home,CFFIXED_USER_HOME:home,XDG_CONFIG_HOME:join(home,'.config'),CLAUDE_CONFIG_DIR:plan.directory,CLAUDE_CODE_PROJECT_DIR_NAME:'projects'}
-  return [join(plan.directory,'settings.json'),join(plan.desktopDirectory,'ccd-environment-config.json')].map(path=>{
+  return [join(plan.directory,'settings.json'),join(plan.desktopDirectory,'ccd-environment-config.json'),join(`${plan.desktopDirectory}-3p`,'ccd-environment-config.json')].map(path=>{
     const raw=readBounded(path,1024*1024)
     if(raw===null)return [path,null]
     let value:unknown
@@ -68,9 +71,18 @@ function settingsIdentity(plan: DesktopPlan,home:string): unknown {
   })
 }
 
-/** Native Desktop login owns its profile. No CLI OAuth, provider key or Codex configuration is projected. */
-export function claudeDesktopRuntimeContext(profile: InstanceProfile, plan: DesktopPlan,upstreamProxy?:string): ClaudeDesktopRuntimeContext {
-  if (!isClaudeDesktopProfile(profile) || profile.connectionMode !== 'client_login' || profile.accountId !== '' || profile.model !== '') throw new Error('Claude Desktop 请使用客户端内登录，并在客户端内选择模型')
+/** Native login and third-party API deployment have separate native profiles.
+ * CLI OAuth is never projected into either Desktop login boundary. */
+export function claudeDesktopRuntimeContext(profile: InstanceProfile, plan: DesktopPlan,upstreamProxy?:string,account?:StoredAccount): ClaudeDesktopRuntimeContext {
+  if (!isClaudeDesktopProfile(profile)) throw new Error('所选实例不是 Claude Desktop')
+  if (profile.connectionMode === 'native') {
+    validateClaudeDesktopGatewayAccount(profile, account)
+    assertClaudeDesktopGatewayCapability(plan.application)
+    plan.claudeDesktopConnection = 'api'
+  } else {
+    if (profile.connectionMode !== 'client_login' || profile.accountId !== '' || profile.model !== '') throw new Error('Claude Desktop 客户端登录不需要绑定管理器账号或模型')
+    delete plan.claudeDesktopConnection
+  }
   if (profile.externalHome || plan.mode !== 'desktop' || plan.clientType !== 'claude_code') throw new Error('Claude Desktop 必须使用独立的受管桌面实例')
   const root = dirname(plan.directory), home = join(root, 'desktop-home'),temporaryDirectory=join(home,'tmp')
   if (plan.directory !== join(root, 'home') || plan.desktopDirectory !== join(root, 'desktop') || plan.workingDirectory !== join(root, 'workspace')) throw new Error('Claude Desktop 配置、桌面与工作目录必须归属同一实例')
@@ -78,28 +90,31 @@ export function claudeDesktopRuntimeContext(profile: InstanceProfile, plan: Desk
   if (!application) throw new Error('Claude Desktop 应用身份已变化，请重新选择应用')
   const identity = captureClaudeExecutableIdentity(plan.executable)
   const directories = [root, plan.directory, plan.desktopDirectory, plan.workingDirectory].map(path => directoryIdentity(path))
+  directories.push(directoryIdentity(`${plan.desktopDirectory}-3p`, true), directoryIdentity(join(`${plan.desktopDirectory}-3p`, 'configLibrary'), true))
   const loginHome = directoryIdentity(home, true)
   const temporary = directoryIdentity(temporaryDirectory,true)
   const bundle = [readBounded(join(plan.application, 'Contents', 'Info.plist'), 256 * 1024), bundleResourcesIdentity(plan.application)]
-  return { profile, plan, identity, home,temporaryDirectory,upstreamProxy, version: application.version,
-    fingerprint: hash([profile, plan.application, identity, bundle, directories, loginHome,temporary, plan.args, settingsIdentity(plan,home),upstreamProxy]) }
+  return { profile, plan, identity, home,temporaryDirectory,upstreamProxy, account, version: application.version,
+    fingerprint: hash([profile, plan.application, identity, bundle, directories, loginHome,temporary, plan.args, settingsIdentity(plan,home),claudeDesktopGatewayFingerprint(plan),upstreamProxy,
+      account&&[account.id,account.revision,account.kind,account.identityService,account.credentialKind,account.protocol,account.baseUrl,account.models,account.credentials.apiKey]]) }
 }
 
 export function claudeDesktopLaunchPreview(context: ClaudeDesktopRuntimeContext): Omit<InstanceLaunchPreview, 'ticket'> {
-  const { plan, profile } = context
+  const { plan, profile, account } = context
+  const api=profile.connectionMode==='native',source=api?'account' as const:'settings' as const
   return {
     clientType: 'claude_code', instanceId: profile.id, name: profile.name, application: plan.application, executable: plan.executable,
-    directory: plan.directory, desktopDirectory: plan.desktopDirectory, workingDirectory: plan.workingDirectory,
-    args: [...plan.args], accountName: '在 Claude Desktop 内登录', model: '', tierSource: 'client',
-    connectionMode: 'client_login', launchMode: 'desktop', identityStatus: 'client_login', clientVersion: context.version,
-    network:context.upstreamProxy===undefined?{mode:'inherit',source:'settings'}:context.upstreamProxy==='direct'?{mode:'direct',source:'settings'}:{mode:'proxy',source:'settings',proxy:proxyAddressView(context.upstreamProxy)},
+    directory: plan.directory, desktopDirectory: api?`${plan.desktopDirectory}-3p`:plan.desktopDirectory, workingDirectory: plan.workingDirectory,
+    args: [...plan.args], accountName: account?.name??'在 Claude Desktop 内登录', ...(account?{providerName:account.name}:{}), model: api?profile.model:'', tierSource: 'client',
+    connectionMode: profile.connectionMode, launchMode: 'desktop', identityStatus: api?'api_configured':'client_login', clientVersion: context.version,
+    network:context.upstreamProxy===undefined?{mode:'inherit',source}:context.upstreamProxy==='direct'?{mode:'direct',source}:{mode:'proxy',source,proxy:proxyAddressView(context.upstreamProxy)},
   }
 }
 
-/** Prepare only manager-owned directories. The official client remains the login and model authority. */
+/** Prepare manager-owned directories and the selected native deployment mode. */
 export async function prepareClaudeDesktopLaunch(context: ClaudeDesktopRuntimeContext, signal: AbortSignal): Promise<ClaudeDesktopRuntimeContext> {
   signal.throwIfAborted()
-  if (claudeDesktopRuntimeContext(context.profile, context.plan,context.upstreamProxy).fingerprint !== context.fingerprint) throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
+  if (claudeDesktopRuntimeContext(context.profile, context.plan,context.upstreamProxy,context.account).fingerprint !== context.fingerprint) throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
   if (!directoryIdentity(context.home, true)) mkdirSync(context.home, { mode: 0o700 })
   directoryIdentity(context.home)
   chmodSync(context.home, 0o700)
@@ -107,6 +122,8 @@ export async function prepareClaudeDesktopLaunch(context: ClaudeDesktopRuntimeCo
   directoryIdentity(context.temporaryDirectory)
   chmodSync(context.temporaryDirectory,0o700)
   signal.throwIfAborted()
+  prepareClaudeDesktopGateway(context.plan, context.profile, context.account)
+  signal.throwIfAborted()
   context.plan.launchEnvironment = { CLAUDE_CONFIG_DIR: context.plan.directory, HOME: context.home, CFFIXED_USER_HOME: context.home,CLAUDE_CODE_TMPDIR:context.temporaryDirectory }
-  return claudeDesktopRuntimeContext(context.profile, context.plan,context.upstreamProxy)
+  return claudeDesktopRuntimeContext(context.profile, context.plan,context.upstreamProxy,context.account)
 }

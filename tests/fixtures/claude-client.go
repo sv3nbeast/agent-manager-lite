@@ -37,6 +37,28 @@ func main() {
 	if config == "" || !filepath.IsAbs(config) {
 		os.Exit(2)
 	}
+	if len(os.Args) >= 3 && os.Args[1] == "auth" && os.Args[2] == "status" {
+		var credentials struct {
+			OAuth struct {
+				AccessToken string `json:"accessToken"`
+			} `json:"claudeAiOauth"`
+		}
+		raw, err := os.ReadFile(filepath.Join(config, ".credentials.json"))
+		if err == nil {
+			_ = json.Unmarshal(raw, &credentials)
+		}
+		loggedIn := credentials.OAuth.AccessToken != ""
+		method := "none"
+		if loggedIn {
+			method = "claude.ai"
+		}
+		data, _ := json.Marshal(map[string]any{"loggedIn": loggedIn, "authMethod": method, "configDirectory": config})
+		fmt.Println(string(data))
+		if !loggedIn {
+			os.Exit(1)
+		}
+		return
+	}
 	cwd, _ := os.Getwd()
 	data, _ := json.Marshal(map[string]any{
 		"configDirectory": config, "home": os.Getenv("HOME"), "cwd": cwd,

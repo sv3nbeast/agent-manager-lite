@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { EditOutlined, GlobalOutlined, InfoCircleOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import type { Account } from '../../../shared/types'
+import { supportsProviderUsageQuery } from '../../../shared/providerUsage'
 import AccountQuota from './AccountQuota.vue'
 import AccountIconAction from './AccountIconAction.vue'
 import { accountCardDate, accountCardIdentity, accountCardPlan, accountCardProtocol, accountCardStatus, accountCardTier, accountCardType, claudeSubscriptionMetadata, isAnthropicAccountRecord, isClaudeSubscriptionAccount } from './accountCardPresentation'
@@ -82,7 +83,7 @@ function openDetails() { quota.value?.openDetails() }
     </AccountQuota>
 
     <footer class="account-actions" aria-label="账号操作">
-      <AccountIconAction v-if="!isAnthropicAccountRecord(account)" action-class="account-refresh" :label="refreshing ? '正在刷新用量' : '刷新用量'" :accessible-label="`刷新用量 · ${account.name}`" :loading="refreshing" @click="$emit('refresh')"><ReloadOutlined /></AccountIconAction>
+      <AccountIconAction v-if="supportsProviderUsageQuery(account) || !isAnthropicAccountRecord(account)" action-class="account-refresh" :label="refreshing ? '正在刷新用量' : '刷新用量'" :accessible-label="`刷新用量 · ${account.name}`" :loading="refreshing" @click="$emit('refresh')"><ReloadOutlined /></AccountIconAction>
       <AccountIconAction v-else-if="isClaudeSubscriptionAccount(account)" action-class="account-refresh" :label="refreshing ? '正在刷新订阅' : '刷新订阅'" :accessible-label="`刷新 Claude 订阅 · ${account.name}`" :loading="refreshing" @click="$emit('refreshSubscription')"><ReloadOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-edit" label="编辑账号" :accessible-label="`编辑账号 · ${account.name}`" @click="$emit('edit')"><EditOutlined /></AccountIconAction>
       <AccountIconAction action-class="account-proxy" label="网络代理" :accessible-label="`网络代理 · ${account.name}`" @click="$emit('proxy')"><GlobalOutlined /></AccountIconAction>
