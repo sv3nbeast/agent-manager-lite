@@ -16,7 +16,7 @@ export interface ClientAdapterRegistration {
   applicationKinds: readonly ('desktop' | 'cli')[]
   identityService: string
   protocol: string
-  /** All evidence gates must be verified before this can become implemented. */
+  /** Evidence for the supported connection mode, not every upstream feature. */
   readiness: 'verified' | 'pending'
   reason?: string
 }
@@ -50,8 +50,8 @@ const registrations: readonly ClientAdapterRegistration[] = [
     applicationKinds: ['desktop'],
     identityService: claudeCodeDesktopClient.identityService,
     protocol: claudeCodeDesktopClient.protocol,
-    readiness: 'pending',
-    reason: 'Claude Desktop 的 Electron profile、Keychain/cookie、Code 模式和会话边界尚未完成实测',
+    readiness: 'verified',
+    reason: 'macOS Desktop 使用独立 HOME、Electron profile 和 Code 配置，在客户端内登录；API 投影与管理器会话索引暂未接入',
   },
 ]
 

@@ -79,4 +79,4 @@ export function inspectClaudeCodeCapabilities(options: ClaudeCodeDetectionOption
   }
 }
 
-export function claudeCodeCanRegisterDesktop(): false { return false }
+export function claudeCodeCanRegisterDesktop(platform: NodeJS.Platform = process.platform): boolean { return platform === 'darwin' }

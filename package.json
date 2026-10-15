@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -65,6 +65,7 @@
     "test:native-identity": "tsx scripts/smoke-native-identity.ts",
     "test:native-proxy": "tsx scripts/smoke-native-proxy.ts",
     "test:claude-code:runtime": "tsx scripts/smoke-claude-code.ts",
+    "test:claude-desktop:runtime": "tsx scripts/smoke-claude-desktop.ts",
     "test:desktop:claude-manager": "node scripts/run-desktop-smoke.cjs --claude-manager",
     "test:claude-code:interactive": "tsx scripts/smoke-claude-code-interactive.ts",
     "check:packaging": "node scripts/check-packaging-dependencies.mjs"

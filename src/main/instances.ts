@@ -1,11 +1,11 @@
 import type {NativeProxyService,NativeProxyLease} from './nativeProxy'
-import {accountProxyURL} from './proxyPolicy'
+import {accountProxyURL,defaultProxyURL} from './proxyPolicy'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, realpathSync, renameSync, rmSync, readdirSync } from 'node:fs'
 import {mkdir,rename,rm} from 'node:fs/promises'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { z } from 'zod'
-import { instanceRevisionSchema, saveInstanceSchema, copyInstanceSchema, copyExternalInstanceSchema, attachInstanceSchema, type ExternalInstanceHome, type InstanceCopySource, type InstanceInput, type InstanceCopyView, type InstanceApplication, type InstanceProfile, type InstanceView, type InstanceLaunchPreview, type InstanceWorkingDirectory, type InstanceCopyMode } from '../shared/instances'
+import { isClaudeDesktopProfile, instanceRevisionSchema, saveInstanceSchema, copyInstanceSchema, copyExternalInstanceSchema, attachInstanceSchema, type ExternalInstanceHome, type InstanceCopySource, type InstanceInput, type InstanceCopyView, type InstanceApplication, type InstanceProfile, type InstanceView, type InstanceLaunchPreview, type InstanceWorkingDirectory, type InstanceCopyMode } from '../shared/instances'
 import { resolveServiceTier } from '../shared/serviceTier'
 import { Store, type StoredAccount } from './store'
 import { Gateway } from './gateway'
@@ -17,6 +17,7 @@ import { MacInstanceRuntime } from './cliInstanceRuntime'
 import {codexInstanceAdapter,getInstanceClientAdapter} from './codexInstanceAdapter'
 import {claudeCodeInstanceAdapter} from './claudeCodeInstanceAdapter'
 import {claudeRuntimeContext,claudeLaunchPreview,prepareClaudeLaunch,claudeConnectionStatus,type ClaudeRuntimeContext} from './claudeCodeRuntime'
+import {claudeDesktopRuntimeContext,claudeDesktopLaunchPreview,prepareClaudeDesktopLaunch,type ClaudeDesktopRuntimeContext} from './claudeDesktopRuntime'
 import {initializeClaudeCodeOnboarding} from './claudeCodeOnboarding'
 import {readClaudeCodeInstanceHistory} from './claudeCodeSessions'
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
@@ -43,7 +44,7 @@ const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspec
 type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const resolveCompatibleApplication=(application:InstanceApplication)=>{try {resolveAgentClientType(application.clientType);return true}catch{return false}}
-const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native']).optional(),nativeTier:z.string().optional(),nativeProxy:z.boolean().optional(),claudeExecutable:z.string().min(1).max(4096).optional()}).strict()
+const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native','client_login']).optional(),launchMode:z.enum(['desktop','cli']).optional(),nativeTier:z.string().optional(),nativeProxy:z.boolean().optional(),claudeExecutable:z.string().min(1).max(4096).optional(),claudeApplication:z.string().min(1).max(4096).optional()}).strict()
 
 export class Instances {
   private readonly root:string
@@ -66,7 +67,7 @@ export class Instances {
       .map(application=>({...application,supportsTempLogin:application.clientType!=='claude_code'&&resolveCompatibleApplication(application)&&supportsOfficialTempLogin(application)}))
   }
   registerApplication(path:string,kind:'desktop'|'cli'='desktop',clientType:unknown='codex'):InstanceApplication {
-    const application=getInstanceClientAdapter(clientType).registerApplication(path,kind)
+    const application=getInstanceClientAdapter(clientType,kind).registerApplication(path,kind)
     this.store.transaction(state=>{const existing=state.instanceApplications ?? [];if(existing.length>=30 && !existing.some(app=>app.id===application.id))throw new Error('最多登记 30 个应用');state.instanceApplications=[...existing.filter(app=>app.id!==application.id),application]})
     return application
   }
@@ -140,29 +141,39 @@ export class Instances {
       const ultraState=ultra?.state??(run?.ultraInspection?'unavailable':undefined)
       const ultraNotice=ultraState==='fallback'?ultra?.reason:run?.ultraInspection&&!run.ultraInspection.supported?run.ultraInspection.reason:undefined
       const account=state.accounts.find(value=>value.id===profile.accountId)
-      const identity=profile.clientType==='claude_code'?{status:claudeConnectionStatus(profile,account),email:undefined,accountId:undefined}:readInstanceIdentityStatus(instanceHomePath(this.root,profile),profile.connectionMode??'local_api',account)
+      const identity=isClaudeDesktopProfile(profile)?{status:'client_login' as const,email:undefined,accountId:undefined}:profile.clientType==='claude_code'?{status:claudeConnectionStatus(profile,account),email:undefined,accountId:undefined}:readInstanceIdentityStatus(instanceHomePath(this.root,profile),profile.connectionMode==='native'?'native':'local_api',account)
       return {...profile,clientType,copying:this.copyingTarget(profile.id),connectionMode:profile.connectionMode??'local_api',directory:instanceHomePath(this.root,profile),desktopDirectory:join(this.root,'instances',profile.id,'desktop'),
-        launchMode:profile.clientType==='claude_code'?'cli':applications.find(app=>app.id===profile.applicationId)?.kind??'desktop',workingDirectory:profile.workingDirectoryId?this.workingDirectories().find(value=>value.id===profile.workingDirectoryId)?.path:join(this.root,'instances',profile.id,'workspace'),
+        launchMode:run?.plan.mode??profile.launchMode??(isClaudeDesktopProfile(profile)?'desktop':profile.clientType==='claude_code'?'cli':applications.find(app=>app.id===profile.applicationId)?.kind??'desktop'),workingDirectory:profile.workingDirectoryId?this.workingDirectories().find(value=>value.id===profile.workingDirectoryId)?.path:join(this.root,'instances',profile.id,'workspace'),
         accountName:state.accounts.find(account=>account.id===profile.accountId)?.name,applicationName:applications.find(app=>app.id===profile.applicationId)?.name,
         status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),menuNotice,localeNotice,ultraNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
         speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState,ultraCompatibility:ultraState,clientVersion:run?.clientVersion,
         identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId}
     })
   }
-  private validateDetails(details:InstanceInput,id:string):void {
-    const adapter=getInstanceClientAdapter(details.clientType)
+  private validateDetails(details:InstanceInput,id:string):InstanceInput {
     const application=this.applications().find(app=>app.id===details.applicationId)
     if(!application)throw new Error('请先选择已检测或登记的桌面应用或 CLI 程序')
+    const launchMode=application.kind??'desktop',adapter=getInstanceClientAdapter(details.clientType,launchMode)
+    if(details.launchMode!==undefined&&details.launchMode!==launchMode)throw new Error('实例运行方式与所选应用不一致，请重新选择')
+    details={...details,launchMode}
     adapter.validateApplication(details,application)
+    if(isClaudeDesktopProfile(details)){
+      if(details.connectionMode!=='client_login'||details.accountId!==''||details.model!=='')throw new Error('Claude Desktop 请在客户端内登录并选择模型')
+      if(details.workingDirectoryId)throw new Error('Claude Desktop 的项目请在客户端内选择')
+      return details
+    }
+    if(details.connectionMode==='client_login')throw new Error('客户端内登录仅适用于 Claude Desktop')
     if(details.workingDirectoryId)this.workingDirectory({...details,id,revision:0,createdAt:0},'')
     const account=this.store.read().accounts.find(account=>account.id===details.accountId)
     if(!account)throw new Error('绑定账号不存在')
     adapter.validateAccount(details,account)
+    return details
   }
   save(raw:unknown,creationId?:string,externalHome?:ExternalInstanceHome):void {
     const input=saveInstanceSchema.parse(raw),id=input.id ?? creationId ?? randomUUID()
     if(input.id){const old=this.profile(id);if(resolveAgentClientType(old.clientType)!==input.details.clientType)throw new Error('更换客户端请创建新实例');if(old.revision!==input.revision)throw new Error('实例已变化，请重新编辑');if(this.inUse(id))throw new Error('请先停止实例')}
-    this.validateDetails(input.details,id)
+    input.details=this.validateDetails(input.details,id)
+    if(input.id){const old=this.profile(id);if(old.clientType==='claude_code'&&isClaudeDesktopProfile(old)!==isClaudeDesktopProfile(input.details))throw new Error('切换 Claude CLI 与 Desktop 请创建新实例，配置和会话不能混用')}
     const fresh=!input.id
     if(fresh)this.folder(id,true)
     try {
@@ -329,15 +340,17 @@ export class Instances {
     this.previews.delete(id)
   }
   private plan(profile:InstanceProfile,nonce:string):DesktopPlan {
-    const adapter=getInstanceClientAdapter(profile.clientType)
     const application=this.applications().find(app=>app.id===profile.applicationId)
     if(!application)throw new Error('桌面应用已不可用，请重新选择')
+    const mode=application.kind??'desktop',adapter=getInstanceClientAdapter(profile.clientType,mode)
+    if(profile.launchMode!==undefined&&profile.launchMode!==mode)throw new Error('实例运行方式与所选应用不一致，请重新选择')
+    if(profile.clientType==='claude_code'&&isClaudeDesktopProfile(profile)!==(mode==='desktop'))throw new Error('Claude CLI 与 Desktop 必须使用各自的独立实例')
     adapter.validateApplication(profile,application)
     const folder=this.folder(profile.id)
     const runtime=adapter.launchRuntime(application),workingDirectory=this.workingDirectory(profile,folder)
     directory(workingDirectory)
     const home=profile.externalHome?validateExternalHome(this.root,profile.externalHome):join(folder,'home')
-    return {clientType:adapter.client.id,application:application.path,...runtime,directory:home,desktopDirectory:join(folder,'desktop'),workingDirectory,args:profile.extraArgs,nonce,mode:application.kind??'desktop'}
+    return {clientType:adapter.client.id,application:application.path,...runtime,directory:home,desktopDirectory:join(folder,'desktop'),workingDirectory,args:profile.extraArgs,nonce,mode}
   }
   private recoveryPlan(profile:InstanceProfile,saved:z.infer<typeof checkpointSchema>):DesktopPlan {
     if(profile.clientType!=='claude_code')return this.plan(profile,saved.nonce)
@@ -347,6 +360,12 @@ export class Instances {
     // PID and start time. A removed installation, changed account or project
     // must not prevent stopping the process that still owns this instance.
     const folder=this.folder(profile.id)
+    if(isClaudeDesktopProfile(profile)){
+      const application=saved.claudeApplication
+      if(saved.launchMode!=='desktop'||profile.connectionMode!=='client_login'||!application||!isAbsolute(application)||resolve(application)!==application||/[\0\r\n]/.test(application))throw new Error('Claude Desktop 恢复记录缺少独立桌面归属')
+      return {clientType:'claude_code',application,executable,directory:join(folder,'home'),desktopDirectory:join(folder,'desktop'),workingDirectory:join(folder,'workspace'),args:[],nonce:saved.nonce,mode:'desktop'}
+    }
+    if(saved.launchMode!==undefined&&saved.launchMode!=='cli')throw new Error('Claude CLI 恢复记录的运行方式不一致')
     return {clientType:'claude_code',application:executable,executable,directory:join(folder,'home'),desktopDirectory:join(folder,'desktop'),workingDirectory:join(folder,'workspace'),args:[],nonce:saved.nonce,mode:'cli'}
   }
   private context(profile:InstanceProfile,nonce:string=randomUUID()) {
@@ -398,16 +417,21 @@ export class Instances {
     const {id,revision}=instanceRevisionSchema.parse(raw),profile=this.profile(id)
     if(profile.revision!==revision||this.inUse(id))throw new Error('实例已变化或正在运行，请停止并刷新后查看会话来源')
     getInstanceClientAdapter(profile.clientType)
+    if(isClaudeDesktopProfile(profile))throw new Error('Claude Desktop 会话请在客户端内查看，管理器暂不索引或迁移')
     return profile.clientType==='claude_code'?readClaudeCodeInstanceHistory(instanceHomePath(this.root,profile),{instanceId:profile.id}):readInstanceHistory(instanceHomePath(this.root,profile))
   }
   preview(raw:unknown):InstanceLaunchPreview {
     const {id,revision}=instanceRevisionSchema.parse(raw),profile=this.profile(id)
     if(profile.revision!==revision || this.inUse(id))throw new Error('实例已变化或正在运行，请刷新后重试')
+    if(isClaudeDesktopProfile(profile)){
+      const context=this.claudeDesktopContext(profile),preview:InstanceLaunchPreview={...claudeDesktopLaunchPreview(context),ticket:randomUUID()}
+      this.previews.set(id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000});return structuredClone(preview)
+    }
     if(profile.clientType==='claude_code'){
       const context=this.claudeContext(profile),preview:InstanceLaunchPreview={...claudeLaunchPreview(context),ticket:randomUUID(),instanceId:profile.id,name:profile.name,model:profile.model,history:readClaudeCodeInstanceHistory(context.plan.directory,{instanceId:profile.id})}
       this.previews.set(id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000});return structuredClone(preview)
     }
-    const context=this.context(profile),identity=readInstanceIdentityStatus(context.plan.directory,profile.connectionMode??'local_api',context.account),preview:InstanceLaunchPreview={clientType:resolveAgentClientType(profile.clientType),ticket:randomUUID(),instanceId:id,name:profile.name,application:context.plan.application,
+    const context=this.context(profile),identity=readInstanceIdentityStatus(context.plan.directory,profile.connectionMode==='native'?'native':'local_api',context.account),preview:InstanceLaunchPreview={clientType:resolveAgentClientType(profile.clientType),ticket:randomUUID(),instanceId:id,name:profile.name,application:context.plan.application,
       executable:context.plan.executable,directory:context.plan.directory,desktopDirectory:context.plan.desktopDirectory,workingDirectory:context.plan.workingDirectory,args:[...profile.extraArgs],
       accountName:context.account.name,providerName:context.providerName,desktopLocale:context.language?.locale,desktopEffectiveLocale:context.language?.effectiveLocale,desktopLocaleSource:context.language?.source,
       effectiveContextWindow:context.modelContext.window,effectiveAutoCompactTokenLimit:context.modelContext.compact,contextWindowSource:context.modelContext.origin,
@@ -425,6 +449,15 @@ export class Instances {
     const entry=[...this.previews.entries()].find(([,value])=>value.preview.ticket===ticket)
     if(!entry || entry[1].expiresAt<Date.now())throw new Error('启动预览已过期，请重新预览')
     const [id,pending]=entry,profile=this.profile(id)
+    if(isClaudeDesktopProfile(profile)){
+      if(this.inUse(id))throw new Error('实例已有启动或运行任务')
+      this.previews.delete(id)
+      const context=this.claudeDesktopContext(profile)
+      if(context.fingerprint!==pending.fingerprint)throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
+      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController()}
+      this.notices.delete(id);this.active.set(id,run)
+      run.task=this.launch(run,'',pending.fingerprint).finally(()=>{run.task=undefined});return
+    }
     if(profile.clientType==='claude_code'){
       if(this.inUse(id))throw new Error('实例已有启动或运行任务')
       this.previews.delete(id)
@@ -448,6 +481,31 @@ export class Instances {
     if(!account)throw new Error('绑定连接已删除，请重新选择')
     return claudeRuntimeContext(profile,account,this.plan(profile,nonce??randomUUID()),accountProxyURL(account,this.store.read()))
   }
+  private claudeDesktopContext(profile:InstanceProfile,nonce?:string):ClaudeDesktopRuntimeContext {
+    return claudeDesktopRuntimeContext(profile,this.plan(profile,nonce??randomUUID()),defaultProxyURL(this.store.proxyState()))
+  }
+  private async launchClaudeDesktop(run:Running,fingerprint:string):Promise<void> {
+    const context=this.claudeDesktopContext(run.profile,run.plan.nonce)
+    if(context.fingerprint!==fingerprint)throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
+    const prepared=await prepareClaudeDesktopLaunch(context,run.controller.signal)
+    run.controller.signal.throwIfAborted()
+    if(prepared.upstreamProxy!==undefined){
+      if(!this.nativeProxyService)throw new Error('实例代理服务不可用，请重新安装管理器')
+      // The native Desktop accepts its own HTTP egress pin, including when the
+      // manager explicitly selects direct. Only the loopback lease is projected.
+      run.nativeProxy=await this.nativeProxyService.acquire(prepared.upstreamProxy,run.profile.id,run.controller.signal)
+      prepared.plan.networkRoute={mode:'proxy',url:run.nativeProxy.url}
+    }
+    run.controller.signal.throwIfAborted()
+    if(this.claudeDesktopContext(run.profile,run.plan.nonce).fingerprint!==prepared.fingerprint)throw new Error('Claude Desktop 配置或网络在启动准备期间已变化，请重新预览')
+    if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('实例代理已退出，请重新启动')
+    run.plan=prepared.plan;run.clientVersion=prepared.version
+    this.checkpoint(run)
+    run.status='starting';run.child=await this.runtime.launch(run.plan,run.controller.signal)
+    run.controller.signal.throwIfAborted()
+    if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('实例代理已退出，请重新启动')
+    run.status='running';run.startedAt=Date.now()
+  }
   private async launchClaude(run:Running,fingerprint:string):Promise<void> {
     const context=this.claudeContext(run.profile,run.plan.nonce)
     if(context.fingerprint!==fingerprint)throw new Error('Claude 配置已变化，请重新预览')
@@ -469,9 +527,10 @@ export class Instances {
     if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('实例代理已退出，请重新启动')
     run.status='running';run.startedAt=Date.now()
   }
-  private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,connectionMode:run.profile.connectionMode??'local_api',nativeTier:run.nativeTier,nativeProxy:run.plan.networkRoute?.mode==='proxy'||undefined,...run.profile.clientType==='claude_code'?{claudeExecutable:run.plan.executable}:{}}))}
+  private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,connectionMode:run.profile.connectionMode??'local_api',launchMode:run.plan.mode??'desktop',nativeTier:run.nativeTier,nativeProxy:run.plan.networkRoute?.mode==='proxy'||undefined,...run.profile.clientType==='claude_code'?{claudeExecutable:run.plan.executable,...isClaudeDesktopProfile(run.profile)?{claudeApplication:run.plan.application}:{}}:{}}))}
   private async launch(run:Running,revision:string,fingerprint:string):Promise<void> {
     try {
+      if(isClaudeDesktopProfile(run.profile)){await this.launchClaudeDesktop(run,fingerprint);return}
       if(run.profile.clientType==='claude_code'){await this.launchClaude(run,fingerprint);return}
       if(run.profile.externalHome&&run.profile.connectionMode!=='native')assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))
       if(run.profile.connectionMode==='native')await this.nativeAccounts!.prepare(run.profile,run.controller.signal)
@@ -583,6 +642,11 @@ export class Instances {
     await this.runtime.stop(run.plan)
     await run.gateway?.stop()
     await run.nativeProxy?.stop();run.nativeProxy=undefined
+    if(isClaudeDesktopProfile(run.profile)){
+      rmSync(join(this.folder(run.profile.id),'launch.json'),{force:true})
+      run.child=undefined
+      return
+    }
     if(run.profile.clientType!=='claude_code'&&run.profile.connectionMode==='native'){
       if(!this.nativeAccounts)throw new Error('原生登录恢复服务不可用，文件已保留')
       await this.nativeAccounts.restore(run.profile,run.plan.nonce)
@@ -616,6 +680,12 @@ export class Instances {
     return run.stopping
   }
   async focus(id:string):Promise<void> {const run=this.active.get(id);if(!run || run.status!=='running')throw new Error('实例未运行');await this.runtime.focus(run.plan)}
+  async completeDesktopLogin(id:string,url:string):Promise<void> {
+    const profile=this.profile(id),run=this.active.get(id)
+    if(!isClaudeDesktopProfile(profile)||!run||run.status!=='running'||!isClaudeDesktopProfile(run.profile))throw new Error('请先启动对应的 Claude Desktop 实例再完成登录')
+    if(!this.runtime.openUrl)throw new Error('当前运行环境不支持 Claude Desktop 登录回调')
+    await this.runtime.openUrl(run.plan,url)
+  }
   async updateCredentials(account:StoredAccount):Promise<void> {await Promise.all([...this.active.values()].map(run=>run.gateway?.updateCredentials(account)))}
   updateRoutingAccount(account:StoredAccount):void {
     let failure:unknown
@@ -635,7 +705,7 @@ export class Instances {
         try {await this.stop(run.profile.id)}catch{run.status='error';run.error='实例已退出，但配置或登录状态未保存，请重试停止'}
       } else if(run.nativeProxy&&!run.nativeProxy.alive()&&run.status==='running'){
         run.status='error';run.error='实例网络代理已退出，连接已中断；请停止后重新启动'
-      } else if(run.profile.connectionMode!=='native'&&!run.gateway?.current().running && run.status==='running') {
+      } else if(run.profile.connectionMode!=='native'&&run.profile.connectionMode!=='client_login'&&!run.gateway?.current().running && run.status==='running') {
         run.status='error';run.error='实例本地连接已退出，请停止后重新启动'
       }
       if(child)run.child=child
@@ -693,11 +763,13 @@ export class Instances {
         if(!content){if(this.store.read().clientSwitches?.some(record=>record.targetId===profile.id&&record.instanceNonce))throw new Error('原生恢复记录缺少启动归属');continue}
         const saved=checkpointSchema.parse(JSON.parse(content))
         if(resolveAgentClientType(saved.clientType)!==resolveAgentClientType(profile.clientType))throw new Error('实例客户端与恢复记录不一致')
+        if(saved.launchMode!==undefined&&profile.launchMode!==undefined&&saved.launchMode!==profile.launchMode)throw new Error('实例运行方式与恢复记录不一致')
         const plan=this.recoveryPlan(profile,saved)
         if((saved.connectionMode??'local_api')!==(profile.connectionMode??'local_api'))throw new Error('实例启动模式与恢复记录不一致')
-        const run:Running={profile,plan,status:'error',controller:new AbortController(),backup:saved.backup,nativeTier:saved.nativeTier,error:saved.nativeProxy?'上次运行的实例代理已结束，请停止并回收登录状态后重新启动':'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
+        const run:Running={profile,plan,status:'error',controller:new AbortController(),backup:saved.backup,nativeTier:saved.nativeTier,error:saved.nativeProxy?'上次运行的实例代理已结束，请停止并回收登录状态后重新启动':isClaudeDesktopProfile(profile)?'检测到上次运行的 Claude Desktop，可定位窗口或停止实例':'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
         this.active.set(profile.id,run);run.child=await this.runtime.find(run.plan)
         if(!run.child){await this.cleanup(run);this.active.delete(profile.id)}
+        else if(isClaudeDesktopProfile(profile)&&!saved.nativeProxy){run.status='running';run.error=undefined}
       } catch {this.recoveryErrors.set(profile.id,'上次实例记录无法安全恢复，已保留原目录；请检查应用路径与 launch.json 后重开管理器')}
     }
   }

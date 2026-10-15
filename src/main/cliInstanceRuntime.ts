@@ -166,4 +166,5 @@ export class MacInstanceRuntime implements DesktopRuntime {
   launch(plan:DesktopPlan,signal:AbortSignal){return this.service(plan).launch(plan,signal)}
   stop(plan:DesktopPlan){return this.service(plan).stop(plan)}
   focus(plan:DesktopPlan){return this.service(plan).focus(plan)}
+  async openUrl(plan:DesktopPlan,url:string){const service=this.service(plan);if(!service.openUrl)throw new Error('此实例不支持桌面登录回调');await service.openUrl(plan,url)}
 }

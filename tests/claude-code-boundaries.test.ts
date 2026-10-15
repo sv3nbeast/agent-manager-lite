@@ -13,8 +13,8 @@ import { assertImplementedClient, getClientAdapterRegistration, listClientAdapte
 
 test('Claude CLI and Desktop keep separate application acceptance boundaries', () => {
   assert.equal(claudeCodeClient.status, 'implemented')
-  assert.equal(claudeCodeDesktopClient.status, 'planned')
-  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli'])
+  assert.equal(claudeCodeDesktopClient.status, 'implemented')
+  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli', 'desktop'])
   assert.deepEqual(claudeCodeDesktopClient.capabilities.launchModes, ['desktop'])
   assert.doesNotThrow(() => claudeCodeCapabilitySchema.parse(claudeCodeDesktopClient.capabilities))
 })
@@ -29,7 +29,7 @@ test('Claude Desktop detection validates bundle identity and version without lau
   assert.equal(found.length, 1)
   assert.equal(found[0].bundleId, 'com.anthropic.claudefordesktop')
   assert.equal(found[0].version, '2.31226.1')
-  assert.equal(verifyClaudeCodeDesktop(found[0]).canRegister, false)
+  assert.equal(verifyClaudeCodeDesktop(found[0]).canRegister, process.platform === 'darwin')
   const wrong = join(root, 'Other.app')
   mkdirSync(join(wrong, 'Contents', 'MacOS'), { recursive: true })
   writeFileSync(join(wrong, 'Contents', 'Info.plist'), '<plist><dict><key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>')
@@ -145,11 +145,11 @@ test('Claude credential compatibility never treats OpenAI credential kinds as An
   assert.deepEqual(discoverClaudeCodeCandidates({ home: '/missing', path: '', platform: 'win32' }), { cli: [], desktop: [] })
 })
 
-test('Claude CLI registration is independent from the planned Desktop lifecycle', () => {
+test('Claude CLI and Desktop register their own supported lifecycle', () => {
   const registrations = listClientAdapterRegistrations().filter(item => item.clientType === 'claude_code')
   assert.deepEqual(registrations.map(item => item.applicationKinds), [['cli'], ['desktop']])
   assert.equal(getClientAdapterRegistration('claude_code', 'cli')?.readiness, 'verified')
   assert.equal(assertImplementedClient('claude_code','cli').status,'implemented')
-  assert.throws(() => assertImplementedClient('claude_code', 'desktop'), /尚未通过登录、配置、隔离和会话边界验收/)
+  assert.equal(assertImplementedClient('claude_code', 'desktop').status, 'implemented')
   assert.equal(assertImplementedClient('codex').clientType, 'codex')
 })

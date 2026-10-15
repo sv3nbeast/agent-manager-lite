@@ -2,7 +2,7 @@ import { execFile as execFileCallback } from 'node:child_process'
 import { lstatSync, readdirSync, realpathSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { isAbsolute, join, relative, sep } from 'node:path'
-import { claudeCodeClientType, type ClaudeCodeApplicationKind, type ClaudeCodeAcceptance } from '../shared/claudeCode'
+import { claudeCodeClientType, claudeCodeDesktopAcceptance, type ClaudeCodeApplicationKind, type ClaudeCodeAcceptance } from '../shared/claudeCode'
 import { claudeCodeConfigPaths, detectClaudeCodeApplications, type ClaudeCodeApplication, type ClaudeCodeConfigPaths } from './claudeCodeInstanceAdapter'
 import { detectClaudeCodeDesktopApplications, type ClaudeCodeDesktopApplication } from './claudeCodeDesktopAdapter'
 
@@ -68,8 +68,8 @@ export interface ClaudeCodeVerificationReport {
   loginProbe?: ClaudeCodeLoginProbe
   sessions?: ClaudeCodeSessionBoundary
   reasons: string[]
-  /** Planned clients must not enter the common instance registry by accident. */
-  canRegister: false
+  /** Registration support does not establish live authentication. */
+  canRegister: boolean
 }
 
 function stableExecutable(path: string): boolean {
@@ -360,10 +360,10 @@ export function verifyClaudeCodeDesktop(application: ClaudeCodeDesktopApplicatio
     clientType: claudeCodeClientType,
     applicationKind: 'desktop',
     application,
-    gates: { detection: 'verified', configProjection: 'pending', credentialIsolation: 'pending', protocolAdapter: 'pending', runtimeLifecycle: 'pending', globalStateOwnership: 'pending', sessionIndexing: 'pending' },
+    gates: { ...claudeCodeDesktopAcceptance },
     version: application.version ? { state: 'verified', version: application.version } : { state: 'pending', reason: 'Desktop bundle 未提供可核实版本' },
-    reasons: ['Claude Desktop 的 Electron profile、Keychain/cookie、MCP OAuth、插件和 Code 模式边界尚未完成双实例实测'],
-    canRegister: false,
+    reasons: ['macOS Desktop 在各实例内登录，启动时确认实际使用独立 profile；CLI OAuth、API 配置投影和管理器会话索引暂未接入'],
+    canRegister: process.platform === 'darwin',
   }
 }
 

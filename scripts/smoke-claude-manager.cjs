@@ -28,11 +28,26 @@ fs.writeFileSync(join(directory, 'state.vault'), safeStorage.encryptString(JSON.
 const executable = join(directory, 'fixture-claude')
 fs.copyFileSync(fs.realpathSync('/usr/bin/true'), executable)
 fs.chmodSync(executable, 0o700)
+// An installed bundle may be registered read-only for the same preview test.
+// startInstance is always rejected below; its real profile is never opened.
+const installedDesktop = process.env.CML_CLAUDE_DESKTOP_APPLICATION
+const desktopApplication = installedDesktop ? fs.realpathSync(installedDesktop) : join(directory, 'Fixture Claude.app')
+if (!installedDesktop) {
+  fs.mkdirSync(join(desktopApplication, 'Contents', 'MacOS'), { recursive: true })
+  fs.copyFileSync(fs.realpathSync('/usr/bin/true'), join(desktopApplication, 'Contents', 'MacOS', 'Claude'))
+  fs.chmodSync(join(desktopApplication, 'Contents', 'MacOS', 'Claude'), 0o700)
+  fs.writeFileSync(join(desktopApplication, 'Contents', 'Info.plist'), '<plist><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>Claude</string><key>CFBundleShortVersionString</key><string>2.31226.1</string></dict></plist>', { mode: 0o600 })
+  const desktopArchiveSource = join(directory, 'desktop-archive-source')
+  fs.mkdirSync(desktopArchiveSource)
+  fs.mkdirSync(join(desktopApplication, 'Contents', 'Resources'))
+  fs.writeFileSync(join(desktopArchiveSource, 'package.json'), JSON.stringify({ name: 'synthetic-desktop-preview-only', version: '0.0.0' }))
+  require('node:child_process').execFileSync(process.execPath, [require.resolve('@electron/asar/bin/asar.js'), 'pack', desktopArchiveSource, join(desktopApplication, 'Contents', 'Resources', 'app.asar')], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 10_000, stdio: 'pipe' })
+}
 let cancelNextPicker = false
 dialog.showOpenDialog = async (_window, options) => {
-  assert.match(options.title, /Claude CLI/)
+  assert.match(options.title, /Claude (?:CLI|Desktop)/)
   if (cancelNextPicker) { cancelNextPicker = false; return { canceled: true, filePaths: [] } }
-  return { canceled: false, filePaths: [executable] }
+  return { canceled: false, filePaths: [options.title.includes('Desktop') ? desktopApplication : executable] }
 }
 dialog.showErrorBox = (title) => { console.error('Unexpected native error dialog:', title); app.exit(1) }
 process.on('uncaughtException', error => { console.error(error); app.exit(1) })
@@ -78,7 +93,7 @@ ipcMain.handle = (channel, listener) => nativeHandle(channel, async (event, ...a
     }
     if (args[0] === 'scanSessions') lastPage = value
     if (args[0] === 'previewInstanceLaunch') lastPreview = value
-    if (args[0] === 'chooseInstanceCli') pickerOutcomes.push(value)
+    if (args[0] === 'chooseInstanceCli' || args[0] === 'chooseInstanceApplication') pickerOutcomes.push(value)
     return value
   }
   return listener(event, ...args)
@@ -195,9 +210,9 @@ app.on('browser-window-created', (_event, window) => {
     const create = async (name, kind) => {
       await click('.instances-panel .page-heading button', '创建实例'); await step(0)
       const clients = await options('实例客户端')
-      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude Code'])
-      await run(clients + '.find(el=>el.textContent==="Claude Code").click()')
-      assert.equal(await run('document.querySelector("[aria-label=实例运行方式]").textContent.includes("桌面应用")'), false)
+      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
+      await run(clients + '.find(el=>el.textContent==="Claude Code CLI").click()')
+      assert.equal(await run('!!document.querySelector("[aria-label=实例运行方式]")'), false)
       const choicesBeforePick = pickerOutcomes.length, chooseDeadline = Date.now() + 5000
       await click('.instance-step[data-step="0"] button', '选择 CLI 程序')
       while (pickerOutcomes.length === choicesBeforePick) { assert.ok(Date.now() < chooseDeadline); await new Promise(resolve => setTimeout(resolve, 25)) }
@@ -264,8 +279,66 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(snapshot.instanceApplications.find(value => value.id === instance.applicationId).path, executable)
       return instance
     }
+    const createDesktop = async () => {
+      await click('.instances-panel .page-heading button', '创建实例'); await step(0)
+      const clients = await options('实例客户端')
+      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
+      await run(clients + '.find(el=>el.textContent==="Claude Desktop").click()')
+      assert.equal(await run('!!document.querySelector("[aria-label=实例运行方式]")'), false)
+      const beforePicker = pickerOutcomes.length, pickerDeadline = Date.now() + 5000
+      await click('.instance-step[data-step="0"] button', '选择应用文件')
+      while (pickerOutcomes.length === beforePicker) { assert.ok(Date.now() < pickerDeadline); await new Promise(resolve => setTimeout(resolve, 25)) }
+      await wait('document.querySelector("[aria-label=实例应用]").closest(".ant-select").textContent.includes(' + JSON.stringify(basename(desktopApplication)) + ')')
+      assert.equal(pickerOutcomes.at(-1)?.application?.path, desktopApplication)
+      assert.equal(pickerOutcomes.at(-1)?.application?.clientType, 'claude_code')
+      assert.equal(pickerOutcomes.at(-1)?.application?.kind, 'desktop')
+      await capture('claude-desktop-client-step.png')
+      await next(1)
+      assert.equal(await run('!!document.querySelector("[aria-label=实例账号],[aria-label=实例供应商密钥],[aria-label=实例接入方式]")'), false)
+      assert.equal(await run('document.querySelector(".instance-client-login").textContent.includes("在 Claude Desktop 中登录")'), true)
+      assert.equal(await run('document.querySelector(".instance-client-login").textContent.includes("订阅账号不会自动登录 Desktop")'), true)
+      await capture('claude-desktop-login-step.png')
+      await next(2)
+      await fill('[aria-label="实例名称"]', 'Claude Desktop 示例')
+      assert.equal(await run('!!document.querySelector("[aria-label=实例模型],[aria-label=实例工作目录],[aria-label=实例服务等级]")'), false)
+      assert.equal(await run('document.querySelector(".instance-history-retained").textContent.includes("暂不展示 Desktop")'), true)
+      await next(3)
+      await click('.ant-modal-footer button', '创建并预览')
+      await wait(visible('.instance-launch-preview') + '.length===1')
+      assert.equal(lastPreview?.clientType, 'claude_code')
+      assert.equal(lastPreview?.launchMode, 'desktop')
+      assert.equal(lastPreview?.connectionMode, 'client_login')
+      assert.equal(lastPreview?.identityStatus, 'client_login')
+      assert.equal(lastPreview?.model, '')
+      assert.equal(lastPreview?.history, undefined)
+      const previewText = await run('document.querySelector(".instance-launch-preview").closest(".ant-modal-content").textContent')
+      assert.ok(previewText.includes('在客户端内登录'))
+      assert.ok(previewText.includes('云端历史仍由 Claude 同步'))
+      assert.equal(previewText.includes('API 连接已配置'), false)
+      assert.equal(previewText.includes('Codex'), false)
+      assert.equal(previewText.includes('原生身份已验证'), false)
+      await capture('claude-desktop-launch-preview.png')
+      await run('document.querySelector(".instance-launch-preview").closest(".ant-modal-content").querySelector(".ant-modal-close").click()')
+      await wait(visible('.instance-launch-preview') + '.length===0')
+      const snapshot = await run('window.manager.load()')
+      const instance = snapshot.instances.find(item => item.name === 'Claude Desktop 示例')
+      assert.ok(instance)
+      assert.equal(instance.accountId, '')
+      assert.equal(instance.model, '')
+      assert.equal(instance.launchMode, 'desktop')
+      assert.equal(instance.connectionMode, 'client_login')
+      assert.equal(snapshot.accounts.length, 0)
+      await click('[data-instance-id="' + instance.id + '"] button', '编辑')
+      await wait(visible('.instance-editor-dialog') + '.length===1')
+      assert.equal(await run('document.querySelector("[aria-label=实例客户端]").closest(".ant-select").classList.contains("ant-select-disabled")'), true)
+      assert.equal(await run('!!document.querySelector("[aria-label=实例运行方式]")'), false)
+      await click('.instance-editor-dialog .ant-modal-footer button', '取消')
+      await wait(visible('.instance-editor-dialog') + '.length===0')
+      return instance
+    }
     try {
       await wait(visible('.instances-panel') + '.length===1')
+      const desktop = await createDesktop()
       const api = await create('Claude API 示例', 'api_key')
       const bearer = await create('Claude Bearer 示例', 'bearer')
       const sessionId = randomUUID(), transcripts = []
@@ -385,17 +458,17 @@ app.on('browser-window-created', (_event, window) => {
       assert.ok(editedAccounts.every(account => !vault().accounts.some(item => item.id === account.id)))
       assert.ok(editedAccounts.every(account => vault().accountRecycle.some(item => item.account.id === account.id)))
       for (const item of transcripts) assert.equal(createHash('sha256').update(fs.readFileSync(item.path)).digest('hex'), item.sha256)
-      for (const instance of [api, bearer]) assert.equal(fs.existsSync(join(directory, 'instances', instance.id, 'launch.json')), false)
+      for (const instance of [desktop, api, bearer]) assert.equal(fs.existsSync(join(directory, 'instances', instance.id, 'launch.json')), false)
       assert.deepEqual(networkAttempts, [], 'API configuration and previews must not call login/model/token services')
       fs.writeFileSync(join(evidence, 'validation.json'), JSON.stringify({
-        passed: true, clients: ['Codex', 'Claude Code'], claudeModes: ['cli'], connections: ['anthropic_api_key', 'anthropic_bearer'],
+        passed: true, clients: ['Codex', 'Claude Code CLI', 'Claude Desktop'], claudeModes: ['cli', 'desktop'], connections: ['anthropic_api_key', 'anthropic_bearer'],
         modelSelections,
-        identityStatus: 'api_configured', isolatedInstances: 2, sameNativeIdSeparateRows: true, readOnlyHistory: true,
+        identityStatus: ['api_configured', 'client_login'], isolatedInstances: 3, desktopIndependentLogin: true, desktopManagedAccountsCreated: 0, desktopModelNotRequired: true, desktopApplication: installedDesktop ? 'installed-official-bundle-read-only-preview' : 'synthetic-bundle', sameNativeIdSeparateRows: true, readOnlyHistory: true,
         nativeIdClipboard: true, sourceTranscriptsUnchanged: true, networkRequests: 0, launchedInstances: 0,
         resourceManagement: { apiConnectionsTab: true, configuredStatus: true, quotaUnavailableLabel: true, details: true, metadata: true, endpointModelsCredentials: true, accountProxy: true, recycle: true },
-        limitation: 'Synthetic native executable, credentials and transcripts; no real Claude login, Terminal launch or model response.',
+        limitation: 'Preview only. Synthetic CLI executable, credentials and transcripts; Desktop bundle is identified above. No real Claude login, client launch or model response.',
       }, null, 2), { mode: 0o600 })
-      console.log('Claude Manager UI smoke passed: API/Bearer creation, exact CLI selection, API identity preview, isolated read-only history, connection editing, encrypted proxy settings and recycling; no network or client launch.')
+      console.log('Claude Manager UI smoke passed: Desktop creation and client-login preview, API/Bearer creation, exact CLI selection, API identity preview, isolated read-only history, connection editing, encrypted proxy settings and recycling; no network or client launch.')
       clearTimeout(timer); window.destroy(); app.exit(0)
     } catch (error) {
       console.error(error)

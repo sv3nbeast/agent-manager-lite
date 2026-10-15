@@ -176,13 +176,19 @@ func nativeHTTPProxyFixture(t *testing.T, target, scheme string) (string, *atomi
 	return proxyURL.String(), &requests
 }
 
-func exerciseNativeProxyForwarding(t *testing.T, fixture *nativeProxyFixture) {
+func exerciseNativeProxyForwarding(t *testing.T, fixture *nativeProxyFixture, targetURL ...string) {
 	t.Helper()
+	requestURL, authority := "http://fixture.invalid/native", "fixture.invalid:443"
+	if len(targetURL) != 0 {
+		requestURL = targetURL[0] + "/native"
+		target, _ := url.Parse(targetURL[0])
+		authority = target.Host
+	}
 	endpoint, _ := url.Parse(fixture.url)
 	transport := &http.Transport{Proxy: http.ProxyURL(endpoint)}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
-	request, _ := http.NewRequest(http.MethodGet, "http://fixture.invalid/native", nil)
+	request, _ := http.NewRequest(http.MethodGet, requestURL, nil)
 	request.Header.Set("Authorization", "Bearer native-fixture")
 	request.Header.Set("Proxy-Authorization", "untrusted-client-proxy-secret")
 	response, err := client.Do(request)
@@ -202,7 +208,7 @@ func exerciseNativeProxyForwarding(t *testing.T, fixture *nativeProxyFixture) {
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	// Send the tunneled request in the same write to verify bytes already read
 	// with CONNECT headers survive the hijack.
-	_, _ = io.WriteString(conn, "CONNECT fixture.invalid:443 HTTP/1.1\r\nHost: fixture.invalid:443\r\nProxy-Authorization: untrusted-client-proxy-secret\r\n\r\nGET /tunnel HTTP/1.1\r\nHost: fixture.invalid\r\nAuthorization: Bearer native-fixture\r\nConnection: close\r\n\r\n")
+	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: untrusted-client-proxy-secret\r\n\r\nGET /tunnel HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer native-fixture\r\nConnection: close\r\n\r\n", authority, authority, authority)
 	reader := bufio.NewReader(conn)
 	response, err = http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
 	if err != nil || response.StatusCode != 200 {
@@ -227,6 +233,28 @@ func TestNativeProxyAuthenticatedHTTP(t *testing.T) {
 	if requests.Load() != 2 {
 		t.Fatalf("HTTP upstream was bypassed: %d requests", requests.Load())
 	}
+}
+
+func TestNativeProxyExplicitDirectPreservesHTTPAndCONNECT(t *testing.T) {
+	target := nativeFixtureTarget(t)
+	var inheritedRequests atomic.Int32
+	inherited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		inheritedRequests.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer inherited.Close()
+	// An explicit direct transport must clear even a programmatically installed
+	// default proxy, rather than relying on loopback environment exclusions.
+	previousTransport := http.DefaultTransport
+	inheritedURL, _ := url.Parse(inherited.URL)
+	http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(inheritedURL)}
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+	bridge := startNativeProxyFixture(t, "direct")
+	exerciseNativeProxyForwarding(t, bridge, target.URL)
+	if inheritedRequests.Load() != 0 {
+		t.Fatal("explicit direct inherited a process proxy")
+	}
+	bridge.stop(t)
 }
 
 func TestNativeProxyAuthenticatedHTTPS(t *testing.T) {
@@ -447,7 +475,9 @@ func TestNativeProxyFailureNeverFallsBackAndRedactsSecrets(t *testing.T) {
 
 func TestNativeProxyRejectsInvalidOrUnboundedConfiguration(t *testing.T) {
 	for _, raw := range []string{
-		`{"proxy":"direct"}`,
+		`{"proxy":"none"}`,
+		`{"proxy":"DIRECT"}`,
+		`{"proxy":" direct "}`,
 		`{"proxy":""}`,
 		`{"proxy":"ftp://fixture:fixture-secret@127.0.0.1:80"}`,
 		`{"proxy":"http://fixture:fixture-secret@127.0.0.1:0"}`,

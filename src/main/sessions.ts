@@ -11,6 +11,7 @@ import {readSessionDisplay,readSessionRolloutIndex,displayTitle,displayProject} 
 import {probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,validateExternalHome} from './instancePaths'
 import {scanClaudeCodeSessionsAsync,verifyClaudeSessionLocation,type ClaudeSessionLocation} from './claudeCodeSessions'
+import {isClaudeDesktopProfile} from '../shared/instances'
 
 interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;record:SessionRecord;duplicateOf?:string}
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
@@ -31,13 +32,13 @@ export class SessionCatalog {
   private readonly root:string
   constructor(private readonly store:Store,private readonly running:(id:string)=>boolean=()=>false){this.configs=new ClientConfigs(store);this.root=realpathSync(store.directory)}
   private claudeTargets():SessionSource[]{
-    return (this.store.read().instances??[]).filter(profile=>profile.clientType==='claude_code').map(profile=>({
+    return (this.store.read().instances??[]).filter(profile=>profile.clientType==='claude_code'&&!isClaudeDesktopProfile(profile)).map(profile=>({
       id:profile.id,name:'实例 · '+profile.name+' · Claude Code',directory:instanceHomePath(this.root,profile),managed:!profile.externalHome,role:'instance',clientType:'claude_code',readOnly:true,
       description:'Claude Code 历史只读预览；在对应实例内使用 /resume 恢复对话。',
     }))
   }
   private async claudeTargetIdentity(target:SessionSource):Promise<{profile:string;root?:{device:number;inode:number}}>{
-    const profile=this.store.read().instances?.find(profile=>profile.id===target.id&&profile.clientType==='claude_code')
+    const profile=this.store.read().instances?.find(profile=>profile.id===target.id&&profile.clientType==='claude_code'&&!isClaudeDesktopProfile(profile))
     if(!profile||instanceHomePath(this.root,profile)!==target.directory)throw new Error('Claude Code 会话来源实例已变化')
     if(profile.externalHome)validateExternalHome(this.root,profile.externalHome)
     try{

@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { parse, compileScript } from '@vue/compiler-sfc'
@@ -52,6 +53,7 @@ function data(): AppSnapshot {
   return { settings: settingsSchema.parse({}), accounts, groups: [], providers: [], instances: [], dataDirectory: '/fixture', instanceApplications: [
     { id: 'codex-app', clientType: 'codex', kind: 'desktop', name: 'Codex', path: '/fixture/Codex.app' },
     { id: 'claude-cli', clientType: 'claude_code', kind: 'cli', name: 'Claude CLI', path: '/fixture/claude' },
+    { id: 'claude-desktop', clientType: 'claude_code', kind: 'desktop', name: 'Claude Desktop', path: '/fixture/Claude.app' },
   ] } as unknown as AppSnapshot
 }
 
@@ -139,6 +141,168 @@ test('desktop picker also retains cancellation and selects the exact previously 
   choice = { application: selected, snapshot }
   await f.state.chooseApplication()
   assert.equal(f.state.form.applicationId, 'chosen-desktop')
+})
+
+test('Claude Desktop wizard creates and previews a client-login instance without a managed account or model', async t => {
+  const snapshot = data(), saved: any[] = [], previews: any[] = []
+  snapshot.accounts = []
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+    saveInstance: async (input: any) => {
+      saved.push(input)
+      snapshot.instances!.push({ ...input.details, id: randomUUID(), revision: 0, createdAt: 1, status: 'stopped', directory: '/fixture/claude-config', desktopDirectory: '/fixture/desktop', identityStatus: 'client_login' })
+      return snapshot
+    },
+    previewInstanceLaunch: async (input: any) => { previews.push(input); return { ...snapshot.instances![0], instanceId: input.id, ticket: randomUUID(), identityStatus: 'client_login' } },
+    fetchChatGPTModels: () => assert.fail('Desktop login must not fetch managed account models'),
+    mutateProvider: () => assert.fail('Desktop login must not create a provider account'),
+  }, snapshot)
+  f.state.edit()
+  assert.deepEqual(f.state.clientOptions.map((choice: any) => choice.label), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
+  f.state.selectClientVariant('claude_desktop'); await nextTick()
+  assert.equal(f.state.clientSelection, 'claude_desktop')
+  assert.equal(f.state.launchMode, 'desktop')
+  assert.equal(f.state.form.applicationId, 'claude-desktop')
+  assert.equal(f.state.form.name, 'Claude Desktop 1')
+  assert.equal(f.state.form.connectionMode, 'client_login')
+  assert.equal(f.state.form.accountId, '')
+  assert.equal(f.state.form.model, '')
+  assert.deepEqual(f.state.availableAccounts, [])
+  assert.equal(f.state.previewNetworkLabel({ mode: 'inherit', source: 'settings' }), '管理器设置 · 继承系统网络')
+  assert.equal(f.state.previewNetworkLabel({ mode: 'direct', source: 'settings' }), '管理器设置 · 直连')
+  assert.equal(f.state.previewNetworkLabel({ mode: 'proxy', source: 'settings', proxy: { protocol: 'SOCKS5', server: 'proxy.invalid', port: 1080, authenticated: true, password: 'must-not-display' } }), '管理器默认代理 · SOCKS5 · proxy.invalid:1080 · 已配置认证')
+  await f.state.nextStep(); assert.equal(f.state.step, 1)
+  await f.state.nextStep(); assert.equal(f.state.step, 2)
+  f.state.args = '--no-sandbox'
+  await f.state.nextStep(); assert.equal(f.state.step, 2)
+  assert.match(f.state.fieldErrors.extraArgs, /--disable-gpu/)
+  f.state.args = '--disable-gpu'
+  await f.state.nextStep(); assert.equal(f.state.step, 3)
+  await f.state.save(true)
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].details.launchMode, 'desktop')
+  assert.equal(saved[0].details.connectionMode, 'client_login')
+  assert.equal(saved[0].details.accountId, '')
+  assert.equal(saved[0].details.model, '')
+  assert.equal(saved[0].details.workingDirectoryId, undefined)
+  assert.equal(previews.length, 1)
+  assert.equal(f.state.preview.identityStatus, 'client_login')
+  assert.equal(f.state.identityStatusLabel(snapshot.instances![0]), '在客户端内登录')
+  assert.equal(f.state.instanceAccountLabel(snapshot.instances![0]), '由 Claude Desktop 管理')
+  assert.equal(snapshot.accounts.length, 0)
+  f.state.edit()
+  assert.equal(f.state.clientSelection, 'claude_desktop', 'a new draft remembers the actual launcher')
+  assert.equal(f.state.form.name, 'Claude Desktop 2')
+})
+
+test('Claude Desktop needs an installed desktop application and editing cannot switch launchers', async t => {
+  const snapshot = data()
+  snapshot.instanceApplications = snapshot.instanceApplications!.filter(app => app.id !== 'claude-desktop')
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, snapshot)
+  f.state.edit(); f.state.selectClientVariant('claude_desktop'); await nextTick()
+  assert.equal(f.state.form.applicationId, '')
+  await f.state.nextStep()
+  assert.equal(f.state.step, 0)
+  assert.match(f.state.fieldErrors.applicationId, /已安装/)
+  const instance = { id: randomUUID(), revision: 0, clientType: 'claude_code', launchMode: 'desktop', connectionMode: 'client_login', accountId: '', model: '', name: 'Existing desktop', applicationId: 'claude-desktop', extraArgs: [], defaultTier: 'inherit', status: 'stopped' }
+  f.state.edit(instance)
+  f.state.selectClientVariant('claude_code_cli')
+  assert.equal(f.state.clientSelection, 'claude_desktop')
+  f.state.launchMode = 'cli'; f.state.changeLaunchMode()
+  assert.equal(f.state.launchMode, 'desktop')
+  assert.equal(f.state.form.launchMode, 'desktop')
+  assert.equal(f.state.form.connectionMode, 'client_login')
+  assert.equal(await f.state.ensureResource(), true)
+})
+
+test('editing a Codex instance preserves its existing desktop to CLI switch', async t => {
+  const snapshot = data()
+  snapshot.instanceApplications!.push({ id: 'codex-cli', clientType: 'codex', kind: 'cli', name: 'Codex CLI', path: '/fixture/codex' })
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, snapshot)
+  f.state.edit({ id: randomUUID(), revision: 0, clientType: 'codex', launchMode: 'desktop', connectionMode: 'local_api', accountId: 'codex-key', model: 'gpt-fixture', name: 'Codex existing', applicationId: 'codex-app', extraArgs: [], defaultTier: 'inherit', status: 'stopped' })
+  f.state.launchMode = 'cli'; f.state.changeLaunchMode()
+  assert.equal(f.state.form.applicationId, 'codex-cli')
+  assert.equal(f.state.form.launchMode, 'cli')
+  assert.equal(f.state.form.accountId, 'codex-key')
+  assert.equal(f.state.form.model, 'gpt-fixture')
+})
+
+test('Claude Desktop picker passes its client and a late result cannot replace a CLI draft', async t => {
+  const calls: string[] = []
+  let resolveChoice!: (choice: InstanceApplicationChoice) => void
+  const selected = { id: 'picked-claude-desktop', clientType: 'claude_code' as const, kind: 'desktop' as const, name: 'Picked Claude Desktop', path: '/fixture/Picked Claude.app' }
+  const snapshot = data(); snapshot.instanceApplications!.push(selected)
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+    chooseInstanceApplication: (client: string) => { calls.push(client); return new Promise(resolve => { resolveChoice = resolve }) },
+  }, data())
+  f.state.edit(); f.state.selectClientVariant('claude_desktop')
+  const pending = f.state.chooseApplication()
+  f.state.selectClientVariant('claude_code_cli'); await nextTick()
+  resolveChoice({ application: selected, snapshot }); await pending
+  assert.deepEqual(calls, ['claude_code'])
+  assert.equal(f.state.form.applicationId, 'claude-cli')
+  assert.equal(f.state.form.connectionMode, 'native')
+  assert.equal(f.state.form.accountId, 'claude-key')
+  const selectedAgain = f.state.chooseApplication()
+  f.state.closeEditor(); f.state.edit(); await nextTick()
+  resolveChoice({ application: selected, snapshot }); await selectedAgain
+  assert.equal(f.state.form.applicationId, 'claude-cli', 'closing and reopening also expires a picker request')
+})
+
+test('a late CLI project-directory picker cannot bind a directory to a Desktop draft', async t => {
+  let choose!: (value: any) => void
+  const target = { id: randomUUID(), path: '/fixture/project', device: 1, inode: 2 }
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [target], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+    chooseInstanceWorkingDirectory: () => new Promise(resolve => { choose = resolve }),
+  }, data())
+  f.state.edit(); f.state.selectClientVariant('claude_code_cli')
+  const pending = f.state.chooseWorkingDirectory()
+  f.state.selectClientVariant('claude_desktop'); choose(target); await pending
+  assert.equal(f.state.form.workingDirectoryId, undefined)
+  assert.equal(f.state.clientSelection, 'claude_desktop')
+})
+
+test('Desktop login callback input clears on success or close and stale errors do not contaminate another instance', async t => {
+  const calls: any[] = []
+  let rejectCallback: ((reason: Error) => void) | undefined
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+    completeClaudeDesktopLogin: async (input: any) => { calls.push(input); if (calls.length > 1) return new Promise((_resolve, reject) => { rejectCallback = reject }) },
+  }, data())
+  const first = { id: randomUUID(), clientType: 'claude_code', connectionMode: 'client_login', status: 'running' }
+  const second = { ...first, id: randomUUID() }
+  f.state.openDesktopLogin({ ...first, status: 'stopped' })
+  assert.equal(f.state.desktopLoginTarget, undefined)
+  f.state.openDesktopLogin(first)
+  await f.state.completeDesktopLogin()
+  assert.equal(calls.length, 0)
+  assert.match(f.state.desktopLoginError, /粘贴/)
+  f.state.desktopLoginUrl = 'claude://login?code=synthetic-private-code'
+  await f.state.completeDesktopLogin()
+  assert.equal(calls[0].id, first.id)
+  assert.equal(f.state.desktopLoginTarget, undefined)
+  assert.equal(f.state.desktopLoginUrl, '')
+  f.state.openDesktopLogin(first); f.state.desktopLoginUrl = 'claude://login?code=synthetic-private-code'
+  const pending = f.state.completeDesktopLogin()
+  f.state.closeDesktopLogin(); f.state.openDesktopLogin(second)
+  rejectCallback!(new Error('must not show synthetic-private-code')); await pending
+  assert.equal(f.state.desktopLoginTarget, second.id)
+  assert.equal(f.state.desktopLoginUrl, '')
+  assert.equal(f.state.desktopLoginError, '')
+  assert.equal(f.state.desktopLoginBusy, false)
+  f.state.desktopLoginUrl = 'claude://login?code=synthetic-private-code'
+  const failed = f.state.completeDesktopLogin()
+  rejectCallback!(new Error('must not show synthetic-private-code')); await failed
+  assert.match(f.state.desktopLoginError, /无法将登录回调/)
+  assert.equal(f.state.desktopLoginError.includes('synthetic-private-code'), false)
+  f.state.closeDesktopLogin()
+  assert.equal(f.state.desktopLoginUrl, '')
 })
 
 test('Claude session source capabilities remain visible while refreshing and after a failed refresh', async t => {

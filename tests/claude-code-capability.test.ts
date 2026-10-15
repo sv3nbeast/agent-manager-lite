@@ -5,11 +5,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { captureClaudeExecutableIdentity, claudeCodeCanRegisterDesktop, inspectClaudeCodeCapabilities, validateClaudeExecutableIdentity } from '../src/main/claudeCodeCapability'
 
-test('Claude capability report keeps Desktop planned and does not register it', () => {
+test('Claude capability report scopes Desktop to native macOS login', () => {
   const report = inspectClaudeCodeCapabilities({ platform: 'linux', home: '/tmp/aml-empty-home', path: '' })
   assert.equal(report.cliAcceptance.configProjection, 'verified')
-  assert.equal(report.desktopAcceptance.configProjection, 'pending')
-  assert.equal(claudeCodeCanRegisterDesktop(), false)
+  assert.equal(report.desktopAcceptance.configProjection, 'verified')
+  assert.equal(report.desktopAcceptance.protocolAdapter, 'pending')
+  assert.equal(report.desktopAcceptance.sessionIndexing, 'pending')
+  assert.equal(claudeCodeCanRegisterDesktop('darwin'), true)
+  assert.equal(claudeCodeCanRegisterDesktop('linux'), false)
 })
 
 test('Claude CLI executable identity detects replacement and symlink paths', () => {

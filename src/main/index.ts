@@ -578,9 +578,14 @@ async function main(): Promise<void> {
       case 'stopInstance': await instances.stop(z.string().uuid().parse(input)); break
       case 'closeAllInstances': await instances.closeAll(); break
       case 'focusInstance': await instances.focus(z.string().uuid().parse(input)); return
+      case 'instance:complete-claude-desktop-login': {
+        const parsed=z.object({id:z.string().uuid(),url:z.string().max(16384)}).strict().parse(input)
+        await instances.completeDesktopLogin(parsed.id,parsed.url);return
+      }
       case 'chooseInstanceApplication': {
-        const selection=await dialog.showOpenDialog(window,{title:'选择 Codex 或 ChatGPT 桌面应用',properties:['openFile'],filters:[{name:'macOS 应用',extensions:['app']}]})
-        const application=!selection.canceled&&selection.filePaths[0]?instances.registerApplication(selection.filePaths[0]):undefined
+        const clientType=agentClientTypeSchema.parse(input??'codex')
+        const selection=await dialog.showOpenDialog(window,{title:clientType==='claude_code'?'选择 Claude Desktop 应用':'选择 Codex 或 ChatGPT 桌面应用',properties:['openFile'],filters:[{name:'macOS 应用',extensions:['app']}]})
+        const application=!selection.canceled&&selection.filePaths[0]?instances.registerApplication(selection.filePaths[0],'desktop',clientType):undefined
         return {application,snapshot:snapshot()}
       }
       case 'chooseInstanceCli': {

@@ -39,7 +39,7 @@ export const claudeCodeCapabilitySchema = z.object({
 }).strict()
 export type ClaudeCodeCapabilities = z.infer<typeof claudeCodeCapabilitySchema>
 
-/** Evidence gates used before this planned client can enter the implemented registry. */
+/** Evidence is scoped to a launcher and its supported connection mode. */
 export const claudeCodeAcceptanceSchema = z.object({
   detection: z.enum(['verified', 'pending']),
   configProjection: z.enum(['verified', 'pending']),
@@ -74,15 +74,15 @@ export const claudeCodeCliAcceptance = claudeCodeAcceptanceSchema.parse({
   sessionIndexing: 'verified',
 })
 
-/** Desktop has an independently detected bundle, but its Electron profile,
- * Keychain/cookie ownership and Code mode transcript boundary remain pending. */
+/** Native Desktop owns its login and isolated profile. Provider projection and
+ * manager-side transcript indexing are separate, unimplemented capabilities. */
 export const claudeCodeDesktopAcceptance = claudeCodeAcceptanceSchema.parse({
   detection: 'verified',
-  configProjection: 'pending',
-  credentialIsolation: 'pending',
+  configProjection: 'verified',
+  credentialIsolation: 'verified',
   protocolAdapter: 'pending',
-  runtimeLifecycle: 'pending',
-  globalStateOwnership: 'pending',
+  runtimeLifecycle: 'verified',
+  globalStateOwnership: 'verified',
   sessionIndexing: 'pending',
 })
 
@@ -100,34 +100,33 @@ export const claudeCodeClient = {
     models: true,
     contextWindow: false,
     fast: false,
-    launchModes: ['cli'] as const,
+    launchModes: ['cli', 'desktop'] as const,
     projectDirectoryModes: ['cli'] as const,
     configDirectory: true,
     sessionPersistence: true,
   },
 } as const
 
-/** Desktop is deliberately described separately from CLI even though both
- * belong to the same Claude Code product family.  Its Electron profile and
- * system login state have not passed the isolation gate yet. */
+/** Desktop has its own login, profile and capability surface within the same
+ * family. CLI OAuth and API connections are never injected into Desktop. */
 export const claudeCodeDesktopClient = {
   id: claudeCodeClientType,
-  name: 'Claude Code Desktop',
-  status: 'planned' as const,
+  name: 'Claude Desktop',
+  status: 'implemented' as const,
   identityService: 'anthropic' as const,
   protocol: 'anthropic_messages' as const,
   applicationKind: 'desktop' as const,
   capabilities: {
     login: true,
-    nativeAccounts: true,
-    apiKey: true,
+    nativeAccounts: false,
+    apiKey: false,
     localApi: false,
-    models: true,
-    contextWindow: true,
+    models: false,
+    contextWindow: false,
     fast: false,
     launchModes: ['desktop'] as const,
     projectDirectoryModes: ['desktop'] as const,
-    configDirectory: false,
+    configDirectory: true,
     sessionPersistence: true,
   },
 } as const

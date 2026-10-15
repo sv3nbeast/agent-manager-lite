@@ -9,6 +9,7 @@ import type { Account } from '../shared/types'
 import type { DesktopPlan } from './instanceRuntime'
 import { accountCompatibility } from '../shared/agentClients'
 import { claudeCodeClient, claudeCodeClientType, claudeCodeOwnedEnvironment, type ClaudeCodeOwnedEnvironment } from '../shared/claudeCode'
+import { detectClaudeCodeDesktopApplications, claudeCodeDesktopMacLaunchArgs, validateClaudeCodeDesktopArgs } from './claudeCodeDesktopAdapter'
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const execFile = promisify(execFileCallback)
@@ -33,7 +34,7 @@ export interface ClaudeDesktopApplication {
   kind: 'desktop'
   applicationId: 'com.anthropic.claudefordesktop'
   version?: string
-  status: 'planned'
+  status: 'implemented'
   reason: string
 }
 
@@ -80,15 +81,13 @@ export function detectClaudeCodeApplications(options: ClaudeCodeDetectionOptions
   return [...found.values()]
 }
 
-/** Desktop is reported for diagnostics only until its Electron/VM stores have
- * a verified per-instance user-data and session boundary. */
+/** Compatibility discovery entry point; use the same validated bundle detector. */
 export function detectClaudeDesktopApplications(options: { platform?: NodeJS.Platform; home?: string } = {}): ClaudeDesktopApplication[] {
   const platform=options.platform??process.platform
   if(platform!=='darwin')return []
-  const home=options.home??homedir(),paths=['/Applications/Claude.app',join(home,'Applications/Claude.app')]
-  return paths.filter(path=>existsSync(join(path,'Contents','MacOS','Claude'))).map(path=>({
-    clientType:claudeCodeClientType,id:digest(`claude-desktop:${path}`),name:'Claude Desktop · Claude Code',path:realpathSync(path),kind:'desktop' as const,
-    applicationId:'com.anthropic.claudefordesktop' as const,status:'planned' as const,reason:'Claude Desktop 使用独立 Electron/VM 会话和 OAuth 状态，尚未完成每实例隔离验证'
+  return detectClaudeCodeDesktopApplications(options).map(application=>({
+    ...application,applicationId:'com.anthropic.claudefordesktop' as const,status:'implemented' as const,
+    reason:'使用独立桌面配置与 HOME，在 Claude Desktop 内登录；CLI 凭据不作为桌面登录'
   }))
 }
 
@@ -395,32 +394,52 @@ export function validateClaudeCodeCliArgs(args: readonly string[], advertisedCom
 
 function applications(stored: readonly InstanceApplication[] = []): InstanceApplication[] {
   const detected = detectClaudeCodeApplications().map(asInstanceApplication)
-  const remembered = stored.filter(application => application.clientType === claudeCodeClientType && application.kind === 'cli').map(application=>{
+  const desktop = process.platform==='darwin'?detectClaudeCodeDesktopApplications().map(application=>({clientType:claudeCodeClientType,id:application.id,name:'Claude Desktop',path:application.path,kind:'desktop' as const})):[]
+  const remembered = stored.filter(application => application.clientType === claudeCodeClientType).map(application=>{
+    if(application.kind==='desktop')return application
     const path=application.installationPath?executableFile(application.installationPath):undefined
     return path?{...application,path}:application
   })
-  return [...new Map([...remembered, ...detected].map(application => [application.id, application])).values()]
+  return [...new Map([...remembered, ...detected, ...desktop].map(application => [application.id, application])).values()]
 }
 
 export const claudeCodeInstanceAdapter = {
   client: claudeCodeClient,
   applications,
   registerApplication(path: string, kind: 'desktop'|'cli' = 'cli'): InstanceApplication {
-    if(kind!=='cli')throw new Error('Claude Desktop 尚未完成隔离验证，暂不能登记为实例应用')
+    if(kind==='desktop'){
+      if(process.platform!=='darwin')throw new Error('Claude Desktop 实例当前支持 macOS')
+      const application=detectClaudeCodeDesktopApplications({roots:[path],platform:'darwin'})[0]
+      if(!application)throw new Error('请选择已安装的 Claude.app')
+      return {clientType:claudeCodeClientType,id:application.id,name:'Claude Desktop',path:application.path,kind:'desktop'}
+    }
     const canonical=executableFile(path)
     if(!canonical)throw new Error('请选择可执行的 Claude Code CLI')
     return {clientType:claudeCodeClientType,id:digest(`claude-code:${resolve(path)}`),name:'Claude Code',path:canonical,installationPath:resolve(path),kind:'cli'}
   },
   executable(application: InstanceApplication): string {
-    if(application.clientType!==claudeCodeClientType||application.kind!=='cli')throw new Error('所选程序不是 Claude Code CLI')
+    if(application.clientType!==claudeCodeClientType)throw new Error('所选程序不是 Claude 客户端')
+    if(application.kind==='desktop'){
+      const found=detectClaudeCodeDesktopApplications({roots:[application.path],platform:'darwin'})[0]
+      if(!found||found.path!==application.path)throw new Error('Claude Desktop 路径已被替换，请重新选择')
+      return found.executable
+    }
+    if(application.kind!=='cli')throw new Error('所选程序不是 Claude Code CLI')
     const canonical=executableFile(application.path)
     if(!canonical||canonical!==application.path)throw new Error('Claude Code CLI 路径已被替换，请重新选择')
     return canonical
   },
   launchRuntime(application: InstanceApplication) { return { executable: claudeCodeInstanceAdapter.executable(application) } },
-  validateApplication(profile: Pick<InstanceProfile,'clientType'|'extraArgs'|'workingDirectoryId'>, application: InstanceApplication): void {
+  validateApplication(profile: Pick<InstanceProfile,'clientType'|'extraArgs'|'workingDirectoryId'> & Partial<Pick<InstanceProfile,'connectionMode'>>, application: InstanceApplication): void {
     if(profile.clientType!==claudeCodeClientType||application.clientType!==claudeCodeClientType)throw new Error('实例客户端与所选程序不兼容')
-    if(application.kind!=='cli')throw new Error('Claude Desktop 尚未完成隔离验证，请使用 Claude Code CLI')
+    if(application.kind==='desktop'){
+      if(process.platform!=='darwin')throw new Error('Claude Desktop 实例当前支持 macOS')
+      if(profile.connectionMode!=='client_login')throw new Error('Claude Desktop 请使用客户端内登录，API 连接和 CLI 订阅凭据不能替代桌面登录')
+      if(profile.workingDirectoryId)throw new Error('Claude Desktop 项目请在客户端内选择')
+      validateClaudeCodeDesktopArgs(profile.extraArgs)
+      return
+    }
+    if(profile.connectionMode==='client_login')throw new Error('客户端内登录仅用于 Claude Desktop')
     validateClaudeCodeCliArgs(profile.extraArgs)
   },
   validateAccount(profile: Pick<InstanceProfile,'clientType'|'connectionMode'|'model'>, account: ClaudeCodeAccount): void {
@@ -430,7 +449,7 @@ export const claudeCodeInstanceAdapter = {
   },
   copiedSessionProvider() { throw new Error('Claude Code 会话格式尚未与 Codex 兼容，暂不能复制或转换会话') },
   desktopEnvironment(source: NodeJS.ProcessEnv, projection: Pick<ClaudeCodeProjection,'environment'>): NodeJS.ProcessEnv { return claudeCodeEnvironment(source,projection) },
-  macLaunchArgs(plan: DesktopPlan, args: readonly string[] = plan.args): string[] { validateClaudeCodeCliArgs(args); return [...args] },
+  macLaunchArgs(plan: DesktopPlan, args: readonly string[] = plan.args): string[] { return claudeCodeDesktopMacLaunchArgs(plan,args) },
   configPaths: claudeCodeConfigPaths,
   projectConfig: projectClaudeCodeConfig,
   environment: claudeCodeEnvironment,

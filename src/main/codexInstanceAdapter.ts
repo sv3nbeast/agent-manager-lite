@@ -137,7 +137,6 @@ export const codexInstanceAdapter={client:getAgentClient('codex'),applications,r
 export function getInstanceClientAdapter(clientType:unknown,applicationKind?:'desktop'|'cli') {
   const type=resolveAgentClientType(clientType)
   if(type==='claude_code'){
-    if(applicationKind==='desktop')throw new Error('Claude Desktop 尚未通过登录、配置、隔离和会话边界验收')
     return claudeCodeInstanceAdapter
   }
   return codexInstanceAdapter

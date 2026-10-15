@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { claudeCodeDesktopEnvironment, claudeCodeDesktopInstanceMarker, claudeCodeDesktopMacLaunchArgs, claudeCodeDesktopProfileDirectory, detectClaudeCodeDesktopApplications, inspectClaudeCodeDesktopIsolation, isClaudeCodeDesktopProcessOwned, validateClaudeCodeDesktopArgs, validateClaudeCodeDesktopProfileDirectory, type ClaudeCodeDesktopApplication } from '../src/main/claudeCodeDesktopAdapter'
+import { claudeCodeDesktopEnvironment, claudeDesktopLaunchEnvironment, isClaudeDesktopCommandOwned, claudeCodeDesktopInstanceMarker, claudeCodeDesktopMacLaunchArgs, claudeCodeDesktopProfileDirectory, detectClaudeCodeDesktopApplications, inspectClaudeCodeDesktopIsolation, isClaudeCodeDesktopProcessOwned, validateClaudeCodeDesktopArgs, validateClaudeCodeDesktopProfileDirectory, type ClaudeCodeDesktopApplication } from '../src/main/claudeCodeDesktopAdapter'
 
 const application: ClaudeCodeDesktopApplication = {
   clientType: 'claude_code', applicationKind: 'desktop', kind: 'desktop', id: 'desktop-fixture',
@@ -33,9 +33,10 @@ test('an existing Desktop profile never proves login or shared session isolation
   assert.equal(result.status, 'pending')
   assert.equal(result.canCreateInstance, false)
   assert.deepEqual(result.checks.map(check => check.id), ['profile', 'login', 'configuration', 'credentials', 'sessions', 'lifecycle'])
-  assert.ok(result.checks.every(check => check.status === 'pending'))
+  assert.equal(result.checks.find(check => check.id === 'login')?.status, 'pending')
+  assert.equal(result.checks.find(check => check.id === 'lifecycle')?.status, 'verified')
   assert.ok(result.checks.find(check => check.id === 'configuration')?.detail.includes('第三方推理配置'))
-  assert.ok(result.checks.find(check => check.id === 'sessions')?.detail.includes('同一条 CLI 会话'))
+  assert.ok(result.checks.find(check => check.id === 'sessions')?.detail.includes('暂不进入管理器索引'))
   assert.equal(readFileSync(config, 'utf8'), 'must-not-read-or-change')
   assert.equal(JSON.stringify(result).includes('must-not-read-or-change'), false)
 })
@@ -140,4 +141,34 @@ test('Desktop process ownership requires exact executable, profile and nonce', t
     ['-user-data-dir=/tmp/other'], ['--remote-debugging-future-option=9222'],
   ]) assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', `--user-data-dir=${profile}`, marker, ...extra] }), false)
   assert.equal(isClaudeCodeDesktopProcessOwned(plan, { executable: plan.executable, args: ['Claude', '--', `--user-data-dir=${profile}`, marker] }), false)
+})
+
+test('Desktop launch owns Foundation home, Code config and task temp roots', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml desktop env ')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const directory = join(root, 'home'), desktopDirectory = join(root, 'desktop'), home = join(root, 'desktop-home')
+  for (const path of [directory, desktopDirectory, join(home, 'tmp')]) mkdirSync(path, { recursive: true })
+  const plan = { directory, desktopDirectory }
+  const expected = { HOME: home, CFFIXED_USER_HOME: home, CLAUDE_CONFIG_DIR: directory, CLAUDE_CODE_TMPDIR: join(home, 'tmp') }
+  assert.deepEqual(claudeDesktopLaunchEnvironment(plan), expected)
+  assert.deepEqual(claudeDesktopLaunchEnvironment({ ...plan, launchEnvironment: expected }), expected)
+  for (const launchEnvironment of [{ HOME: root }, { CLAUDE_CONFIG_DIR: home }, { CLAUDE_CODE_TMPDIR: root }, { ANTHROPIC_API_KEY: 'synthetic' }]) {
+    assert.throws(() => claudeDesktopLaunchEnvironment({ ...plan, launchEnvironment }), /不能覆盖/)
+  }
+  assert.throws(() => claudeDesktopLaunchEnvironment({ ...plan, directory: home }), /不属于当前实例/)
+  const env = claudeCodeDesktopEnvironment({ HOME: '/other', CFFIXED_USER_HOME: '/other', XDG_CONFIG_HOME: '/other', DYLD_INSERT_LIBRARIES: '/other', CLAUDE_CODE_TMPDIR: '/other' })
+  for (const key of ['CFFIXED_USER_HOME', 'XDG_CONFIG_HOME', 'DYLD_INSERT_LIBRARIES', 'CLAUDE_CODE_TMPDIR']) assert.equal(env[key], undefined)
+})
+
+test('Desktop recovery recognizes exact paths with spaces and rejects another profile', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'aml desktop owner ')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const desktopDirectory = join(root, 'desktop')
+  mkdirSync(desktopDirectory)
+  const plan = { clientType: 'claude_code' as const, executable: '/Applications/Claude App/Claude.app/Contents/MacOS/Claude', desktopDirectory, nonce: 'owned-nonce' }
+  const command = `${plan.executable} --user-data-dir=${desktopDirectory} --cml-instance=owned-nonce`
+  assert.equal(isClaudeDesktopCommandOwned(plan, command), true)
+  assert.equal(isClaudeDesktopCommandOwned(plan, command.replace(desktopDirectory, desktopDirectory + '-other')), false)
+  assert.equal(isClaudeDesktopCommandOwned(plan, command + ' --user-data-dir=/other'), false)
+  assert.equal(isClaudeDesktopCommandOwned(plan, command.replace('owned-nonce', 'other-nonce')), false)
 })

@@ -272,7 +272,7 @@ export interface ManagerAPI {
   chooseExistingInstanceDirectory():Promise<InstanceCopySource|undefined>
   attachExistingInstance(input:AttachInstanceInput):Promise<AppSnapshot>
   cancelInstanceCopy(id:string):Promise<AppSnapshot>
-  chooseInstanceApplication():Promise<InstanceApplicationChoice>
+  chooseInstanceApplication(clientType?:import('./agentClients').AgentClientType):Promise<InstanceApplicationChoice>
   chooseInstanceCli(clientType?:import('./agentClients').AgentClientType):Promise<InstanceApplicationChoice>
   chooseInstanceWorkingDirectory():Promise<InstanceWorkingDirectory|undefined>
   listInstanceWorkingDirectories():Promise<InstanceWorkingDirectory[]>
@@ -283,6 +283,7 @@ export interface ManagerAPI {
   stopInstance(id:string):Promise<AppSnapshot>
   closeAllInstances():Promise<AppSnapshot>
   focusInstance(id:string):Promise<void>
+  completeClaudeDesktopLogin(input:{id:string;url:string}):Promise<void>
   listClientConfigs(): Promise<ClientConfigTarget[]>
   chooseClientConfig(): Promise<ClientConfigTarget | undefined>
   readClientConfig(id: string): Promise<ClientConfigView>

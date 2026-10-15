@@ -170,10 +170,10 @@ onUnmounted(cancelPending)
   <a-modal v-model:open="open" title="添加账号" :footer="null" :width="760" :body-style="{ maxHeight: '75vh', overflowY: 'auto' }">
     <div class="login-client-purpose">
       <a-form-item v-if="!clientType && !subscriptionOnly" label="客户端用途"><a-select v-model:value="selectedClient" aria-label="账号用途" :disabled="locked" :options="implementedAgentClients.map(item=>({value:item.id,label:item.name}))" /></a-form-item>
-      <p v-else-if="subscriptionOnly" class="muted">用于 Claude 订阅账号 · 完成验证后仍需单独完成 Desktop 实例隔离验收</p>
+      <p v-else-if="subscriptionOnly" class="muted">用于 Claude 订阅账号 · Claude Desktop 在各实例内单独登录</p>
       <p v-else class="muted">用于 {{ client.name }} · 添加完成后回到实例配置</p>
     </div>
-    <p class="muted login-introduction">{{ isClaude ? method === 'subscription' ? '添加 Claude 订阅账号。授权只用于读取经过验证的账号身份，Desktop 和受管实例仍需单独完成隔离验收。' : '为 Claude Code CLI 添加 API Key 或 Bearer 连接。Claude 订阅账号可在账号管理中单独验证。' : `为 ${client.name} 添加登录身份或连接。选择一种添加方式；供应商密钥在供应商页管理。` }}</p>
+    <p class="muted login-introduction">{{ isClaude ? method === 'subscription' ? '添加 Claude 订阅账号，用于读取账号身份与用量；此授权不替代 Claude Desktop 的客户端内登录。' : '为 Claude Code CLI 添加 API Key 或 Bearer 连接。Claude 订阅账号可在账号管理中单独验证。' : `为 ${client.name} 添加登录身份或连接。选择一种添加方式；供应商密钥在供应商页管理。` }}</p>
     <a-tabs v-model:active-key="method" class="login-methods" :animated="false">
       <a-tab-pane v-if="!isClaude" key="official" :disabled="locked && method !== 'official'"><template #tab><span class="method-label"><DesktopOutlined />官方客户端</span></template></a-tab-pane>
       <a-tab-pane v-if="!isClaude" key="oauth" :disabled="locked && method !== 'oauth'"><template #tab><span class="method-label"><GlobalOutlined />浏览器授权</span></template></a-tab-pane>

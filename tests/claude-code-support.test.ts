@@ -6,11 +6,11 @@ import { join } from 'node:path'
 import { claudeCodeClientType, claudeCodeClient } from '../src/shared/claudeCode'
 import { claudeCodeEnvironment, claudeCodeConfigPaths, detectClaudeCodeApplications, projectClaudeCodeConfig, validateClaudeCodeCliArgs } from '../src/main/claudeCodeInstanceAdapter'
 
-test('Claude CLI declares API-only runtime capabilities independently from Desktop', () => {
+test('Claude family exposes CLI and Desktop with independently scoped connections', () => {
   assert.equal(claudeCodeClientType, 'claude_code')
   assert.equal(claudeCodeClient.status, 'implemented')
   assert.equal(claudeCodeClient.protocol, 'anthropic_messages')
-  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli'])
+  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli', 'desktop'])
   assert.equal(claudeCodeClient.capabilities.localApi, false)
   assert.equal(claudeCodeClient.capabilities.login, false)
   assert.equal(claudeCodeClient.capabilities.contextWindow, false)

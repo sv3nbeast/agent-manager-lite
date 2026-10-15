@@ -46,6 +46,19 @@ test('native bridge never falls back to a directly reachable target when its con
   assert.equal(response.status,502);assert.equal(directHits,0);assert.equal(response.body.includes('private-secret'),false)
 })
 
+test('native direct bridge reaches its destination and closes with the instance lease',async t=>{
+  const target=await listen(t,createServer((req,res)=>{
+    assert.equal(req.headers['proxy-authorization'],undefined)
+    res.end('explicit-direct')
+  }))
+  const bridge=await new NativeProxy(resolve('resources/bin/codex-proxy')).acquire('direct','direct',new AbortController().signal)
+  t.after(()=>bridge.stop())
+  assert.deepEqual(await get(bridge.url,'http://127.0.0.1:'+target+'/direct'),{status:200,body:'explicit-direct'})
+  await bridge.stop()
+  assert.equal(bridge.alive(),false)
+  await assert.rejects(get(bridge.url,'http://127.0.0.1:'+target+'/direct'))
+})
+
 test('ending native bridge stdin closes an already established CONNECT tunnel',async t=>{
   const sockets=new Set<import('node:net').Socket>(),upstream=createServer()
   upstream.on('connect',(_req,socket)=>{

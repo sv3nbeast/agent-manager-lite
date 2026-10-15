@@ -33,6 +33,9 @@ type nativeProxyInput struct {
 }
 
 func validNativeProxyURL(raw string) bool {
+	if raw == "direct" {
+		return true
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" || u.Opaque != "" || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
 		return false
@@ -146,13 +149,17 @@ func nativeProxyHandler(ctx context.Context, raw string, connections *nativeProx
 	if !validNativeProxyURL(raw) {
 		return nil, nil, errNativeProxy
 	}
+	expectedMode := proxyutil.ModeProxy
+	if raw == "direct" {
+		expectedMode = proxyutil.ModeDirect
+	}
 	transport, mode, err := proxyutil.BuildHTTPTransport(raw)
-	if err != nil || mode != proxyutil.ModeProxy || transport == nil {
+	if err != nil || mode != expectedMode || transport == nil {
 		return nil, nil, errNativeProxy
 	}
 	dialer, mode, err := proxyutil.BuildDialer(raw)
 	contextDialer, ok := dialer.(proxy.ContextDialer)
-	if err != nil || mode != proxyutil.ModeProxy || !ok {
+	if err != nil || mode != expectedMode || !ok {
 		transport.CloseIdleConnections()
 		return nil, nil, errNativeProxy
 	}

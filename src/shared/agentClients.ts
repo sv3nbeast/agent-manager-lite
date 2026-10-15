@@ -47,9 +47,10 @@ export function recommendedInstanceConnectionMode(clientType:unknown,account:Pic
 }
 
 export interface AccountCompatibility {compatible:boolean;reason?:string}
-export interface AccountCompatibilityOptions {connectionMode:'local_api'|'native';model?:string}
+export interface AccountCompatibilityOptions {connectionMode:'local_api'|'native'|'client_login';model?:string}
 /** Static capability check; live credential ownership, proxies and refresh locks stay in their services. */
 export function accountCompatibility(clientType:unknown,account:Pick<Account,'kind'|'wireApi'|'models'|'identityService'|'credentialKind'|'protocol'>,options:AccountCompatibilityOptions):AccountCompatibility {
+  if(options.connectionMode==='client_login')return {compatible:false,reason:'Claude Desktop 在客户端内独立登录，不绑定管理器中的 API 或 CLI 订阅凭据'}
   let type:AgentClientType
   try {type=resolveAgentClientType(clientType)}catch(error){return {compatible:false,reason:error instanceof Error?error.message:'客户端尚未接入'}}
   if(type==='claude_code') {

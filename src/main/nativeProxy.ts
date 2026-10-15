@@ -11,10 +11,10 @@ export class NativeProxy implements NativeProxyService {
   constructor(private readonly binary:string,private readonly tunnels?:Pick<ProxyTunnels,'acquire'>){}
   async acquire(proxy:string,scope:string,signal:AbortSignal):Promise<NativeProxyLease> {
     signal.throwIfAborted()
-    const normalized=normalizeStoredProxy(proxy)
+    const normalized=proxy==='direct'?'direct':normalizeStoredProxy(proxy)
     let upstream:ProxyLease|undefined
     try {
-      if(needsProxyTunnel(normalized)){
+      if(normalized!=='direct'&&needsProxyTunnel(normalized)){
         if(!this.tunnels)throw new Error('代理引擎尚未接入')
         upstream=await this.tunnels.acquire(normalized,scope,signal)
       }

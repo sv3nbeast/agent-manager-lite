@@ -100,7 +100,7 @@ app.on('browser-window-created', (_event, window) => {
       await openWizard()
       const clientControl = await run(`(()=>{const el=document.querySelector('[aria-label="实例客户端"]').closest('.ant-select');el.querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));return el.querySelector('input').getAttribute('aria-controls')})()`)
       await wait(`!!document.getElementById(${JSON.stringify(clientControl)})?.closest('.ant-select-dropdown')?.querySelector('.ant-select-item-option')`)
-      assert.deepEqual(await run(`Array.from(document.getElementById(${JSON.stringify(clientControl)}).closest('.ant-select-dropdown').querySelectorAll('.ant-select-item-option')).map(el=>el.textContent)`), ['Codex'])
+      assert.deepEqual(await run(`Array.from(document.getElementById(${JSON.stringify(clientControl)}).closest('.ant-select-dropdown').querySelectorAll('.ant-select-item-option')).map(el=>el.textContent)`), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
       await click('.ant-select-dropdown .ant-select-item-option', 'Codex')
       await capture('agent-manager-client-step.png')
       await next(1); await click('.ant-modal-footer button', '返回'); await step(0)

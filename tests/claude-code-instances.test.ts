@@ -245,7 +245,7 @@ test('Claude only accepts verified API credential and native CLI boundaries', { 
     const view = f.add('Script rejected', f.api, [], app.id)
     f.instances.preview({ id: view.id, revision: 0 })
   }, /原生/)
-  assert.throws(() => f.instances.registerApplication(f.executable, 'desktop', 'claude_code'), /Desktop|隔离/)
+  assert.throws(() => f.instances.registerApplication(f.executable, 'desktop', 'claude_code'), /Claude\.app|Desktop|隔离/)
   for (const args of [['auth', 'login'], ['setup-token'], ['update'], ['mcp', 'add'], ['-rforeign-session'], ['-mforeign-model'], ['-wother-worktree']]) {
     assert.throws(() => f.add(`Rejected ${args[0]}`, f.api, args), /参数|命令|覆盖|允许/)
   }
