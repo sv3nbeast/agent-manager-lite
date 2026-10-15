@@ -280,9 +280,9 @@ func TestNativeWebsocketLifecycleOnWire(t *testing.T) {
 				mu.Unlock()
 				upstream.Close()
 			})
-			budget := 100
-			if strings.HasPrefix(phase, "cancel_") {
-				budget = 5000 // Prove client cancellation, not incidental timeout.
+			budget := 5000 // Let cancellation, close and error cases reach their intended trigger.
+			if strings.HasPrefix(phase, "timeout_") {
+				budget = 100
 			}
 			records := make(chan coreusage.Record, 4)
 			conn := dialLifecycleWebsocket(t, lifecycleWebsocketServer(t, upstream.URL, budget, records))
