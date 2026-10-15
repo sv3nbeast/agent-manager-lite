@@ -2,15 +2,16 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { ProviderSummary } from '../../../shared/providerLibrary'
 import type { ProbeModel } from '../../../shared/providerProbe'
+import type { AccountProtocol } from '../../../shared/types'
 
-const props=defineProps<{modelValue:string[];baseUrl:string;apiKey?:string;provider?:ProviderSummary;active:boolean;keyManaged?:boolean;keyLoading?:boolean;savedKey?:{providerId:string;revision:number;keyId:string}}>()
+const props=defineProps<{modelValue:string[];baseUrl:string;apiKey?:string;protocol?:AccountProtocol;credentialKind?:'openai_api_key'|'anthropic_api_key'|'anthropic_bearer'|'gateway';provider?:ProviderSummary;active:boolean;keyManaged?:boolean;keyLoading?:boolean;savedKey?:{providerId:string;revision:number;keyId:string}}>()
 const emit=defineEmits<{'update:modelValue':[models:string[]]}>()
 const fetched=ref<ProbeModel[]>([]), selectedKey=ref<string>(), busy=ref(false), error=ref(''), status=ref('')
 const selectedModels=ref<string[]>([])
 let requestId:string|undefined
 let cancellation:Promise<void>|undefined
 const options=computed(()=>fetched.value.map(model=>({label:model.name ? `${model.id} · ${model.name}` : model.id,value:model.id})))
-const target=computed(()=>JSON.stringify([props.active,props.baseUrl,props.apiKey,props.provider?.id,props.provider?.revision,selectedKey.value,props.savedKey]))
+const target=computed(()=>JSON.stringify([props.active,props.baseUrl,props.apiKey,props.protocol,props.credentialKind,props.provider?.id,props.provider?.revision,selectedKey.value,props.savedKey]))
 watch(()=>props.provider?.id,()=>{selectedKey.value=props.provider?.keys[0]?.id},{immediate:true})
 async function cancel() {
   const id=requestId;requestId=undefined
@@ -31,6 +32,7 @@ async function fetchModels() {
   try {
     const provider=props.provider,apiKey=props.apiKey?.trim()
     const result=await window.manager.fetchProviderModels({requestId:id,baseUrl:props.baseUrl.trim(),
+      ...(props.protocol ? {protocol:props.protocol} : {}),...(props.credentialKind ? {credentialKind:props.credentialKind} : {}),
       ...(props.savedKey ? {savedKey:props.savedKey} : apiKey ? {apiKey} : !props.keyManaged && provider && selectedKey.value ? {savedKey:{providerId:provider.id,revision:provider.revision,keyId:selectedKey.value}} : {})})
     if(requestId!==id)return
     fetched.value=result.models;selectedModels.value=[]
@@ -43,6 +45,7 @@ function addModels(all=false) {
   if(next.length>500){error.value='最多保存 500 个模型，请缩小选择范围';return}
   emit('update:modelValue',next);selectedModels.value=[];error.value=''
 }
+function clearModels() {emit('update:modelValue',[]);selectedModels.value=[];error.value=''}
 </script>
 
 <template>
@@ -59,11 +62,12 @@ function addModels(all=false) {
       <a-select v-model:value="selectedModels" mode="multiple" show-search option-filter-prop="label" :options="options" :max-tag-count="3" placeholder="搜索并选择模型" aria-label="API 返回的模型" style="width:100%" />
       <a-space><a-button size="small" :disabled="!selectedModels.length" @click="addModels()">加入所选</a-button><a-button size="small" :disabled="fetched.length>500" @click="addModels(true)">全部加入</a-button></a-space>
     </div>
-    <a-select :value="modelValue" mode="tags" :token-separators="[',','\n']" :max-tag-count="5" :options="modelValue.map(id=>({label:id,value:id}))" placeholder="选择模型，或输入模型 ID 后回车" aria-label="供应商模型" style="width:100%" @change="emit('update:modelValue',[...new Set(($event as string[]).map(v=>v.trim()).filter(Boolean))])" />
-    <small class="muted">已选 {{ modelValue.length }} / 500 · 支持手动补充；获取结果不会覆盖已选模型。</small>
+    <a-select :value="modelValue" mode="tags" :token-separators="[',','\n']" :max-tag-count="5" :options="modelValue.map(id=>({label:id,value:id}))" placeholder="选择模型，或输入模型 ID 后回车" aria-label="密钥模型" style="width:100%" @change="emit('update:modelValue',[...new Set(($event as string[]).map(v=>v.trim()).filter(Boolean))])" />
+    <div class="model-selection-footer"><small class="muted">已选 {{ modelValue.length }} / 500 · 模型仅属于当前密钥。</small><a-button size="small" :disabled="!modelValue.length" @click="clearModels">全部清除</a-button></div>
+    <small class="muted">支持任意模型 ID。清除已选模型会保留上方获取结果，可再点击「全部加入」。</small>
   </section>
 </template>
 
 <style scoped>
-.model-discovery{display:grid;gap:12px}.model-discovery-actions{display:flex;gap:8px;align-items:center}.model-discovery p{margin:0;font-size:12px}.discovered-models{display:grid;gap:8px;padding:12px;background:#7c3aed08;border-radius:10px}.model-discovery small{font-size:11px}
+.model-discovery{display:grid;gap:12px}.model-discovery-actions{display:flex;gap:8px;align-items:center}.model-discovery p{margin:0;font-size:12px}.discovered-models{display:grid;gap:8px;padding:12px;background:#7c3aed08;border-radius:10px}.model-discovery small{font-size:11px}.model-selection-footer{display:flex;justify-content:space-between;align-items:center;gap:12px}
 </style>

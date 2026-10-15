@@ -208,11 +208,14 @@ app.on('browser-window-created', (_event, window) => {
     const next = async index => { await click('.ant-modal-footer button', '下一步'); await step(index) }
     const model = 'claude-fixture-model'
     const create = async (name, kind) => {
+      const connectionModel = kind === 'bearer' ? 'claude-bearer-fixture' : model
       await click('.instances-panel .page-heading button', '创建实例'); await step(0)
       const clients = await options('实例客户端')
-      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
-      await run(clients + '.find(el=>el.textContent==="Claude Code CLI").click()')
-      assert.equal(await run('!!document.querySelector("[aria-label=实例运行方式]")'), false)
+      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude'])
+      await run(clients + '.find(el=>el.textContent==="Claude").click()')
+      await click('[aria-label=实例运行方式] .ant-segmented-item', 'CLI 终端')
+      await wait('document.querySelector("[aria-label=实例运行方式] .ant-segmented-item-selected")?.textContent==="CLI 终端"')
+      assert.equal(await run('document.querySelector("[aria-label=实例运行方式] .ant-segmented-item-selected").textContent'), 'CLI 终端')
       const choicesBeforePick = pickerOutcomes.length, chooseDeadline = Date.now() + 5000
       await click('.instance-step[data-step="0"] button', '选择 CLI 程序')
       while (pickerOutcomes.length === choicesBeforePick) { assert.ok(Date.now() < chooseDeadline); await new Promise(resolve => setTimeout(resolve, 25)) }
@@ -230,25 +233,23 @@ app.on('browser-window-created', (_event, window) => {
       }
       await next(1)
       assert.equal(await run('!!document.querySelector("[aria-label=资源类型]")'), false)
-      await click('.instance-step[data-step="1"] button', '添加 API 连接')
-      await wait(visible('.claude-api-connection') + '.length===1')
-      await fill('[aria-label="Claude 连接名称"]', name + '连接')
-      await fill('[aria-label="Claude API 地址"]', 'https://claude-fixture.invalid')
-      if (kind === 'bearer') await select('Claude 认证方式', 'Bearer Token（Authorization）')
+      await click('.instance-step[data-step="1"] button', '添加供应商')
+      await wait(visible('.instance-provider-dialog') + '.length===1')
+      await fill('[aria-label="供应商名称"]', name + '连接')
+      await fill('[aria-label="供应商地址"]', 'https://claude-fixture.invalid')
+      assert.equal(await run('document.querySelector("[aria-label=密钥协议]").closest(".ant-select").textContent'), 'Anthropic Messages')
+      if (kind === 'bearer') await select('密钥认证方式', 'Bearer Token')
       const secret = 'fixture-' + kind + '-not-a-real-secret'
-      await fill('[aria-label="Claude API 凭据"]', secret)
-      await addTag('Claude 连接模型', model)
-      await click('.credential-actions button', '检查连接配置')
-      await wait('document.querySelector(".credential-preview")?.textContent.includes(' + JSON.stringify(name + '连接') + ')', visible('.credential-import-panel .ant-form-item-explain-error,.credential-import-panel .ant-alert-error') + '.length>0')
-      assert.equal(await run('document.querySelector(".credential-preview").innerText.includes(' + JSON.stringify(secret) + ')'), false)
+      await fill('[aria-label="供应商密钥"]', secret)
+      await addTag('密钥模型', connectionModel)
       await capture('claude-' + kind + '-connection.png')
-      await click('.credential-actions button', '保存连接')
-      await wait(visible('.claude-api-connection') + '.length===0'); await step(1)
+      await run('document.querySelector(".instance-provider-dialog").closest(".ant-modal-content").querySelector(".ant-modal-footer .ant-btn-primary").click()')
+      await wait(visible('.instance-provider-dialog') + '.length===0', visible('.instance-provider-dialog .ant-form-item-explain-error,.instance-provider-dialog .form-feedback-error') + '.length>0'); await step(1)
       await wait('document.querySelector("[aria-label=实例供应商密钥]").closest(".ant-select").textContent.includes(' + JSON.stringify(name + '连接') + ')')
       assert.equal(await run('document.querySelector("[aria-label=实例接入方式]").closest(".ant-select").textContent.includes("直接 API")'), true)
       await next(2)
       await fill('[aria-label="实例名称"]', name)
-      assert.equal(await run('document.querySelector("[aria-label=实例模型]").value'), model)
+      assert.equal(await run('document.querySelector("[aria-label=实例模型]").value'), connectionModel)
       assert.equal(await run('!!document.querySelector("[aria-label=刷新官方模型列表]")'), false)
       assert.equal(await run('!!document.querySelector("[aria-label=实例服务等级]")'), false)
       assert.equal(await run('!!document.querySelector(".instance-history-options")'), false)
@@ -275,6 +276,16 @@ app.on('browser-window-created', (_event, window) => {
       assert.ok(instance && account)
       assert.equal(account.identityService, 'anthropic'); assert.equal(account.protocol, 'anthropic_messages')
       assert.equal(account.credentialKind, kind === 'bearer' ? 'anthropic_bearer' : 'anthropic_api_key')
+      assert.deepEqual(account.models, [connectionModel])
+      assert.equal(snapshot.providers.length, 1, 'one endpoint owns both keys without duplicating the provider')
+      const key = snapshot.providers[0].keys.find(item => item.id === account.providerKeyId)
+      assert.ok(key && key.accountIds.includes(account.id))
+      assert.deepEqual(key.models, [connectionModel])
+      assert.equal(key.protocol, 'anthropic_messages')
+      if (kind === 'bearer') {
+        assert.equal(snapshot.providers[0].keys.length, 2)
+        assert.deepEqual(snapshot.providers[0].keys.map(item => item.models), [[model], [connectionModel]])
+      }
       assert.equal(instance.clientType, 'claude_code'); assert.equal(instance.connectionMode, 'native')
       assert.equal(snapshot.instanceApplications.find(value => value.id === instance.applicationId).path, executable)
       return instance
@@ -282,9 +293,10 @@ app.on('browser-window-created', (_event, window) => {
     const createDesktop = async () => {
       await click('.instances-panel .page-heading button', '创建实例'); await step(0)
       const clients = await options('实例客户端')
-      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
-      await run(clients + '.find(el=>el.textContent==="Claude Desktop").click()')
-      assert.equal(await run('!!document.querySelector("[aria-label=实例运行方式]")'), false)
+      assert.deepEqual(await run(clients + '.map(el=>el.textContent)'), ['Codex', 'Claude'])
+      await run(clients + '.find(el=>el.textContent==="Claude").click()')
+      await click('[aria-label=实例运行方式] .ant-segmented-item', '桌面应用')
+      assert.equal(await run('document.querySelector("[aria-label=实例运行方式] .ant-segmented-item-selected").textContent'), '桌面应用')
       const beforePicker = pickerOutcomes.length, pickerDeadline = Date.now() + 5000
       await click('.instance-step[data-step="0"] button', '选择应用文件')
       while (pickerOutcomes.length === beforePicker) { assert.ok(Date.now() < pickerDeadline); await new Promise(resolve => setTimeout(resolve, 25)) }
@@ -331,7 +343,7 @@ app.on('browser-window-created', (_event, window) => {
       await click('[data-instance-id="' + instance.id + '"] button', '编辑')
       await wait(visible('.instance-editor-dialog') + '.length===1')
       assert.equal(await run('document.querySelector("[aria-label=实例客户端]").closest(".ant-select").classList.contains("ant-select-disabled")'), true)
-      assert.equal(await run('!!document.querySelector("[aria-label=实例运行方式]")'), false)
+      assert.equal(await run('document.querySelector("[aria-label=实例运行方式]").classList.contains("ant-segmented-disabled")'), true)
       await click('.instance-editor-dialog .ant-modal-footer button', '取消')
       await wait(visible('.instance-editor-dialog') + '.length===0')
       return instance
@@ -396,8 +408,7 @@ app.on('browser-window-created', (_event, window) => {
       const editedAccounts = []
       for (const instance of [api, bearer]) {
         const card = '[data-account-id="' + instance.accountId + '"]'
-        const original = vault().accounts.find(account => account.id === instance.accountId)
-        const priorRevision = original.revision ?? 0, name = original.name + '已编辑'
+        let original = vault().accounts.find(account => account.id === instance.accountId)
         await clickElement(card + ' .account-details')
         await wait(visible('.account-quota-details') + '.length===1')
         assert.equal(await run('document.querySelector(".account-quota-details").textContent.includes("Anthropic Messages")'), true)
@@ -406,6 +417,19 @@ app.on('browser-window-created', (_event, window) => {
         assert.equal(await run('document.querySelector(".account-quota-details").textContent.includes("待适配器验证")'), false)
         await clickElement('.ant-drawer-content-wrapper .ant-drawer-close')
         await wait(visible('.account-quota-details') + '.length===0')
+        await clickElement(card + ' .account-edit')
+        await wait(visible('[aria-label="供应商共享配置"]') + '.length===1')
+        assert.equal(await run('document.querySelector("[aria-label=供应商共享配置]").textContent.includes("Anthropic Messages")'), true)
+        assert.equal(await run('document.querySelector("[aria-label=供应商共享配置]").textContent.includes(' + JSON.stringify(original.models[0]) + ')'), true)
+        assert.equal(await run('!!document.querySelector("[aria-label=\\"Claude API 地址\\"]")'), false)
+        await click('[aria-label="供应商共享配置"] button', '解除关联')
+        await wait(visible('.account-editor-form') + '.length===0')
+        const unlinked = vault().accounts.find(account => account.id === instance.accountId)
+        assert.equal(unlinked.providerId, undefined)
+        assert.deepEqual(unlinked.models, original.models)
+        assert.equal(unlinked.protocol, original.protocol)
+        original = unlinked
+        const priorRevision = original.revision ?? 0, name = original.name + '已编辑'
         await clickElement(card + ' .account-edit')
         await wait(visible('[aria-label="Claude API 地址"]') + '.length===1')
         await fill('.ant-drawer-content input[maxlength="120"]', name)
@@ -461,11 +485,11 @@ app.on('browser-window-created', (_event, window) => {
       for (const instance of [desktop, api, bearer]) assert.equal(fs.existsSync(join(directory, 'instances', instance.id, 'launch.json')), false)
       assert.deepEqual(networkAttempts, [], 'API configuration and previews must not call login/model/token services')
       fs.writeFileSync(join(evidence, 'validation.json'), JSON.stringify({
-        passed: true, clients: ['Codex', 'Claude Code CLI', 'Claude Desktop'], claudeModes: ['cli', 'desktop'], connections: ['anthropic_api_key', 'anthropic_bearer'],
+        passed: true, clients: ['Codex', 'Claude'], claudeModes: ['cli', 'desktop'], connections: ['anthropic_api_key', 'anthropic_bearer'],
         modelSelections,
         identityStatus: ['api_configured', 'client_login'], isolatedInstances: 3, desktopIndependentLogin: true, desktopManagedAccountsCreated: 0, desktopModelNotRequired: true, desktopApplication: installedDesktop ? 'installed-official-bundle-read-only-preview' : 'synthetic-bundle', sameNativeIdSeparateRows: true, readOnlyHistory: true,
         nativeIdClipboard: true, sourceTranscriptsUnchanged: true, networkRequests: 0, launchedInstances: 0,
-        resourceManagement: { apiConnectionsTab: true, configuredStatus: true, quotaUnavailableLabel: true, details: true, metadata: true, endpointModelsCredentials: true, accountProxy: true, recycle: true },
+        resourceManagement: { apiConnectionsTab: true, configuredStatus: true, quotaUnavailableLabel: true, details: true, metadata: true, perKeyModels: true, sharedProvider: true, unlinkPreservesKeySettings: true, endpointModelsCredentials: true, accountProxy: true, recycle: true },
         limitation: 'Preview only. Synthetic CLI executable, credentials and transcripts; Desktop bundle is identified above. No real Claude login, client launch or model response.',
       }, null, 2), { mode: 0o600 })
       console.log('Claude Manager UI smoke passed: Desktop creation and client-login preview, API/Bearer creation, exact CLI selection, API identity preview, isolated read-only history, connection editing, encrypted proxy settings and recycling; no network or client launch.')

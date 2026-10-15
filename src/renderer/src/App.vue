@@ -202,10 +202,10 @@ function connectionContext(account: Account): string {
   const provider = connectionProvider(account), key = connectionKey(account)
   return provider ? `${provider.name} · ${key?.name || '未命名密钥'}` : '独立连接'
 }
-async function editConnectionProvider(id: string) {
+async function editConnectionProvider(id: string,keyId?:string) {
   page.value = 'providers'
   await nextTick()
-  if (!providerLibrary.value?.editProvider(id)) message.info('供应商已变化，请查看最新列表')
+  if (!providerLibrary.value?.editProvider(id,keyId)) message.info('供应商已变化，请查看最新列表')
 }
 async function viewConnections(accountId?: string) {
   page.value = 'connections'; search.value = ''; groupFilter.value = 'all'; tagFilter.value = undefined

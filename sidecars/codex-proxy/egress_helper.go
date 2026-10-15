@@ -52,7 +52,7 @@ func egressRequest(ctx context.Context, input egressInput) egressOutput {
 	}
 	for key, value := range input.Headers {
 		switch strings.ToLower(key) {
-		case "authorization", "content-type", "accept", "user-agent", "originator", "chatgpt-account-id", "referer", "x-openai-target-path", "x-openai-target-route", "x-openai-fedramp":
+		case "authorization", "content-type", "accept", "user-agent", "originator", "chatgpt-account-id", "referer", "x-openai-target-path", "x-openai-target-route", "x-openai-fedramp", "x-api-key", "anthropic-version", "anthropic-beta":
 			request.Header.Set(key, value)
 		default:
 			return invalid

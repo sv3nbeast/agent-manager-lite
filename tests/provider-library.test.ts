@@ -215,7 +215,7 @@ test('provider updates project only linked credentials, block live connection ed
   assert.throws(()=>editAccount(f.store,{id:original.id,revision:original.revision,changes:{name:'Old form'}}),/已被修改/)
   assert.throws(()=>f.act(id,'editKey',{keyId:a.id,apiKey:'fixture-b'}),/已保存此密钥/)
   f.act(id,'update',{changes:{baseUrl:'https://new.invalid/v1',models:['new-model'],wireApi:'chat_completions'}})
-  assert.ok(f.store.read().accounts.every(account=>account.baseUrl==='https://new.invalid/v1' && account.wireApi==='chat_completions' && account.models[0]==='new-model'))
+  assert.ok(f.store.read().accounts.every(account=>account.baseUrl==='https://new.invalid/v1' && account.wireApi==='responses' && account.models[0]==='fixture-model'))
   const edited=f.store.read().accounts[0]
   assert.equal(providerTierForAccount(f.store.read(),edited),'standard')
   const tampered={...edited,baseUrl:'https://wrong.invalid/v1'}

@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { ArrowRightOutlined, KeyOutlined, UserOutlined } from '@ant-design/icons-vue'
 import type { Account, CreditUsage, QuotaWindow } from '../../../shared/types'
-import type { ProviderKeySummary, ProviderSummary } from '../../../shared/providerLibrary'
+import { providerKeyModels,type ProviderKeySummary,type ProviderSummary } from '../../../shared/providerLibrary'
 import { accountCardType } from './accountCardPresentation'
 
 const props = defineProps<{ accounts: Account[]; providers: ProviderSummary[] }>()
@@ -87,7 +87,7 @@ function keyUsage(key: ProviderKeySummary): string {
       <div v-else class="asset-grid">
         <button v-for="item in visibleKeys" :key="`${item.provider.id}:${item.key.id}`" type="button" class="asset-card key-thumbnail" :data-provider-id="item.provider.id" :data-key-id="item.key.id" :aria-label="`查看 ${item.provider.name} 的密钥 ${item.key.name || '未命名密钥'}`" @click="emit('view-key', item.provider.id, item.key.id)">
           <span class="asset-identity"><span class="asset-icon"><KeyOutlined /></span><span class="asset-names"><strong :title="item.provider.name">{{ item.provider.name }}</strong><small :title="item.key.name || '未命名密钥'">{{ item.key.name || '未命名密钥' }}</small></span><ArrowRightOutlined class="asset-open" /></span>
-          <span class="asset-meta"><span class="asset-chip">{{ item.provider.models.length }} 个模型</span><span class="asset-plan">{{ item.key.accountIds.length ? `${item.key.accountIds.length} 个已启用连接` : '未启用连接' }}</span></span>
+          <span class="asset-meta"><span class="asset-chip">{{ providerKeyModels(item.provider,item.key).length }} 个模型</span><span class="asset-plan">{{ item.key.accountIds.length ? `${item.key.accountIds.length} 个已启用连接` : '未启用连接' }}</span></span>
           <span class="asset-quota key-quota"><span class="asset-quota-label">密钥额度</span><strong class="asset-balance" :title="keyUsage(item.key)">{{ keyUsage(item.key) }}</strong><span v-if="item.key.usage?.summary?.planName" class="asset-quota-note" :title="item.key.usage.summary.planName">{{ item.key.usage.summary.planName }}</span></span>
           <span class="asset-footer"><span :class="{ 'asset-attention': !!item.key.usage?.error }">{{ item.key.usage?.error ? item.key.usage.summary ? '刷新失败 · 上次结果' : '查询未成功' : item.key.usage?.summary?.isValid === false ? '密钥已失效' : '密钥已保存' }}</span><span>查看详情</span></span>
         </button>

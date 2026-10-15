@@ -56,6 +56,37 @@ func TestAccountEgressRetainsOnlyFailureClassificationHeaders(t *testing.T) {
 	}
 }
 
+func TestAccountEgressAllowsAnthropicAuthenticationThroughProxy(t *testing.T) {
+	for _, auth := range []map[string]string{{"x-api-key": "fixture-anthropic-key"}, {"Authorization": "Bearer fixture-anthropic-token", "anthropic-beta": "oauth-2025-04-20"}} {
+		headers := map[string]string{"anthropic-version": "2023-06-01", "content-type": "application/json"}
+		for key, value := range auth {
+			headers[key] = value
+		}
+		requests := 0
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if r.URL.String() != "http://anthropic-fixture.invalid/v1/messages" || r.Method != "POST" {
+				t.Errorf("unexpected route: %s %s", r.Method, r.URL)
+			}
+			for key, value := range headers {
+				if r.Header.Get(key) != value {
+					t.Errorf("Anthropic header %s was changed", key)
+				}
+			}
+			body, _ := io.ReadAll(r.Body)
+			if string(body) != `{"model":"custom-model","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}` {
+				t.Errorf("Anthropic request body was changed")
+			}
+			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"ok"}]}`)
+		}))
+		output := egressRequest(context.Background(), egressInput{URL: "http://anthropic-fixture.invalid/v1/messages", Method: "POST", Proxy: proxy.URL, Headers: headers, Body: `{"model":"custom-model","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}`})
+		proxy.Close()
+		if output.Error != "" || output.Status != http.StatusOK || requests != 1 {
+			t.Fatalf("Anthropic proxy request failed: status=%d error=%s requests=%d", output.Status, output.Error, requests)
+		}
+	}
+}
+
 func TestAccountEgressSOCKSAuthenticationAndRemoteName(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Proxy-Authorization") != "" {

@@ -3,10 +3,9 @@ import type { Account } from './types'
 import { claudeCodeClient, claudeCodeClientType, type ClaudeCodeCredentialKind } from './claudeCode'
 
 /**
- * Client types are persisted independently from the list of clients that may
- * be created today. Claude Code is known to the data model so diagnostics and
- * future migrations can retain it, while the implemented list remains the
- * fail-closed product gate until its evidence checks pass.
+ * A client type identifies the product family. Desktop/CLI are separate
+ * launch choices within that family; the persisted Claude type retains its
+ * original value so existing instances and credentials keep their identity.
  */
 export const agentClientTypeSchema = z.enum(['codex', claudeCodeClientType])
 export type AgentClientType = z.infer<typeof agentClientTypeSchema>

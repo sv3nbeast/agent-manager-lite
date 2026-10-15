@@ -10,7 +10,7 @@ test('Claude family exposes CLI and Desktop with independently scoped connection
   assert.equal(claudeCodeClientType, 'claude_code')
   assert.equal(claudeCodeClient.status, 'implemented')
   assert.equal(claudeCodeClient.protocol, 'anthropic_messages')
-  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli', 'desktop'])
+  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['desktop', 'cli'])
   assert.equal(claudeCodeClient.capabilities.localApi, false)
   assert.equal(claudeCodeClient.capabilities.login, false)
   assert.equal(claudeCodeClient.capabilities.contextWindow, false)

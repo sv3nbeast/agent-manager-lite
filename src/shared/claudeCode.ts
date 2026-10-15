@@ -88,7 +88,7 @@ export const claudeCodeDesktopAcceptance = claudeCodeAcceptanceSchema.parse({
 
 export const claudeCodeClient = {
   id: claudeCodeClientType,
-  name: 'Claude Code',
+  name: 'Claude',
   status: 'implemented' as const,
   identityService: 'anthropic' as const,
   protocol: 'anthropic_messages' as const,
@@ -100,7 +100,7 @@ export const claudeCodeClient = {
     models: true,
     contextWindow: false,
     fast: false,
-    launchModes: ['cli', 'desktop'] as const,
+    launchModes: ['desktop', 'cli'] as const,
     projectDirectoryModes: ['cli'] as const,
     configDirectory: true,
     sessionPersistence: true,

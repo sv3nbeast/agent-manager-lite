@@ -11,6 +11,7 @@ import { Store } from '../src/main/store'
 import { createAPIAccount, importParsedAccounts } from '../src/main/accounts'
 import { mutateProvider } from '../src/main/providerLibrary'
 import * as clients from '../src/shared/agentClients'
+import * as providers from '../src/shared/providerLibrary'
 import * as instances from '../src/shared/instances'
 import * as windows from '../src/shared/modelContextWindows'
 import { validationErrors } from '../src/renderer/src/formFeedback'
@@ -36,18 +37,18 @@ function fixture(t: { after(fn: () => void): void }, wireApi: 'responses' | 'cha
   return { root, store, account: store.read().accounts[0] }
 }
 
-function mount(store: Store) {
+function mount(store: Store, options: { inUse?: (id: string) => boolean } = {}) {
   const writes: unknown[] = [], saved: instances.InstanceInput[] = []
   const manager = vue.reactive({ data: store.snapshot() as AppSnapshot, error: '', loading: false,
     async execute(action: () => Promise<AppSnapshot>) { try { this.data = await action(); return true } catch (cause) { this.error = String(cause); return false } } })
   const exports = {}, context = { module: { exports }, exports, document: { querySelector: () => null },
     window: { manager: {
       listInstanceWorkingDirectories: async () => [], readModelContextDefaults: async () => [],
-      mutateProvider: async (input: unknown) => { writes.push(input); mutateProvider(store, input); return store.snapshot() },
+      mutateProvider: async (input: unknown) => { writes.push(input); mutateProvider(store, input, options.inUse); return store.snapshot() },
       saveInstance: async (input: { details: instances.InstanceInput }) => { saved.push(input.details); return store.snapshot() }
     } },
     require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { Modal: {}, message: { success() {} } } : id === '@ant-design/icons-vue' ? {}
-      : id.endsWith('/agentClients') ? clients : id.endsWith('/instances') ? instances : id.endsWith('/modelContextWindows') ? windows
+      : id.endsWith('/agentClients') ? clients : id.endsWith('/providerLibrary') ? providers : id.endsWith('/instances') ? instances : id.endsWith('/modelContextWindows') ? windows
       : id === '../formFeedback' ? { validationErrors, useFormFeedback: () => () => {} }
       : id === '../store' ? { useManager: () => manager } : id.endsWith('.vue') ? { default: {} }
       : (() => { throw new Error(`Unexpected module ${id}`) })() }
@@ -151,4 +152,88 @@ test('wizard prefers a managed link over reusable matches and old snapshots stil
   ui.state.selectSupplier(`${provider.id}:${key.id}`)
   assert.equal(ui.state.form.accountId, linked.id)
   assert.equal(await ui.state.ensureResource(), true); assert.equal(ui.writes.length, 1)
+})
+
+function changeKeyCatalog(store: Store, models: string[]) {
+  const provider = store.read().providers![0], key = provider.keys[0]
+  mutateProvider(store, { action: 'editKey', id: provider.id, revision: provider.revision, keyId: key.id, models })
+}
+
+test('choosing a key with changed models requires an explicit link before it can replace a standalone connection', async t => {
+  const f = fixture(t)
+  changeKeyCatalog(f.store, ['key-model', 'other-key-model'])
+  const before = f.store.read(), oldAccount = before.accounts[0], ui = mount(f.store); t.after(ui.unmount)
+  selectSupplier(ui); await settle()
+  assert.equal(ui.state.selectedSupplier.requiresKeyLink, true)
+  assert.equal(ui.state.selectedSupplier.disabled, true)
+  assert.deepEqual(Array.from(ui.state.modelChoices), ['key-model', 'other-key-model'])
+  assert.equal(ui.state.form.model, 'key-model')
+  assert.equal(ui.state.form.accountId, '')
+  assert.equal(await ui.state.ensureResource(), false)
+  await ui.state.nextStep()
+  assert.equal(ui.state.step, 1)
+  assert.match(ui.state.error, /关联并使用密钥配置/)
+  assert.equal(ui.writes.length, 0)
+  assert.deepEqual(f.store.read(), before)
+
+  const supplier = ui.state.supplierSelection
+  ui.state.selectSupplier(`account:${oldAccount.id}`)
+  assert.equal(await ui.state.ensureResource(), true)
+  assert.equal(ui.state.form.model, 'connection-model', 'the explicit standalone option retains its original catalogue')
+  assert.equal(ui.writes.length, 0)
+  ui.state.selectSupplier(supplier)
+  await ui.state.linkSelectedSupplier(); await settle()
+  assert.equal(ui.writes.length, 1)
+  assert.equal((ui.writes[0] as any).action, 'linkAccount')
+  assert.equal((ui.writes[0] as any).revision, before.providers![0].revision)
+  assert.equal((ui.writes[0] as any).accountRevision, oldAccount.revision ?? 0)
+  assert.equal(ui.state.selectedSupplier.requiresKeyLink, false)
+  assert.equal(ui.state.form.accountId, oldAccount.id)
+  assert.equal(await ui.state.ensureResource(), true)
+  assert.equal(ui.state.form.model, 'key-model')
+  const after = f.store.read().accounts[0]
+  assert.deepEqual(after.models, ['key-model', 'other-key-model'])
+  assert.equal(after.providerKeyId, before.providers![0].keys[0].id)
+  for (const field of ['name', 'note', 'tags', 'modelContextWindows', 'defaultTier', 'proxy', 'credentials'] as const) assert.deepEqual(after[field], oldAccount[field], `preserve unrelated ${field}`)
+  assert.equal(f.store.read().accounts.length, before.accounts.length)
+})
+
+test('editing an existing standalone instance keeps its own configuration when a matching key catalogue differs', async t => {
+  const f = fixture(t)
+  changeKeyCatalog(f.store, ['key-model'])
+  const ui = mount(f.store); t.after(ui.unmount)
+  ui.state.edit({ id: 'existing-instance', revision: 0, clientType: 'codex', launchMode: 'desktop', connectionMode: 'local_api', accountId: f.account.id, applicationId: 'fixture-app', name: 'Existing instance', model: 'connection-model', extraArgs: [], defaultTier: 'inherit' })
+  assert.equal(ui.state.supplierSelection, `account:${f.account.id}`)
+  assert.equal(ui.state.form.model, 'connection-model')
+  assert.equal(await ui.state.ensureResource(), true)
+  assert.equal(ui.writes.length, 0)
+})
+
+test('explicit key linking rejects in-use or stale connections without replacing their models', async t => {
+  const f = fixture(t)
+  changeKeyCatalog(f.store, ['key-model'])
+  let inUse = true
+  const ui = mount(f.store, { inUse: id => inUse && id === f.account.id }); t.after(ui.unmount)
+  selectSupplier(ui)
+  assert.equal(await ui.state.ensureResource(), false)
+  let before = f.store.read()
+  await ui.state.linkSelectedSupplier()
+  assert.match(ui.manager.error, /先停止/)
+  assert.equal(ui.state.error, '', 'the earlier confirmation hint must not hide the actual in-use rejection')
+  assert.deepEqual(f.store.read(), before)
+  assert.equal(ui.state.selectedSupplier.requiresKeyLink, true)
+  assert.equal(ui.state.form.accountId, '')
+  inUse = false
+  changeKeyCatalog(f.store, ['newer-key-model'])
+  before = f.store.read()
+  await ui.state.linkSelectedSupplier()
+  assert.match(ui.manager.error, /供应商已被修改/)
+  assert.deepEqual(f.store.read(), before)
+  ui.manager.data = f.store.snapshot()
+  f.store.transaction(state => { state.accounts[0].revision = (state.accounts[0].revision ?? 0) + 1 })
+  before = f.store.read()
+  await ui.state.linkSelectedSupplier()
+  assert.match(ui.manager.error, /账号已被修改/)
+  assert.deepEqual(f.store.read(), before)
+  assert.equal(ui.state.form.accountId, '')
 })

@@ -134,7 +134,7 @@ test('invalid Claude connection fields and duplicate retargeting fail without a 
   assert.deepEqual(f.disk(), before)
 })
 
-test('Claude edits do not join OpenAI provider keys or schedule OpenAI usage and token requests', async t => {
+test('Claude edits reconcile independent Anthropic key settings without scheduling OpenAI usage and token requests', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000000 })
   const f = fixture(t)
   f.store.transaction(state => {
@@ -149,7 +149,13 @@ test('Claude edits do not join OpenAI provider keys or schedule OpenAI usage and
   t.mock.timers.tick(24 * 60 * 60_000)
   await quotas.settled()
   assert.equal((await authority.ensure(f.account.id, { force: true })).credentials.apiKey, 'synthetic-updated-key')
-  assert.deepEqual(f.store.read().providers?.[0].keys, [])
-  assert.equal(f.store.read().providers?.[0].revision, 0)
+  const provider=f.store.read().providers![0]
+  assert.equal(provider.keys.length,1)
+  assert.deepEqual(provider.keys[0].models,['model-b'])
+  assert.equal(provider.keys[0].protocol,'anthropic_messages')
+  assert.equal(provider.keys[0].credentialKind,'anthropic_api_key')
+  assert.deepEqual(provider.models,['openai-model'])
+  assert.equal(f.store.read().accounts[0].providerId,undefined)
+  assert.equal(provider.revision,1)
   assert.equal(upstreamCalls, 0)
 })

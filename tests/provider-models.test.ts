@@ -75,3 +75,80 @@ test('saved credentials stay in main process; changed URL or revision cannot reu
   release();await assert.rejects(pending,/已变化/)
   assert.equal(JSON.stringify(f.store.snapshot()).includes('fixture-saved'),false)
 })
+
+test('Anthropic draft discovery uses the selected authentication and bounded same-origin pagination',async t=>{
+  const seen:Array<{path:string;apiKey?:string;authorization?:string}>=[]
+  const f=await fixture(t,(req,res)=>{
+    seen.push({path:req.url!,apiKey:req.headers['x-api-key'] as string|undefined,authorization:req.headers.authorization})
+    assert.equal(req.headers['anthropic-version'],'2023-06-01');assert.equal(req.method,'GET')
+    if(req.url!.includes('after_id='))res.end(JSON.stringify({data:[{id:'custom-部署'},{id:'CaseSensitive'}],has_more:false}))
+    else res.end(JSON.stringify({data:[{id:'custom-部署'}],has_more:true,last_id:'cursor/path?&='}))
+  })
+  const root=f.baseUrl.replace(/\/v1$/,'')
+  const result=await f.models.fetch(f.input({baseUrl:root,apiKey:'fixture-api-key',protocol:'anthropic_messages',credentialKind:'anthropic_api_key'}))
+  assert.deepEqual(result.models.map(item=>item.id),['custom-部署','CaseSensitive']);assert.equal(result.modelsTruncated,false)
+  assert.deepEqual(seen.map(item=>item.path),['/tenant/Case/v1/models','/tenant/Case/v1/models?after_id=cursor%2Fpath%3F%26%3D'])
+  assert.ok(seen.every(item=>item.apiKey==='fixture-api-key'&&item.authorization===undefined))
+  seen.length=0
+  await f.models.fetch(f.input({apiKey:'fixture-bearer',protocol:'anthropic_messages',credentialKind:'anthropic_bearer'}))
+  assert.ok(seen.every(item=>item.authorization==='Bearer fixture-bearer'&&item.apiKey===undefined))
+  assert.equal(existsSync(join(f.root,'state.vault')),false)
+})
+
+test('saved-key discovery chooses the key protocol and auth even if the draft asks for another protocol',async t=>{
+  const seen:Array<{path:string;authorization?:string;apiKey?:string}>=[]
+  const f=await fixture(t,(req,res)=>{
+    seen.push({path:req.url!,authorization:req.headers.authorization,apiKey:req.headers['x-api-key'] as string|undefined})
+    res.end(JSON.stringify({data:[{id:req.headers['x-api-key']?'anthropic-catalog':'chat-catalog'}]}))
+  })
+  mutateProvider(f.store,{action:'create',details:{name:'mixed',baseUrl:f.baseUrl,models:['legacy'],wireApi:'responses'},initialKey:{name:'ant',apiKey:'fixture-saved-ant',models:['custom-ant'],protocol:'anthropic_messages',credentialKind:'anthropic_api_key',createConnection:false}})
+  let provider=f.store.read().providers![0]
+  mutateProvider(f.store,{action:'addKey',id:provider.id,revision:provider.revision,name:'chat',apiKey:'fixture-saved-chat',models:['custom-chat'],protocol:'openai_chat_completions',credentialKind:'openai_api_key'})
+  provider=f.store.read().providers![0]
+  const before=f.store.read(),catalogs:string[][]=[]
+  for(const key of provider.keys)catalogs.push((await f.models.fetch(f.input({savedKey:{providerId:provider.id,keyId:key.id,revision:provider.revision},protocol:'openai_responses',credentialKind:'openai_api_key'}))).models.map(item=>item.id))
+  assert.deepEqual(catalogs,[['anthropic-catalog'],['chat-catalog']])
+  assert.deepEqual(seen,[{path:'/tenant/Case/v1/models',authorization:undefined,apiKey:'fixture-saved-ant'},{path:'/tenant/Case/v1/models',authorization:'Bearer fixture-saved-chat',apiKey:undefined}])
+  assert.deepEqual(f.store.read(),before)
+})
+
+test('Anthropic pagination rejects repeated or missing cursors and stops at a fixed page limit',async t=>{
+  let mode:'repeat'|'missing'|'pages'='repeat',calls=0
+  const f=await fixture(t,(_req,res)=>{
+    calls++
+    res.end(JSON.stringify({data:[{id:`model-${calls}`}],has_more:true,...(mode==='missing'?{}:{last_id:mode==='pages'?`cursor-${calls}`:'same-cursor'})}))
+  })
+  const input=()=>f.input({protocol:'anthropic_messages'})
+  await assert.rejects(f.models.fetch(input()),/分页/);assert.equal(calls,2)
+  mode='missing';calls=0;await assert.rejects(f.models.fetch(input()),/分页/);assert.equal(calls,1)
+  mode='pages';calls=0;const result=await f.models.fetch(input())
+  assert.equal(calls,10);assert.equal(result.models.length,10);assert.equal(result.modelsTruncated,true)
+})
+
+test('cancelling Anthropic pagination aborts the active page and does not return a partial catalogue',async t=>{
+  let secondPage=false,closed=false
+  const f=await fixture(t,(req,res)=>{
+    if(req.url!.includes('after_id=')){secondPage=true;res.on('close',()=>{closed=true})}
+    else res.end(JSON.stringify({data:[{id:'partial-model'}],has_more:true,last_id:'next'}))
+  })
+  const input=f.input({protocol:'anthropic_messages'}),pending=f.models.fetch(input)
+  const cancelled=assert.rejects(pending,/取消/)
+  for(let i=0;!secondPage&&i<100;i++)await new Promise(resolve=>setTimeout(resolve,5))
+  assert.ok(secondPage);await f.models.cancel(input.requestId);await cancelled
+  for(let i=0;!closed&&i<100;i++)await new Promise(resolve=>setTimeout(resolve,5))
+  assert.ok(closed)
+})
+
+test('a saved key protocol change during discovery rejects late results and further pages without changing its catalogue',async t=>{
+  let release:(()=>void)|undefined,requests=0
+  const f=await fixture(t,(_req,res)=>{requests++;release=()=>res.end('{"data":[{"id":"late-model"}],"has_more":true,"last_id":"next-page"}')})
+  mutateProvider(f.store,{action:'create',details:{name:'saved',baseUrl:f.baseUrl,models:['legacy']},initialKey:{name:'key',apiKey:'fixture-secret',models:['original'],protocol:'anthropic_messages',credentialKind:'anthropic_api_key',createConnection:false}})
+  const provider=f.store.read().providers![0],key=provider.keys[0]
+  const pending=f.models.fetch(f.input({savedKey:{providerId:provider.id,keyId:key.id,revision:provider.revision}}))
+  for(let i=0;!release&&i<100;i++)await new Promise(resolve=>setTimeout(resolve,5))
+  assert.ok(release)
+  mutateProvider(f.store,{action:'editKey',id:provider.id,revision:provider.revision,keyId:key.id,protocol:'openai_chat_completions',credentialKind:'openai_api_key'})
+  release();await assert.rejects(pending,/已变化/)
+  assert.equal(requests,1)
+  assert.deepEqual(f.store.read().providers![0].keys[0].models,['original'])
+})

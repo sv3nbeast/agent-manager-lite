@@ -3,14 +3,14 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { accountInputSchema, type Account, type AccountInput } from '../../../shared/types'
 import { integrationTypeOptions } from '../../../shared/providerUsage'
-import { providerEndpoint } from '../../../shared/providerLibrary'
+import { providerEndpoint,providerKeyModels,providerKeyProtocol } from '../../../shared/providerLibrary'
 import ModelContextWindowsField from './ModelContextWindowsField.vue'
 import { useManager } from '../store'
 import { focusFirstInvalidField, useFormFeedback, validationErrors } from '../formFeedback'
 import FormFeedback from './FormFeedback.vue'
 
 const props = defineProps<{ open: boolean; account?: Account }>()
-const emit = defineEmits<{ 'update:open': [value: boolean]; 'edit-provider': [providerId: string] }>()
+const emit = defineEmits<{ 'update:open': [value: boolean]; 'edit-provider': [providerId: string,keyId?:string] }>()
 const manager = useManager()
 const managedConnection = computed(() => props.account?.kind === 'api_key' && !!(props.account.providerId || props.account.providerKeyId))
 const isAnthropic = computed(() => props.account?.identityService === 'anthropic' || props.account?.protocol === 'anthropic_messages' || props.account?.credentialKind?.startsWith('anthropic_') === true || props.account?.credentialKind === 'claude_ai_oauth')
@@ -19,12 +19,15 @@ const editableAnthropic = computed(() => props.account?.kind === 'api_key' && pr
 const secretLabel = computed(() => props.account?.credentialKind === 'anthropic_bearer' ? 'Bearer Token' : 'API Key')
 const linkedProvider = computed(() => manager.data?.providers?.find(provider => provider.id === props.account?.providerId))
 const linkedKey = computed(() => linkedProvider.value?.keys.find(key => key.id === props.account?.providerKeyId))
-const inheritedModels = computed(() => linkedProvider.value?.models ?? props.account?.models ?? [])
-const inheritedProtocol = computed(() => isAnthropic.value ? 'Anthropic Messages' : (linkedProvider.value?.wireApi ?? props.account?.wireApi) === 'chat_completions' ? 'Chat Completions' : 'Responses')
+const inheritedModels = computed(() => linkedProvider.value&&linkedKey.value ? providerKeyModels(linkedProvider.value,linkedKey.value) : props.account?.models ?? [])
+const inheritedProtocol = computed(() => {
+  const protocol=linkedProvider.value&&linkedKey.value?providerKeyProtocol(linkedProvider.value,linkedKey.value):props.account?.protocol
+  return protocol==='anthropic_messages'||isAnthropic.value?'Anthropic Messages':protocol==='openai_chat_completions'||!protocol&&props.account?.wireApi==='chat_completions'?'Chat Completions':'Responses'
+})
 const inheritedIntegration = computed(() => integrationTypeOptions.find(option => option.value === (linkedProvider.value?.integrationType ?? props.account?.integrationType ?? 'auto'))?.label ?? '自动识别')
-const models = ref('gpt-5.5')
+const models = ref('')
 const connectionModels = computed(() => managedConnection.value ? inheritedModels.value : models.value.split(/[\n,]/).map(model => model.trim()).filter(Boolean))
-const form = reactive<AccountInput>({ name: '', apiKey: '', baseUrl: 'https://api.openai.com/v1', models: ['gpt-5.5'], wireApi: 'responses', defaultTier: 'inherit', note: '', tags: [] })
+const form = reactive<AccountInput>({ name: '', apiKey: '', baseUrl: 'https://api.openai.com/v1', models: [], wireApi: 'responses', defaultTier: 'inherit', note: '', tags: [] })
 const editingAccount = ref<Account>()
 const keyLoading = ref(false), keyError = ref(''), loadedKey = ref(''), keyNeedsEntry = ref(false)
 const formError = ref(''), fieldErrors = ref<Record<string, string>>({})
@@ -65,7 +68,7 @@ watch([() => props.open, () => props.account?.id], ([open]) => {
   editingAccount.value = account
   initializing = true
   Object.assign(form, { name: account?.name ?? '', apiKey: '', baseUrl: account?.baseUrl ?? 'https://api.openai.com/v1',
-    models: [...(account?.models ?? ['gpt-5.5'])], wireApi: account?.wireApi ?? 'responses',
+    models: [...(account?.models ?? [])], wireApi: account?.wireApi ?? 'responses',
     modelContextWindows: account?.modelContextWindows ? { ...account.modelContextWindows } : undefined,
     defaultTier: account?.defaultTier ?? 'inherit', integrationType: account?.integrationType ?? 'auto', note: account?.note ?? '', tags: [...(account?.tags ?? [])] })
   models.value = form.models.join('\n')
@@ -130,7 +133,7 @@ function editProvider() {
   const provider = linkedProvider.value
   if (!provider) return
   close()
-  emit('edit-provider', provider.id)
+  emit('edit-provider', provider.id,linkedKey.value?.id)
 }
 </script>
 
@@ -138,7 +141,7 @@ function editProvider() {
   <a-drawer :open="open" :title="isAnthropic ? '编辑 Claude 连接' : managedConnection ? '编辑连接' : account ? '编辑账号' : '添加 API 账号'" :width="500" destroy-on-close @close="close">
     <a-form layout="vertical" class="account-editor-form" @finish="save">
       <section v-if="managedConnection" class="connection-shared-config" aria-label="供应商共享配置">
-        <div class="connection-source-heading"><span><small>共享配置来源</small><strong>{{ linkedProvider?.name ?? '未知供应商' }}</strong></span><a-button v-if="linkedProvider" type="link" size="small" @click="editProvider">编辑供应商配置</a-button></div>
+        <div class="connection-source-heading"><span><small>共享配置来源</small><strong>{{ linkedProvider?.name ?? '未知供应商' }}</strong></span><a-button v-if="linkedProvider" type="link" size="small" @click="editProvider">编辑密钥配置</a-button></div>
         <p v-if="linkedProvider">使用密钥「{{ linkedKey?.name || '已关联密钥' }}」· {{ inheritedModels.length }} 个模型 · {{ inheritedProtocol }}</p>
         <p v-else>当前找不到关联的供应商。此连接仍保留已保存的配置，可解除关联后独立编辑。</p>
         <details class="connection-inherited-details">
@@ -151,7 +154,7 @@ function editProvider() {
             <div><dt>模型列表</dt><dd class="connection-inherited-models"><span v-for="model in inheritedModels" :key="model">{{ model }}</span><span v-if="!inheritedModels.length">未配置模型</span></dd></div>
           </dl>
         </details>
-        <div class="connection-source-footer"><small>{{ linkedProvider ? '地址、密钥和模型在供应商处统一维护。' : '解除关联后保留现有连接配置。' }}</small><a-button type="link" size="small" @click="unlink">解除关联</a-button></div>
+        <div class="connection-source-footer"><small>{{ linkedProvider ? '地址由供应商维护，模型和协议按密钥分别配置。' : '解除关联后保留现有连接配置。' }}</small><a-button type="link" size="small" @click="unlink">解除关联</a-button></div>
       </section>
       <a-form-item :label="managedConnection || isAnthropic ? '连接名称' : '账号名称'" required :validate-status="fieldErrors.name ? 'error' : undefined" :help="fieldErrors.name"><a-input v-model:value="form.name" :maxlength="120" /></a-form-item>
       <section v-if="isAnthropic" class="anthropic-boundary" aria-label="Anthropic 账号边界">

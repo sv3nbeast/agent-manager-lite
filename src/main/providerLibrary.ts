@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { providerDetailsSchema, providerEndpoint, providerKeyReadSchema, providerMutationSchema, type ProviderDetails, type ProviderSummary } from '../shared/providerLibrary'
+import { providerDetailsSchema, providerEndpoint, providerKeyReadSchema, providerMutationSchema, providerKeyConnection, providerKeyModels, providerKeyProtocol, providerKeyCredentialKind, type ProviderKeySettings, type ProviderDetails, type ProviderSummary } from '../shared/providerLibrary'
 import type { State, Store, StoredAccount } from './store'
 import type { DefaultTier } from '../shared/types'
 import {invalidateProviderUsage} from './providerUsage'
 import type {ProviderUsageState} from '../shared/providerUsage'
 
-interface StoredProviderKey { id: string; name: string; apiKey: string; createdAt: number; updatedAt: number; usage?:ProviderUsageState }
+export interface StoredProviderKey extends ProviderKeySettings { id: string; name: string; apiKey: string; createdAt: number; updatedAt: number; usage?:ProviderUsageState }
 export interface StoredProvider extends ProviderDetails {
   id: string; revision: number; createdAt: number; updatedAt: number
   keys: StoredProviderKey[]; excludedKeyHashes: string[]
@@ -18,18 +18,49 @@ function allow(provider: StoredProvider, apiKey: string): void {
 function exclude(provider: StoredProvider, apiKey: string): void {
   provider.excludedKeyHashes = [...new Set([...provider.excludedKeyHashes, fingerprint(apiKey)])]
 }
-function ensureKey(provider: StoredProvider, apiKey: string, name: string): StoredProviderKey {
-  const existing = provider.keys.find(key => key.apiKey === apiKey)
-  if (existing) return existing // Never overwrite a user's saved display name on reuse.
-  const key = { id: randomUUID(), name, apiKey, createdAt: Date.now(), updatedAt: Date.now() }
+function keySettings(provider:StoredProvider,settings:ProviderKeySettings):Required<ProviderKeySettings> {
+  const protocol=providerKeyProtocol(provider,settings),credentialKind=providerKeyCredentialKind(provider,settings)
+  if ((protocol==='anthropic_messages') !== (credentialKind!=='openai_api_key')) throw new Error('密钥认证方式与 API 协议不匹配')
+  return {models:providerKeyModels(provider,settings),protocol,credentialKind}
+}
+/** Freeze only missing legacy settings before a mutation can change provider defaults. */
+export function materializeProviderKeys(provider:StoredProvider):boolean {
+  let changed=false
+  for(const key of provider.keys) {
+    const effective=keySettings(provider,key)
+    if(key.models===undefined||key.protocol===undefined||key.credentialKind===undefined)changed=true
+    Object.assign(key,effective)
+  }
+  return changed
+}
+function accountSettings(account:StoredAccount):Required<ProviderKeySettings> {
+  const protocol=account.protocol ?? (account.identityService==='anthropic'?'anthropic_messages':account.wireApi==='chat_completions'?'openai_chat_completions':'openai_responses')
+  const credentialKind=account.credentialKind ?? (protocol==='anthropic_messages'?'anthropic_api_key':'openai_api_key')
+  if(!['openai_api_key','anthropic_api_key','anthropic_bearer','gateway'].includes(credentialKind))throw new Error('此 API 凭据类型无法保存到供应商密钥')
+  return {models:[...account.models],protocol,credentialKind:credentialKind as Required<ProviderKeySettings>['credentialKind']}
+}
+function sameProtocol(account:StoredAccount,provider:StoredProvider,key:StoredProviderKey):boolean {
+  const actual=accountSettings(account)
+  return actual.protocol===providerKeyProtocol(provider,key)&&actual.credentialKind===providerKeyCredentialKind(provider,key)
+}
+function ensureKey(provider:StoredProvider, apiKey:string, name:string,settings:ProviderKeySettings={}):StoredProviderKey {
+  const existing=provider.keys.find(key=>key.apiKey===apiKey)
+  if(existing) {
+    // Idempotent submission cannot silently overwrite a key's catalogue.
+    for(const field of ['models','protocol','credentialKind'] as const)if(settings[field]!==undefined&&JSON.stringify(settings[field])!==JSON.stringify(existing[field]))throw new Error('供应商已保存此密钥，请编辑现有密钥的模型或协议')
+    return existing
+  }
+  const normalized={...settings,models:[...new Set(providerKeyModels(provider,settings))]}
+  const key={id:randomUUID(),name,apiKey,...keySettings(provider,normalized),createdAt:Date.now(),updatedAt:Date.now()}
   provider.keys.push(key)
   return key
 }
 export function providerSummaries(state: State): ProviderSummary[] {
   const references = new Map<string, Map<string, string[]>>()
   const reusable = new Map<string, Map<string, string[]>>()
+  const accountsById=new Map(state.accounts.map(account=>[account.id,account]))
   for (const account of state.accounts) {
-    if (account.kind === 'api_key' && account.identityService !== 'anthropic' && account.credentials.apiKey) {
+    if (account.kind === 'api_key' && account.credentials.apiKey) {
       const endpoint = providerEndpoint(account.baseUrl)
       const connections = reusable.get(endpoint) ?? new Map<string, string[]>()
       const ids = connections.get(account.credentials.apiKey) ?? []
@@ -52,10 +83,10 @@ export function providerSummaries(state: State): ProviderSummary[] {
     ...(provider.supportsWebsockets === undefined ? {} : {supportsWebsockets:provider.supportsWebsockets}),
     ...(provider.enableModePreference === undefined ? {} : {enableModePreference:provider.enableModePreference}),
     createdAt: provider.createdAt, updatedAt: provider.updatedAt,
-    keys: provider.keys.map(key => ({ id: key.id, name: key.name, createdAt: key.createdAt, updatedAt: key.updatedAt,
+    keys: provider.keys.map(key => ({ ...keySettings(provider,key),id: key.id, name: key.name, createdAt: key.createdAt, updatedAt: key.updatedAt,
       ...(key.usage ? {usage:structuredClone(key.usage)} : {}),
       accountIds: references.get(provider.id)?.get(key.id) ?? [],
-      reusableAccountIds: reusable.get(providerEndpoint(provider.baseUrl))?.get(key.apiKey) ?? [] }))
+      reusableAccountIds: (reusable.get(providerEndpoint(provider.baseUrl))?.get(key.apiKey) ?? []).filter(id=>sameProtocol(accountsById.get(id)!,provider,key)) }))
   }))
 }
 
@@ -78,11 +109,11 @@ export function reconcileProviderKeys(state: State): void {
   const excluded = new Map((state.providers ?? []).map(p => [p.id, new Set(p.excludedKeyHashes)]))
   const changed = new Set<StoredProvider>()
   for (const account of state.accounts) {
-    if (account.kind !== 'api_key' || account.identityService === 'anthropic' || !account.credentials.apiKey) continue
+    if (account.kind !== 'api_key' || !account.credentials.apiKey) continue
     const provider = providers.get(providerEndpoint(account.baseUrl))
     if (!provider || keys.get(provider.id)!.has(account.credentials.apiKey)
       || excluded.get(provider.id)!.has(fingerprint(account.credentials.apiKey))) continue
-    provider.keys.push({id:randomUUID(),name:account.name,apiKey:account.credentials.apiKey,createdAt:Date.now(),updatedAt:Date.now()})
+    provider.keys.push({id:randomUUID(),name:account.name,apiKey:account.credentials.apiKey,...accountSettings(account),createdAt:Date.now(),updatedAt:Date.now()})
     keys.get(provider.id)!.add(account.credentials.apiKey)
     changed.add(provider)
   }
@@ -102,10 +133,10 @@ function detach(account: StoredAccount, provider?: StoredProvider): void {
   account.revision = (account.revision ?? 0) + 1
 }
 function project(account: StoredAccount, provider: StoredProvider, key: StoredProviderKey): void {
-  if (account.baseUrl !== provider.baseUrl || account.credentials.apiKey !== key.apiKey
+  if (account.baseUrl !== provider.baseUrl || account.credentials.apiKey !== key.apiKey || !sameProtocol(account,provider,key)
     || (account.integrationType ?? 'auto') !== (provider.integrationType ?? 'auto')) invalidateProviderUsage(account)
   account.providerId = provider.id; account.providerKeyId = key.id
-  account.baseUrl = provider.baseUrl; account.wireApi = provider.wireApi; account.models = [...provider.models]
+  account.baseUrl = provider.baseUrl; Object.assign(account,providerKeyConnection(provider,key))
   account.credentials.apiKey = key.apiKey
   if (provider.integrationType === undefined) delete account.integrationType
   else account.integrationType = provider.integrationType
@@ -115,7 +146,7 @@ function assertNoDuplicateAccounts(state: State): void {
   const seen = new Map<string, Set<string>>()
   for (const account of state.accounts) {
     if (account.kind !== 'api_key') continue
-    const endpoint = providerEndpoint(account.baseUrl), apiKey = account.credentials.apiKey ?? ''
+    const endpoint = JSON.stringify([providerEndpoint(account.baseUrl),accountSettings(account).protocol,accountSettings(account).credentialKind]), apiKey = account.credentials.apiKey ?? ''
     const keys = seen.get(endpoint) ?? new Set<string>()
     if (keys.has(apiKey)) throw new Error('此修改会产生重复账号，请先处理相同接口和密钥的账号')
     keys.add(apiKey); seen.set(endpoint, keys)
@@ -123,8 +154,9 @@ function assertNoDuplicateAccounts(state: State): void {
 }
 
 function createLinkedConnection(state:State, provider:StoredProvider, key:StoredProviderKey, name:string):void {
+  if(!providerKeyModels(provider,key).length)throw new Error('请先为此密钥配置模型，再启用 API 连接')
   const account:StoredAccount={id:randomUUID(),kind:'api_key',name,
-    baseUrl:provider.baseUrl,models:[...provider.models],wireApi:provider.wireApi,defaultTier:'inherit',
+    baseUrl:provider.baseUrl,...providerKeyConnection(provider,key),defaultTier:'inherit',
     note:'',tags:[],createdAt:Date.now(),credentials:{apiKey:key.apiKey}}
   project(account,provider,key)
   state.accounts.push(account)
@@ -136,9 +168,24 @@ export function providerTierForAccount(state: State, account: StoredAccount): De
   const provider = state.providers?.find(p => p.id === account.providerId)
   const key = provider?.keys.find(k => k.id === account.providerKeyId)
   if (!provider || !key || account.kind !== 'api_key' || providerEndpoint(account.baseUrl) !== providerEndpoint(provider.baseUrl)
-    || account.credentials.apiKey !== key.apiKey || account.wireApi !== provider.wireApi
-    || JSON.stringify(account.models) !== JSON.stringify(provider.models)) throw new Error('供应商关联已变化，请重新关联账号')
+    || account.credentials.apiKey !== key.apiKey || !sameProtocol(account,provider,key)
+    || account.wireApi !== providerKeyConnection(provider,key).wireApi || JSON.stringify(account.models) !== JSON.stringify(providerKeyModels(provider,key))) throw new Error('供应商关联已变化，请重新关联账号')
   return provider.defaultTier
+}
+
+function updateKey(provider:StoredProvider,key:StoredProviderKey,changes:ProviderKeySettings&{apiKey?:string},stopped:(accounts:StoredAccount[])=>void,accounts:StoredAccount[]):boolean {
+  const next=keySettings(provider,{...key,...Object.fromEntries(Object.entries(changes).filter(([,value])=>value!==undefined)),
+    ...(changes.models===undefined?{}:{models:[...new Set(changes.models)]})})
+  const changed=(changes.apiKey!==undefined&&changes.apiKey!==key.apiKey)||JSON.stringify(next)!==JSON.stringify(keySettings(provider,key))
+  if(!changed)return false
+  stopped(accounts)
+  if(changes.apiKey!==undefined&&changes.apiKey!==key.apiKey) {
+    if(provider.keys.some(item=>item.id!==key.id&&item.apiKey===changes.apiKey))throw new Error('供应商已保存此密钥')
+    exclude(provider,key.apiKey);key.apiKey=changes.apiKey;allow(provider,key.apiKey);delete key.usage
+  }
+  if(providerKeyProtocol(provider,key)!==next.protocol||providerKeyCredentialKind(provider,key)!==next.credentialKind)delete key.usage
+  Object.assign(key,next,{updatedAt:Date.now()})
+  return true
 }
 
 // Synchronous Store transactions are serialized by the Electron main loop. The
@@ -158,7 +205,7 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
     }
     const accountById = (id: string, revision: number) => {
       const account = state.accounts.find(a => a.id === id)
-      if (!account || account.kind !== 'api_key' || account.identityService === 'anthropic') throw new Error('请选择现有 OpenAI API 账号')
+      if (!account || account.kind !== 'api_key') throw new Error('请选择现有 API 连接')
       if ((account.revision ?? 0) !== revision) throw new Error('账号已被修改，请重新打开操作窗口')
       return account
     }
@@ -172,7 +219,7 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
         createdAt: Date.now(), updatedAt: Date.now(), keys: [], excludedKeyHashes: [] }
       state.providers.push(provider)
       if(input.initialKey) {
-        const key=ensureKey(provider,input.initialKey.apiKey,input.initialKey.name)
+        const key=ensureKey(provider,input.initialKey.apiKey,input.initialKey.name,input.initialKey)
         if(input.initialKey.createConnection)createLinkedConnection(state,provider,key,input.initialKey.name || provider.name)
       }
       reconcileProviderKeys(state)
@@ -187,6 +234,7 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
       return
     }
     const provider = current(input.id, input.revision)
+    materializeProviderKeys(provider)
     if (input.action === 'update') {
       if (input.clearModelContextWindows && input.changes.modelContextWindows !== undefined) throw new Error('上下文窗口不能同时清空和设置')
       const next = providerDetailsSchema.parse({name:provider.name,baseUrl:provider.baseUrl,
@@ -203,21 +251,15 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
       if (input.clearModelContextWindows) delete next.modelContextWindows
       next.models = [...new Set(next.models)]
       uniqueEndpoint(next.baseUrl, provider.id)
-      const connectionChanged = ['baseUrl','wireApi','models'].some(field => JSON.stringify(next[field as keyof ProviderDetails]) !== JSON.stringify(provider[field as keyof ProviderDetails]))
+      const connectionChanged = ['baseUrl'].some(field => JSON.stringify(next[field as keyof ProviderDetails]) !== JSON.stringify(provider[field as keyof ProviderDetails]))
       const integrationChanged = (next.integrationType ?? 'auto') !== (provider.integrationType ?? 'auto')
       if (next.baseUrl !== provider.baseUrl || integrationChanged) for (const key of provider.keys) delete key.usage
       const accounts = linked(state, provider)
       if (connectionChanged) stopped(accounts)
-      if (input.keyChange) {
-        const key = provider.keys.find(item => item.id === input.keyChange!.keyId)
-        if (!key) throw new Error('密钥已删除或移动')
-        if (key.apiKey !== input.keyChange.apiKey) {
-          if (provider.keys.some(item => item.id !== key.id && item.apiKey === input.keyChange!.apiKey)) throw new Error('供应商已保存此密钥')
-          stopped(linked(state, provider, key))
-          exclude(provider, key.apiKey)
-          key.apiKey = input.keyChange.apiKey; key.updatedAt = Date.now()
-          allow(provider, key.apiKey); delete key.usage
-        }
+      if(input.keyChange) {
+        const key=provider.keys.find(item=>item.id===input.keyChange!.keyId)
+        if(!key)throw new Error('密钥已删除或移动')
+        updateKey(provider,key,input.keyChange,stopped,linked(state,provider,key))
       }
       if (input.clearModelContextWindows) delete provider.modelContextWindows
       Object.assign(provider, next)
@@ -238,30 +280,29 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
       return
     }
     if (input.action === 'addKey') {
-      const key=ensureKey(provider, input.apiKey, input.name)
+      const key=ensureKey(provider, input.apiKey, input.name,input)
       if(input.createConnection && !linked(state,provider,key).length)createLinkedConnection(state,provider,key,input.name || provider.name)
       allow(provider, input.apiKey); touch(provider); return
     }
     const key = provider.keys.find(key => key.id === input.keyId)
     if (!key) throw new Error('密钥已删除或移动')
-    if (input.action === 'editKey') {
-      if (input.apiKey !== undefined && input.apiKey !== key.apiKey) {
-        if (provider.keys.some(k => k.id !== key.id && k.apiKey === input.apiKey)) throw new Error('供应商已保存此密钥')
-        const accounts = linked(state, provider, key); stopped(accounts)
-        exclude(provider, key.apiKey); key.apiKey = input.apiKey; allow(provider, key.apiKey); delete key.usage
-        accounts.forEach(account => project(account, provider, key))
-        assertNoDuplicateAccounts(state)
-      }
-      if (input.name !== undefined) key.name = input.name
-      key.updatedAt = Date.now(); touch(provider); return
+    if(input.action==='editKey') {
+      const accounts=linked(state,provider,key)
+      const changed=updateKey(provider,key,input,stopped,accounts)
+      if(changed)accounts.forEach(account=>project(account,provider,key))
+      assertNoDuplicateAccounts(state)
+      if(input.name!==undefined)key.name=input.name
+      key.updatedAt=Date.now();touch(provider);return
     }
     if (input.action === 'removeKey' || input.action === 'moveKey') {
       const accounts = linked(state, provider, key); stopped(accounts)
       if (input.action === 'moveKey') {
         if (input.targetId === provider.id) throw new Error('请选择不同的目标供应商')
         const target = current(input.targetId, input.targetRevision)
+        materializeProviderKeys(target)
         const duplicate = target.keys.find(k => k.apiKey === key.apiKey)
         if (duplicate) {
+          if(JSON.stringify(keySettings(target,duplicate))!==JSON.stringify(keySettings(provider,key)))throw new Error('两边密钥的模型或协议不同，请先统一配置；源密钥已保留')
           if (key.name && duplicate.name && key.name !== duplicate.name) throw new Error('两边的密钥名称不同，请先统一名称再移动；源密钥已保留')
           if (!duplicate.name) duplicate.name = key.name
           duplicate.updatedAt = Date.now()
@@ -277,6 +318,7 @@ export function mutateProvider(store: Store, raw: unknown, inUse: (id: string) =
     } else {
       const account = accountById(input.accountId, input.accountRevision)
       stopped([account])
+      if(!sameProtocol(account,provider,key))throw new Error('API 连接与密钥的协议或认证方式不同，请选择兼容连接')
       const previous = state.providers.find(p => p.id === account.providerId && p.id !== provider.id)
       if (previous) touch(previous)
       project(account, provider, key)

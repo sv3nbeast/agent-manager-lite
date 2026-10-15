@@ -129,3 +129,47 @@ test('mismatched or ambiguous linked accounts cannot silently choose a route by 
   const fallback=providerNetworkTarget({accounts:[{...state.accounts[0],providerId:undefined,providerKeyId:undefined}]},provider,key)
   assert.equal(fallback.proxy,undefined);assert.equal(fallback.id,key.id)
 })
+
+test('mixed protocol keys keep their linked proxy identity for discovery and direct chat probes',async t=>{
+  const f=fixture(t),seen:Array<{path:string;key:string;model?:string}>=[];let globalHits=0
+  const global=await server(t,(_req,res)=>{globalHits++;res.end('{}')})
+  const proxy=await server(t,(req,res)=>{
+    let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
+      const path=new URL(req.url!).pathname,key=String(req.headers['x-api-key']??req.headers.authorization)
+      const body=raw?JSON.parse(raw):{}
+      seen.push({path,key,...(body.model?{model:body.model}:{})})
+      if(path.endsWith('/models'))res.end(JSON.stringify({data:[{id:key.includes('anthropic')?'custom-claude':'custom-gemini'}]}))
+      else if(path.endsWith('/messages')) {
+        assert.equal(req.headers['anthropic-version'],'2023-06-01');assert.equal(body.service_tier,undefined)
+        res.end(JSON.stringify({content:[{type:'text',text:'Messages proxy reply'}],stop_reason:'end_turn'}))
+      } else res.end(JSON.stringify({choices:[{message:{content:'Chat proxy reply'},finish_reason:'stop'}]}))
+    })
+  })
+  f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:global}})
+  mutateProvider(f.store,{action:'create',details:{name:'Mixed provider',baseUrl:'http://mixed-provider.invalid/v1',models:['wrong-provider-model']},
+    initialKey:{name:'Anthropic',apiKey:'fixture-anthropic-key',models:['custom-claude'],protocol:'anthropic_messages',credentialKind:'anthropic_api_key',createConnection:true}})
+  let provider=f.store.read().providers![0]
+  mutateProvider(f.store,{action:'addKey',id:provider.id,revision:provider.revision,name:'Chat',apiKey:'fixture-chat-key',models:['custom-gemini'],protocol:'openai_chat_completions',credentialKind:'openai_api_key',createConnection:true})
+  f.store.transaction(state=>{for(const account of state.accounts)account.proxy={mode:'custom',url:proxy}})
+  const state=f.store.read();provider=state.providers![0]
+  assert.equal(state.accounts.length,2)
+  const targets=provider.keys.map(key=>({providerId:provider.id,keyId:key.id,revision:provider.revision}))
+  for(const key of provider.keys) {
+    const account=providerNetworkTarget(state,provider,key),linked=state.accounts.find(item=>item.providerKeyId===key.id)!
+    assert.equal(account.id,linked.id);assert.deepEqual(account.proxy,linked.proxy);assert.deepEqual(account.models,key.models)
+    assert.equal(account.protocol,key.protocol)
+  }
+  const models=new ProviderModels(f.store,3000,f.network.fetchUpstream)
+  const probes=new ProviderProbes(f.store,binary,join(f.root,'probes'),{models:3000,chat:3000},f.network.fetchUpstream)
+  t.after(async()=>{await models.stop();await probes.stop()})
+  for(const target of targets)await models.fetch({requestId:randomUUID(),baseUrl:provider.baseUrl,savedKey:target})
+  probes.start({mode:'chat',targets,serviceTier:'priority'});await probes.settled()
+  assert.equal(probes.snapshot().succeeded,2,JSON.stringify(probes.snapshot()))
+  assert.deepEqual(seen,[
+    {path:'/v1/models',key:'fixture-anthropic-key'},
+    {path:'/v1/models',key:'Bearer fixture-chat-key'},
+    {path:'/v1/messages',key:'fixture-anthropic-key',model:'custom-claude'},
+    {path:'/v1/chat/completions',key:'Bearer fixture-chat-key',model:'custom-gemini'},
+  ])
+  assert.equal(globalHits,0)
+})

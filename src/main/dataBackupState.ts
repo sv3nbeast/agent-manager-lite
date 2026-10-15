@@ -1,6 +1,6 @@
 import {z} from 'zod'
 import {settingsSchema,accountInputSchema,defaultTierSchema,groupInputSchema,accountProtocolSchema,accountIdentityServiceSchema,accountCredentialKindSchema} from '../shared/types'
-import {providerDetailsSchema} from '../shared/providerLibrary'
+import {providerDetailsSchema,providerKeySettingsSchema,providerKeyConnection,providerKeyProtocol,providerKeyCredentialKind} from '../shared/providerLibrary'
 import {instanceInputSchema} from '../shared/instances'
 import {localPoolSchema,localKeyDetailsSchema} from '../shared/localAccess'
 import type {State} from './store'
@@ -29,7 +29,7 @@ const account=z.object({id,name:accountInputSchema.shape.name,email:text.optiona
   credentials:z.object({apiKey:text.optional(),accessToken:text.optional(),refreshToken:text.optional(),idToken:text.optional(),accountId:text.optional(),lastRefresh:z.string().datetime({offset:true}).optional(),expiresAt:date.optional(),tokenType:text.optional(),scope:text.optional(),localAPIKey:text.optional(),agentIdentity:identity.optional()}).strict(),
   generation:text.optional(),source:json.optional(),revision:integer.optional(),providerId:id.optional(),providerKeyId:id.optional(),proxy:proxy.optional(),quota:quota.optional(),providerUsage:providerUsage.optional(),subscriptionActiveUntil:date.optional(),subscriptionSource:z.enum(['token','web']).optional(),subscriptionQueryLastAttemptAt:date.optional(),subscriptionQueryNextRetryAt:date.optional(),subscriptionQueryLastSuccessAt:date.optional(),subscriptionQueryLastError:text.optional(),error:text.optional(),errorAt:date.optional(),needsTokenExchange:z.boolean().optional()
 }).strict()
-const provider=providerDetailsSchema.extend({models:accountInputSchema.shape.models.min(0),id,revision:integer,createdAt:date,updatedAt:date,keys:z.array(z.object({id,name:text,apiKey:text,createdAt:date,updatedAt:date,usage:providerUsage.optional()}).strict()).max(10000),excludedKeyHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(10000)}).strict()
+const provider=providerDetailsSchema.extend({models:accountInputSchema.shape.models.min(0),id,revision:integer,createdAt:date,updatedAt:date,keys:z.array(z.object({...providerKeySettingsSchema.shape,id,name:text,apiKey:text,createdAt:date,updatedAt:date,usage:providerUsage.optional()}).strict()).max(10000),excludedKeyHashes:z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(10000)}).strict()
 const profile=z.object({id,revision:integer,createdAt:date,externalHome:z.object({directory:text,device:integer,inode:integer,previousTargetName:text.optional()}).strict().optional()}).passthrough().superRefine((value,ctx)=>{
   const {id:_id,revision:_revision,createdAt:_createdAt,externalHome:_external,...details}=value
   if(!instanceInputSchema.safeParse(details).success)ctx.addIssue({code:'custom',message:'实例配置无效'})
@@ -77,7 +77,10 @@ export function validateBackup(value:unknown):DataBackupBundle{
   for(const rows of [s.accounts,s.groups,s.providers??[],s.instances??[],s.instanceApplications??[],s.instanceWorkingDirectories??[],s.localAccess?.keys??[],s.proxyResources??[],s.proxyCatalogs??[],s.accountRecycle??[],s.sshServers?.servers??[]])unique(rows)
   if(s.sshServers?.selectedId&&!s.sshServers.servers.some(server=>server.id===s.sshServers!.selectedId))throw new Error('备份 SSH 服务器选择无效')
   if(s.wakeup){unique(s.wakeup.tasks);unique(s.wakeup.history)}
-  for(const p of s.providers??[])unique(p.keys)
+  for(const p of s.providers??[]){
+    unique(p.keys)
+    for(const key of p.keys)if((providerKeyProtocol(p,key)==='anthropic_messages')!==(providerKeyCredentialKind(p,key)!=='openai_api_key'))throw new Error('备份密钥协议与认证方式不一致')
+  }
   for(const source of s.proxyCatalogs??[])unique([...source.catalog.nodes,...source.catalog.groups])
   const known=new Set(s.accounts.map(a=>a.id))
   for(const a of [...s.accounts,...(s.accountRecycle??[]).map(entry=>entry.account)]){
@@ -87,7 +90,12 @@ export function validateBackup(value:unknown):DataBackupBundle{
   for(const a of s.accounts){
     if(a.kind==='api_key'&&!a.credentials.apiKey||a.kind==='oauth'&&!a.credentials.accessToken&&!a.credentials.refreshToken||a.kind==='agent_identity'&&!a.credentials.agentIdentity)throw new Error('备份账号缺少凭据')
     if(!!a.providerId!==!!a.providerKeyId)throw new Error('备份供应商关联不一致')
-    if(a.providerId){const p=s.providers?.find(p=>p.id===a.providerId),key=p?.keys.find(k=>k.id===a.providerKeyId);if(a.kind!=='api_key'||!p||!key||a.credentials.apiKey!==key.apiKey||a.baseUrl!==p.baseUrl||a.wireApi!==p.wireApi||(a.integrationType??'auto')!==(p.integrationType??'auto')||JSON.stringify(a.models)!==JSON.stringify(p.models))throw new Error('备份供应商关联不一致')}
+    if(a.providerId){
+      const p=s.providers?.find(p=>p.id===a.providerId),key=p?.keys.find(k=>k.id===a.providerKeyId)
+      if(a.kind!=='api_key'||!p||!key||a.credentials.apiKey!==key.apiKey||a.baseUrl!==p.baseUrl||(a.integrationType??'auto')!==(p.integrationType??'auto'))throw new Error('备份供应商关联不一致')
+      const connection=providerKeyConnection(p,key),protocol=a.protocol??(a.identityService==='anthropic'?'anthropic_messages':a.wireApi==='chat_completions'?'openai_chat_completions':'openai_responses')
+      if(a.wireApi!==connection.wireApi||protocol!==connection.protocol||(a.identityService??'openai')!==connection.identityService||(a.credentialKind??'openai_api_key')!==connection.credentialKind||JSON.stringify(a.models)!==JSON.stringify(connection.models))throw new Error('备份供应商关联不一致')
+    }
   }
   for(const group of s.groups)if(group.accountIds.some(id=>!known.has(id)))throw new Error('备份分组引用缺失账号')
   for(const task of s.wakeup?.tasks??[])if(task.accountIds.some(id=>!known.has(id)))throw new Error('备份任务引用缺失账号')

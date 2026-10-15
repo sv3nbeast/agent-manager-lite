@@ -1,26 +1,23 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import { Gateway } from './gateway'
-import type { Store, StoredAccount } from './store'
+import type { Store } from './store'
 import type { StoredProvider } from './providerLibrary'
 import { providerProbeInputSchema, type ProviderProbeInput, type ProviderProbeState, type ProviderProbeRecord, type ProbeModel } from '../shared/providerProbe'
+import { providerKeyModels, providerKeyProtocol, providerKeyCredentialKind } from '../shared/providerLibrary'
+import { resolveServiceTier } from '../shared/serviceTier'
 import { object,type JSONFetch } from './network'
-import {providerNetworkTarget,type UpstreamFetch} from './providerNetworkTarget'
+import {providerNetworkTarget,providerAPIEndpoint,providerAPIHeaders,type UpstreamFetch} from './providerNetworkTarget'
 import type {ProxyState} from './proxyPolicy'
 import type {ProxyTunnels} from './proxyTunnels'
-import type { Settings } from '../shared/types'
+import type { AccountCredentialKind, AccountProtocol, Settings } from '../shared/types'
 
 class ProbeError extends Error { constructor(message:string,readonly status?:number) { super(message) } }
-type Target = { provider:StoredProvider; keyId:string; apiKey:string; record:ProviderProbeRecord }
+type Target = { provider:StoredProvider; keyId:string; apiKey:string; models:string[]; protocol:AccountProtocol; credentialKind:AccountCredentialKind; explicitModel?:string; record:ProviderProbeRecord }
 const empty = ():ProviderProbeState=>({running:false,cancelling:false,cancelled:false,total:0,completed:0,succeeded:0,failed:0,records:[]})
 const knownTiers = new Set(['priority','default','auto','flex','scale','ultrafast'])
 const tier = (value:unknown) => typeof value==='string' && knownTiers.has(value) ? value : undefined
-const preferredModels = ['gpt-5.6-luna','gpt-6.1-sol','gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.5']
-export function selectProbeModel(models:string[],wireApi:string,explicit?:string):string | undefined {
-  if(explicit)return explicit
-  if(wireApi==='responses')return preferredModels.map(preferred=>models.find(model=>model.toLowerCase()===preferred)).find(Boolean)
-    ?? models.find(model=>!/(^gpt-image|^dall-e|image-gen)/i.test(model)) ?? models[0]
-  return models[0]
+export function selectProbeModel(models:string[],_wireApi:string,explicit?:string):string | undefined {
+  return explicit ?? models[0]
 }
 function redact(value:string,secrets:string[]):string {
   for(const secret of secrets) {
@@ -30,6 +27,7 @@ function redact(value:string,secrets:string[]):string {
   return value
 }
 export async function probeJSON(url:string,init:RequestInit,signal:AbortSignal,transport:JSONFetch=fetch):Promise<{body:Record<string,unknown>;status:number}> {
+  signal.throwIfAborted()
   let response:Response
   try { response=await transport(url,{...init,signal,redirect:'manual'}) }
   catch { throw new ProbeError('无法连接接口，请检查地址、网络或代理') }
@@ -47,10 +45,12 @@ export async function probeJSON(url:string,init:RequestInit,signal:AbortSignal,t
     let size=0;const chunks:Uint8Array[]=[]
     while(true) {
       const {value,done}=await reader.read();if(done)break
+      signal.throwIfAborted()
       size+=value.length;if(size>2*1024*1024)throw new Error('oversize')
       chunks.push(value)
     }
     const body:unknown=JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    signal.throwIfAborted()
     if(!body || typeof body!=='object' || Array.isArray(body))throw new Error('shape')
     return {body:body as Record<string,unknown>,status:response.status}
   } catch {throw new ProbeError('响应格式无效、读取中断或超过 2 MB',response.status)}
@@ -69,11 +69,53 @@ export function probeModelList(body:Record<string,unknown>,secrets:string[]):{mo
   }
   return {models:[...found.values()],modelsTruncated:count>1000}
 }
+/** Bound pagination and keep provider-supplied cursors on the same endpoint. */
+export async function fetchProbeModels(baseUrl:string,protocol:AccountProtocol,credentialKind:AccountCredentialKind,apiKey:string|undefined,signal:AbortSignal,transport:JSONFetch=fetch,validateCurrent?:()=>unknown):Promise<{models:ProbeModel[];modelsTruncated:boolean;httpStatus:number}> {
+  const endpoint=providerAPIEndpoint(baseUrl,protocol,'models'),models=new Map<string,ProbeModel>(),cursors=new Set<string>()
+  let url=endpoint,httpStatus=200
+  for(let page=0;page<10;page++) {
+    validateCurrent?.()
+    const {body,status}=await probeJSON(url,{headers:providerAPIHeaders(protocol,credentialKind,apiKey)},signal,transport)
+    validateCurrent?.()
+    httpStatus=status
+    const parsed=probeModelList(body,apiKey?[apiKey]:[])
+    let modelsTruncated=parsed.modelsTruncated
+    for(const model of parsed.models) {
+      if(models.has(model.id))continue
+      if(models.size===1000){modelsTruncated=true;continue}
+      models.set(model.id,model)
+    }
+    const more=protocol==='anthropic_messages'&&body.has_more===true
+    if(modelsTruncated||!more||models.size===1000||page===9)return {models:[...models.values()],modelsTruncated:modelsTruncated||more,httpStatus}
+    const cursor=typeof body.last_id==='string'?body.last_id:''
+    if(!cursor||cursor.length>1000||/[\x00-\x1f\x7f]/.test(cursor)||cursors.has(cursor)||apiKey&&redact(cursor,[apiKey])!==cursor)throw new ProbeError('模型接口返回无效的分页信息')
+    cursors.add(cursor)
+    const next=new URL(endpoint);next.searchParams.set('after_id',cursor);url=next.href
+  }
+  return {models:[...models.values()],modelsTruncated:true,httpStatus}
+}
 function responseText(body:Record<string,unknown>):string {
   if(body.error || body.status!==undefined && body.status!=='completed')throw new ProbeError('对话未正常完成，请检查模型支持和输出限制')
   const text = typeof body.output_text==='string' ? body.output_text : Array.isArray(body.output)
     ? body.output.flatMap(item=>Array.isArray(object(item).content) ? object(item).content as unknown[] : [])
       .filter(item=>object(item).type==='output_text').map(item=>typeof object(item).text==='string' ? object(item).text : '').join('') : ''
+  if(!text.trim())throw new ProbeError('对话返回成功状态，但没有可读回复')
+  return text
+}
+function chatText(body:Record<string,unknown>,protocol:AccountProtocol):string {
+  if(protocol==='openai_responses')return responseText(body)
+  if(body.error)throw new ProbeError('对话未正常完成，请检查模型支持和输出限制')
+  let text=''
+  if(protocol==='anthropic_messages') {
+    if(body.stop_reason!==undefined&&!['end_turn','stop_sequence'].includes(String(body.stop_reason)))throw new ProbeError('对话未正常完成，请检查模型支持和输出限制')
+    text=Array.isArray(body.content)?body.content.filter(item=>object(item).type==='text').map(item=>typeof object(item).text==='string'?object(item).text:'').join(''):''
+  } else if(Array.isArray(body.choices)) {
+    if(body.choices.some(choice=>object(choice).finish_reason!==undefined&&object(choice).finish_reason!=='stop'))throw new ProbeError('对话未正常完成，请检查模型支持和输出限制')
+    text=body.choices.map(choice=>{
+      const content=object(object(choice).message).content
+      return typeof content==='string'?content:Array.isArray(content)?content.filter(item=>object(item).type==='text').map(item=>typeof object(item).text==='string'?object(item).text:'').join(''):''
+    }).join('')
+  }
   if(!text.trim())throw new ProbeError('对话返回成功状态，但没有可读回复')
   return text
 }
@@ -83,9 +125,9 @@ export class ProviderProbes {
   private task?:Promise<void>
   private controller?:AbortController
   private active?:{target:Target;controller:AbortController}
-  constructor(private readonly store:Store,private readonly binary:string,private readonly runtimeRoot:string,
+  constructor(private readonly store:Store,_binary:string,_runtimeRoot:string,
     private readonly timeouts={models:20_000,chat:90_000},private readonly fetchUpstream:UpstreamFetch=fetch,
-    private readonly proxyState:()=>ProxyState=()=>({}),private readonly tunnels?:Pick<ProxyTunnels,'acquire'>) {}
+    _proxyState:()=>ProxyState=()=>({}),_tunnels?:Pick<ProxyTunnels,'acquire'>) {}
   snapshot():ProviderProbeState {this.invalidate();return structuredClone(this.state)}
   private current(target:Target):boolean {
     const provider=this.store.read().providers?.find(p=>p.id===target.provider.id)
@@ -101,9 +143,10 @@ export class ProviderProbes {
       seen.add(identity)
       const provider=state.providers?.find(p=>p.id===selection.providerId),key=provider?.keys.find(k=>k.id===selection.keyId)
       if(!provider || provider.revision!==selection.revision || !key)throw new Error('供应商或密钥已变化，请重新选择测试目标')
+      const protocol=providerKeyProtocol(provider,key),credentialKind=providerKeyCredentialKind(provider,key)
       const record:ProviderProbeRecord={providerId:provider.id,providerRevision:provider.revision,providerName:provider.name,
-        keyId:key.id,keyName:key.name,baseUrl:provider.baseUrl,wireApi:provider.wireApi,status:'pending',stage:'queued'}
-      return {provider,keyId:key.id,apiKey:key.apiKey,record}
+        keyId:key.id,keyName:key.name,baseUrl:provider.baseUrl,protocol,wireApi:protocol==='openai_responses'?'responses':'chat_completions',status:'pending',stage:'queued'}
+      return {provider,keyId:key.id,apiKey:key.apiKey,models:providerKeyModels(provider,key),protocol,credentialKind,explicitModel:selection.model,record}
     })
     this.state={...empty(),runId:randomUUID(),mode:input.mode,running:true,total:targets.length,records:targets.map(target=>target.record)}
     this.controller=new AbortController()
@@ -131,10 +174,10 @@ export class ProviderProbes {
         try {
           if(input.mode==='models') {
             record.stage='models'
-            const url=target.provider.baseUrl.replace(/\/+$/,'')+'/models'
             const account=providerNetworkTarget(this.store.read(),target.provider,{id:target.keyId,apiKey:target.apiKey})
-            const {body,status}=await probeJSON(url,{headers:{Authorization:`Bearer ${target.apiKey}`,Accept:'application/json'}},combined,(url,init)=>this.fetchUpstream(url,init,account))
-            record.httpStatus=status;Object.assign(record,probeModelList(body,[target.apiKey]))
+            Object.assign(record,await fetchProbeModels(target.provider.baseUrl,target.protocol,target.credentialKind,target.apiKey,combined,(url,init)=>this.fetchUpstream(url,init,account),()=>{
+              if(!this.current(target))throw new ProbeError('配置已变化，请重新测试')
+            }))
           } else await this.chat(target,input,settings,combined)
           if(combined.aborted)throw new ProbeError('测试已中止')
           record.status='success'
@@ -142,7 +185,7 @@ export class ProviderProbes {
           if(signal.aborted) {record.status='cancelled';record.error='测试已取消'}
           else if(!this.current(target)) {record.status='stale';record.error='配置已变化，请重新测试'}
           else if(timeout.signal.aborted) {record.status='error';record.error='测试超时，已停止请求'}
-          else {record.status='error';record.error=error instanceof ProbeError ? error.message : '本地测试失败，请检查接口或侧车运行状态'}
+          else {record.status='error';record.error=error instanceof ProbeError ? error.message : '本地测试失败，请检查接口或网络配置'}
           if(error instanceof ProbeError && error.status)record.httpStatus=error.status
           delete record.reply;delete record.replyTruncated;delete record.models;delete record.modelsTruncated
         } finally {
@@ -160,24 +203,19 @@ export class ProviderProbes {
   }
   private async chat(target:Target,input:ProviderProbeInput,settings:Settings,signal:AbortSignal):Promise<void> {
     const record=target.record,provider=target.provider
-    const model=selectProbeModel(provider.models,provider.wireApi,input.model)
+    const model=selectProbeModel(target.models,target.protocol,target.explicitModel??input.model)
     if(!model)throw new ProbeError('没有可用的测试模型，请先配置或获取模型列表')
     record.model=model;record.stage='starting'
-    const account={...providerNetworkTarget(this.store.read(),provider,{id:target.keyId,apiKey:target.apiKey}),
-      models:[model,...provider.models.filter(id=>id!==model)]}
-    const localKey=`cml-probe-${randomBytes(32).toString('hex')}`
-    const gateway=new Gateway(this.binary,this.runtimeRoot,event=>{
-      if(event.type==='usage') {record.outboundTier=tier(event.outboundServiceTier);record.responseTier=tier(event.responseServiceTier)}
-    },undefined,this.proxyState,this.tunnels)
-    try {
-      const status=await gateway.start({id:account.id,port:0,account,apiKey:localKey,providerTier:provider.defaultTier},settings,signal)
-      signal.throwIfAborted();record.stage='chat'
-      const {body,status:httpStatus}=await probeJSON(`http://127.0.0.1:${status.port}/v1/responses`,{
-        method:'POST',headers:{Authorization:`Bearer ${localKey}`,'Content-Type':'application/json'},
-        body:JSON.stringify({model,input:[{type:'message',role:'user',content:[{type:'input_text',text:input.prompt}]}],instructions:'',store:false,stream:false,max_output_tokens:256,service_tier:input.serviceTier})
-      },signal)
-      const reply=Array.from(redact(responseText(body),[target.apiKey,localKey]))
-      record.httpStatus=httpStatus;record.reply=reply.slice(0,8000).join('');record.replyTruncated=reply.length>8000
-    } finally {record.stage='cleanup';await gateway.stop()}
+    const account=providerNetworkTarget(this.store.read(),provider,{id:target.keyId,apiKey:target.apiKey})
+    const serviceTier=target.protocol==='anthropic_messages'?undefined:resolveServiceTier(input.serviceTier,settings.defaultTier,provider.defaultTier,undefined,account.defaultTier).tier
+    const payload=target.protocol==='openai_responses'
+      ? {model,input:[{role:'user',content:[{type:'input_text',text:input.prompt}]}],store:false,stream:false,max_output_tokens:256,...(serviceTier?{service_tier:serviceTier}:{})}
+      : {model,messages:[{role:'user',content:input.prompt}],stream:false,max_tokens:256,...(serviceTier?{service_tier:serviceTier}:{})}
+    signal.throwIfAborted();record.stage='chat';record.outboundTier=tier(serviceTier)
+    const {body,status:httpStatus}=await probeJSON(providerAPIEndpoint(provider.baseUrl,target.protocol,'chat'),{
+      method:'POST',headers:{...providerAPIHeaders(target.protocol,target.credentialKind,target.apiKey),'Content-Type':'application/json'},body:JSON.stringify(payload)
+    },signal,(url,init)=>this.fetchUpstream(url,init,account))
+    const reply=Array.from(redact(chatText(body,target.protocol),[target.apiKey]))
+    record.httpStatus=httpStatus;record.responseTier=tier(body.service_tier);record.reply=reply.slice(0,8000).join('');record.replyTruncated=reply.length>8000
   }
 }

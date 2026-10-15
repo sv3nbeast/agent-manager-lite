@@ -15,7 +15,7 @@ const script = compileScript(descriptor, { id: 'provider-models-field-test' })
 const javascript = ts.transpileModule(script.content, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(yes => { resolve = yes }); return { promise, resolve } }
 function mount(overrides:Partial<ManagerAPI>={}) {
-  const requests:unknown[]=[],cancelled:string[]=[]
+  const requests:unknown[]=[],cancelled:string[]=[],selections:string[][]=[]
   const api:Partial<ManagerAPI>={fetchProviderModels:async input=>{requests.push(structuredClone(input));return {requestId:input.requestId,models:[{id:'fixture-model'}],modelsTruncated:false}},cancelProviderModels:async id=>{cancelled.push(id)},...overrides}
   const exports={}
   const context={module:{exports},exports,window:{manager:api},console,crypto:webcrypto,require:(id:string)=>id==='vue'?vue:(()=>{throw new Error(`Unexpected module ${id}`)})()}
@@ -23,11 +23,11 @@ function mount(overrides:Partial<ManagerAPI>={}) {
   const component=(context.module.exports as {default:vue.Component}).default as vue.Component&{render?:()=>null};component.render=()=>null
   const renderer=vue.createRenderer<object,{children:object[]}>({patchProp(){},insert(node,parent){parent.children.push(node)},remove(){},createElement:()=>({children:[]}),createText:()=>({}),createComment:()=>({}),setText(){},setElementText(){},parentNode:()=>null,nextSibling:()=>null})
   const container={children:[] as object[]}
-  let props:Record<string,unknown>={modelValue:[],baseUrl:'https://fixture.invalid/v1',apiKey:'fixture-secret',active:true,keyManaged:true}
+  let props:Record<string,unknown>={modelValue:[],baseUrl:'https://fixture.invalid/v1',apiKey:'fixture-secret',active:true,keyManaged:true,'onUpdate:modelValue':(value:string[])=>{selections.push(Array.from(value))}}
   let vnode=vue.h(component,props);renderer.render(vnode,container)
   const state=vnode.component!.setupState as Record<string,any>
   const update=(changes:Record<string,unknown>)=>{props={...props,...changes};vnode=vue.h(component,props);renderer.render(vnode,container)}
-  return {state,requests,cancelled,update,unmount:()=>renderer.render(null,container)}
+  return {state,requests,cancelled,selections,update,unmount:()=>renderer.render(null,container)}
 }
 
 test('changing target during cancellation keeps retries disabled until main-process cleanup and ignores late results',async t=>{
@@ -54,4 +54,30 @@ test('an externally managed empty key never falls back to the provider default a
   assert.equal(ui.requests.length,1)
   assert.equal((ui.requests[0] as any).apiKey,undefined)
   assert.equal((ui.requests[0] as any).savedKey,undefined)
+})
+
+
+test('clear all preserves fetched results for replacement and never auto-saves discovery',async t=>{
+  const ui=mount();t.after(ui.unmount)
+  ui.update({modelValue:['old-model']});await vue.nextTick()
+  await ui.state.fetchModels()
+  assert.equal(ui.selections.length,0)
+  ui.state.clearModels();assert.deepEqual(ui.selections.at(-1),[])
+  assert.deepEqual(Array.from(ui.state.fetched,(value:any)=>value.id),['fixture-model'])
+  ui.update({modelValue:[]});await vue.nextTick()
+  assert.equal(ui.state.fetched.length,1,'Changing selected models must not reset the fetched list')
+  ui.state.addModels(true)
+  assert.deepEqual(ui.selections.at(-1),['fixture-model'])
+})
+
+test('fetch uses the key protocol and auth form, and protocol changes invalidate previous results',async t=>{
+  const ui=mount();t.after(ui.unmount)
+  ui.update({protocol:'anthropic_messages',credentialKind:'anthropic_api_key'});await vue.nextTick()
+  await ui.state.fetchModels()
+  assert.equal((ui.requests[0] as any).protocol,'anthropic_messages')
+  assert.equal((ui.requests[0] as any).credentialKind,'anthropic_api_key')
+  ui.update({credentialKind:'anthropic_bearer'});await vue.nextTick()
+  assert.equal(ui.state.fetched.length,0)
+  await ui.state.fetchModels()
+  assert.equal((ui.requests[1] as any).credentialKind,'anthropic_bearer')
 })

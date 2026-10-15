@@ -7,6 +7,7 @@ import ts from 'typescript'
 import { compileScript, parse } from '@vue/compiler-sfc'
 import * as vue from 'vue'
 import * as clients from '../src/shared/agentClients'
+import * as providers from '../src/shared/providerLibrary'
 import * as instances from '../src/shared/instances'
 import * as windows from '../src/shared/modelContextWindows'
 import { validationErrors } from '../src/renderer/src/formFeedback'
@@ -35,7 +36,7 @@ function mount(values: Account[] = [account(), account('oauth'), account('agent_
   }
   const exports = {}, context = { module: { exports }, exports, crypto: { randomUUID }, document: { querySelector: () => null }, window: { manager: api },
     require: (id: string) => id === 'vue' ? vue : id === 'ant-design-vue' ? { Modal: {}, message: { success() {}, warning() {} } } : id === '@ant-design/icons-vue' ? {}
-      : id.endsWith('/agentClients') ? clients : id.endsWith('/instances') ? instances : id.endsWith('/modelContextWindows') ? windows
+      : id.endsWith('/agentClients') ? clients : id.endsWith('/providerLibrary') ? providers : id.endsWith('/instances') ? instances : id.endsWith('/modelContextWindows') ? windows
       : id === '../formFeedback' ? { validationErrors, useFormFeedback: () => () => {} }
       : id === '../store' ? { useManager: () => manager } : id.endsWith('.vue') ? { default: {} }
       : (() => { throw new Error(`Unexpected module ${id}`) })() }

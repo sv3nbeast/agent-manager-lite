@@ -1061,7 +1061,7 @@ test('supplier context overrides reach local instance config and clearing them r
   const f=fixture(t),account=f.account(),provider=linkProvider(f,account,'Context supplier'),instance=f.add(account.id)
   const file=join(instance.directory,'config.toml'),original='# preserve hand configuration\nmodel="before"\nmodel_context_window=80000\nmodel_auto_compact_token_limit=70000\n[desktop]\nlocaleOverride="en-US"\n'
   writeFileSync(file,original)
-  mutateProvider(f.store,{action:'update',id:provider.id,revision:provider.revision,changes:{models:['fixture-model','other-model','fallback-model'],modelContextWindows:{'fixture-model':128000,'other-model':256000}}})
+  mutateProvider(f.store,{action:'update',id:provider.id,revision:provider.revision,changes:{modelContextWindows:{'fixture-model':128000,'other-model':256000}},keyChange:{keyId:provider.keys[0].id,models:['fixture-model','other-model','fallback-model']}})
   let preview=f.instances.preview({id:instance.id,revision:instance.revision})
   assert.equal(preview.effectiveContextWindow,128000);assert.equal(preview.effectiveAutoCompactTokenLimit,115200);assert.equal(preview.contextWindowSource,'provider')
   f.instances.start(preview.ticket);await f.instances.settled(instance.id)
@@ -1163,7 +1163,7 @@ test('changing the model catalog during a run keeps the new catalog without rest
 test('one supplier window does not expand a 500-model discovery list into duplicated model instructions',async t=>{
   const f=fixture(t),account=f.account(),provider=linkProvider(f,account,'Large supplier'),instance=f.add(account.id)
   const models=['fixture-model',...Array.from({length:499},(_,index)=>`large-model-${index}`)]
-  mutateProvider(f.store,{action:'update',id:provider.id,revision:provider.revision,changes:{models,modelContextWindows:{'fixture-model':128000}}})
+  mutateProvider(f.store,{action:'update',id:provider.id,revision:provider.revision,changes:{modelContextWindows:{'fixture-model':128000}},keyChange:{keyId:provider.keys[0].id,models}})
   f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket);await f.instances.settled(instance.id)
   assert.equal(f.instances.views()[0].status,'running',JSON.stringify(f.instances.views()))
   const doc=new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8'))
@@ -1179,7 +1179,7 @@ test('oversized projection needed to preserve an existing global window fails be
   const f=fixture(t),account=f.account(),provider=linkProvider(f,account,'Global large supplier'),instance=f.add(account.id),file=join(instance.directory,'config.toml')
   const original='model_context_window=80000\nmodel_auto_compact_token_limit=70000\n'
   writeFileSync(file,original)
-  mutateProvider(f.store,{action:'update',id:provider.id,revision:provider.revision,changes:{models:['fixture-model',...Array.from({length:499},(_,index)=>`large-model-${index}`)],modelContextWindows:{'fixture-model':128000}}})
+  mutateProvider(f.store,{action:'update',id:provider.id,revision:provider.revision,changes:{modelContextWindows:{'fixture-model':128000}},keyChange:{keyId:provider.keys[0].id,models:['fixture-model',...Array.from({length:499},(_,index)=>`large-model-${index}`)]}})
   assert.throws(()=>f.instances.preview({id:instance.id,revision:instance.revision}),/模型目录超过.*16 MiB/)
   assert.equal(readFileSync(file,'utf8'),original)
   assert.equal(existsSync(join(f.store.directory,'model-catalogs',instance.id)),false)

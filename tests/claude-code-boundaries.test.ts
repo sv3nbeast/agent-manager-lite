@@ -14,7 +14,7 @@ import { assertImplementedClient, getClientAdapterRegistration, listClientAdapte
 test('Claude CLI and Desktop keep separate application acceptance boundaries', () => {
   assert.equal(claudeCodeClient.status, 'implemented')
   assert.equal(claudeCodeDesktopClient.status, 'implemented')
-  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['cli', 'desktop'])
+  assert.deepEqual(claudeCodeClient.capabilities.launchModes, ['desktop', 'cli'])
   assert.deepEqual(claudeCodeDesktopClient.capabilities.launchModes, ['desktop'])
   assert.doesNotThrow(() => claudeCodeCapabilitySchema.parse(claudeCodeDesktopClient.capabilities))
 })

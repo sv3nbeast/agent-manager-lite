@@ -6,7 +6,8 @@ import { join, relative } from 'node:path'
 import { tmpdir } from 'node:os'
 import { LocalDataMigration } from '../src/main/localDataMigration'
 import { Store, type VaultCodec } from '../src/main/store'
-import { mutateProvider } from '../src/main/providerLibrary'
+import { mutateProvider, providerTierForAccount } from '../src/main/providerLibrary'
+import { createAPIAccount } from '../src/main/accounts'
 import { DataBackups } from '../src/main/dataBackups'
 import { exportBackupState, validateBackup } from '../src/main/dataBackupState'
 import type { LocalDataPreview } from '../src/shared/localDataMigration'
@@ -198,12 +199,55 @@ test('explicit group quota refresh minutes, including inherit, take precedence o
 
 test('supplier configuration conflicts prevent all writes and preserve destination metadata', async t => {
   const f = fixture(t)
-  mutateProvider(f.store, { action: 'create', details: { name: '已有供应商', baseUrl: f.provider.baseUrl, models: ['different-model'], wireApi: 'responses', defaultTier: 'inherit' } })
+  mutateProvider(f.store, { action: 'create', details: { name: '已有供应商', baseUrl: f.provider.baseUrl, models: ['different-model'], wireApi: 'responses', defaultTier: 'fast' } })
   const original = f.store.read(), p = await preview(f)
   assert.ok(p.errors.length > 0)
   assert.equal(p.providers[0].action, 'conflict')
   await assert.rejects(apply(f, p))
   assert.deepEqual(f.store.read(), original)
+})
+
+test('same-address legacy suppliers merge disjoint keys using each source catalogue and protocol, preserving empty keys',async t=>{
+  const f=fixture(t),sourceModels=['custom-model','custom-model']
+  f.provider.modelCatalog=sourceModels
+  writeJSON(join(f.source,'codex_model_providers.json'),[{...f.provider,apiKeys:[...f.provider.apiKeys,{name:'Explicit empty',apiKey:'fixture-source-empty',models:[]}]}])
+  for(let index=0;index<f.details.length;index++){f.details[index].api_model_catalog=sourceModels;f.saveAccount(index)}
+  const sourceBytes=bytes(f.source)
+  mutateProvider(f.store,{action:'create',details:{name:'Destination',baseUrl:f.provider.baseUrl,models:['destination-model'],wireApi:'chat_completions',defaultTier:'inherit'}})
+  const provider=f.store.read().providers![0],keyId=randomUUID(),destinationModels=['destination-model','destination-model']
+  const account={...createAPIAccount({name:'Existing connection',baseUrl:provider.baseUrl,apiKey:'fixture-destination-key',models:destinationModels,wireApi:'chat_completions'}),providerId:provider.id,providerKeyId:keyId}
+  f.store.transaction(state=>{
+    state.providers![0].models=[...destinationModels]
+    state.providers![0].keys=[{id:keyId,name:'Legacy destination',apiKey:'fixture-destination-key',createdAt:observedAt,updatedAt:observedAt}]
+    state.accounts.push(account)
+  })
+  const p=await preview(f)
+  assert.deepEqual(p.errors,[]);assert.equal(p.providers[0].action,'merge');assert.equal(p.counts.addedKeys,5)
+  await apply(f,p)
+  const state=f.store.read(),merged=state.providers![0]
+  assert.deepEqual(merged.models,destinationModels);assert.equal(merged.wireApi,'chat_completions')
+  assert.deepEqual(merged.keys[0].models,destinationModels);assert.equal(merged.keys[0].protocol,'openai_chat_completions')
+  for(const key of merged.keys.slice(1,5)) {
+    assert.deepEqual(key.models,sourceModels);assert.equal(key.protocol,'openai_responses');assert.equal(key.credentialKind,'openai_api_key')
+  }
+  assert.deepEqual(merged.keys[5].models,[]);assert.equal(merged.keys[5].protocol,'openai_responses')
+  assert.deepEqual(state.accounts[0],account)
+  for(const connection of state.accounts)assert.equal(providerTierForAccount(state,connection),'inherit')
+  assert.doesNotThrow(()=>validateBackup(exportBackupState(state,{})))
+  assert.deepEqual(bytes(f.source),sourceBytes)
+  const repeated=await preview(f)
+  assert.deepEqual(repeated.errors,[]);assert.equal(repeated.counts.addedKeys,0);assert.equal(repeated.counts.mergedProviders,0)
+  await apply(f,repeated);assert.deepEqual(f.store.read(),state)
+})
+
+for(const conflict of ['models','protocol'] as const)test(`same-secret key ${conflict} conflicts block migration after legacy supplier defaults differ`,async t=>{
+  const f=fixture(t)
+  mutateProvider(f.store,{action:'create',details:{name:'Destination',baseUrl:f.provider.baseUrl,models:[],wireApi:'chat_completions',defaultTier:'inherit'},
+    initialKey:{name:'Existing key',apiKey:f.details[0].openai_api_key,models:conflict==='models'?[]:['custom-model'],protocol:conflict==='protocol'?'openai_chat_completions':'openai_responses',createConnection:false}})
+  const before=f.store.read(),p=await preview(f)
+  assert.ok(p.errors.some(error=>error.includes('相同密钥的模型或协议不同')))
+  assert.equal(p.providers[0].action,'conflict')
+  await assert.rejects(apply(f,p));assert.deepEqual(f.store.read(),before)
 })
 
 test('same-endpoint connections with different models keep their original routing and do not become provider projections', async t => {

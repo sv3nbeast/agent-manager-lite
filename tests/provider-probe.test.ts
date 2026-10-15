@@ -56,7 +56,7 @@ test('connection probe validates model lists, preserves case, redacts credential
   assert.equal(JSON.stringify(result).includes('fixture-probe-secret'),false)
   assert.deepEqual(f.store.read(),before)
   assert.equal(existsSync(f.runtime),false)
-  assert.equal(selectProbeModel(['gpt-image-1','gpt-5.6-luna'],'responses'),'gpt-5.6-luna')
+  assert.equal(selectProbeModel(['custom-vendor/Model-A','gpt-5.6-luna'],'responses'),'custom-vendor/Model-A')
   assert.equal(selectProbeModel(['first'],'responses','explicit'),'explicit')
 })
 
@@ -81,7 +81,7 @@ test('connection failures are bounded and classified; redirects never receive cr
   assert.equal(JSON.stringify(result).includes('fixture-probe-secret'),false)
 })
 
-test('chat probes use the real Responses/Chat Completions gateway and observe actual Fast, explicit tiers and replies',async t=>{
+test('chat probes use direct Responses/Chat Completions requests and observe actual Fast, explicit tiers and replies',async t=>{
   const received:Record<string,unknown>[]=[]
   const upstream=await server(t,async(req,res)=>{
     assert.equal(req.headers.authorization,'Bearer fixture-probe-secret')
@@ -106,13 +106,101 @@ test('chat probes use the real Responses/Chat Completions gateway and observe ac
       assert.equal(JSON.stringify(result).includes('fixture-probe-secret'),false)
       assert.equal(result.outboundTier,serviceTier ?? 'priority')
       assert.equal(result.responseTier,'default')
-      assert.deepEqual(readdirSync(f.runtime),[])
+      assert.equal(existsSync(f.runtime),false)
       assert.deepEqual(f.store.read(),before)
     }
   }
 })
 
-test('chat cancellation closes the upstream, skips queued targets, cleans its sidecar and leaves an existing local service running',async t=>{
+test('one provider probes each key with its own models, protocol and authentication; manual model names remain exact',async t=>{
+  const received:Array<{path:string;body:Record<string,unknown>;authorization?:string;apiKey?:string}>=[]
+  const upstream=await server(t,async(req,res)=>{
+    let raw='';for await(const chunk of req)raw+=chunk
+    const body=JSON.parse(raw)
+    received.push({path:req.url!,body,authorization:req.headers.authorization,apiKey:req.headers['x-api-key'] as string|undefined})
+    assert.equal(body.stream,false)
+    assert.equal(req.headers['content-type'],'application/json')
+    if(req.url==='/v1/messages') {
+      assert.equal(req.headers['anthropic-version'],'2023-06-01')
+      assert.deepEqual(body.messages,[{role:'user',content:'真实请求格式 🧪'}])
+      assert.equal(body.max_tokens,256);assert.equal(body.service_tier,undefined)
+      assert.equal(body.input,undefined);assert.equal(body.store,undefined)
+      res.end(JSON.stringify({type:'message',role:'assistant',stop_reason:'end_turn',content:[{type:'text',text:`Anthropic ${req.headers['x-api-key']??req.headers.authorization}`}]}))
+    } else if(req.url==='/v1/chat/completions') {
+      assert.deepEqual(body.messages,[{role:'user',content:'真实请求格式 🧪'}])
+      assert.equal(body.max_tokens,256);assert.equal(body.input,undefined)
+      res.end(JSON.stringify({choices:[{message:{role:'assistant',content:'chat reply'},finish_reason:'stop'}]}))
+    } else {
+      assert.equal(req.url,'/v1/responses')
+      assert.deepEqual(body.input,[{role:'user',content:[{type:'input_text',text:'真实请求格式 🧪'}]}])
+      assert.equal(body.max_output_tokens,256);assert.equal(body.store,false);assert.equal(body.messages,undefined)
+      res.end(JSON.stringify({status:'completed',output_text:'responses reply'}))
+    }
+  })
+  const f=fixture(t)
+  mutateProvider(f.store,{action:'create',details:{name:'Mixed',baseUrl:upstream.url+'/v1',models:['unrelated-legacy-model'],defaultTier:'fast'}})
+  const variants=[
+    {name:'Responses',apiKey:'fixture-secret-responses',models:['DeepSeek/Reasoner-Custom','gpt-later'],protocol:'openai_responses',credentialKind:'openai_api_key'},
+    {name:'Chat',apiKey:'fixture-secret-chat',models:['Gemini-Custom'],protocol:'openai_chat_completions',credentialKind:'openai_api_key'},
+    {name:'Anthropic API',apiKey:'fixture-secret-ant-api',models:['Claude-Custom'],protocol:'anthropic_messages',credentialKind:'anthropic_api_key'},
+    {name:'Anthropic Bearer',apiKey:'fixture-secret-ant-bearer',models:['My-Deployment'],protocol:'anthropic_messages',credentialKind:'anthropic_bearer'},
+  ]
+  for(const variant of variants) {
+    const provider=f.store.read().providers![0]
+    mutateProvider(f.store,{action:'addKey',id:provider.id,revision:provider.revision,...variant})
+  }
+  const provider=f.store.read().providers![0],targets=provider.keys.map(key=>({providerId:provider.id,keyId:key.id,revision:provider.revision}))
+  f.probes.start({mode:'chat',targets,prompt:'真实请求格式 🧪'});await f.probes.settled()
+  assert.equal(f.probes.snapshot().succeeded,4,JSON.stringify(f.probes.snapshot()))
+  assert.deepEqual(received.map(item=>item.body.model),variants.map(item=>item.models[0]))
+  assert.deepEqual(received.map(item=>item.path),['/v1/responses','/v1/chat/completions','/v1/messages','/v1/messages'])
+  assert.deepEqual(received.map(item=>item.authorization),['Bearer fixture-secret-responses','Bearer fixture-secret-chat',undefined,'Bearer fixture-secret-ant-bearer'])
+  assert.deepEqual(received.map(item=>item.apiKey),[undefined,undefined,'fixture-secret-ant-api',undefined])
+  assert.deepEqual(f.probes.snapshot().records.map(record=>record.protocol),variants.map(item=>item.protocol))
+  assert.match(f.probes.snapshot().records[2].reply!,/已隐藏密钥/)
+  assert.equal(f.probes.snapshot().records[2].reply!.includes('fixture-secret-ant-api'),false)
+  f.probes.start({mode:'chat',targets:[{...targets[0],model:'manual-vendor/自由模型'}],model:'global-override',prompt:'真实请求格式 🧪'});await f.probes.settled()
+  assert.equal(f.probes.snapshot().succeeded,1)
+  assert.equal(received.at(-1)!.body.model,'manual-vendor/自由模型')
+})
+
+test('an explicitly empty key catalogue cannot inherit another key or legacy provider model',async t=>{
+  let requests=0
+  const upstream=await server(t,(_req,res)=>{requests++;res.end('{"status":"completed","output_text":"ok"}')})
+  const f=fixture(t),target=f.add(upstream.url+'/v1')
+  mutateProvider(f.store,{action:'editKey',id:target.providerId,revision:target.revision,keyId:target.keyId,models:[]})
+  const current=f.target(target.providerId)
+  f.probes.start({mode:'chat',targets:[current]});await f.probes.settled()
+  assert.equal(requests,0);assert.match(f.probes.snapshot().records[0].error!,/没有可用/)
+  f.probes.start({mode:'chat',targets:[{...current,model:'manually-chosen'}]});await f.probes.settled()
+  assert.equal(requests,1);assert.equal(f.probes.snapshot().records[0].model,'manually-chosen')
+})
+
+test('a late successful chat response after catalogue revision is rejected even without a polling invalidation',async t=>{
+  let release:(()=>void)|undefined
+  const upstream=await server(t,(req,res)=>{req.resume();release=()=>res.end('{"status":"completed","output_text":"stale reply"}')})
+  const f=fixture(t),target=f.add(upstream.url+'/v1')
+  f.probes.start({mode:'chat',targets:[target]});await until(()=>!!release)
+  mutateProvider(f.store,{action:'editKey',id:target.providerId,revision:target.revision,keyId:target.keyId,models:['new-model']})
+  release!();await f.probes.settled()
+  const record=f.probes.snapshot().records[0]
+  assert.equal(record.status,'stale');assert.equal(record.reply,undefined)
+})
+
+test('a late Anthropic model page after key rotation cannot trigger another request or publish partial results',async t=>{
+  let release:(()=>void)|undefined,requests=0
+  const upstream=await server(t,(req,res)=>{requests++;req.resume();release=()=>res.end('{"data":[{"id":"old-model"}],"has_more":true,"last_id":"next-page"}')})
+  const f=fixture(t)
+  mutateProvider(f.store,{action:'create',details:{name:'Anthropic',baseUrl:upstream.url},initialKey:{name:'key',apiKey:'fixture-old',models:['custom-model'],protocol:'anthropic_messages',credentialKind:'anthropic_api_key',createConnection:false}})
+  const provider=f.store.read().providers![0],target=f.target(provider.id)
+  f.probes.start({mode:'models',targets:[target]});await until(()=>!!release)
+  mutateProvider(f.store,{action:'editKey',id:target.providerId,revision:target.revision,keyId:target.keyId,apiKey:'fixture-new'})
+  release!();await f.probes.settled()
+  const record=f.probes.snapshot().records[0]
+  assert.equal(record.status,'stale');assert.equal(record.models,undefined);assert.equal(requests,1)
+})
+
+test('chat cancellation closes the upstream, skips queued targets and leaves an existing local service running',async t=>{
   let count=0,closed=false
   const upstream=await server(t,(req,res)=>{count++;res.on('close',()=>{closed=true});req.resume()})
   const f=fixture(t),first=f.add(upstream.url+'/one'),second=f.add(upstream.url+'/two')
@@ -128,7 +216,7 @@ test('chat cancellation closes the upstream, skips queued targets, cleans its si
     assert.equal(count,1)
     assert.ok(f.probes.snapshot().records.every(record=>record.status==='cancelled'))
     assert.equal(f.probes.snapshot().cancelled,true)
-    assert.deepEqual(readdirSync(f.runtime),[])
+    assert.equal(existsSync(f.runtime),false)
     assert.equal(existing.current().running,true)
     const models=await fetch(`http://127.0.0.1:${existingStatus.port}/v1/models`,{headers:{Authorization:'Bearer fixture-local'}})
     assert.equal(models.status,200)

@@ -33,15 +33,15 @@ async function component(t: { after(fn: () => void): void }, name: string, initi
   const renderer = createRenderer<any, any>({
     createElement: () => ({}), createText: () => ({}), createComment: () => ({}), insert() {}, remove() {}, setElementText() {}, setText() {}, patchProp() {}, parentNode: () => null, nextSibling: () => null,
   })
-  const props = reactive(initial), state = shallowRef<any>(), events: string[][] = []
-  const app = renderer.createApp({ setup: () => () => h(target.exports.default, { ...props, ref: state, 'onUpdate:open': (value: boolean) => { props.open = value }, onImported: (ids: string[]) => events.push(ids) }) })
+  const props = reactive(initial), state = shallowRef<any>(), events: string[][] = [], created: string[] = []
+  const app = renderer.createApp({ setup: () => () => h(target.exports.default, { ...props, ref: state, 'onUpdate:open': (value: boolean) => { props.open = value }, onImported: (ids: string[]) => events.push(ids), onCreated: (id: string) => created.push(id) }) })
   app.use(pinia); app.mount({})
   t.after(() => {
     app.unmount()
     for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key)
   })
   await nextTick()
-  return { state: state.value, props, manager, events }
+  return { state: state.value, props, manager, events, created }
 }
 
 const accounts = [
@@ -57,7 +57,109 @@ function data(): AppSnapshot {
   ] } as unknown as AppSnapshot
 }
 
-test('switching the instance client selects Claude CLI and only compatible API resources', async t => {
+test('client families share the desktop/CLI choice and switching Claude launchers clears incompatible draft fields', async t => {
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, data())
+  f.state.edit(); f.state.selectClient('claude_code'); await nextTick()
+  assert.deepEqual(f.state.clientOptions.map((choice: any) => ({ ...choice })), [{ value: 'codex', label: 'Codex' }, { value: 'claude_code', label: 'Claude' }])
+  assert.deepEqual(f.state.client.capabilities.launchModes, ['desktop', 'cli'])
+  assert.equal(f.state.launchMode, 'desktop')
+  assert.equal(f.state.form.connectionMode, 'client_login')
+  assert.equal(f.state.form.applicationId, 'claude-desktop')
+  assert.equal(f.state.form.name, 'Claude Desktop 1')
+  f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
+  assert.equal(f.state.form.launchMode, 'cli')
+  assert.equal(f.state.form.connectionMode, 'native')
+  assert.equal(f.state.form.accountId, 'claude-key')
+  assert.equal(f.state.form.model, 'gateway-model')
+  assert.equal(f.state.form.name, 'Claude Code CLI 1')
+  f.state.form.name = 'My Claude'; f.state.form.workingDirectoryId = randomUUID(); f.state.args = '--verbose'; f.state.providerOpen = true
+  f.state.launchMode = 'desktop'; f.state.changeLaunchMode(); await nextTick()
+  assert.equal(f.state.form.name, 'My Claude')
+  assert.equal(f.state.form.accountId, '')
+  assert.equal(f.state.form.model, '')
+  assert.equal(f.state.form.workingDirectoryId, undefined)
+  assert.equal(f.state.args, '')
+  assert.equal(f.state.providerOpen, false)
+  assert.deepEqual(f.state.supplierChoices, [])
+  f.state.closeEditor(); f.state.edit()
+  assert.equal(f.state.clientSelection, 'claude_code')
+  assert.equal(f.state.launchMode, 'desktop')
+})
+
+test('instance suppliers follow each key protocol and model list without assuming GPT model names', async t => {
+  const snapshot = data()
+  snapshot.accounts = []
+  const provider = { id: randomUUID(), revision: 0, name: 'Mixed provider', baseUrl: 'https://mixed.invalid/v1', wireApi: 'responses', models: ['legacy-default'], defaultTier: 'inherit', createdAt: 1, updatedAt: 1, keys: [
+    { id: randomUUID(), name: 'OpenAI key', protocol: 'openai_responses', models: ['gpt-fixture', 'claude-through-responses'], accountIds: [], createdAt: 1, updatedAt: 1 },
+    { id: randomUUID(), name: 'Messages key', protocol: 'anthropic_messages', credentialKind: 'anthropic_bearer', models: ['claude-team-model', 'team-alias'], accountIds: [], createdAt: 1, updatedAt: 1 },
+    { id: randomUUID(), name: 'Other OpenAI key', protocol: 'openai_chat_completions', models: ['gemini-fixture'], accountIds: [], createdAt: 1, updatedAt: 1 },
+  ] }
+  snapshot.providers = [provider] as AppSnapshot['providers']
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, snapshot)
+  f.state.edit(); f.state.resourceKind = 'provider'; f.state.resetResource(); await nextTick()
+  assert.deepEqual(f.state.supplierChoices.map((choice: any) => choice.key.name), ['OpenAI key', 'Other OpenAI key'])
+  assert.deepEqual(f.state.modelChoices, ['gpt-fixture', 'claude-through-responses'])
+  f.state.selectSupplier(`${provider.id}:${provider.keys[2].id}`)
+  assert.deepEqual(f.state.modelChoices, ['gemini-fixture'])
+  assert.equal(f.state.form.model, 'gemini-fixture')
+  f.manager.data!.providers![0].keys[2].models = []
+  f.state.selectSupplier(`${provider.id}:${provider.keys[2].id}`)
+  assert.deepEqual(f.state.modelChoices, [], 'a deliberately cleared key must not recover the supplier legacy model list')
+  assert.equal(f.state.form.model, '')
+  f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
+  assert.deepEqual(f.state.supplierChoices.map((choice: any) => choice.key.name), ['Messages key'])
+  assert.equal(f.state.selectedSupplier.disabled, false)
+  assert.deepEqual(f.state.modelChoices, ['claude-team-model', 'team-alias'])
+  assert.equal(f.state.form.model, 'claude-team-model')
+  assert.equal(f.state.form.accountId, '', 'unenabled keys stay unbound until the user continues')
+})
+
+test('inline Claude connection saves models and authentication on the key and reuses an existing endpoint', async t => {
+  const snapshot = data(); snapshot.accounts = []; snapshot.providers = []
+  const writes: any[] = []
+  const f = await component(t, 'InstanceProviderDialog', { open: false, clientType: 'claude_code' }, {
+    mutateProvider: async (input: any) => {
+      writes.push(input)
+      const providerId = input.action === 'create' ? randomUUID() : input.id, keyId = randomUUID(), accountId = randomUUID()
+      const config = input.action === 'create' ? input.initialKey : input
+      if (input.action === 'create') snapshot.providers!.push({ ...input.details, id: providerId, revision: 1, createdAt: 1, updatedAt: 1, keys: [] })
+      snapshot.providers!.find(provider => provider.id === providerId)!.keys.push({ id: keyId, name: config.name, accountIds: [accountId], models: config.models, protocol: config.protocol, credentialKind: config.credentialKind, createdAt: 1, updatedAt: 1 })
+      snapshot.accounts.push({ ...accounts[1], id: accountId, providerId, providerKeyId: keyId, models: config.models } as any)
+      return structuredClone(snapshot)
+    },
+  }, snapshot)
+  f.props.open = true; await nextTick()
+  assert.equal(f.state.protocol, 'anthropic_messages')
+  assert.equal(f.state.credentialKind, 'anthropic_api_key')
+  f.state.name = 'One supplier'; f.state.baseUrl = 'https://gateway.invalid/v1/'; f.state.apiKey = 'fixture-api-key'
+  await f.state.save()
+  assert.equal(writes.length, 0)
+  assert.match(f.state.fieldErrors.models, /至少一个模型/)
+  f.state.models = ['custom-model-a']; await f.state.save(); await nextTick()
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].action, 'create')
+  assert.deepEqual(writes[0].details.models, [])
+  assert.deepEqual(writes[0].initialKey.models, ['custom-model-a'])
+  assert.equal(writes[0].initialKey.protocol, 'anthropic_messages')
+  assert.equal(f.created.length, 1)
+  f.props.open = true; await nextTick()
+  f.state.name = 'Second key'; f.state.baseUrl = 'https://GATEWAY.invalid:443/v1'; f.state.apiKey = 'fixture-bearer'; f.state.credentialKind = 'anthropic_bearer'; f.state.models = ['custom-model-b']
+  assert.equal(f.state.existingProvider?.id, snapshot.providers![0].id)
+  await f.state.save(); await nextTick()
+  assert.equal(writes[1].action, 'addKey')
+  assert.deepEqual(writes[1].models, ['custom-model-b'])
+  assert.equal(writes[1].credentialKind, 'anthropic_bearer')
+  assert.equal(writes[1].createConnection, true)
+  assert.equal(snapshot.providers!.length, 1)
+  assert.deepEqual(snapshot.providers![0].keys.map(key => key.models), [['custom-model-a'], ['custom-model-b']])
+  assert.equal(f.created.length, 2)
+})
+
+test('selecting Claude then CLI lists only compatible API resources', async t => {
   const calls: unknown[] = []
   const f = await component(t, 'InstancesView', {}, {
     listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
@@ -65,7 +167,7 @@ test('switching the instance client selects Claude CLI and only compatible API r
     fetchChatGPTModels: () => assert.fail('Claude must not request ChatGPT models'),
   }, data())
   f.state.edit(); await nextTick()
-  f.state.form.clientType = 'claude_code'; f.state.changeClient(); await nextTick()
+  f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
   assert.equal(f.state.launchMode, 'cli')
   assert.equal(f.state.form.applicationId, 'claude-cli')
   assert.equal(f.state.form.connectionMode, 'native')
@@ -80,7 +182,7 @@ test('switching the instance client selects Claude CLI and only compatible API r
   assert.deepEqual(calls, ['claude_code'])
   f.state.historyMode = 'copy'
   assert.equal(f.state.validHistorySource(), false)
-  f.state.form.clientType = 'codex'; f.state.changeClient(); await nextTick()
+  f.state.selectClient('codex'); await nextTick()
   assert.equal(f.state.launchMode, 'desktop')
   assert.equal(f.state.form.applicationId, 'codex-app')
   assert.equal(f.state.historyMode, 'empty')
@@ -95,7 +197,7 @@ test('CLI picker selects its exact result across detection order, cancellation a
     listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
     chooseInstanceCli: async () => choice,
   }, data())
-  f.state.edit(); f.state.form.clientType = 'claude_code'; f.state.changeClient(); await nextTick()
+  f.state.edit(); f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
   await f.state.chooseCli()
   assert.equal(f.state.form.applicationId, 'chosen-claude', 'explicit selection precedes the automatically detected program')
   choice = { snapshot }
@@ -114,9 +216,9 @@ test('a CLI picker result cannot change a draft after its client or launch mode 
     listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
     chooseInstanceCli: () => pendingChoice,
   }, data())
-  f.state.edit(); f.state.form.clientType = 'claude_code'; f.state.changeClient(); await nextTick()
+  f.state.edit(); f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
   const pending = f.state.chooseCli()
-  f.state.form.clientType = 'codex'; f.state.changeClient(); await nextTick()
+  f.state.selectClient('codex'); await nextTick()
   resolveChoice({ application: data().instanceApplications?.find(app => app.id === 'claude-cli'), snapshot: data() })
   await pending
   assert.equal(f.state.form.applicationId, 'codex-app')
@@ -158,9 +260,9 @@ test('Claude Desktop wizard creates and previews a client-login instance without
     mutateProvider: () => assert.fail('Desktop login must not create a provider account'),
   }, snapshot)
   f.state.edit()
-  assert.deepEqual(f.state.clientOptions.map((choice: any) => choice.label), ['Codex', 'Claude Code CLI', 'Claude Desktop'])
-  f.state.selectClientVariant('claude_desktop'); await nextTick()
-  assert.equal(f.state.clientSelection, 'claude_desktop')
+  assert.deepEqual(f.state.clientOptions.map((choice: any) => choice.label), ['Codex', 'Claude'])
+  f.state.selectClient('claude_code'); f.state.launchMode = 'desktop'; f.state.changeLaunchMode(); await nextTick()
+  assert.equal(f.state.clientSelection, 'claude_code')
   assert.equal(f.state.launchMode, 'desktop')
   assert.equal(f.state.form.applicationId, 'claude-desktop')
   assert.equal(f.state.form.name, 'Claude Desktop 1')
@@ -191,7 +293,7 @@ test('Claude Desktop wizard creates and previews a client-login instance without
   assert.equal(f.state.instanceAccountLabel(snapshot.instances![0]), '由 Claude Desktop 管理')
   assert.equal(snapshot.accounts.length, 0)
   f.state.edit()
-  assert.equal(f.state.clientSelection, 'claude_desktop', 'a new draft remembers the actual launcher')
+  assert.equal(f.state.clientSelection, 'claude_code', 'a new draft remembers the actual launcher')
   assert.equal(f.state.form.name, 'Claude Desktop 2')
 })
 
@@ -201,15 +303,15 @@ test('Claude Desktop needs an installed desktop application and editing cannot s
   const f = await component(t, 'InstancesView', {}, {
     listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
   }, snapshot)
-  f.state.edit(); f.state.selectClientVariant('claude_desktop'); await nextTick()
+  f.state.edit(); f.state.selectClient('claude_code'); f.state.launchMode = 'desktop'; f.state.changeLaunchMode(); await nextTick()
   assert.equal(f.state.form.applicationId, '')
   await f.state.nextStep()
   assert.equal(f.state.step, 0)
   assert.match(f.state.fieldErrors.applicationId, /已安装/)
   const instance = { id: randomUUID(), revision: 0, clientType: 'claude_code', launchMode: 'desktop', connectionMode: 'client_login', accountId: '', model: '', name: 'Existing desktop', applicationId: 'claude-desktop', extraArgs: [], defaultTier: 'inherit', status: 'stopped' }
   f.state.edit(instance)
-  f.state.selectClientVariant('claude_code_cli')
-  assert.equal(f.state.clientSelection, 'claude_desktop')
+  f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode()
+  assert.equal(f.state.clientSelection, 'claude_code')
   f.state.launchMode = 'cli'; f.state.changeLaunchMode()
   assert.equal(f.state.launchMode, 'desktop')
   assert.equal(f.state.form.launchMode, 'desktop')
@@ -231,6 +333,26 @@ test('editing a Codex instance preserves its existing desktop to CLI switch', as
   assert.equal(f.state.form.model, 'gpt-fixture')
 })
 
+test('legacy Claude instances retain the saved login boundary without an installed application', async t => {
+  const snapshot = data(); snapshot.instanceApplications = []
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, snapshot)
+  f.state.edit({ id: randomUUID(), revision: 0, clientType: 'claude_code', connectionMode: 'native', accountId: 'claude-key', model: 'gateway-model', name: 'Legacy CLI', applicationId: 'removed-cli', extraArgs: [], defaultTier: 'inherit', status: 'stopped' })
+  assert.equal(f.state.launchMode, 'cli')
+  assert.equal(f.state.form.connectionMode, 'native')
+  f.state.launchMode = 'desktop'; f.state.changeLaunchMode()
+  assert.equal(f.state.launchMode, 'cli')
+  assert.equal(f.state.form.launchMode, 'cli')
+  assert.equal(f.state.form.accountId, 'claude-key')
+  f.state.edit({ id: randomUUID(), revision: 0, clientType: 'claude_code', connectionMode: 'client_login', accountId: '', model: '', name: 'Desktop login', applicationId: 'removed-desktop', extraArgs: [], defaultTier: 'inherit', status: 'stopped' })
+  assert.equal(f.state.launchMode, 'desktop')
+  f.state.launchMode = 'cli'; f.state.changeLaunchMode()
+  assert.equal(f.state.launchMode, 'desktop')
+  assert.equal(f.state.form.launchMode, 'desktop')
+  assert.equal(f.state.form.accountId, '')
+})
+
 test('Claude Desktop picker passes its client and a late result cannot replace a CLI draft', async t => {
   const calls: string[] = []
   let resolveChoice!: (choice: InstanceApplicationChoice) => void
@@ -240,9 +362,9 @@ test('Claude Desktop picker passes its client and a late result cannot replace a
     listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
     chooseInstanceApplication: (client: string) => { calls.push(client); return new Promise(resolve => { resolveChoice = resolve }) },
   }, data())
-  f.state.edit(); f.state.selectClientVariant('claude_desktop')
+  f.state.edit(); f.state.selectClient('claude_code'); f.state.launchMode = 'desktop'; f.state.changeLaunchMode()
   const pending = f.state.chooseApplication()
-  f.state.selectClientVariant('claude_code_cli'); await nextTick()
+  f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode(); await nextTick()
   resolveChoice({ application: selected, snapshot }); await pending
   assert.deepEqual(calls, ['claude_code'])
   assert.equal(f.state.form.applicationId, 'claude-cli')
@@ -261,11 +383,11 @@ test('a late CLI project-directory picker cannot bind a directory to a Desktop d
     listInstanceWorkingDirectories: async () => [target], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
     chooseInstanceWorkingDirectory: () => new Promise(resolve => { choose = resolve }),
   }, data())
-  f.state.edit(); f.state.selectClientVariant('claude_code_cli')
+  f.state.edit(); f.state.selectClient('claude_code'); f.state.launchMode = 'cli'; f.state.changeLaunchMode()
   const pending = f.state.chooseWorkingDirectory()
-  f.state.selectClientVariant('claude_desktop'); choose(target); await pending
+  f.state.selectClient('claude_code'); f.state.launchMode = 'desktop'; f.state.changeLaunchMode(); choose(target); await pending
   assert.equal(f.state.form.workingDirectoryId, undefined)
-  assert.equal(f.state.clientSelection, 'claude_desktop')
+  assert.equal(f.state.clientSelection, 'claude_code')
 })
 
 test('Desktop login callback input clears on success or close and stale errors do not contaminate another instance', async t => {

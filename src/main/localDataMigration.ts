@@ -7,12 +7,12 @@ import {setImmediate as yieldIO} from 'node:timers/promises'
 import {z} from 'zod'
 import {localDataSelectionSchema,localDataApplySchema,type LocalDataSource,type LocalDataScan,type LocalDataPreview,type LocalDataCounts} from '../shared/localDataMigration'
 import {accountInputSchema,groupInputSchema,type AccountGroup} from '../shared/types'
-import {providerDetailsSchema,providerEndpoint} from '../shared/providerLibrary'
+import {providerKeySettingsSchema,providerKeyConnection,providerDetailsSchema,providerEndpoint} from '../shared/providerLibrary'
 import {parseAccountImport,sameAccount} from './accounts'
 import {accountFromAuth,configuredProviderAuth} from './clientIdentity'
 import {TomlDocument} from './tomlPatch'
 import {Store,type State,type StoredAccount,type LocalDataArchive} from './store'
-import type {StoredProvider} from './providerLibrary'
+import {materializeProviderKeys,type StoredProvider} from './providerLibrary'
 import {exportBackupState} from './dataBackupState'
 import {MAX_DATA_BACKUP_BYTES} from './dataBackupArchive'
 
@@ -213,7 +213,7 @@ export class LocalDataMigration {
       const valid=providerDetailsSchema.extend({models:accountInputSchema.shape.models.min(0)}).parse(details),rawKeys=p.apiKeys??p.keys??[]
       if(!Array.isArray(rawKeys)||rawKeys.length>10000)throw new MigrationError('供应商密钥列表格式无效')
       const keys:StoredProvider['keys']=[]
-      for(const item of rawKeys){const k=obj(item),apiKey=accountInputSchema.shape.apiKey.parse(k.apiKey);if(keys.some(x=>x.apiKey===apiKey)){b.warnings.push('来源供应商含重复密钥，保留首项名称；其余原数据已归档');continue}keys.push({id:randomUUID(),name:z.string().max(16384).parse(k.name??''),apiKey,createdAt:ms(k.createdAt,this.now()),updatedAt:ms(k.updatedAt,this.now())})}
+      for(const item of rawKeys){const k=obj(item),apiKey=accountInputSchema.shape.apiKey.parse(k.apiKey);if(keys.some(x=>x.apiKey===apiKey)){b.warnings.push('来源供应商含重复密钥，保留首项名称；其余原数据已归档');continue}keys.push({id:randomUUID(),name:z.string().max(16384).parse(k.name??''),apiKey,...providerKeySettingsSchema.parse(Object.fromEntries(Object.entries({models:k.models,protocol:k.protocol,credentialKind:k.credentialKind}).filter(([,value])=>value!==undefined))),createdAt:ms(k.createdAt,this.now()),updatedAt:ms(k.updatedAt,this.now())})}
       const excluded=z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(10000).parse(p.excludedApiKeyHashes??p.excludedKeyHashes??[])
       b.providers.push({...valid,id:randomUUID(),revision:0,createdAt:ms(p.createdAt,this.now()),updatedAt:ms(p.updatedAt,this.now()),keys,excludedKeyHashes:excluded})
       if(!valid.models.length)b.warnings.push('有供应商未配置模型，空目录已保留，可导入后从 API 获取')
@@ -222,21 +222,26 @@ export class LocalDataMigration {
   private async merge(state:State,b:Bundle,p:LocalDataPreview,check:()=>void):Promise<void>{
     let processed=0;const cooperate=async()=>{check();if(++processed%100===0){await yieldIO();check()}}
     state.providers??=[];const counts=p.counts,compatible=(a:StoredProvider,c:StoredProvider)=>{
-      const select=(v:StoredProvider)=>{const {id,revision,createdAt,updatedAt,name,keys,excludedKeyHashes,...details}=v;return details}
+      const select=(v:StoredProvider)=>{const {id,revision,createdAt,updatedAt,name,keys,excludedKeyHashes,models,wireApi,...details}=v;return details}
       return stable(select(a))===stable(select(c))
     }
     for(const provider of b.providers){
       await cooperate()
+      // Resolve each legacy key against its own supplier before moving it into
+      // another catalogue. Explicit empty models remain empty.
+      materializeProviderKeys(provider)
       const existing=state.providers.find(x=>providerEndpoint(x.baseUrl)===providerEndpoint(provider.baseUrl))
       const entry:LocalDataPreview['providers'][number]={name:provider.name,baseUrl:provider.baseUrl,models:provider.models.length,keys:provider.keys.length,action:'add'};p.providers.push(entry)
       if(existing){
-        if(!compatible(existing,provider)){entry.action='conflict';p.errors.push('同地址供应商的模型、协议、等级或能力配置不同，请先处理冲突再迁移');continue}
-        let added=0
-        for(const key of provider.keys){if(existing.keys.some(k=>k.apiKey===key.apiKey))continue;if(existing.excludedKeyHashes.includes(hash(key.apiKey))){p.warnings.push('本应用曾移除的供应商密钥已跳过，来源原数据仍归档');continue}existing.keys.push(structuredClone(key));added++;counts.addedKeys++}
+        if(!compatible(existing,provider)){entry.action='conflict';p.errors.push('同地址供应商的等级或共享能力配置不同，请先处理冲突再迁移');continue}
+        const materialized=materializeProviderKeys(existing)
+        let added=0,conflict=false
+        for(const key of provider.keys){const duplicate=existing.keys.find(k=>k.apiKey===key.apiKey);if(duplicate){if(stable(providerKeyConnection(existing,duplicate))!==stable(providerKeyConnection(provider,key))){conflict=true;p.errors.push('相同密钥的模型或协议不同，请先处理冲突再迁移')}continue;}if(existing.excludedKeyHashes.includes(hash(key.apiKey))){p.warnings.push('本应用曾移除的供应商密钥已跳过，来源原数据仍归档');continue}existing.keys.push(structuredClone(key));added++;counts.addedKeys++}
         const excluded=[...new Set([...existing.excludedKeyHashes,...provider.excludedKeyHashes])]
-        const changed=added>0||JSON.stringify(excluded)!==JSON.stringify(existing.excludedKeyHashes)
+        const changed=materialized||added>0||JSON.stringify(excluded)!==JSON.stringify(existing.excludedKeyHashes)
         existing.excludedKeyHashes=excluded
-        if(changed){entry.action='merge';existing.revision++;existing.updatedAt=this.now();counts.mergedProviders++}else entry.action='duplicate'
+        if(changed){existing.revision++;existing.updatedAt=this.now();counts.mergedProviders++}
+        entry.action=conflict?'conflict':changed?'merge':'duplicate'
       }else{state.providers.push(structuredClone(provider));counts.addedProviders++;counts.addedKeys+=provider.keys.length}
     }
     const mapped=new Map<string,string>()
@@ -250,7 +255,7 @@ export class LocalDataMigration {
         const provider=state.providers.find(x=>providerEndpoint(x.baseUrl)===providerEndpoint(a.baseUrl)&&x.keys.some(k=>k.apiKey===a.credentials.apiKey)),key=provider?.keys.find(k=>k.apiKey===a.credentials.apiKey)
         const capFields={api_model_context_windows:'modelContextWindows',api_model_capabilities:'modelCapabilities',api_supports_vision:'supportsVision',api_supports_websockets:'supportsWebsockets',api_vision_routing_model:'visionRoutingModel',api_enable_mode_preference:'enableModePreference'} as const
         const capsMatch=provider&&Object.entries(capFields).every(([from,to])=>a.source?.[from]===undefined||a.source[from]===null||JSON.stringify(a.source[from])===JSON.stringify(provider[to]))
-        if(provider&&key&&a.baseUrl===provider.baseUrl&&a.wireApi===provider.wireApi&&(a.integrationType??'auto')===(provider.integrationType??'auto')&&JSON.stringify(a.models)===JSON.stringify(provider.models)&&capsMatch){a.providerId=provider.id;a.providerKeyId=key.id}
+        if(provider&&key&&a.baseUrl===provider.baseUrl&&a.wireApi===providerKeyConnection(provider,key).wireApi&&(a.integrationType??'auto')===(provider.integrationType??'auto')&&JSON.stringify(a.models)===JSON.stringify(providerKeyConnection(provider,key).models)&&(a.protocol??(a.wireApi==='responses'?'openai_responses':'openai_chat_completions'))===providerKeyConnection(provider,key).protocol&&capsMatch){a.providerId=provider.id;a.providerKeyId=key.id}
         else if(provider)p.warnings.push('部分连接与供应商的模型或能力配置不同，已保留独立连接，避免被覆盖')
       }
       state.accounts.push(a);counts.addedAccounts++

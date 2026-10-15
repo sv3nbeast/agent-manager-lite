@@ -210,10 +210,11 @@ test('clearing connection model windows sends an explicit empty map; missing win
 })
 
 test('managed connection overrides are local and do not submit shared endpoint, key, models or integration', async t => {
-  const provider: library.ProviderSummary = { id: randomUUID(), revision: 3, name: 'Shared', baseUrl: 'https://shared.invalid/v1', models: ['shared-model'], wireApi: 'responses', defaultTier: 'inherit', modelContextWindows: { 'shared-model': 400000 }, createdAt: 1, updatedAt: 1, keys: [] }
+  const provider: library.ProviderSummary = { id: randomUUID(), revision: 3, name: 'Shared', baseUrl: 'https://shared.invalid/v1', models: ['legacy-shared-model'], wireApi: 'responses', defaultTier: 'inherit', modelContextWindows: { 'shared-model': 400000 }, createdAt: 1, updatedAt: 1, keys: [] }
   const selected = { ...account('Managed'), providerId: provider.id, providerKeyId: randomUUID(), modelContextWindows: { 'shared-model': 256000 } }
+  provider.keys.push({id:selected.providerKeyId,name:'Key',models:['shared-model'],protocol:'openai_responses',createdAt:1,updatedAt:1,accountIds:[selected.id]})
   const ui = mount({}, selected, [provider]); t.after(ui.unmount); await flush()
-  assert.deepEqual(plain(ui.state.connectionModels), ['shared-model'], 'Use the current supplier models, not a stale account snapshot')
+  assert.deepEqual(plain(ui.state.connectionModels), ['shared-model'], 'Use the current key models, not provider legacy defaults or a stale account snapshot')
   assert.deepEqual(plain(ui.state.linkedProvider.modelContextWindows), { 'shared-model': 400000 })
   ui.state.form.modelContextWindows = { 'shared-model': 512000 }
   ui.state.form.baseUrl = 'https://must-not-save.invalid/v1'; ui.state.form.apiKey = 'fixture-must-not-save'; ui.state.form.wireApi = 'chat_completions'; ui.state.form.integrationType = 'custom'

@@ -67,6 +67,7 @@ app.on('browser-window-created', (_event, window) => {
       progress('renderer loaded')
       const upstream = createServer(async (request, response) => {
         if(request.url==='/v1/models'){response.setHeader('Content-Type','application/json');response.end(JSON.stringify({data:[{id:'gpt-5.5'}]}));return}
+        if(request.method!=='POST'){response.statusCode=404;response.end('{}');return}
         let input = ''; for await (const chunk of request) input += chunk
         assert.equal(JSON.parse(input).service_tier, 'priority')
         response.setHeader('Content-Type', 'application/json')

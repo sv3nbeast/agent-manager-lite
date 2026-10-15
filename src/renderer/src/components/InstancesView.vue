@@ -6,7 +6,8 @@ import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkin
 import { accountCompatibility, getAgentClient, hasInstanceUpstreamProxy, implementedAgentClients, recommendedInstanceConnectionMode, resolveAgentClientType } from '../../../shared/agentClients'
 import type { AgentClientType } from '../../../shared/agentClients'
 import type { InstanceApplicationChoice } from '../../../shared/types'
-import { instanceInputSchema } from '../../../shared/instances'
+import { instanceInputSchema, isClaudeDesktopProfile } from '../../../shared/instances'
+import { providerKeyConnection, providerKeyModels } from '../../../shared/providerLibrary'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
 import type { InstanceLoginRequest, InstanceLoginResult } from '../instanceOnboarding'
 import InstanceProviderDialog from './InstanceProviderDialog.vue'
@@ -220,10 +221,8 @@ watch(open,async visible=>{
 const client=computed(()=>getAgentClient(form.clientType))
 const isClaude=computed(()=>form.clientType==='claude_code')
 const isClaudeDesktop=computed(()=>isClaude.value&&launchMode.value==='desktop')
-const clientSelection=computed(()=>isClaude.value?(isClaudeDesktop.value?'claude_desktop':'claude_code_cli'):'codex')
-const clientOptions=computed(()=>implementedAgentClients.flatMap(item=>item.id==='claude_code'
-  ?item.capabilities.launchModes.map(mode=>({value:mode==='desktop'?'claude_desktop':'claude_code_cli',label:mode==='desktop'?'Claude Desktop':'Claude Code CLI'}))
-  :[{value:item.id,label:item.name}]))
+const clientSelection=computed(()=>form.clientType)
+const clientOptions=computed(()=>implementedAgentClients.map(item=>({value:item.id,label:item.name})))
 const resourceConnectionMode=computed(()=>form.connectionMode==='client_login'?'native':form.connectionMode)
 // Keep resources visible across mode changes so users can resolve incompatibilities without losing their selection.
 const availableAccounts=computed(()=>isClaudeDesktop.value?[]:accounts.value.filter(account=>(!isClaude.value||account.kind==='api_key')&&accountCompatibility(form.clientType,account,{connectionMode:isClaude.value?'native':'local_api'}).compatible))
@@ -243,20 +242,26 @@ let pendingLogin:string|undefined
 let draftGeneration=0
 const committing=ref(false),savingDraft=ref(false)
 const supplierChoices=computed(()=>{
-  const providers=isClaude.value?[]:manager.data?.providers??[]
+  if(isClaudeDesktop.value)return []
+  const providers=manager.data?.providers??[]
   const apiAccounts=new Map(accounts.value.filter(account=>account.kind==='api_key').map(account=>[account.id,account]))
+  const compatibleWithClient=(account:Parameters<typeof accountCompatibility>[1])=>accountCompatibility(form.clientType,account,{connectionMode:isClaude.value?'native':'local_api'}).compatible
   return [
-    ...providers.flatMap(provider=>provider.keys.map(key=>{
+    ...providers.flatMap(provider=>provider.keys.flatMap(key=>{
       const ids=[...new Set([...key.accountIds,...(key.reusableAccountIds??[])])]
       const candidates=ids.flatMap(id=>{const account=apiAccounts.get(id);return account?[account]:[]})
-      const account=candidates.find(account=>account.id===form.accountId)??candidates.find(account=>accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).compatible)??candidates[0]
+      const connection={kind:'api_key' as const,...providerKeyConnection(provider,key)}
+      const compatibleCandidates=candidates.filter(compatibleWithClient)
+      if(!compatibleWithClient(connection)&&!compatibleCandidates.length)return []
+      const account=compatibleCandidates.find(account=>account.id===form.accountId)??compatibleCandidates.find(account=>accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).compatible)??compatibleCandidates[0]??candidates[0]
       const reusingStandalone=!!account&&!key.accountIds.includes(account.id)
-      const incompatible=!!account&&!accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).compatible
-      return {value:provider.id+':'+key.id,label:provider.name+' · '+(key.name||'默认密钥')+(reusingStandalone?' · 已有连接':''),provider,key,account,reusingStandalone,
-        disabled:incompatible||(!account&&form.connectionMode==='native'&&provider.wireApi!=='responses'),
-        reason:incompatible?'此密钥已有 API 连接，但不支持当前接入方式。请改用本地 API，或在「API 连接」中调整该连接。':undefined}
+      const requiresKeyLink=reusingStandalone&&JSON.stringify(account.models)!==JSON.stringify(providerKeyModels(provider,key))
+      const compatibility=accountCompatibility(form.clientType,account??connection,{connectionMode:resourceConnectionMode.value})
+      return [{value:provider.id+':'+key.id,label:provider.name+' · '+(key.name||'默认密钥')+(reusingStandalone?' · 已有连接':''),provider,key,account,reusingStandalone,requiresKeyLink,
+        disabled:requiresKeyLink||!compatibility.compatible,
+        reason:requiresKeyLink?'此密钥与已有独立连接的模型不同。请先关联并使用密钥配置，或选择原独立连接。':compatibility.compatible?undefined:account&&!isClaude.value?'此密钥已有 API 连接，但不支持当前接入方式。请改用本地 API，或在「API 连接」中调整该连接。':compatibility.reason}]
     })),
-    ...availableAccounts.value.filter(account=>account.kind==='api_key'&&(isClaude.value||!account.providerId)).map(account=>({value:'account:'+account.id,label:account.name+(isClaude.value?'':' · 独立连接'),account,provider:undefined,key:undefined,reusingStandalone:false,disabled:!accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).compatible,reason:accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).reason}))
+    ...availableAccounts.value.filter(account=>account.kind==='api_key'&&!account.providerId).map(account=>({value:'account:'+account.id,label:account.name+' · 独立连接',account,provider:undefined,key:undefined,reusingStandalone:false,requiresKeyLink:false,disabled:!accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).compatible,reason:accountCompatibility(form.clientType,account,{connectionMode:resourceConnectionMode.value}).reason}))
   ]
 })
 const selectedSupplier=computed(()=>supplierChoices.value.find(item=>item.value===supplierSelection.value))
@@ -289,13 +294,15 @@ let officialModelsCancellation:Promise<void>=Promise.resolve()
 const usesNativeModels=computed(()=>form.clientType==='codex'&&resourceKind.value==='account'&&!!selectedAccount.value&&selectedAccount.value.kind!=='api_key')
 const currentOfficialModels=computed(()=>officialModels.value?.accountId===form.accountId&&officialApplicationId===form.applicationId?officialModels.value:undefined)
 const modelChoices=computed(()=>{
+  const choice=resourceKind.value==='provider'?selectedSupplier.value:undefined
+  if(choice?.requiresKeyLink&&choice.provider&&choice.key)return providerKeyModels(choice.provider,choice.key)
   const account=selectedAccount.value
   if(account){
     if(!usesNativeModels.value)return account.models
     if(currentOfficialModels.value)return currentOfficialModels.value.models
     return officialModelsError.value?nativeModelDefaults.value?.models??[]:[]
   }
-  return resourceKind.value==='provider'?selectedSupplier.value?.provider?.models??[]:[]
+  return choice?.provider&&choice.key?providerKeyModels(choice.provider,choice.key):[]
 })
 const modelSourceLabel=computed(()=>{
   if(officialModelsLoading.value)return '正在获取此账号的官方模型列表…'
@@ -356,8 +363,17 @@ function selectSupplier(value:string){
   if(isClaude.value)form.connectionMode='native';else if(!connectionModeTouched)form.connectionMode='local_api'
   if(value!==supplierSelection.value)form.accountId=''
   supplierSelection.value=value
-  form.accountId=selectedSupplier.value?.account?.id??''
-  form.model=(selectedSupplier.value?.account?.models??selectedSupplier.value?.provider?.models)?.[0]??''
+  form.accountId=selectedSupplier.value?.requiresKeyLink?'':selectedSupplier.value?.account?.id??''
+  automaticModel.value=null;form.model=modelChoices.value[0]??''
+}
+async function linkSelectedSupplier(){
+  const choice=selectedSupplier.value,generation=draftGeneration,selection=supplierSelection.value,clientType=form.clientType,mode=launchMode.value
+  if(!open.value||manager.loading||busy.value||committing.value||resourceKind.value!=='provider'||!choice?.requiresKeyLink||!choice.provider||!choice.key||!choice.account)return
+  const {provider,key,account}=choice
+  clearValidation()
+  if(!await manager.execute(()=>window.manager.mutateProvider({action:'linkAccount',id:provider.id,revision:provider.revision,keyId:key.id,accountId:account.id,accountRevision:account.revision??0})))return
+  if(!open.value||generation!==draftGeneration||selection!==supplierSelection.value||clientType!==form.clientType||mode!==launchMode.value||resourceKind.value!=='provider')return
+  clearValidation();selectSupplier(selection)
 }
 function resetResource(){
   if(isClaudeDesktop.value){form.connectionMode='client_login';form.accountId='';supplierSelection.value='';setAutomaticModel('');return}
@@ -382,10 +398,10 @@ function providerCreated(accountId:string){
   if(choice)selectSupplier(choice.value)
   else error.value='供应商已保存，请刷新资源后选择密钥。'
 }
-function selectClientVariant(value:string){
+function selectClient(value:string){
   if(editing.value||copyingForm.value||attachingForm.value||!clientOptions.value.some(option=>option.value===value))return
-  form.clientType=value==='codex'?'codex':'claude_code'
-  changeClient(value==='claude_desktop'?'desktop':value==='claude_code_cli'?'cli':undefined)
+  form.clientType=resolveAgentClientType(value)
+  changeClient()
 }
 function changeClient(mode?:'desktop'|'cli'){
   if(editing.value||copyingForm.value||attachingForm.value)return
@@ -487,6 +503,9 @@ const labels:Record<string,string>={stopped:'已停止',preparing:'准备连接'
 const tierName=(value?:string)=>value==='priority' || value==='fast' ? 'Fast' : value==='default' || value==='standard' ? 'Standard' : value==='auto'?'Auto':value==='flex'?'Flex':value==='inherit'?'继承账号与全局':'跟随请求'
 const initialSpeedName=(value?:string)=>value===undefined?'普通':tierName(value)==='Standard'?'普通':tierName(value)
 const contextSourceName=(value?:string)=>value==='connection'?'API 连接设置':value==='provider'?'供应商设置':value==='config'?'实例配置':value==='catalog'?'模型目录':'默认模板'
+function savedLaunchMode(instance:InstanceView):'desktop'|'cli'{
+  return instance.launchMode??(isClaudeDesktopProfile(instance)?'desktop':instance.clientType==='claude_code'?'cli':applications.value.find(app=>app.id===instance.applicationId)?.kind??'desktop')
+}
 function edit(instance?:InstanceView) {
   cancelOfficialModelRequest();automaticModel.value=null;draftGeneration++;cancelCopyPreview();closePreview()
   let clientType:AgentClientType
@@ -496,13 +515,13 @@ function edit(instance?:InstanceView) {
   discoveredSources.value=[];discoveryError.value='';discoveryIssues.value=[]
   sourceMode.value='copy'
   copyMode.value='sessions'
-  editing.value=instance;clearValidation();manager.error='';generatedName='';form.clientType=clientType;launchMode.value=instance?.launchMode??(instance?(applications.value.find(app=>app.id===instance.applicationId)?.kind??getAgentClient(clientType).capabilities.launchModes[0]):lastLaunchMode.value)
+  editing.value=instance;clearValidation();manager.error='';generatedName='';form.clientType=clientType;launchMode.value=instance?savedLaunchMode(instance):lastLaunchMode.value
   connectionModeTouched=!!instance
   const firstAccount=availableAccounts.value.find(account=>account.kind!=='api_key')??availableAccounts.value[0]
   Object.assign(form,instance ? {clientType,launchMode:launchMode.value,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
     {clientType,launchMode:launchMode.value,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:firstAccount?.id ?? '',connectionMode:clientType==='claude_code'?'native':recommendedInstanceConnectionMode(clientType,firstAccount),workingDirectoryId:undefined,defaultTier:'inherit',model:firstAccount?.models[0] ?? '',extraArgs:[]})
   resourceKind.value=isClaude.value||accounts.value.find(account=>account.id===form.accountId)?.kind==='api_key'?'provider':'account'
-  if(resourceKind.value==='provider')supplierSelection.value=supplierChoices.value.find(choice=>choice.account?.id===form.accountId)?.value??''
+  if(resourceKind.value==='provider')supplierSelection.value=(supplierChoices.value.find(choice=>choice.account?.id===form.accountId&&!choice.requiresKeyLink)??supplierChoices.value.find(choice=>choice.account?.id===form.accountId))?.value??''
   else supplierSelection.value=''
   if(!instance){resetResource();prepareName()}
   args.value=form.extraArgs.join('\n');open.value=true
@@ -539,7 +558,8 @@ async function chooseApplication(){
   await chooseProgram(()=>window.manager.chooseInstanceApplication(clientType))
 }
 function changeLaunchMode(){
-  if(editing.value&&isClaude.value){launchMode.value=editing.value.launchMode??applications.value.find(app=>app.id===editing.value?.applicationId)?.kind??'cli';return}
+  if(editing.value&&isClaude.value){launchMode.value=savedLaunchMode(editing.value);return}
+  if(isClaude.value){changeClient(launchMode.value);return}
   draftGeneration++;form.launchMode=launchMode.value;lastLaunchMode.value=launchMode.value
   form.applicationId=availableApplications.value[0]?.id??'';form.workingDirectoryId=undefined
 }
@@ -653,8 +673,8 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
         <div v-if="externalSource&&!wizard" class="external-copy-source"><p class="instance-path">{{attachingForm?'已有目录':'来源'}}：{{externalSource.directory}}</p><p class="muted">{{attachingForm?'请先关闭使用此目录的客户端；此实例运行时，不要再由其他客户端同时使用该目录。':'复制已保存历史的独立快照，来源可以继续使用。复制完成后的新消息不会同步；配置中的其他 API 密钥会随配置复制，链接会跳过。'}}</p><a-checkbox v-if="attachingForm" v-model:checked="sourceClosed" aria-label="来源客户端已关闭">我已关闭使用此目录的客户端</a-checkbox></div>
         <template v-if="copyingForm&&!wizard"><p v-if="historyLoading" class="muted">正在读取项目与会话概况…</p><a-alert v-if="historyError" type="error" :message="historyError" /><InstanceHistoryOverview v-if="chosenHistory" :history="chosenHistory" aria-label="所选会话概况" /></template>
         <section v-show="!wizard||step===0" class="instance-step" data-step="0">
-          <a-form-item label="客户端"><a-select :value="clientSelection" aria-label="实例客户端" :disabled="!!editing||copyingForm||attachingForm" :options="clientOptions" @change="selectClientVariant(String($event))" /></a-form-item>
-          <a-form-item v-if="!isClaude" label="运行方式"><a-segmented v-model:value="launchMode" aria-label="实例运行方式" :options="client.capabilities.launchModes.map(mode=>({value:mode,label:mode==='desktop'?'桌面应用':'CLI 终端'}))" @change="changeLaunchMode" /></a-form-item>
+          <a-form-item label="客户端"><a-select :value="clientSelection" aria-label="实例客户端" :disabled="!!editing||copyingForm||attachingForm" :options="clientOptions" @change="selectClient(String($event))" /></a-form-item>
+          <a-form-item label="运行方式"><a-segmented v-model:value="launchMode" aria-label="实例运行方式" :disabled="isClaude&&!!editing" :options="client.capabilities.launchModes.map(mode=>({value:mode,label:mode==='desktop'?'桌面应用':'CLI 终端'}))" @change="changeLaunchMode" /><p v-if="isClaude&&editing" class="muted">此实例保留原运行方式。如需另一种方式，请创建新实例。</p></a-form-item>
           <a-form-item data-field="applicationId" :validate-status="fieldErrors.applicationId?'error':undefined" :help="fieldErrors.applicationId" :label="launchMode==='cli'?'CLI 程序':'已安装应用'"><a-select v-model:value="form.applicationId" aria-label="实例应用" :options="availableApplications.map(app=>({value:app.id,label:app.name+' · '+app.path}))" placeholder="选择已安装的程序" /><a-button v-if="launchMode==='desktop'" type="link" @click="chooseApplication">选择应用文件</a-button><a-button v-else type="link" @click="chooseCli">选择 CLI 程序</a-button></a-form-item>
           <a-alert v-if="isClaudeDesktop&&!availableApplications.length" type="info" show-icon message="未找到 Claude Desktop，请先安装，或选择已安装的 Claude.app。" />
           <p class="muted">{{isClaudeDesktop?'使用已安装的 Claude Desktop，在独立窗口中登录并选择 Chat、Code 或 Cowork。':isClaude?'使用已安装的 Claude Code 原生 CLI，在 macOS Terminal 中运行。':'选择已安装的 Codex 桌面应用或 CLI 程序。'}}</p>
@@ -672,9 +692,10 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <p v-if="!identityAccounts.length" class="muted">没有兼容的登录账号，可在此添加后继续。</p>
           </template>
           <template v-else>
-            <a-form-item data-field="accountId" :validate-status="fieldErrors.accountId?'error':undefined" :help="fieldErrors.accountId"  :label="isClaude?'API 连接':'供应商密钥'"><a-select :value="supplierSelection||undefined" aria-label="实例供应商密钥" :options="supplierChoices.map(item=>({value:item.value,label:item.label+(item.disabled?(isClaude?' · 当前不可用':' · 需本地 API'):''),disabled:isClaude&&item.disabled}))" placeholder="选择兼容密钥" @change="selectSupplier(String($event))" /><a-button class="instance-add-provider" type="link" @click="providerOpen=true"><PlusOutlined />{{isClaude?'添加 API 连接':'添加供应商'}}</a-button></a-form-item>
-            <p class="muted">{{isClaude?'选择已保存的 Anthropic API Key 或 Bearer 连接，可在多个实例中复用。':'引用已保存的密钥，多个兼容实例可复用。尚未启用的密钥会在继续时建立共享连接。'}}</p>
-            <p v-if="selectedSupplier?.reusingStandalone" class="muted instance-reused-connection">使用已有 API 连接「{{selectedSupplier.account?.name}}」，保留它的模型、上下文、服务等级和网络代理配置。</p>
+            <a-form-item data-field="accountId" :validate-status="fieldErrors.accountId?'error':undefined" :help="fieldErrors.accountId" label="供应商密钥"><a-select :value="supplierSelection||undefined" aria-label="实例供应商密钥" :options="supplierChoices.map(item=>({value:item.value,label:item.label+(item.requiresKeyLink?' · 需确认关联':item.disabled?(isClaude?' · 当前不可用':' · 需本地 API'):''),disabled:isClaude&&item.disabled&&!item.requiresKeyLink}))" placeholder="选择兼容密钥" @change="selectSupplier(String($event))" /><a-button class="instance-add-provider" type="link" @click="providerOpen=true"><PlusOutlined />添加供应商</a-button></a-form-item>
+            <p class="muted">{{isClaude?'选择支持 Anthropic Messages 的供应商密钥或已有 API 连接。模型按所选密钥保存，可供多个兼容实例复用。':'引用已保存的密钥，模型按所选密钥保存。尚未启用的密钥会在继续时建立共享连接，可供多个兼容实例复用。'}}</p>
+            <div v-if="selectedSupplier?.requiresKeyLink" class="instance-key-config-mismatch"><a-alert type="warning" show-icon :message="'已有独立连接「'+selectedSupplier.account?.name+'」使用不同的模型。'" description="关联后，该连接及引用它的实例将使用此密钥的模型和共享配置。也可以选择原独立连接继续使用原配置。" /><a-button type="link" :loading="manager.loading" :disabled="busy||committing" @click="linkSelectedSupplier">关联并使用密钥配置</a-button></div>
+            <p v-else-if="selectedSupplier?.reusingStandalone" class="muted instance-reused-connection">使用已有 API 连接「{{selectedSupplier.account?.name}}」，保留它的模型、上下文、服务等级和网络代理配置。</p>
           </template>
           <div class="instance-connection-options">
             <a-form-item data-field="connectionMode" label="连接方式" :validate-status="fieldErrors.connectionMode?'error':undefined" :help="fieldErrors.connectionMode"><a-select v-model:value="form.connectionMode" aria-label="实例接入方式" :options="isClaude?[{value:'native',label:'直接 API'}]:[{value:'native',label:'原生账号登录'},{value:'local_api',label:'本地 API'}]" @change="changeConnectionMode" /></a-form-item>
