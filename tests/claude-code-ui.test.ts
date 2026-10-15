@@ -88,6 +88,15 @@ test('client families share the desktop/CLI choice and switching Claude launcher
   assert.equal(f.state.launchMode, 'desktop')
 })
 
+test('legacy Claude Desktop records without launchMode keep the Desktop label', async t => {
+  const f = await component(t, 'InstancesView', {}, {
+    listInstanceWorkingDirectories: async () => [], readInstanceModelDefaults: async () => ({ models: [], defaultModelId: null }),
+  }, data())
+  assert.equal(f.state.clientName('claude_code', undefined, 'client_login'), 'Claude Desktop')
+  assert.equal(f.state.clientName('claude_code', undefined, 'native'), 'Claude Code CLI')
+  assert.equal(f.state.clientName('claude_code', 'desktop', 'native'), 'Claude Desktop')
+})
+
 test('instance suppliers follow each key protocol and model list without assuming GPT model names', async t => {
   const snapshot = data()
   snapshot.accounts = []
