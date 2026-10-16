@@ -389,9 +389,14 @@ export class Instances {
     const modelContext=configs.instanceModelContext(profile.id,profile.model)
     const providerTier=providerTierForAccount(state,account)
     const providerName=instanceProviderName(state,account)
-    const language=plan.mode==='cli'?undefined:previewDesktopLocale(this.localeOptions(profile.id,plan))
+    // Official accounts use the installed client's own UI and feature policy.
+    // Do not make their launch depend on renderer resources, old compatibility
+    // markers or a manager-derived language choice after a client update.
+    // Existing client preferences remain in the isolated profile unchanged.
+    const managedDesktopUi=plan.mode!=='cli'&&!(profile.connectionMode==='native'&&account.kind==='oauth')
+    const language=managedDesktopUi?previewDesktopLocale(this.localeOptions(profile.id,plan)):undefined
     const tier=resolveServiceTier(undefined,state.settings.defaultTier,providerTier,profile.defaultTier,account.defaultTier)
-    const desktopUi=plan.mode==='cli'?undefined:this.speedMenuServices.inspectFeatures?.({application:plan.application,executable:plan.executable,features:profile.connectionMode==='native'?['locale']:['locale','speed','ultra']})
+    const desktopUi=managedDesktopUi?this.speedMenuServices.inspectFeatures?.({application:plan.application,executable:plan.executable,features:profile.connectionMode==='native'?['locale']:['locale','speed','ultra']}):undefined
     const feature=(name:'speed'|'locale'|'ultra'):CodexSpeedMenuInspection|undefined=>desktopUi?{...desktopUi,supported:desktopUi.featureSupport?.[name].supported===true,reason:desktopUi.featureSupport?.[name].reason??desktopUi.reason}:undefined
     const clientMenu=plan.mode!=='cli'&&profile.connectionMode!=='native'?(desktopUi?feature('speed'):this.speedMenuServices.inspect({application:plan.application,executable:plan.executable})):undefined
     // The renderer compatibility hook is what exposes the Normal / Fast
@@ -403,7 +408,7 @@ export class Instances {
     // is still carried by the gateway and can be rejected upstream when it is
     // genuinely unsupported.
     const speedMenu=clientMenu
-    const localeCandidate=plan.mode==='cli'?undefined:desktopUi?feature('locale'):this.speedMenuServices.inspectLocale?.({application:plan.application,executable:plan.executable})
+    const localeCandidate=!managedDesktopUi?undefined:desktopUi?feature('locale'):this.speedMenuServices.inspectLocale?.({application:plan.application,executable:plan.executable})
     const ultraCompatibility=plan.mode!=='cli'&&profile.connectionMode!=='native'?feature('ultra'):undefined
     const combined=!desktopUi&&speedMenu?.supported&&localeCandidate?.supported?this.speedMenuServices.inspectCombined?.({application:plan.application,executable:plan.executable}):undefined
     const localeCompatibility=!desktopUi&&localeCandidate?.supported&&speedMenu?.supported&&!combined?.supported?{...localeCandidate,supported:false,reason:combined?.reason??'当前客户端组合界面适配未就绪，保留原页面语言'}:localeCandidate

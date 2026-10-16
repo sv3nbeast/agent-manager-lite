@@ -19,7 +19,7 @@ import {TokenAuthority} from '../src/main/tokens'
 import {parseAccountImport,importParsedAccounts,createAPIAccount} from '../src/main/accounts'
 import {TomlDocument,patchToml} from '../src/main/tomlPatch'
 import {mutateProvider} from '../src/main/providerLibrary'
-import type {DesktopRuntime,DesktopPlan,DesktopProcess} from '../src/main/instanceRuntime'
+import {macLaunchArgs,type DesktopRuntime,type DesktopPlan,type DesktopProcess} from '../src/main/instanceRuntime'
 import type {InstanceProfile} from '../src/shared/instances'
 
 function auth(workspace:string,generation='initial',lifetime=3600){
@@ -163,6 +163,71 @@ test('local API OAuth projection keeps the gateway and exposes the official acco
   assert.equal(f.store.read().clientSwitches?.length??0,0)
   assert.equal(f.store.read().clientAuthorities?.length??0,0)
   view=f.instances.views()[0];assert.equal(view.status,'stopped');assert.equal(view.identityStatus,'local_api')
+})
+
+test('explicit local API OAuth instances retain gateway UI compatibility independently of native accounts',async t=>{
+  let prepared=0,inspected=0
+  const compatibility:InstanceSpeedMenuServices={
+    inspect:()=>assert.fail('The combined capability contract must be used'),
+    inspectFeatures:options=>{
+      inspected++;assert.deepEqual(options.features,['locale','speed','ultra'])
+      return {supported:true,reason:'fixture',fingerprint:'local-api-fixture',version:'99.0.0',features:['locale','speed','ultra'],enhancements:'speed-locale',featureSupport:{
+        locale:{supported:true,reason:'fixture'},speed:{supported:true,reason:'fixture'},ultra:{supported:true,reason:'fixture'}
+      }}
+    },
+    prepare:options=>{
+      prepared++;assert.deepEqual(options.inspection.features,['locale','speed','ultra'])
+      const folder=join(options.desktopDirectory,'cml-speed-menu',options.nonce);mkdirSync(folder,{recursive:true})
+      const script=join(folder,'hook.cjs'),manifest=join(folder,'manifest.json'),statusLog=join(folder,'status.jsonl')
+      for(const file of [script,manifest,statusLog])writeFileSync(file,'fixture')
+      return {script,manifest,statusLog,env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
+    },readStatus:()=>({state:'active'})
+  }
+  const f=fixture(t,['zh-Hans-CN'],compatibility,undefined,fixtureGateway)
+  f.instances.save({details:{name:'Explicit local API',accountId:f.alpha.id,applicationId:f.app.id,connectionMode:'local_api',model:'native-model',defaultTier:'standard',extraArgs:[]}})
+  const instance=f.instances.views()[0],preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.desktopLocaleCompatibilityAvailable,true);assert.equal(preview.speedMenuAvailable,true);assert.equal(preview.ultraAvailable,true)
+  f.instances.start(preview.ticket);await f.instances.settled(instance.id)
+  const view=f.instances.views()[0]
+  assert.equal(view.status,'running',view.error);assert.equal(view.connectionMode,'local_api');assert.equal(view.port,39123)
+  assert.ok(inspected>0);assert.equal(prepared,1);assert.ok(f.plans[0].speedMenuHook);assert.equal(f.plans[0].desktopLocaleHook,undefined)
+  assert.equal(view.desktopLocaleCompatibility,'active');assert.equal(view.speedMenu,'active');assert.equal(view.ultraCompatibility,'active')
+  assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).scalar(['model_provider']),'cml_instance')
+  assert.equal(existsSync(join(f.store.directory,'instances',instance.id,'desktop-locale.json')),true)
+  await f.instances.stop(instance.id)
+  assert.equal(existsSync(join(instance.desktopDirectory,'cml-speed-menu',f.plans[0].nonce)),false)
+})
+
+test('native API connections retain locale compatibility without acquiring official-account UI semantics',async t=>{
+  let prepared=0
+  const compatibility:InstanceSpeedMenuServices={
+    inspect:()=>assert.fail('Native API connections do not use the local API speed menu'),
+    inspectFeatures:options=>{
+      assert.deepEqual(options.features,['locale'])
+      return {supported:true,reason:'fixture',fingerprint:'native-api-locale',features:['locale'],enhancements:'locale',featureSupport:{
+        locale:{supported:true,reason:'fixture'},speed:{supported:false,reason:'not requested'},ultra:{supported:false,reason:'not requested'}
+      }}
+    },
+    prepare:options=>{
+      prepared++;assert.deepEqual(options.inspection.features,['locale'])
+      const folder=join(options.desktopDirectory,'cml-speed-menu',options.nonce);mkdirSync(folder,{recursive:true})
+      const script=join(folder,'hook.cjs'),manifest=join(folder,'manifest.json'),statusLog=join(folder,'status.jsonl')
+      for(const file of [script,manifest,statusLog])writeFileSync(file,'fixture')
+      return {script,manifest,statusLog,env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
+    },readStatus:()=>({state:'active'})
+  }
+  const f=fixture(t,['zh-Hans-CN'],compatibility)
+  const account=createAPIAccount({name:'Native API',apiKey:'fixture-native-api',baseUrl:'https://fixture.invalid/v1',models:['native-model'],wireApi:'responses'})
+  importParsedAccounts(f.store,[account])
+  const instance=f.add(account.id),preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.desktopLocaleCompatibilityAvailable,true);assert.equal(preview.speedMenuAvailable,undefined);assert.equal(preview.ultraAvailable,undefined)
+  await f.start(instance.id)
+  const view=f.instances.views()[0]
+  assert.equal(view.status,'running',view.error);assert.equal(view.connectionMode,'native');assert.equal(view.port,undefined)
+  assert.equal(prepared,1);assert.ok(f.plans[0].desktopLocaleHook);assert.equal(f.plans[0].speedMenuHook,undefined)
+  assert.equal(view.desktopLocaleCompatibility,'active');assert.equal(view.speedMenu,undefined);assert.equal(view.ultraCompatibility,undefined)
+  assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).scalar(['model_provider']),'cml_native_account')
+  await f.instances.stop(instance.id)
 })
 
 test('external native instance recovers rotated credentials and detaches without losing the original login or its refresh authority',async t=>{
@@ -321,68 +386,84 @@ test('native desktop instances default to auto detection and preserve user langu
   const defaultTarget=f.configs.prepareIdentityTarget(f.configs.targets()[0].id),defaultFile=join(defaultTarget.directory,'config.toml'),defaultConfig='# untouched default\n[desktop]\nlocaleOverride="fr-FR"\n'
   writeFileSync(defaultFile,defaultConfig)
   const preview=f.instances.preview({id:instance.id,revision:instance.revision})
-  assert.equal(preview.desktopLocale,undefined);assert.equal(preview.desktopEffectiveLocale,'zh-CN');assert.equal(preview.desktopLocaleSource,'system')
+  assert.equal(preview.desktopLocale,undefined);assert.equal(preview.desktopEffectiveLocale,undefined);assert.equal(preview.desktopLocaleSource,undefined)
   assert.equal(existsSync(file),false);assert.equal(existsSync(marker),false)
   await f.start(instance.id)
   assert.equal(f.instances.views()[0].status,'running',JSON.stringify(f.instances.views()))
   assert.equal(new TomlDocument(readFileSync(file,'utf8')).raw(['desktop','localeOverride']),null)
   await f.instances.stop(instance.id)
   assert.equal(new TomlDocument(existsSync(file)?readFileSync(file,'utf8'):'').raw(['desktop','localeOverride']),null)
-  assert.equal(existsSync(marker),true);assert.equal(existsSync(join(instance.directory,'auth.json')),false)
+  assert.equal(existsSync(marker),false);assert.equal(existsSync(join(instance.directory,'auth.json')),false)
   await f.start(instance.id)
   writeFileSync(file,patchToml(readFileSync(file,'utf8'),[{path:['desktop','localeOverride'],raw:'"en-US"'}]))
   await f.instances.stop(instance.id)
   assert.equal(new TomlDocument(readFileSync(file,'utf8')).scalar(['desktop','localeOverride']),'en-US')
-  const english=f.instances.preview({id:instance.id,revision:instance.revision})
-  assert.equal(english.desktopLocale,'en-US');assert.equal(english.desktopLocaleSource,'existing')
+  f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(new TomlDocument(readFileSync(file,'utf8')).scalar(['desktop','localeOverride']),'en-US')
   await f.start(instance.id)
   writeFileSync(file,patchToml(readFileSync(file,'utf8'),[{path:['desktop','localeOverride'],raw:null}]))
   await f.instances.stop(instance.id)
   assert.equal(new TomlDocument(readFileSync(file,'utf8')).raw(['desktop','localeOverride']),null)
   const auto=f.instances.preview({id:instance.id,revision:instance.revision})
-  assert.equal(auto.desktopLocale,undefined);assert.equal(auto.desktopLocaleSource,'initialized')
+  assert.equal(auto.desktopLocale,undefined);assert.equal(auto.desktopLocaleSource,undefined)
   await f.start(instance.id);await f.instances.stop(instance.id)
   assert.equal(new TomlDocument(readFileSync(file,'utf8')).raw(['desktop','localeOverride']),null)
   assert.equal(readFileSync(defaultFile,'utf8'),defaultConfig)
 })
 
-test('native desktop loads locale compatibility independently of model speed and restores authentication',async t=>{
-  let prepared=0
+test('native OAuth launch is independent of renderer compatibility and preserves native UI preferences',async t=>{
   const compatibility:InstanceSpeedMenuServices={
-    inspect:()=>assert.fail('Native desktops must not inspect the API speed menu'),
-    inspectLocale:()=>({supported:true,reason:'',fingerprint:'native-locale-fixture',enhancements:'locale'}),
-    prepare:options=>{
-      prepared++;assert.equal(options.inspection.enhancements,'locale')
-      const folder=join(options.desktopDirectory,'cml-speed-menu',options.nonce);mkdirSync(folder,{recursive:true})
-      const script=join(folder,'hook.cjs'),manifest=join(folder,'manifest.json'),statusLog=join(folder,'status.jsonl')
-      for(const file of [script,manifest,statusLog])writeFileSync(file,'fixture')
-      return {script,manifest,statusLog,env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
-    },readStatus:()=>({state:'active'})
+    inspect:()=>assert.fail('Official accounts must not inspect the API speed menu'),
+    inspectFeatures:()=>assert.fail('Official accounts must not inspect client renderer assets'),
+    inspectLocale:()=>assert.fail('Official accounts must not inspect locale compatibility'),
+    inspectCombined:()=>assert.fail('Official accounts must not inspect combined compatibility'),
+    prepare:()=>assert.fail('Official accounts must not prepare renderer hooks'),
+    readStatus:()=>assert.fail('Official accounts have no manager renderer hook status')
   }
-  const f=fixture(t,['zh-Hans-CN'],compatibility),instance=f.add(),preview=f.instances.preview({id:instance.id,revision:instance.revision})
-  assert.equal(preview.desktopLocaleCompatibilityAvailable,true);assert.equal(preview.speedMenuAvailable,undefined)
-  assert.equal(preview.desktopLocale,undefined);assert.equal(preview.desktopEffectiveLocale,'zh-CN')
-  await f.start(instance.id);assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
-  assert.equal(prepared,1);assert.ok(f.plans[0].desktopLocaleHook);assert.equal(f.plans[0].speedMenuHook,undefined)
-  assert.equal(f.instances.views()[0].desktopLocaleCompatibility,'active')
-  assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).raw(['desktop','localeOverride']),null)
+  const f=fixture(t,['zh-Hans-CN'],compatibility),instance=f.add()
+  const file=join(instance.directory,'config.toml'),globalFile=join(instance.directory,'.codex-global-state.json'),marker=join(f.store.directory,'instances',instance.id,'desktop-locale.json')
+  const original='model="original"\n[desktop]\nlocaleOverride="en-US"\nappearanceTheme="dark"\n[features]\nin_app_chat=true\nfuture_client_feature=true\n'
+  const global=JSON.stringify({'electron-persisted-atom-state':{'home-composer-mode-v1':'chat','electron:onboarding-override':'auto','future-client-preference':{enabled:true}}})
+  const legacyMarker='not a current compatibility marker'
+  writeFileSync(file,original);writeFileSync(globalFile,global);writeFileSync(marker,legacyMarker)
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.desktopLocaleCompatibilityAvailable,undefined);assert.equal(preview.speedMenuAvailable,undefined);assert.equal(preview.ultraAvailable,undefined)
+  assert.equal(preview.desktopLocale,undefined);assert.equal(preview.desktopEffectiveLocale,undefined)
+  // The client can replace its renderer after preview without a manager asset
+  // allowlist or compatibility manifest. Only the executable remains owned.
+  mkdirSync(join(f.app.path,'Contents','Resources'));writeFileSync(join(f.app.path,'Contents','Resources','app.asar'),'new official renderer')
+  f.instances.start(preview.ticket);await f.instances.settled(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.equal(f.plans[0].application,f.app.path);assert.equal(f.plans[0].desktopLocaleHook,undefined);assert.equal(f.plans[0].speedMenuHook,undefined)
+  assert.equal(f.plans[0].tempLoginHook,undefined);assert.equal(f.plans[0].cdpPort,undefined)
+  const args=macLaunchArgs(f.plans[0])
+  assert.ok(args.includes('CODEX_HOME='+instance.directory));assert.ok(args.includes('--user-data-dir='+instance.desktopDirectory))
+  assert.equal(args.some(arg=>/NODE_OPTIONS|CML_CODEX_SPEED_MENU|remote-debugging|--enable-features|--disable-features/.test(arg)),false)
+  const view=f.instances.views()[0]
+  assert.equal(view.desktopLocaleCompatibility,undefined);assert.equal(view.speedMenu,undefined);assert.equal(view.ultraCompatibility,undefined)
+  const config=new TomlDocument(readFileSync(file,'utf8'))
+  assert.equal(config.scalar(['model_provider']),'openai');assert.equal(config.scalar(['model_catalog_json']),null)
+  assert.equal(config.scalar(['desktop','localeOverride']),'en-US');assert.equal(config.scalar(['desktop','appearanceTheme']),'dark')
+  assert.equal(config.scalar(['features','in_app_chat']),true);assert.equal(config.scalar(['features','future_client_feature']),true)
+  assert.equal(readFileSync(globalFile,'utf8'),global);assert.equal(readFileSync(marker,'utf8'),legacyMarker)
   assert.equal(existsSync(join(instance.directory,'auth.json')),true)
   await f.instances.stop(instance.id)
+  assert.equal(readFileSync(file,'utf8'),original);assert.equal(readFileSync(globalFile,'utf8'),global);assert.equal(readFileSync(marker,'utf8'),legacyMarker)
   assert.equal(existsSync(join(instance.directory,'auth.json')),false)
-  assert.equal(existsSync(join(instance.desktopDirectory,'cml-speed-menu',f.plans[0].nonce)),false)
+  assert.equal(existsSync(join(instance.desktopDirectory,'cml-speed-menu')),false)
 })
 
-test('native desktop migrates the old manager-seeded locale without restoring it when auth is removed',async t=>{
+test('native desktop preserves the existing locale and obsolete manager markers for the official client',async t=>{
   const f=fixture(t,['zh-Hans-CN']),instance=f.add(),file=join(instance.directory,'config.toml'),marker=join(f.store.directory,'instances',instance.id,'desktop-locale.json')
   writeFileSync(file,'# keep\nmodel="original"\n[desktop]\nlocaleOverride="zh-CN"\nappearanceTheme="dark"\n')
   writeFileSync(marker,JSON.stringify({version:1,source:'system',locale:'zh-CN'}))
   await f.start(instance.id);assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
   await f.instances.stop(instance.id)
   const doc=new TomlDocument(readFileSync(file,'utf8'))
-  assert.equal(doc.raw(['desktop','localeOverride']),null);assert.equal(doc.scalar(['model']),'original')
+  assert.equal(doc.scalar(['desktop','localeOverride']),'zh-CN');assert.equal(doc.scalar(['model']),'original')
   assert.equal(doc.scalar(['desktop','appearanceTheme']),'dark')
   assert.equal(existsSync(join(instance.directory,'auth.json')),false)
-  assert.deepEqual(JSON.parse(readFileSync(marker,'utf8')),{version:2,source:'auto'})
+  assert.deepEqual(JSON.parse(readFileSync(marker,'utf8')),{version:1,source:'system',locale:'zh-CN'})
 })
 
 test('native language changes invalidate launch tickets before creating auth or persistent locale state',async t=>{
