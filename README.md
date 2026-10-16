@@ -82,7 +82,7 @@ CLI 验收使用真实 **Claude CLI 2.1.295** 进程连接本地模拟服务，�
 3. Codex 可登录 ChatGPT 或使用 API 连接；Claude Code CLI 选择 API Key / Bearer，填写 Anthropic Messages 地址和模型；Claude Desktop 可启动后在客户端内登录，或选择已保存的 API / 第三方连接。
 4. 检查启动预览后启动；Codex 还可选择会话来源。桌面模型与项目在对应客户端中选择，CLI 在 Terminal 中运行。
 
-新建 ChatGPT 账号实例默认使用「原生账号登录」，客户端读取真实登录身份，具体账号功能由套餐、工作区与客户端版本决定。HTTP、HTTPS、SOCKS5、SOCKS5H 代理可与原生账号登录同时使用。Codex 的 API 密钥和 Agent Identity 默认走「本地 API」；ChatGPT OAuth 账号使用本地 API 时，管理器会保留本地网关并在启动期间投影真实账号身份，停止实例后恢复原配置。纯 API 连接没有可供客户端显示的 ChatGPT OAuth 身份。已有实例保留当前接入方式，可停止后在编辑中切换。若切换后 Codex 历史列表未显示，可在「会话 → 修复可见性」选择该实例，按实例接入方式预览修复。
+新建 ChatGPT 账号实例默认使用「原生账号登录」，客户端读取真实登录身份，具体账号功能由套餐、工作区与客户端版本决定。原生账号桌面直接使用已安装客户端的原版界面，管理器不注入页面脚本、不强制首页，也不依赖界面补丁的版本适配；语言、首页与功能偏好由客户端保存。HTTP、HTTPS、SOCKS5、SOCKS5H 代理可与原生账号登录同时使用。Codex 的 API 密钥和 Agent Identity 默认走「本地 API」；ChatGPT OAuth 账号使用本地 API 时，管理器会保留本地网关并在启动期间投影真实账号身份，停止实例后恢复原配置。纯 API 连接没有可供客户端显示的 ChatGPT OAuth 身份。已有实例保留当前接入方式，可停止后在编辑中切换。若切换后 Codex 历史列表未显示，可在「会话 → 修复可见性」选择该实例，按实例接入方式预览修复。
 
 需要代理时，在设置中配置默认网络，再按需为账号覆盖。代理用于管理器的登录交换、令牌刷新、用量查询、本地 API，以及管理器启动的原生桌面和 CLI 实例。Codex 原生账号实例保留 ChatGPT 身份，通过独立的本地转接服务使用账号代理（支持认证）；Claude Desktop 无绑定的管理器账号，使用设置中的默认网络。显式直连会覆盖系统及继承的代理设置。关闭管理窗口后，转接服务随实例保留到退出。外部浏览器及自行启动的客户端仍使用自身网络配置。
 
@@ -130,7 +130,7 @@ npm run build
 npx electron-builder --mac --arm64 --publish never
 ```
 
-Codex、Claude Desktop 和 Claude Code CLI 需单独安装，本项目不附带官方客户端。Codex 桌面语言、普通 / Fast 和 Ultra 按实际功能结构独立检测，启动预览会显示各项状态。仅版本号或资源名称变化时可自动兼容；内部接口变化仍可能需要适配。Ultra 和 Fast 还取决于模型及服务商能力。
+Codex、Claude Desktop 和 Claude Code CLI 需单独安装，本项目不附带官方客户端。Codex API 桌面模式的语言、普通 / Fast 和 Ultra 按实际功能结构独立检测，启动预览会显示已适用的项目。官方账号的原生桌面启动使用原版界面。仅版本号或资源名称变化时可自动兼容；内部接口变化仍可能需要适配。Ultra 和 Fast 还取决于模型及服务商能力。
 
 Ultra 按模型目录提供，是客户端的推理与任务委派预设，与 Ultra Fast 速度等级独立。新版客户端可能将 Ultra 映射为模型声明的 API 推理档位（例如 `xhigh`），同时启用主动任务委派；仅看请求中的 `reasoning.effort` 不能判断是否降档。管理器保留这一原生行为。
 
