@@ -24,6 +24,7 @@ type providerUsageObserver struct {
 	terminal, failed           bool
 	responseTerminal, doneSeen bool
 	wireAPI                    string
+	imageEventType             string
 	readErr                    error
 }
 
@@ -44,6 +45,10 @@ func (o *providerUsageObserver) observeJSON(payload []byte) {
 		o.detail = detail
 	}
 	kind := gjson.GetBytes(payload, "type").String()
+	if o.wireAPI == "images" && (kind == "image_generation.completed" || kind == "image_edit.completed") {
+		o.terminal = true
+		o.doneSeen = true
+	}
 	if kind == "response.completed" || kind == "response.done" {
 		o.terminal = true
 		o.responseTerminal = true
@@ -63,14 +68,27 @@ func (o *providerUsageObserver) consumeLine() {
 		if !o.skipEvent && len(o.event) > 0 {
 			payload := bytes.TrimSpace(o.event)
 			if bytes.Equal(payload, []byte("[DONE]")) {
-				o.terminal = true
-				o.doneSeen = true
+				if o.wireAPI != "images" {
+					o.terminal = true
+					o.doneSeen = true
+				}
 			} else {
 				o.observeJSON(payload)
+				if o.wireAPI == "images" && gjson.ValidBytes(payload) {
+					switch o.imageEventType {
+					case "image_generation.completed", "image_edit.completed":
+						o.terminal, o.doneSeen = true, true
+					case "error":
+						o.failed = true
+					}
+				}
 			}
 		}
 		o.event = o.event[:0]
 		o.skipEvent = false
+		o.imageEventType = ""
+	} else if o.wireAPI == "images" && bytes.HasPrefix(line, []byte("event:")) {
+		o.imageEventType = strings.TrimSpace(string(line[6:]))
 	} else if bytes.HasPrefix(line, []byte("data:")) && !o.skipEvent {
 		value := bytes.TrimPrefix(line[5:], []byte(" "))
 		if len(o.event)+len(value) > 4<<20 {

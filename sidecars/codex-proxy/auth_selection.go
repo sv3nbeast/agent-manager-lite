@@ -42,8 +42,10 @@ type cockpitSelector struct {
 	quota      *quotaReserveStateStore
 	priorities *apiKeyPriorityStateStore
 	tracker    *requestUsageTracker
-	mu         sync.Mutex
-	cursor     int
+	// Native provider Images is distinct from hosted OAuth image_generation.
+	nativeProviderImages bool
+	mu                   sync.Mutex
+	cursor               int
 }
 
 type recordingSelector struct {
@@ -696,7 +698,11 @@ func (s *cockpitSelector) filterAuthsForImageGeneration(auths []*coreauth.Auth) 
 	filtered := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
 		account := s.accountForAuth(auth)
-		if account == nil || imageGenerationAllowedForAccount(account) {
+		allowed := account == nil || imageGenerationAllowedForAccount(account)
+		if s.nativeProviderImages && account != nil && strings.EqualFold(account.AuthKind, "api_key") && strings.TrimSpace(account.ImageGenerationPolicy) == "" {
+			allowed = true
+		}
+		if allowed {
 			filtered = append(filtered, auth)
 		}
 	}

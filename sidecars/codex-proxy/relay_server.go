@@ -32,6 +32,8 @@ import (
 type relayServer struct {
 	automaticSelector     coreauth.Selector
 	automaticSelectorOnce sync.Once
+	imageProviderSelector coreauth.Selector
+	imageProviderOnce     sync.Once
 	runtime               executorRuntime
 	cfg                   *config.Config
 	manifest              *manifest
@@ -899,6 +901,9 @@ func (s *relayServer) handleImagesGenerations(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if s.handleProviderGatewayImages(c, spec) {
+		return
+	}
 	rawJSON, err := c.GetRawData()
 	if err != nil {
 		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
@@ -919,6 +924,9 @@ func (s *relayServer) handleImagesGenerations(c *gin.Context) {
 func (s *relayServer) handleImagesEdits(c *gin.Context) {
 	spec, ok := s.requireAPIKey(c)
 	if !ok {
+		return
+	}
+	if s.handleProviderGatewayImages(c, spec) {
 		return
 	}
 	imageReq, err := buildImageEditRelayRequestWithModel(

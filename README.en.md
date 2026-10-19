@@ -4,11 +4,19 @@
 
 [简体中文](README.md) · English · [Downloads](https://github.com/sv3nbeast/agent-manager-lite/releases) · [Issues](https://github.com/sv3nbeast/agent-manager-lite/issues)
 
-A lightweight Agent workspace organized around instances, with shared accounts, provider keys and client settings, gradually connecting terminal agents, desktop clients and AI editors.
+A lightweight workspace for **Codex, Claude Code CLI and Claude Desktop**, with multiple instances, shared accounts and provider keys, separate configurations, session management and network proxies.
 
-**Create an instance → Choose a client → Select a connection or sign in inside the client → Configure the project → Launch**
+**Create an instance → Choose Codex / Claude → Choose desktop / CLI → Select sign-in or a connection → Preview and launch**
 
-**Codex** desktop and CLI, **Claude Desktop on macOS with sign-in inside the client**, and the **official native Claude Code CLI on macOS with API connections** are supported. More Agent clients and editors are being planned and evaluated; see Integration direction below.
+The following clients are supported on macOS. Isolation details and acceptance limits are described below.
+
+| Client | Launch mode | Sign-in and connections |
+| --- | --- | --- |
+| Codex | Desktop application, CLI terminal | ChatGPT accounts, API connections |
+| Claude Code | Official native CLI terminal | Claude subscription accounts, API Key / Bearer, Anthropic Messages gateways |
+| Claude Desktop | Desktop application | Sign-in inside the client, or API / third-party connections for Code / Cowork |
+
+More Agent clients and editors are being planned and evaluated; see Integration direction below.
 
 ## Screenshots
 
@@ -25,7 +33,7 @@ These screenshots capture the running v0.1.0 application content at its default 
 
 ## Features
 
-- **Independent instances**: choose Codex or Claude, then desktop application or CLI terminal in one wizard, with automatically suggested, editable names and only compatible accounts and supported settings. Preview, launch and stop instances. Claude Desktop signs in inside its own client.
+- **Independent instances**: choose Codex or Claude, then desktop application or CLI terminal in one wizard, with automatically suggested, editable names and only compatible accounts and supported settings. Preview, launch and stop instances. Claude Desktop supports sign-in inside its own client or API / third-party connections for native Code / Cowork.
 - **Codex personal skills**: managed desktop and CLI instances automatically gain missing entries from the local user's `~/.codex/skills` on launch, including existing instances and session copies. Individual directory links follow source updates while preserving any existing instance directory, file or link with the same name. System skills remain separate. Directly adopted external homes retain their own skill configuration.
 - **Accounts**: sign in to ChatGPT using a browser or device code, import accounts, and manage tags, groups, usage windows, subscription expiry and the account recycle bin. Add Claude subscription accounts and refresh their identity, plan and usage, or use them in managed CLI instances alongside API Key / Bearer connections. Desktop API connections reuse shared provider keys. Expiry dates and usage depend on the upstream response.
 - **Providers and keys**: each key has its own models, API protocol and authentication method. One supplier can hold separate OpenAI Responses, Chat Completions and Anthropic Messages keys. Fetch models and run cancellable connection or conversation tests for the selected key, choosing from its own model list. Clear all selected models without discarding fetched results, then add all fetched models. Editing one key only updates connections linked to that key; existing standalone connections keep their configuration until explicitly linked. Active instances must stop before their connection changes.
@@ -33,9 +41,16 @@ These screenshots capture the running v0.1.0 application content at its default 
 - **Standard / Fast**: choose a speed in the existing menu of supported Codex desktop instances. The local API supports service tier settings and outbound tier records. Availability depends on the client version, model and provider.
 - **Network proxies**: configure a default proxy and account overrides using HTTP, HTTPS, SOCKS5 or SOCKS5H.
 - **Local API**: use multiple Codex accounts, scheduling strategies and separate access keys with model restrictions and Token limits. Claude Code CLI connects directly to the selected Anthropic Messages service.
+- **Image generation and editing APIs**: the local API forwards `/v1/images/generations` and `/v1/images/edits` to providers that support Images APIs, enforcing key model scopes and account authorization, using the configured proxy and preserving provider streaming responses.
 - **Codex sessions and records**: start fresh or copy sessions from an instance or local directory. Automatically discover local instances from compatible tools, including running sources. Preview session counts and project grouping, search project details, then create an independent snapshot of saved history, preserving the original directory. External sources on macOS APFS can remain active; new messages do not continuously sync to the copy. Directly reusing an existing directory still requires closing its source client. Copies skip temporary files, caches and worktree code, retain original project paths, and report stale session indexes omitted from the copy. Manage session import, export, copies and restoration, and query request history, statistics and CSV exports.
 - **Claude Code CLI sessions**: view managed CLI instance history on the shared Sessions page, filter by source and title, open a file, reveal its location or copy its original session ID. Repeated IDs remain separate by instance, project and file. Import, export, copying, synchronization, archiving, deletion, visibility repair, content search and Token statistics are not available for Claude sessions. View Desktop Chat, Code and Cowork history inside the client.
 - **Data backups**: preview imports, export accounts or create encrypted portable data backups.
+
+## Image generation and editing APIs
+
+Configure the image models available to a provider key, then call `/v1/images/generations` or `/v1/images/edits` with an authorized local API access key. Model routes select the provider and its connection's network proxy; image models must satisfy both provider-key and local-access-key model scopes. Generation accepts JSON, and editing accepts JSON or multipart file uploads. When the provider supports streaming, its SSE events and returned usage information are preserved.
+
+Provider image requests call its Images endpoint directly, preserving native fields, image data and response formats while applying configured model mappings. The ChatGPT OAuth image account pool continues to use the Responses `image_generation` tool through a separate upstream path. Available image models, editing fields and streaming modes depend on the provider. Configuring Responses, Chat Completions or Anthropic Messages for conversations does not establish that the service offers an Images API.
 
 ## Claude support
 
@@ -45,7 +60,7 @@ Install the official Claude Desktop application for macOS separately. Choose **C
 
 Each instance stores its own desktop profile, cookies, client configuration and local history, retained after stopping. Cloud history for the same Claude account can still sync across instances. Instances use the current macOS user's system Keychain service while keeping their encrypted state files separate. The manager makes that service available without reading or copying Keychain credentials. Native custom environments and temporary directory settings are retained; configuration isolation is not a filesystem sandbox. The manager does not index, copy or migrate Desktop sessions; manage that history inside the corresponding client.
 
-Desktop uses the default network in **Settings**: a configured proxy runs through a relay dedicated to the instance, explicit direct mode bypasses system proxies, and inherit keeps the system network behavior. Explicit custom environment variables in Code mode can still override that default proxy. Upstream proxy credentials are never written into Desktop configuration or command arguments. Closing the manager window keeps the instance and its relay running.
+Desktop sign-in inside the client uses the default network in **Settings**; API / third-party connections can also use the selected connection's account proxy override. A configured proxy runs through a relay dedicated to the instance, explicit direct mode bypasses system proxies, and inherit keeps the system network behavior. Explicit custom environment variables in Code mode can still override that default proxy. Upstream proxy credentials are never written into Desktop configuration or command arguments. Closing the manager window keeps the instance and its relay running.
 
 ### Claude subscription accounts
 
@@ -53,7 +68,7 @@ Use **Accounts → Add account → Claude subscription** to authorize through th
 
 ### Claude Code CLI
 
-Install the **official native Claude CLI for macOS** separately. Choose **Claude → CLI terminal** when creating an instance, then add or select a subscription account, API Key, Bearer token or gateway compatible with Anthropic Messages, including its service URL and available models. Keys and model lists are managed in the shared provider library. “API connection configured” indicates that credentials are configured; it does not establish that the upstream service accepts them. Cloud modes such as Bedrock / Vertex / Foundry and npm wrapper launchers are not integrated.
+Install the **official native Claude CLI for macOS** separately. Choose **Claude → CLI terminal** when creating an instance, then add or select a Claude subscription account. Alternatively, choose an API Key, Bearer token or Anthropic Messages gateway connection and configure its service URL and available models. Keys and model lists are managed in the shared provider library. “API connection configured” indicates that credentials are configured; it does not establish that the upstream service accepts them. Cloud modes such as Bedrock / Vertex / Foundry and npm wrapper launchers are not integrated.
 
 Each instance has separate Claude configuration, global state and session directories. User settings and history are retained when the instance stops. Initial startup configures the welcome flow; Claude still asks for workspace trust, API key approval and tool permissions. User-selectable setting sources are limited to that instance's user settings; project and local settings, their environment variables and hooks are excluded, and MCP uses a managed empty configuration. System or organization managed policies still apply through Claude. Project `CLAUDE.md` files remain readable and project code stays in its original location. Configuration isolation is not a filesystem sandbox.
 
@@ -78,15 +93,15 @@ New integrations will use the same Create an instance → Choose a client flow, 
 The current release target is **macOS Apple Silicon (arm64)**, with DMG and ZIP packages. Check [Releases](https://github.com/sv3nbeast/agent-manager-lite/releases) for available downloads; if none are available, run from source using the instructions below. Windows, Linux and other architectures have not been validated.
 
 1. Install and open Agent Manager Lite, and prepare a local Codex desktop application / CLI, Claude Desktop or the official native Claude CLI.
-2. Create an instance and choose its client. Clients that use an API connection or manager account can select one or add it within the wizard.
-3. For Codex, sign in to ChatGPT or use an API connection. For Claude Code CLI, choose API Key / Bearer and provide an Anthropic Messages URL and models. For Claude Desktop, sign in inside the client after launch.
+2. Create an instance, choose Codex or Claude, then choose a desktop application or CLI terminal. Select an existing account or API connection where needed, or add one within the wizard.
+3. For Codex, sign in to ChatGPT or use an API connection. For Claude Code CLI, select a Claude subscription account or configure an API Key / Bearer connection with its Anthropic Messages URL and models. For Claude Desktop, sign in inside the client after launch or select a saved API / third-party connection for Code / Cowork.
 4. Check the launch preview, then launch. Codex also supports selecting a session source. Choose desktop models and projects inside the corresponding client; CLI instances run in Terminal.
 
 New ChatGPT account instances default to native sign-in, which supplies the client's real login identity. Native account desktop instances use the installed client’s original UI, without manager page scripts or forced home navigation. This launch path does not depend on a renderer patch version; the client retains its language, home and feature preferences. Account features depend on the plan, workspace and client version. HTTP, HTTPS, SOCKS5 and SOCKS5H proxies also work with native sign-in. Codex API keys and Agent Identity default to Local API. When a ChatGPT OAuth account uses Local API, the manager keeps the local gateway and projects the real account identity for the duration of the launch, then restores the original files when the instance stops. A pure API connection has no ChatGPT OAuth identity for the client to display. Existing instances keep their current mode and can be edited after stopping. If Codex history is hidden after changing modes, select that instance under Sessions → Repair visibility and preview the repair for its connection mode.
 
 Local API keeps its gateway and API UI compatibility settings even when it displays a ChatGPT account. To use the original account UI, finish the instance’s active work, stop it, choose Native sign-in in Edit, save, and relaunch. The instance card and launch preview identify the UI mode. A new instance has its own desktop profile and does not copy the main client’s cookies or home preferences.
 
-If a proxy is required, configure the default network in Settings and override it per account as needed. Proxies apply to the manager’s login exchanges, token refreshes, usage queries, local API, and native desktop/CLI instances launched by the manager. Codex native account instances retain their ChatGPT identity and use a dedicated local relay for authenticated upstream proxies. Claude Desktop has no bound manager account and uses the default network in Settings. Explicit direct mode overrides inherited and system proxies. Closing the manager window keeps each relay alive until its instance exits. External browsers and independently launched clients use their own network settings.
+If a proxy is required, configure the default network in Settings and override it per account as needed. Proxies apply to the manager’s login exchanges, token refreshes, usage queries, local API, and native desktop/CLI instances launched by the manager. Codex native account instances retain their ChatGPT identity and use a dedicated local relay for authenticated upstream proxies. Claude Desktop sign-in inside the client uses the default network; API / third-party connections can use an account proxy override. Explicit direct mode overrides inherited and system proxies. Closing the manager window keeps each relay alive until its instance exits. External browsers and independently launched clients use their own network settings.
 
 While instances are active, Cmd+Q, menu Quit and the ordinary tray Quit close the management UI and keep its background services alive. Instances and their local API connections continue running; the manager exits after all instances finish and their configuration is restored. Reopen the app or show its window from the tray to resume management. The tray's “Quit and stop running instances” action stops the instances and exits completely.
 
