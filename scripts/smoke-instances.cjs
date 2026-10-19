@@ -56,6 +56,14 @@ app.on('browser-window-created',(_event,window)=>{
     const wait=async expression=>{const end=Date.now()+7000;while(!await run(expression)){if(Date.now()>end)throw new Error('Instance UI condition timed out: '+expression);await new Promise(resolve=>setTimeout(resolve,40))}}
     const click=(selector,text)=>run(`Array.from(document.querySelectorAll(${JSON.stringify(selector)})).find(el=>el.getClientRects().length && el.textContent.replace(/\\s/g,'')===${JSON.stringify(text.replace(/\s/g,''))}).click()`)
     const ensureAdvanced=async()=>{if(!await run(`document.querySelector('[aria-label="实例服务等级"]')?.getClientRects().length>0`))await click('.instance-editor .instance-advanced .ant-collapse-header','高级设置')}
+    const chooseLocalApiKey=async label=>{
+      await click('.instance-editor .ant-radio-wrapper','供应商密钥')
+      await run(`document.querySelector('[aria-label="实例供应商密钥"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
+      await click('.ant-select-item-option',label)
+      await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
+      await click('.ant-select-item-option','本地 API')
+      assert.match(await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').innerText`),/本地 API/)
+    }
     const capture=async name=>{
       await run('Promise.all(document.getAnimations().filter(a=>a.effect?.getTiming().iterations!==Infinity).map(a=>a.finished.catch(()=>{})))')
       await wait('!document.querySelector(".ant-message-notice")')
@@ -200,7 +208,7 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.instance-card button','编辑')
       await wait('!!document.querySelector(".instance-editor")')
       await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
-      await click('.ant-select-item-option','原生账号登录')
+      await click('.ant-select-item-option','直连 API')
       await click('.instance-editor .ant-radio-wrapper','账号')
       await run(`document.querySelector('[aria-label="实例账号"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
       await click('.ant-select-item-option',native.name)
@@ -292,6 +300,9 @@ app.on('browser-window-created',(_event,window)=>{
       assert.equal(await run('!!document.querySelector("[aria-label=来源客户端已关闭]")'),false,'copying a snapshot does not require closing the source')
       await click('[aria-label="实例复制内容"] .ant-radio-wrapper','完整复制（高级）')
       await click('.instance-editor button','选择应用文件')
+      // External drafts now prefer the previously imported OAuth identity.
+      // This scenario specifically exercises the gateway and fixture upstream.
+      await chooseLocalApiKey(contextProvider.name+' · '+contextProvider.keys[0].name)
       await run(`(()=>{const el=document.querySelector('[aria-label="实例名称"]');el.value='已有目录副本';el.dispatchEvent(new Event('input',{bubbles:true}))})()`)
       await ensureAdvanced()
       await run(`document.querySelector('[aria-label="实例服务等级"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
@@ -300,6 +311,9 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.ant-modal-footer button','创建副本')
       await wait(`document.querySelectorAll('.instance-card').length===3 && document.querySelector('.instance-copy-job')?.textContent.includes('副本已创建')`)
       snapshot=await run('window.manager.load()');const externalCopy=snapshot.instances.find(value=>value.id===snapshot.instanceCopy.targetId)
+      assert.equal(externalCopy.accountId,contextAccount.id)
+      assert.equal(externalCopy.connectionMode,'local_api')
+      assert.equal(externalCopy.model,'fixture-model')
       assert.equal(existsSync(join(externalCopy.directory,'auth.json')),false)
       assert.equal(readFileSync(join(externalCopy.directory,'sessions','external.jsonl'),'utf8'),'fixture external session')
       assert.ok(readFileSync(join(externalCopy.directory,'work.config.toml'),'utf8').includes(JSON.stringify(join(externalCopy.directory,'log'))))
@@ -325,6 +339,7 @@ app.on('browser-window-created',(_event,window)=>{
       assert.equal(await run(`document.querySelector('.external-copy-source').textContent.includes(${JSON.stringify(existingHome)})`),true)
       await run(`document.querySelector('[aria-label="来源客户端已关闭"]').click()`)
       await click('.instance-editor button','选择应用文件')
+      await chooseLocalApiKey(contextProvider.name+' · '+contextProvider.keys[0].name)
       await run(`(()=>{const el=document.querySelector('[aria-label="实例名称"]');el.value='直接使用已有目录';el.dispatchEvent(new Event('input',{bubbles:true}))})()`)
       await ensureAdvanced()
       await run(`document.querySelector('[aria-label="实例服务等级"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
@@ -333,6 +348,9 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.ant-modal-footer button','登记实例')
       await wait(`document.querySelectorAll('.instance-card').length===4`)
       snapshot=await run('window.manager.load()');const attached=snapshot.instances.find(value=>value.externalHome)
+      assert.equal(attached.accountId,contextAccount.id)
+      assert.equal(attached.connectionMode,'local_api')
+      assert.equal(attached.model,'fixture-model')
       assert.equal(attached.directory,existingHome)
       assert.equal(snapshot.instanceApplications.find(value=>value.id===attached.applicationId).path,application)
       assert.equal(readFileSync(join(existingHome,'config.toml'),'utf8'),existingConfig)

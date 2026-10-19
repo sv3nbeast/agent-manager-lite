@@ -165,23 +165,25 @@ test('local API OAuth projection keeps the gateway and exposes the official acco
   view=f.instances.views()[0];assert.equal(view.status,'stopped');assert.equal(view.identityStatus,'local_api')
 })
 
-test('explicit local API OAuth instances retain gateway UI compatibility independently of native accounts',async t=>{
-  let prepared=0,inspected=0
+test('explicit local API OAuth can switch to native UI and preserve client preferences across restart',async t=>{
+  let prepared=0,inspected=0,nativePhase=false
   const compatibility:InstanceSpeedMenuServices={
     inspect:()=>assert.fail('The combined capability contract must be used'),
     inspectFeatures:options=>{
+      assert.equal(nativePhase,false,'Native OAuth must not inspect renderer compatibility after a mode change')
       inspected++;assert.deepEqual(options.features,['locale','speed','ultra'])
       return {supported:true,reason:'fixture',fingerprint:'local-api-fixture',version:'99.0.0',features:['locale','speed','ultra'],enhancements:'speed-locale',featureSupport:{
         locale:{supported:true,reason:'fixture'},speed:{supported:true,reason:'fixture'},ultra:{supported:true,reason:'fixture'}
       }}
     },
     prepare:options=>{
+      assert.equal(nativePhase,false,'Native OAuth must not prepare a renderer hook after a mode change')
       prepared++;assert.deepEqual(options.inspection.features,['locale','speed','ultra'])
       const folder=join(options.desktopDirectory,'cml-speed-menu',options.nonce);mkdirSync(folder,{recursive:true})
       const script=join(folder,'hook.cjs'),manifest=join(folder,'manifest.json'),statusLog=join(folder,'status.jsonl')
       for(const file of [script,manifest,statusLog])writeFileSync(file,'fixture')
       return {script,manifest,statusLog,env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
-    },readStatus:()=>({state:'active'})
+    },readStatus:()=>{assert.equal(nativePhase,false,'Native OAuth must not read the previous API hook status');return {state:'active'}}
   }
   const f=fixture(t,['zh-Hans-CN'],compatibility,undefined,fixtureGateway)
   f.instances.save({details:{name:'Explicit local API',accountId:f.alpha.id,applicationId:f.app.id,connectionMode:'local_api',model:'native-model',defaultTier:'standard',extraArgs:[]}})
@@ -194,8 +196,44 @@ test('explicit local API OAuth instances retain gateway UI compatibility indepen
   assert.equal(view.desktopLocaleCompatibility,'active');assert.equal(view.speedMenu,'active');assert.equal(view.ultraCompatibility,'active')
   assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).scalar(['model_provider']),'cml_instance')
   assert.equal(existsSync(join(f.store.directory,'instances',instance.id,'desktop-locale.json')),true)
+  const preferencesFile=join(instance.desktopDirectory,'Preferences'),globalFile=join(instance.directory,'.codex-global-state.json')
+  const preferences='{\n "appearance": "dark", "future-client-preference": {"enabled": true}\n}\n'
+  const global=JSON.stringify({'electron-persisted-atom-state':{'home-composer-mode-v1':'chat','future-client-preference':{source:'client'}}})
+  // Simulate the official client saving its own preferences before the user
+  // stops the API instance and explicitly changes its connection mode.
+  writeFileSync(preferencesFile,preferences);writeFileSync(globalFile,global)
   await f.instances.stop(instance.id)
   assert.equal(existsSync(join(instance.desktopDirectory,'cml-speed-menu',f.plans[0].nonce)),false)
+  nativePhase=true
+  const details={name:instance.name,accountId:f.alpha.id,applicationId:f.app.id,connectionMode:'native',model:'native-model',defaultTier:'standard',extraArgs:[]}
+  f.instances.save({id:instance.id,revision:instance.revision,details})
+  await f.start(instance.id)
+  const native=f.instances.views()[0],plan=f.plans[1]
+  assert.equal(native.id,instance.id);assert.equal(native.status,'running',native.error)
+  assert.equal(native.connectionMode,'native');assert.equal(native.port,undefined)
+  assert.equal(native.desktopDirectory,instance.desktopDirectory);assert.equal(native.directory,instance.directory)
+  assert.equal(plan.speedMenuHook,undefined);assert.equal(plan.desktopLocaleHook,undefined);assert.equal(plan.tempLoginHook,undefined)
+  assert.equal(macLaunchArgs(plan).some(arg=>/NODE_OPTIONS|CML_CODEX_SPEED_MENU|remote-debugging/.test(arg)),false)
+  assert.equal(prepared,1)
+  assert.equal(readFileSync(preferencesFile,'utf8'),preferences);assert.equal(readFileSync(globalFile,'utf8'),global)
+  assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).scalar(['model_provider']),'openai')
+  const changedPreferences=preferences.replace('dark','light'),changedGlobal=global.replace('"chat"','"local"')
+  const configFile=join(instance.directory,'config.toml')
+  writeFileSync(preferencesFile,changedPreferences);writeFileSync(globalFile,changedGlobal)
+  writeFileSync(configFile,patchToml(readFileSync(configFile,'utf8'),[
+    {path:['desktop','localeOverride'],raw:'"en-US"'},
+    {path:['features','future_client_feature'],raw:'true'}
+  ]))
+  await f.instances.stop(instance.id)
+  const stoppedConfig=readFileSync(configFile,'utf8')
+  await f.start(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.equal(f.plans[2].speedMenuHook,undefined);assert.equal(f.plans[2].desktopLocaleHook,undefined)
+  assert.equal(new TomlDocument(readFileSync(configFile,'utf8')).scalar(['desktop','localeOverride']),'en-US')
+  assert.equal(new TomlDocument(readFileSync(configFile,'utf8')).scalar(['features','future_client_feature']),true)
+  await f.instances.stop(instance.id)
+  assert.equal(readFileSync(configFile,'utf8'),stoppedConfig)
+  assert.equal(readFileSync(preferencesFile,'utf8'),changedPreferences);assert.equal(readFileSync(globalFile,'utf8'),changedGlobal)
 })
 
 test('native API connections retain locale compatibility without acquiring official-account UI semantics',async t=>{

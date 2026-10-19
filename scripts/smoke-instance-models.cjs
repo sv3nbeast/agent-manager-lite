@@ -100,6 +100,18 @@ app.on('browser-window-created', (_event, window) => {
       await run('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
     }
     const capture = async name => { await settle(); fs.writeFileSync(join(output, name), (await window.webContents.capturePage()).toPNG()) }
+    const capturePreviewMode = async name => {
+      await run('document.querySelector(".instance-launch-preview .instance-ui-mode").scrollIntoView({block:"center"})')
+      await settle()
+      assert.equal(await run(`(()=>{
+        const el=document.querySelector('.instance-launch-preview .instance-ui-mode'),body=el.closest('.ant-modal-body')
+        const rect=el.getBoundingClientRect(),bounds=body.getBoundingClientRect()
+        return rect.width>0&&rect.height>0&&getComputedStyle(el).visibility!=='hidden'
+          &&rect.top>=Math.max(0,bounds.top)&&rect.bottom<=Math.min(innerHeight,bounds.bottom)
+          &&rect.left>=Math.max(0,bounds.left)&&rect.right<=Math.min(innerWidth,bounds.right)
+      })()`), true, 'Preview UI mode must be visible inside the modal scroll area before capture')
+      await capture(name)
+    }
     const step = async index => { await wait(`(()=>{const el=document.querySelector('.instance-step[data-step="${index}"]');return !!el&&getComputedStyle(el).display!=='none'&&el.getClientRects().length>0})()`); await settle() }
     const next = async index => { await click('.ant-modal-footer button', '下一步'); await step(index) }
     const close = async () => { await click('.ant-modal-footer button', '取消'); await wait(`!(${visible('.instance-editor')}).length`); await settle() }
@@ -144,6 +156,7 @@ app.on('browser-window-created', (_event, window) => {
       await next(1)
       assert.match(await modeValue(), /原生账号登录/, 'OAuth native login is visible before continuing')
       assert.match(await run('document.querySelector(".instance-connection-description").innerText'), /直接登录.*ChatGPT/)
+      assert.match(await run('document.querySelector(".instance-connection-description").innerText'), /官方客户端原版界面/)
       assert.match(await run('document.querySelector("[aria-label=实例账号]").closest(".ant-select").innerText'), /示例 ChatGPT 账号/)
       await next(2)
       const firstPending = await waitPending(0)
@@ -179,6 +192,7 @@ app.on('browser-window-created', (_event, window) => {
       await capture('oauth-default-model.png')
       await next(3)
       assert.equal(await run(`document.querySelector('.instance-step[data-step="3"]').innerText.includes(${JSON.stringify(officialModels[0])})`), true)
+      assert.equal(await run(`document.querySelector('.instance-step[data-step="3"] .instance-ui-mode').innerText`), '官方客户端原版界面')
       await click('.ant-modal-footer button', '仅创建')
       await wait(`!(${visible('.instance-editor')}).length`)
       let snapshot = await run('window.manager.load()')
@@ -188,6 +202,7 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(snapshot.instances[0].connectionMode, 'native', 'New OAuth instance uses native identity by default')
       assert.equal(snapshot.instanceApplications.find(item => item.id === snapshot.instances[0].applicationId).path, application)
       assert.deepEqual(snapshot.accounts.find(item => item.id === identity.id).models, [], 'Selecting a default must not rewrite the OAuth account catalog')
+      assert.equal(await run('document.querySelector(".instance-card .instance-ui-mode").innerText'), '官方客户端原版界面')
 
       await click('.instance-card button', '预览启动')
       await wait(`!!document.querySelector('.instance-launch-preview')`)
@@ -205,6 +220,7 @@ app.on('browser-window-created', (_event, window) => {
       await select('实例接入方式', '本地 API')
       assert.equal(await modelValue(), 'fixture-saved-custom-model', 'Mode changes preserve the selected model')
       assert.match(await run('document.querySelector(".instance-connection-description").innerText'), /请求仍经本地 API 网关转发/)
+      assert.match(await run('document.querySelector(".instance-connection-description").innerText'), /本地 API 网关界面.*原生账号登录/)
       await click('.ant-modal-footer button', '保存')
       await wait(`!(${visible('.instance-editor')}).length`)
       await click('.instance-card button', '编辑')
@@ -229,6 +245,10 @@ app.on('browser-window-created', (_event, window) => {
       await click('.instance-step[data-step="1"] .ant-radio-wrapper', '供应商密钥')
       await select('实例供应商密钥', '示例供应商连接 · 独立连接')
       assert.match(await modeValue(), /本地 API/, 'Provider selection automatically uses local API in a new draft')
+      await select('实例接入方式', '直连 API')
+      assert.match(await modeValue(), /直连 API/, 'Native API credentials are not labeled as ChatGPT login')
+      assert.match(await run('document.querySelector(".instance-connection-description").innerText'), /API 密钥.*不会获得 ChatGPT 登录身份/)
+      await select('实例接入方式', '本地 API')
       await settle()
       const beforeProvider = requests.length
       await next(2)
@@ -240,6 +260,42 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(await modelValue(), 'fixture-provider-custom-model')
       assert.equal(requests.length, beforeProvider, 'Provider selection must not request an official ChatGPT catalog')
       await next(3); await capture('provider-model-boundary.png'); await close()
+
+      // The last dismissed draft selected an API key. Previewing the saved
+      // OAuth instance must resolve its own account instead of that stale form.
+      await click('.instance-card button', '预览启动')
+      await wait(`!!document.querySelector('.instance-launch-preview')`)
+      assert.match(await run('document.querySelector(".instance-launch-preview").innerText'), /启动时投影 ChatGPT 账号/)
+      assert.equal(await run('document.querySelector(".instance-launch-preview .instance-ui-mode").innerText'), '本地 API 网关界面')
+      assert.match(await run('document.querySelector(".instance-local-api-note").innerText'), /绑定的 ChatGPT 账号.*原生账号登录/)
+      assert.equal(await run('!!document.querySelector(".instance-official-desktop-note")'), false)
+      await click('.ant-modal-footer button', '取消')
+      await wait(`!(${visible('.instance-launch-preview')}).length`)
+
+      // Exercise the real identity reader with synthetic projected credentials.
+      // Successful verification must not hide the local API mode explanation.
+      snapshot = await run('window.manager.load()')
+      const oauthHome = snapshot.instances[0].directory
+      assert.ok(oauthHome.startsWith(fs.realpathSync(directory) + sep))
+      const identityFiles = ['config.toml', 'auth.json'].map(name => ({ path: join(oauthHome, name), before: fs.existsSync(join(oauthHome, name)) ? fs.readFileSync(join(oauthHome, name)) : null }))
+      fs.writeFileSync(join(oauthHome, 'config.toml'), 'model_provider = "cml_instance"\ncli_auth_credentials_store = "file"\nforced_login_method = "chatgpt"\n[model_providers.cml_instance]\nrequires_openai_auth = true\n', { mode: 0o600 })
+      fs.writeFileSync(join(oauthHome, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null, last_refresh: new Date().toISOString(), tokens: { access_token: jwt, id_token: jwt, refresh_token: identity.credentials.refreshToken, account_id: identity.credentials.accountId } }), { mode: 0o600 })
+      await click('.instances-panel .toolbar button', '刷新状态')
+      await wait('document.querySelector(".instance-card")?.textContent.includes("ChatGPT 身份已验证")')
+      assert.equal((await run('window.manager.load()')).instances[0].identityStatus, 'native_verified')
+      assert.equal(await run('document.querySelector(".instance-card .instance-ui-mode").innerText'), '本地 API 网关界面')
+      assert.match(await run('document.querySelector(".instance-card .instance-identity-warning").innerText'), /本地 API 网关界面.*编辑.*原生账号登录/)
+      await capture('oauth-verified-local-api-card.png')
+      await click('.instance-card button', '预览启动')
+      await wait(`!!document.querySelector('.instance-launch-preview')`)
+      assert.match(await run('document.querySelector(".instance-launch-preview").innerText'), /ChatGPT 身份已验证/)
+      assert.equal(await run('document.querySelector(".instance-launch-preview .instance-ui-mode").innerText'), '本地 API 网关界面')
+      assert.match(await run('document.querySelector(".instance-local-api-note").innerText'), /验证成功.*本地 API 网关界面/)
+      await capturePreviewMode('oauth-verified-local-api-preview.png')
+      await click('.ant-modal-footer button', '取消')
+      await wait(`!(${visible('.instance-launch-preview')}).length`)
+      for (const file of identityFiles) { if (file.before === null) fs.rmSync(file.path); else fs.writeFileSync(file.path, file.before) }
+      await click('.instances-panel .toolbar button', '刷新状态')
 
       // Account B resolves first; A's delayed response is still delivered even
       // after cancellation and must not contaminate B's model list or default.
@@ -282,13 +338,33 @@ app.on('browser-window-created', (_event, window) => {
       await wait(`document.querySelector('[aria-label="实例模型"]').value===${JSON.stringify(officialModels[0])}`)
       assert.equal(await modelValue(), officialModels[0], 'A reopened draft loads its account official catalog')
       await next(3); await close()
+
+      // Conversely, a saved native API profile must not inherit the most
+      // recent OAuth draft's official-account UI or identity explanations.
+      const apiCreated = await run(`window.manager.saveInstance(${JSON.stringify({ details: { clientType: 'codex', launchMode: 'desktop', name: '原生 API 边界', applicationId: snapshot.instances[0].applicationId, accountId: connection.id, connectionMode: 'native', model: connection.models[0], defaultTier: 'inherit', extraArgs: [] } })})`)
+      const apiInstance = apiCreated.instances.find(item => item.accountId === connection.id)
+      assert.ok(apiInstance)
+      await click('.instances-panel .toolbar button', '刷新状态')
+      await wait(`!!document.querySelector('.instance-card[data-instance-id="${apiInstance.id}"]')`)
+      assert.equal(await run(`document.querySelector('.instance-card[data-instance-id="${apiInstance.id}"] .instance-ui-mode').innerText`), 'API 密钥界面')
+      await click(`.instance-card[data-instance-id="${apiInstance.id}"] button`, '预览启动')
+      await wait(`!!document.querySelector('.instance-launch-preview')`)
+      assert.equal(await run('document.querySelector(".instance-launch-preview .instance-ui-mode").innerText'), 'API 密钥界面')
+      assert.match(await run('document.querySelector(".instance-native-api-note").innerText'), /直接使用绑定的供应商密钥/)
+      assert.equal(await run('!!document.querySelector(".instance-official-desktop-note, .instance-local-api-note")'), false)
+      await capturePreviewMode('native-api-preview.png')
+      await click('.ant-modal-footer button', '取消')
+      await wait(`!(${visible('.instance-launch-preview')}).length`)
+      await run(`window.manager.removeInstance(${JSON.stringify({ id: apiInstance.id, revision: apiInstance.revision })})`)
+      await click('.instances-panel .toolbar button', '刷新状态')
+      await wait('document.querySelectorAll(".instance-card").length===1')
       snapshot = await run('window.manager.load()')
       assert.equal(snapshot.instances[0].model, 'fixture-saved-custom-model')
       assert.deepEqual(snapshot.accounts.find(item => item.id === identity.id).models, [])
       assert.deepEqual(snapshot.accounts.find(item => item.id === secondIdentity.id).models, ['fixture-obsolete-account-model'])
       assert.deepEqual(snapshot.accounts.find(item => item.id === connection.id).models, ['fixture-provider-model'])
       assert.equal(requests.some(request => request.accountId === connection.id), false)
-      const validation = { oauthNativeByDefault: true, modeChoiceVisible: true, modeSwitchPreservesAccountAndModel: true, existingAndCopiedModesPreserved: true, proxyDefaultsUnitTested: true, oauthEmptyCatalog: true, officialDefault: officialModels[0], officialDropdown: nativeOptions, officialOverridesBuiltin: true, forceRefreshRequestsFreshCatalog: true, noManualInputRequired: true, delayedCatalogPreservesTyping: true, secondAccountDropdown: secondOptions, slowAccountResponseIsolated: true, cancelledRequests: cancelled.length, officialFailureLabelsBuiltinBackup: true, backupDropdown: backupOptions, providerDropdown: providerOptions, providerModelsIsolated: true, apiOfficialRequests: 0, editingPreservesModel: true, copyingPreservesModel: true, reopenedDraftUsesDefaults: true, accountCatalogsUnchanged: true, actualClientLaunched: false, upstreamRequests: false }
+      const validation = { oauthNativeByDefault: true, modeChoiceVisible: true, uiModeShownInWizardCardAndPreview: true, verifiedOAuthKeepsLocalApiExplanation: true, previewUsesBoundAccountAfterOtherDraft: true, nativeApiNeverClaimsOfficialAccountUi: true, modeSwitchPreservesAccountAndModel: true, existingAndCopiedModesPreserved: true, proxyDefaultsUnitTested: true, oauthEmptyCatalog: true, officialDefault: officialModels[0], officialDropdown: nativeOptions, officialOverridesBuiltin: true, forceRefreshRequestsFreshCatalog: true, noManualInputRequired: true, delayedCatalogPreservesTyping: true, secondAccountDropdown: secondOptions, slowAccountResponseIsolated: true, cancelledRequests: cancelled.length, officialFailureLabelsBuiltinBackup: true, backupDropdown: backupOptions, providerDropdown: providerOptions, providerModelsIsolated: true, apiOfficialRequests: 0, editingPreservesModel: true, copyingPreservesModel: true, reopenedDraftUsesDefaults: true, accountCatalogsUnchanged: true, actualClientLaunched: false, upstreamRequests: false }
       fs.writeFileSync(join(output, 'validation.json'), JSON.stringify(validation, null, 2))
       console.log('Instance model UI passed: official account catalogs override builtin and stale account candidates; next succeeds without typing; delayed IPC preserves manual input; slow account A cannot overwrite account B; failure explicitly labels builtin backup; API catalogs stay isolated; edit/copy preserve saved models. Temporary encrypted vault, fixture official IPC and app; no upstream request or actual client launch.')
       clearTimeout(timer); app.quit()
