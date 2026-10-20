@@ -49,12 +49,18 @@ function fixture(t: TestContext) {
   const library = `${desktopDirectory}-3p/configLibrary`, meta = join(library, '_meta.json'), journal = join(instance, '.cml-claude-desktop-gateway.json'), deployment = join(`${desktopDirectory}-3p`, 'claude_desktop_config.json')
   const read = (path: string) => JSON.parse(readFileSync(path, 'utf8'))
   const current = () => read(join(library, `${read(meta).appliedId}.json`))
+  const editor = () => {
+    const value = read(meta)
+    value.entries.map((entry: { id: string; name: string }) => assert.equal(typeof entry.name, 'string'))
+    if (!value.entries.some((entry: { id: string }) => entry.id === value.appliedId)) throw new Error('unknown config id')
+    return current()
+  }
   const setup = (config: Record<string, unknown>, extra: Record<string, unknown> = {}) => {
     mkdirSync(library, { recursive: true }); const id = randomUUID(), path = join(library, `${id}.json`)
     writeFileSync(path, JSON.stringify(config)); writeFileSync(meta, JSON.stringify({ appliedId: id, entries: [{ id, name: 'Native choice' }], ...extra })); return { id, path }
   }
   t.after(() => rmSync(root, { recursive: true, force: true }))
-  return { root, application, asar, instance, directory, desktopDirectory, account, profile, login, plan, library, meta, journal, deployment, read, current, setup }
+  return { root, application, asar, instance, directory, desktopDirectory, account, profile, login, plan, library, meta, journal, deployment, read, current, editor, setup }
 }
 
 test('Desktop API connection validates credential and protocol independently of model names', t => {
@@ -73,6 +79,7 @@ test('native gateway selects per-key models and stores credentials only in a pri
   assert.equal(existsSync(`${f.desktopDirectory}-3p`), false, 'preview must not create a native profile')
   prepareClaudeDesktopGateway(f.plan, f.profile, f.account)
   const current = f.current(), id = f.read(f.meta).appliedId
+  assert.deepEqual(f.editor(), current)
   assert.equal(current.inferenceGatewayAuthScheme, 'x-api-key')
   assert.equal(current.inferenceGatewayApiKey, f.account.credentials.apiKey)
   assert.deepEqual(current.inferenceModels, [{ name: 'model-two' }, { name: 'model-one' }])
@@ -97,15 +104,19 @@ test('proxy overlays compose with gateway changes and restore native login witho
   f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:23192' }
   prepareClaudeDesktopNetwork(f.plan)
   assert.equal(f.current().egressProxyUrl, f.plan.networkRoute.url)
+  assert.deepEqual(f.editor(), f.current())
   const selected = join(f.library, `${f.read(f.meta).appliedId}.json`)
   writeFileSync(selected, JSON.stringify({ ...f.current(), theme: 'light', userSetting: true }))
   f.account.credentials.apiKey = 'rotated-key'
   prepareClaudeDesktopGateway(f.plan, f.profile, f.account)
   prepareClaudeDesktopNetwork(f.plan)
+  assert.deepEqual(f.editor(), f.current())
   assert.equal(f.current().inferenceGatewayApiKey, 'rotated-key')
   assert.equal(f.current().theme, 'light')
   prepareClaudeDesktopGateway(f.plan, f.login)
   assert.equal(f.read(f.meta).appliedId, source.id)
+  assert.deepEqual(f.read(f.meta).entries, [{ id: source.id, name: 'Native choice' }])
+  assert.deepEqual(f.editor(), f.current())
   assert.deepEqual(f.current(), { theme: 'light', nativeField: 'keep', userSetting: true })
   assert.equal(f.read(f.deployment).deploymentMode, '1p')
   assert.equal(f.read(f.deployment).customDeploymentField, true)
@@ -122,7 +133,60 @@ test('native fields created under an API entry survive release of that entry', t
   writeFileSync(selected, JSON.stringify({ ...f.current(), windowPreference: 'keep' }))
   prepareClaudeDesktopGateway(f.plan, f.login)
   assert.deepEqual(f.current(), { windowPreference: 'keep' })
+  assert.deepEqual(f.editor(), f.current())
   assert.equal(existsSync(f.journal), false)
+})
+
+test('legacy unlisted API proxy can rotate credentials and restore the native editor catalogue', t => {
+  const f = fixture(t), source = f.setup({ native: 'preserve' }, { future: { keep: true } })
+  prepareClaudeDesktopGateway(f.plan, f.profile, f.account)
+  const gatewayId = f.read(f.meta).appliedId
+  f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:23192' }
+  prepareClaudeDesktopNetwork(f.plan)
+  const proxyId = f.read(f.meta).appliedId
+  writeFileSync(f.meta, JSON.stringify({ ...f.read(f.meta), entries: f.read(f.meta).entries.filter((entry: { id: string }) => entry.id !== proxyId) }))
+  assert.throws(f.editor, /unknown config id/)
+  writeFileSync(join(f.library, `${proxyId}.json`), JSON.stringify({ ...f.current(), userPreference: true }))
+  f.account.credentials.apiKey = 'rotated-synthetic-key'
+  prepareClaudeDesktopGateway(f.plan, f.profile, f.account)
+  prepareClaudeDesktopNetwork(f.plan)
+  assert.equal(f.editor().inferenceGatewayApiKey, 'rotated-synthetic-key')
+  assert.equal(f.editor().userPreference, true)
+  assert.deepEqual(f.read(f.meta).entries.map((entry: { id: string }) => entry.id), [source.id, gatewayId, f.read(f.meta).appliedId])
+  prepareClaudeDesktopGateway(f.plan, f.login)
+  assert.deepEqual(f.editor(), { native: 'preserve', userPreference: true })
+  assert.deepEqual(f.read(f.meta), { appliedId: source.id, entries: [{ id: source.id, name: 'Native choice' }], future: { keep: true } })
+  const before = readFileSync(f.meta, 'utf8')
+  prepareClaudeDesktopGateway(f.plan, f.login)
+  assert.equal(readFileSync(f.meta, 'utf8'), before)
+})
+
+test('a native entry created and selected beside API and proxy overlays survives login restoration', t => {
+  const f = fixture(t), source = f.setup({ native: true })
+  prepareClaudeDesktopGateway(f.plan, f.profile, f.account)
+  f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:23192' }
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = randomUUID(), path = join(f.library, `${id}.json`)
+  writeFileSync(path, JSON.stringify({ native: 'new configuration' }))
+  const entry = { id, name: 'My configuration', future: 'retained' }
+  writeFileSync(f.meta, JSON.stringify({ ...f.read(f.meta), appliedId: id, entries: [...f.read(f.meta).entries, entry], future: true }))
+  prepareClaudeDesktopGateway(f.plan, f.login)
+  assert.deepEqual(f.editor(), { native: 'new configuration' })
+  assert.deepEqual(f.read(f.meta), { appliedId: id, entries: [{ id: source.id, name: 'Native choice' }, entry], future: true })
+  assert.deepEqual(f.read(source.path), { native: true })
+})
+
+test('API and proxy recovery selects a newly saved entry when the instance had no prior configuration', t => {
+  const f = fixture(t)
+  prepareClaudeDesktopGateway(f.plan, f.profile, f.account)
+  f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:23192' }
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = randomUUID(), entry = { id, name: 'Saved native config' }
+  writeFileSync(join(f.library, `${id}.json`), JSON.stringify({ native: 'preserve' }))
+  writeFileSync(f.meta, JSON.stringify({ ...f.read(f.meta), entries: [...f.read(f.meta).entries, entry] }))
+  prepareClaudeDesktopGateway(f.plan, f.login)
+  assert.deepEqual(f.read(f.meta), { appliedId: id, entries: [entry] })
+  assert.deepEqual(f.editor(), { native: 'preserve' })
 })
 
 test('native concurrent edits fail before selecting or losing either configuration', t => {
@@ -144,6 +208,11 @@ test('preview fingerprints bind the original entry referenced by a network recov
   const before = claudeDesktopGatewayFingerprint(f.plan)
   writeFileSync(source.path, JSON.stringify({ native: 'changed after preview' }))
   assert.notEqual(claudeDesktopGatewayFingerprint(f.plan), before)
+  const after = claudeDesktopGatewayFingerprint(f.plan)
+  const meta = f.read(f.meta)
+  meta.entries[0].name = 'Renamed in native editor'
+  writeFileSync(f.meta, JSON.stringify(meta))
+  assert.notEqual(claudeDesktopGatewayFingerprint(f.plan), after, 'native catalogue edits invalidate a launch preview')
 })
 
 test('malformed native metadata, shared organization ownership and symlinks are retained', t => {

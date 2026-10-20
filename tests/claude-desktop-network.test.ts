@@ -42,14 +42,26 @@ function fixture(t: TestContext) {
   const library = `${desktopDirectory}-3p/configLibrary`, meta = join(library, '_meta.json'), journal = join(instance, '.cml-claude-desktop-network.json')
   const read = (path: string) => JSON.parse(readFileSync(path, 'utf8'))
   const current = () => read(join(library, `${read(meta).appliedId}.json`))
+  // The native editor lists metadata entries, then checks membership before
+  // reading or saving an entry. The startup reader only follows appliedId.
+  const editor = () => {
+    const value = read(meta)
+    const entries = value.entries.map((entry: { id: string; name: string }) => {
+      assert.equal(typeof entry.name, 'string')
+      return entry.id
+    })
+    if (!value.entries.some((entry: { id: string }) => entry.id === value.appliedId)) throw new Error('unknown config id')
+    assert.equal(new Set(entries).size, entries.length, 'native list must not contain duplicate entries')
+    return current()
+  }
   const setup = (config: Record<string, unknown>, extraMeta: Record<string, unknown> = {}) => {
     mkdirSync(library, { recursive: true })
     const id = randomUUID(), path = join(library, `${id}.json`)
-    writeFileSync(path, JSON.stringify(config)); writeFileSync(meta, JSON.stringify({ appliedId: id, ...extraMeta }))
+    writeFileSync(path, JSON.stringify(config)); writeFileSync(meta, JSON.stringify({ appliedId: id, entries: [{ id, name: 'Native choice' }], ...extraMeta }))
     return { id, path }
   }
   t.after(() => rmSync(root, { recursive: true, force: true }))
-  return { root, instance, application, asar, plan, library, meta, journal, setup, read, current }
+  return { root, instance, application, asar, plan, library, meta, journal, setup, read, current, editor }
 }
 
 test('native Desktop proxy preserves local settings and metadata without selecting a login or deployment mode', t => {
@@ -61,19 +73,23 @@ test('native Desktop proxy preserves local settings and metadata without selecti
   prepareClaudeDesktopNetwork(f.plan)
   const firstId = f.read(f.meta).appliedId
   assert.notEqual(firstId, source.id)
+  assert.deepEqual(f.editor(), f.current())
   assert.deepEqual(f.current(), { theme: 'dark', inferenceProvider: 'native-user-choice', toolPolicy: { allow: ['Read'] }, egressProxyUrl: 'http://127.0.0.1:21918' })
   assert.deepEqual(f.read(source.path), original)
-  assert.deepEqual(f.read(f.meta), { appliedId: firstId, libraryVersion: 3, favorites: ['local'] })
+  assert.deepEqual(f.read(f.meta), { appliedId: firstId, entries: [{ id: source.id, name: 'Native choice' }, { id: firstId, name: 'Native choice' }], libraryVersion: 3, favorites: ['local'] })
   assert.equal(readFileSync(deployment, 'utf8'), '{"deploymentMode":"3p","custom":true}')
   for (const path of [f.meta, f.journal, join(f.library, `${firstId}.json`)]) assert.equal(lstatSync(path).mode & 0o777, 0o600)
   f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:22918' }
   prepareClaudeDesktopNetwork(f.plan)
   assert.equal(f.read(f.meta).appliedId, firstId, 'normal restarts reuse the manager entry')
+  assert.deepEqual(f.editor(), f.current())
   assert.equal(f.current().egressProxyUrl, 'http://127.0.0.1:22918')
   f.plan.networkRoute = undefined
   prepareClaudeDesktopNetwork(f.plan)
   assert.deepEqual(f.current(), original)
   assert.equal(f.read(f.meta).appliedId, source.id)
+  assert.deepEqual(f.read(f.meta).entries, [{ id: source.id, name: 'Native choice' }])
+  assert.deepEqual(f.editor(), original)
   assert.equal(existsSync(f.journal), false)
   assert.equal(existsSync(join(f.library, `${firstId}.json`)), false)
 })
@@ -84,6 +100,7 @@ test('inherit on a new instance performs no writes and proxy to inherit removes 
   assert.equal(existsSync(`${f.plan.desktopDirectory}-3p`), false)
   f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:23918' }; prepareClaudeDesktopNetwork(f.plan)
   assert.deepEqual(Object.keys(f.current()), ['egressProxyUrl'])
+  assert.deepEqual(f.editor(), f.current())
   f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
   assert.equal(existsSync(f.meta), false)
   assert.deepEqual(readdirSync(f.library), [])
@@ -121,6 +138,7 @@ test('native settings created in a fresh profile remain selected when the proxy 
   writeFileSync(path, JSON.stringify({ ...f.current(), customSetting: 'preserve' }))
   f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
   assert.equal(f.read(f.meta).appliedId, id)
+  assert.deepEqual(f.editor(), { customSetting: 'preserve' })
   assert.deepEqual(f.current(), { customSetting: 'preserve' })
   assert.equal(existsSync(f.journal), false)
   f.plan.networkRoute = { mode: 'proxy', url: 'http://127.0.0.1:27001' }; prepareClaudeDesktopNetwork(f.plan)
@@ -153,9 +171,11 @@ test('selecting another native config while stopped is preserved and old manager
   prepareClaudeDesktopNetwork(f.plan)
   const managedId = f.read(f.meta).appliedId, next = randomUUID()
   writeFileSync(join(f.library, `${next}.json`), '{"native":"selected"}')
-  writeFileSync(f.meta, JSON.stringify({ appliedId: next, keep: 1 }))
+  const entries = [...f.read(f.meta).entries, { id: next, name: 'Selected by user', customMetadata: true }]
+  writeFileSync(f.meta, JSON.stringify({ appliedId: next, entries, keep: 1 }))
   f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
-  assert.deepEqual(f.read(f.meta), { appliedId: next, keep: 1 })
+  assert.deepEqual(f.read(f.meta), { appliedId: next, entries: entries.filter(entry => entry.id !== managedId), keep: 1 })
+  assert.deepEqual(f.editor(), { native: 'selected' })
   assert.deepEqual(f.current(), { native: 'selected' })
   assert.deepEqual(f.read(source.path), { theme: 'dark' })
   assert.equal(existsSync(join(f.library, `${managedId}.json`)), false)
@@ -247,12 +267,98 @@ test('an interrupted prepare before selecting the manager entry recovers on the 
   prepareClaudeDesktopNetwork(f.plan)
   const managerId = f.read(f.meta).appliedId
   // Simulate the state after journal/entry creation but before metadata commit.
-  writeFileSync(f.meta, JSON.stringify({ appliedId: source.id }))
+  writeFileSync(f.meta, JSON.stringify({ appliedId: source.id, entries: [{ id: source.id, name: 'Native choice' }] }))
   prepareClaudeDesktopNetwork(f.plan)
   assert.equal(f.read(f.meta).appliedId, managerId)
+  assert.deepEqual(f.editor(), { keep: true, egressProxyUrl: f.plan.networkRoute?.mode === 'proxy' ? f.plan.networkRoute.url : undefined })
   assert.equal(f.current().keep, true)
   f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
   assert.deepEqual(f.current(), { keep: true })
+})
+
+test('legacy unlisted proxy entries are repaired on restart without duplicating native entries', t => {
+  const f = fixture(t), source = f.setup({ native: true }, { keep: { future: true } })
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = f.read(f.meta).appliedId
+  const legacy = { ...f.read(f.meta), entries: [{ id: source.id, name: 'Native choice', extra: 'retain' }] }
+  writeFileSync(f.meta, JSON.stringify(legacy))
+  assert.throws(f.editor, /unknown config id/)
+  for (let i = 0; i < 2; i++) {
+    prepareClaudeDesktopNetwork(f.plan)
+    assert.equal(f.read(f.meta).appliedId, id)
+    assert.deepEqual(f.editor(), { native: true, egressProxyUrl: 'http://127.0.0.1:21918' })
+    assert.deepEqual(f.read(f.meta).entries[0], legacy.entries[0])
+  }
+  f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
+  assert.deepEqual(f.read(f.meta), { ...legacy, appliedId: source.id })
+  assert.deepEqual(f.editor(), { native: true })
+})
+
+test('legacy proxy-only metadata remains editable when native changes retain its entry', t => {
+  const f = fixture(t)
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = f.read(f.meta).appliedId, path = join(f.library, `${id}.json`)
+  writeFileSync(f.meta, JSON.stringify({ appliedId: id, futureMetadata: 'keep' }))
+  writeFileSync(path, JSON.stringify({ ...f.current(), nativeEdit: true }))
+  assert.throws(f.editor, /map/)
+  f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
+  assert.equal(f.read(f.meta).appliedId, id)
+  assert.equal(f.read(f.meta).futureMetadata, 'keep')
+  assert.deepEqual(f.editor(), { nativeEdit: true })
+  const before = readFileSync(f.meta, 'utf8')
+  prepareClaudeDesktopNetwork(f.plan)
+  assert.equal(readFileSync(f.meta, 'utf8'), before, 'completed recovery is idempotent')
+})
+
+test('retained native edits and a newly selected configuration survive releasing a fresh proxy entry', t => {
+  const f = fixture(t)
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = f.read(f.meta).appliedId, next = randomUUID()
+  writeFileSync(join(f.library, `${id}.json`), JSON.stringify({ ...f.current(), nativeEdit: true }))
+  writeFileSync(join(f.library, `${next}.json`), JSON.stringify({ choice: 'new' }))
+  const meta = { appliedId: next, entries: [{ id, name: 'My saved settings', note: 'keep' }, { id: next, name: 'Another configuration' }], future: true }
+  writeFileSync(f.meta, JSON.stringify(meta))
+  f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
+  assert.deepEqual(f.read(f.meta), meta)
+  assert.deepEqual(f.read(join(f.library, `${id}.json`)), { nativeEdit: true })
+  assert.deepEqual(f.editor(), { choice: 'new' })
+  assert.equal(existsSync(f.journal), false)
+})
+
+test('a newly saved native configuration becomes selected when no earlier entry can be restored', t => {
+  const f = fixture(t)
+  prepareClaudeDesktopNetwork(f.plan)
+  const managed = f.read(f.meta).appliedId, id = randomUUID(), entry = { id, name: 'Saved before selecting' }
+  writeFileSync(join(f.library, `${id}.json`), JSON.stringify({ native: 'saved' }))
+  writeFileSync(f.meta, JSON.stringify({ ...f.read(f.meta), entries: [...f.read(f.meta).entries, entry] }))
+  f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
+  assert.deepEqual(f.read(f.meta), { appliedId: id, entries: [entry] })
+  assert.deepEqual(f.editor(), { native: 'saved' })
+  assert.equal(existsSync(join(f.library, `${managed}.json`)), false)
+})
+
+test('native metadata added to a fresh proxy retains a readable default entry after recovery', t => {
+  const f = fixture(t)
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = f.read(f.meta).appliedId
+  writeFileSync(f.meta, JSON.stringify({ ...f.read(f.meta), futureNativeMetadata: { keep: true } }))
+  f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
+  assert.equal(f.read(f.meta).appliedId, id)
+  assert.deepEqual(f.read(f.meta).futureNativeMetadata, { keep: true })
+  assert.deepEqual(f.editor(), {})
+  assert.equal(existsSync(f.journal), false)
+})
+
+test('interrupted removal clears a stale listed proxy without changing the selected native entry', t => {
+  const f = fixture(t), source = f.setup({ native: true })
+  prepareClaudeDesktopNetwork(f.plan)
+  const id = f.read(f.meta).appliedId
+  writeFileSync(f.meta, JSON.stringify({ ...f.read(f.meta), appliedId: source.id }))
+  rmSync(join(f.library, `${id}.json`))
+  f.plan.networkRoute = undefined; prepareClaudeDesktopNetwork(f.plan)
+  assert.deepEqual(f.read(f.meta).entries, [{ id: source.id, name: 'Native choice' }])
+  assert.deepEqual(f.editor(), { native: true })
+  assert.equal(existsSync(f.journal), false)
 })
 
 test('installed Claude Desktop proxy capability is inspected without launching or modifying it', t => {

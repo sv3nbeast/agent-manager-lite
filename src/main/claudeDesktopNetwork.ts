@@ -180,6 +180,51 @@ export function claudeDesktopEntryAt(scope: ClaudeDesktopConfigScope, id: string
   return value
 }
 
+type LibraryEntry = Document & { id: string; name: string }
+
+/** Startup follows appliedId directly, but the native editor lists entries
+ * and rejects reads/saves for IDs absent from that list. Keep both in sync. */
+export function claudeDesktopLibraryEntries(meta: Document | undefined): LibraryEntry[] {
+  const value = meta?.entries
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry)
+    || typeof entry.id !== 'string' || !uuid.test(entry.id) || typeof entry.name !== 'string')) throw new Error('Claude Desktop 配置目录列表格式无效，原文件已保留')
+  return value as LibraryEntry[]
+}
+
+export function claudeDesktopLibraryRecovery(meta: Document | undefined, journal: Pick<Journal, 'entryId' | 'previousAppliedId'>, restored?: Document): { metadata: Document; keepEntry: boolean } {
+  const entries = claudeDesktopLibraryEntries(meta), next = { ...meta }
+  const remaining = entries.filter(entry => entry.id !== journal.entryId)
+  // Native metadata added while using a fresh managed entry must not leave a
+  // metadata-only file that prevents Desktop from creating its default entry.
+  const nativeMetadata = Object.keys(meta ?? {}).some(key => key !== 'entries' && key !== 'appliedId')
+  const keepEntry = restored !== undefined && !journal.previousAppliedId
+    && (Object.keys(restored).length > 0 || remaining.length === 0 && nativeMetadata)
+  if (keepEntry) {
+    // Older manager versions selected a valid file without registering it.
+    // Only the entry owned by this recovery journal may be repaired here.
+    next.entries = entries.some(entry => entry.id === journal.entryId) ? entries
+      : [...entries, { id: journal.entryId, name: 'Agent Manager Lite' }]
+  } else {
+    if (remaining.length) next.entries = remaining
+    else delete next.entries
+    if (claudeDesktopAppliedId(meta) === journal.entryId) {
+      // A config saved in the native editor may not have been selected yet.
+      // When no earlier entry exists, keep its catalogue readable by selecting
+      // the first remaining entry, as Desktop does when deleting a selection.
+      if (!journal.previousAppliedId && remaining.length) next.appliedId = remaining[0].id
+      else if (journal.previousAppliedId === undefined) delete next.appliedId
+      else next.appliedId = journal.previousAppliedId
+    }
+  }
+  return { metadata: next, keepEntry }
+}
+
+function writeNetworkMetadata(scope: ClaudeDesktopConfigScope, meta: Document, journal: Journal): void {
+  if (!journal.metaExisted && !Object.keys(meta).length) removeClaudeDesktopDocument(scope, scope.meta)
+  else writeClaudeDesktopDocument(scope, scope.meta, meta)
+}
+
 /** Merge edits made in Desktop while the proxy was selected, without losing
  * edits to the original library entry or copying raw credentials into a journal. */
 function restoreContents(managed: Document, original: Document, journal: Journal): Document {
@@ -211,21 +256,18 @@ function restoreNetwork(scope: ClaudeDesktopConfigScope): string | undefined {
   const managed = claudeDesktopDocumentAt(scope, path)
   if (!managed) {
     if (selected === journal.entryId) throw new Error('Claude Desktop 受管网络配置缺失，原记录已保留')
+    writeNetworkMetadata(scope, claudeDesktopLibraryRecovery(meta, journal).metadata, journal)
     removeClaudeDesktopDocument(scope, scope.journal); return journal.entryId
   }
   const original = claudeDesktopEntryAt(scope, journal.previousAppliedId), restored = restoreContents(managed, original, journal)
   // With no prior entry, settings added inside Desktop become its own native
   // entry after the proxy is removed. They must remain selected and readable.
-  const keepEntry = !journal.previousAppliedId && Object.keys(restored).length > 0
+  // Validate metadata before modifying either config file. Removing an overlay
+  // must also remove its catalogue entry when the user selected another config.
+  const { metadata: next, keepEntry } = claudeDesktopLibraryRecovery(meta, journal, restored)
   if (keepEntry) writeClaudeDesktopDocument(scope, path, restored)
   else if (journal.previousAppliedId && digest(restored) !== digest(original)) writeClaudeDesktopDocument(scope, join(scope.library, `${journal.previousAppliedId}.json`), restored)
-  if (selected === journal.entryId && !keepEntry) {
-    const next = { ...meta }
-    if (journal.previousAppliedId === undefined) delete next.appliedId
-    else next.appliedId = journal.previousAppliedId
-    if (!journal.metaExisted && !Object.keys(next).length) removeClaudeDesktopDocument(scope, scope.meta)
-    else writeClaudeDesktopDocument(scope, scope.meta, next)
-  }
+  writeNetworkMetadata(scope, next, journal)
   if (!keepEntry) removeClaudeDesktopDocument(scope, path)
   removeClaudeDesktopDocument(scope, scope.journal)
   return keepEntry ? undefined : journal.entryId
@@ -257,6 +299,7 @@ export function prepareClaudeDesktopNetwork(plan: DesktopPlan): void {
   const meta = claudeDesktopDocumentAt(scope, scope.meta)
   if (meta?.hybridPointer !== undefined && meta.hybridPointer !== null) throw new Error('Claude Desktop 由组织或共享配置管理网络，请在客户端的原生配置中设置代理')
   const previousAppliedId = claudeDesktopAppliedId(meta), original = claudeDesktopEntryAt(scope, previousAppliedId)
+  const entries = claudeDesktopLibraryEntries(meta)
   const entryId = previousEntry ?? randomUUID(), entry = join(scope.library, `${entryId}.json`)
   if (claudeDesktopDocumentAt(scope, entry)) throw new Error('Claude Desktop 受管配置标识发生冲突，原文件已保留')
   const next: Document = { ...original, egressProxyUrl: route.url }
@@ -264,5 +307,6 @@ export function prepareClaudeDesktopNetwork(plan: DesktopPlan): void {
   const journal: Journal = { version: 1, entryId, previousAppliedId, metaExisted: meta !== undefined, proxy: route.url, baseline: Object.fromEntries(Object.entries(original).map(([key, value]) => [key, digest(value)])) }
   writeClaudeDesktopDocument(scope, scope.journal, journal)
   writeClaudeDesktopDocument(scope, entry, next)
-  writeClaudeDesktopDocument(scope, scope.meta, { ...meta, appliedId: entryId })
+  const name = entries.find(entry => entry.id === previousAppliedId)?.name ?? 'Agent Manager Lite'
+  writeClaudeDesktopDocument(scope, scope.meta, { ...meta, appliedId: entryId, entries: [...entries, { id: entryId, name }] })
 }

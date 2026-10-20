@@ -11,6 +11,7 @@ import type { DesktopPlan } from './instanceRuntime'
 import { proxyAddressView } from './proxyPolicy'
 import type { StoredAccount } from './store'
 import { assertClaudeDesktopGatewayCapability, claudeDesktopGatewayFingerprint, prepareClaudeDesktopGateway, validateClaudeDesktopGatewayAccount } from './claudeDesktopGateway'
+import { claudeDesktopConfigScope, claudeDesktopDocumentAt, claudeDesktopNativeSource, writeClaudeDesktopDocument } from './claudeDesktopNetwork'
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 // Electron exposes app.asar as a virtual directory through node:fs. Bundle
@@ -47,9 +48,10 @@ function bundleResourcesIdentity(application: string): unknown {
   return [path, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]
 }
 
-function settingsIdentity(plan: DesktopPlan,home:string): unknown {
+function settingsIdentity(plan: DesktopPlan,home:string, api: boolean): unknown {
   const isolatedEnvironment:Record<string,string>={HOME:home,CFFIXED_USER_HOME:home,XDG_CONFIG_HOME:join(home,'.config'),CLAUDE_CONFIG_DIR:plan.directory,CLAUDE_CODE_PROJECT_DIR_NAME:'projects'}
-  return [join(plan.directory,'settings.json'),join(plan.desktopDirectory,'ccd-environment-config.json'),join(`${plan.desktopDirectory}-3p`,'ccd-environment-config.json')].map(path=>{
+  const developerSettings = join(`${plan.desktopDirectory}-3p`, 'developer_settings.json')
+  return [join(plan.directory,'settings.json'),join(plan.desktopDirectory,'ccd-environment-config.json'),join(`${plan.desktopDirectory}-3p`,'ccd-environment-config.json'),...(api?[developerSettings]:[])].map(path=>{
     const raw=readBounded(path,1024*1024)
     if(raw===null)return [path,null]
     let value:unknown
@@ -66,9 +68,25 @@ function settingsIdentity(plan: DesktopPlan,home:string): unknown {
     // Native encrypted environments stay opaque and untouched: saving even an
     // empty environment in Desktop creates ciphertext. Managed launch roots
     // are an isolation default, not a filesystem sandbox for native settings.
-    inspect(path.endsWith('settings.json')?(value as Record<string,unknown>).env:value)
+    if (path !== developerSettings) inspect(path.endsWith('settings.json')?(value as Record<string,unknown>).env:value)
     return [path,hash(raw)]
   })
+}
+
+/** Third-party connections expose their native editor through Developer.
+ * Initialize the native preference once, retaining explicit user choices.
+ * Desktop still enforces its organization and restricted-account policies. */
+function prepareDeveloperSettings(plan: DesktopPlan): void {
+  const source = claudeDesktopNativeSource(plan.application)
+  // The preference path is available before ready; its field reader may live
+  // in a lazily imported chunk. Do not tie this default to a bundler layout.
+  if (!source.includes('developer_settings.json')) return
+  const scope = claudeDesktopConfigScope(plan, false)
+  if (!scope) return
+  const path = join(`${plan.desktopDirectory}-3p`, 'developer_settings.json')
+  const current = claudeDesktopDocumentAt(scope, path)
+  if (current && Object.hasOwn(current, 'allowDevTools')) return
+  writeClaudeDesktopDocument(scope, path, { ...current, allowDevTools: true })
 }
 
 /** Native login and third-party API deployment have separate native profiles.
@@ -95,7 +113,7 @@ export function claudeDesktopRuntimeContext(profile: InstanceProfile, plan: Desk
   const temporary = directoryIdentity(temporaryDirectory,true)
   const bundle = [readBounded(join(plan.application, 'Contents', 'Info.plist'), 256 * 1024), bundleResourcesIdentity(plan.application)]
   return { profile, plan, identity, home,temporaryDirectory,upstreamProxy, account, version: application.version,
-    fingerprint: hash([profile, plan.application, identity, bundle, directories, loginHome,temporary, plan.args, settingsIdentity(plan,home),claudeDesktopGatewayFingerprint(plan),upstreamProxy,
+    fingerprint: hash([profile, plan.application, identity, bundle, directories, loginHome,temporary, plan.args, settingsIdentity(plan,home,profile.connectionMode==='native'),claudeDesktopGatewayFingerprint(plan),upstreamProxy,
       account&&[account.id,account.revision,account.kind,account.identityService,account.credentialKind,account.protocol,account.baseUrl,account.models,account.credentials.apiKey]]) }
 }
 
@@ -123,6 +141,7 @@ export async function prepareClaudeDesktopLaunch(context: ClaudeDesktopRuntimeCo
   chmodSync(context.temporaryDirectory,0o700)
   signal.throwIfAborted()
   prepareClaudeDesktopGateway(context.plan, context.profile, context.account)
+  if (context.profile.connectionMode === 'native') prepareDeveloperSettings(context.plan)
   signal.throwIfAborted()
   context.plan.launchEnvironment = { CLAUDE_CONFIG_DIR: context.plan.directory, HOME: context.home, CFFIXED_USER_HOME: context.home,CLAUDE_CODE_TMPDIR:context.temporaryDirectory }
   return claudeDesktopRuntimeContext(context.profile, context.plan,context.upstreamProxy,context.account)

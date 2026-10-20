@@ -6,7 +6,7 @@ import type { StoredAccount } from './store'
 import type { DesktopPlan } from './instanceRuntime'
 import { readBounded } from './clientConfig'
 import {
-  claudeDesktopAppliedId, claudeDesktopConfigScope, claudeDesktopDocumentAt, claudeDesktopEntryAt,
+  claudeDesktopAppliedId, claudeDesktopConfigScope, claudeDesktopDocumentAt, claudeDesktopEntryAt, claudeDesktopLibraryEntries, claudeDesktopLibraryRecovery,
   claudeDesktopNativeSchema, claudeDesktopNativeSource, claudeDesktopNetworkFingerprint, prepareClaudeDesktopNetwork,
   removeClaudeDesktopDocument, writeClaudeDesktopDocument, type ClaudeDesktopConfigScope,
 } from './claudeDesktopNetwork'
@@ -79,13 +79,6 @@ function journalAt(scope: ClaudeDesktopConfigScope): Journal | undefined {
   return parsed.data
 }
 
-function metadataEntries(meta: Document | undefined): Array<Document> {
-  const value = meta?.entries
-  if (value === undefined) return []
-  if (!Array.isArray(value) || value.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.id !== 'string' || !uuid.test(entry.id))) throw new Error('Claude Desktop 配置目录列表格式无效，原文件已保留')
-  return value as Array<Document>
-}
-
 /** Three-way recovery preserves independent native edits; journal fields are
  * hashes/references so upstream keys are never copied into recovery metadata. */
 function restoredContents(managed: Document, original: Document, journal: Journal): Document {
@@ -109,22 +102,15 @@ function restoreGateway(scope: ClaudeDesktopConfigScope): string | undefined {
   const path = join(scope.library, `${journal.entryId}.json`), managed = claudeDesktopDocumentAt(scope, path)
   if (!managed) {
     if (selected === journal.entryId) throw new Error('Claude Desktop API 配置缺失，恢复记录已保留')
+    const { metadata } = claudeDesktopLibraryRecovery(meta, journal)
+    if (!journal.metaExisted && !Object.keys(metadata).length) removeClaudeDesktopDocument(scope, scope.meta)
+    else writeClaudeDesktopDocument(scope, scope.meta, metadata)
     removeClaudeDesktopDocument(scope, join(scope.root, journalName)); return journal.entryId
   }
   const original = claudeDesktopEntryAt(scope, journal.previousAppliedId), restored = restoredContents(managed, original, journal)
-  const keepEntry = !journal.previousAppliedId && Object.keys(restored).length > 0
+  const { metadata: next, keepEntry } = claudeDesktopLibraryRecovery(meta, journal, restored)
   if (keepEntry) writeClaudeDesktopDocument(scope, path, restored)
   else if (journal.previousAppliedId && digest(restored) !== digest(original)) writeClaudeDesktopDocument(scope, join(scope.library, `${journal.previousAppliedId}.json`), restored)
-  const next: Document = { ...meta }
-  if (!keepEntry) {
-    const entries = metadataEntries(meta).filter(entry => entry.id !== journal.entryId)
-    if (entries.length) next.entries = entries
-    else delete next.entries
-    if (selected === journal.entryId) {
-      if (journal.previousAppliedId === undefined) delete next.appliedId
-      else next.appliedId = journal.previousAppliedId
-    }
-  }
   if (!journal.metaExisted && !Object.keys(next).length) removeClaudeDesktopDocument(scope, scope.meta)
   else writeClaudeDesktopDocument(scope, scope.meta, next)
   if (!keepEntry) removeClaudeDesktopDocument(scope, path)
@@ -167,7 +153,7 @@ export function prepareClaudeDesktopGateway(plan: DesktopPlan, profile: Instance
   }
   const meta = claudeDesktopDocumentAt(scope, scope.meta)
   if (meta?.hybridPointer !== undefined && meta.hybridPointer !== null) throw new Error('Claude Desktop 由组织或共享配置管理连接，请先在客户端确认配置')
-  const entries = metadataEntries(meta), previousAppliedId = claudeDesktopAppliedId(meta), original = claudeDesktopEntryAt(scope, previousAppliedId)
+  const entries = claudeDesktopLibraryEntries(meta), previousAppliedId = claudeDesktopAppliedId(meta), original = claudeDesktopEntryAt(scope, previousAppliedId)
   const entryId = previousEntry ?? randomUUID(), path = join(scope.library, `${entryId}.json`)
   if (claudeDesktopDocumentAt(scope, path)) throw new Error('Claude Desktop 受管 API 配置标识冲突，原文件已保留')
   const projection = claudeDesktopGatewayProjection(account!, profile.model), next = { ...original, ...projection }

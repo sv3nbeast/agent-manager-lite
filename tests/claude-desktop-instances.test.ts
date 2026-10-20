@@ -16,7 +16,7 @@ import { exportBackupState, validateBackup } from '../src/main/dataBackupState'
 import { DataBackups } from '../src/main/dataBackups'
 import { readBackupArchive } from '../src/main/dataBackupArchive'
 
-const gatewaySchemaSource = `const schemas=${JSON.stringify(['inferenceProvider','inferenceCredentialKind','inferenceGatewayBaseUrl','inferenceGatewayApiKey','inferenceGatewayAuthScheme','inferenceModels','modelDiscoveryEnabled','disableDeploymentModeChooser'].map(flatKey => ({ flatKey, support: { enabled: { scopes: ['3p'] } } })))}; const proxy={flatKey:'egressProxyUrl',appBehaviorOnly:true,support:{enabled:{scopes:['1p','3p']}}}; const contracts=['configLibrary','_meta.json','appliedId','deploymentMode','claude_desktop_config.json','-3p','egressProxyPacUrl','proxy-server','proxy-pac-url'];`
+const gatewaySchemaSource = `const schemas=${JSON.stringify(['inferenceProvider','inferenceCredentialKind','inferenceGatewayBaseUrl','inferenceGatewayApiKey','inferenceGatewayAuthScheme','inferenceModels','modelDiscoveryEnabled','disableDeploymentModeChooser'].map(flatKey => ({ flatKey, support: { enabled: { scopes: ['3p'] } } })))}; const proxy={flatKey:'egressProxyUrl',appBehaviorOnly:true,support:{enabled:{scopes:['1p','3p']}}}; const contracts=['configLibrary','_meta.json','appliedId','deploymentMode','claude_desktop_config.json','-3p','egressProxyPacUrl','proxy-server','proxy-pac-url','developer_settings.json'];`
 
 function writeGatewayArchive(path: string): void {
   const files: any = { files: {} }, bodies: Buffer[] = []
@@ -210,6 +210,52 @@ desktopTest('Desktop API preview rejects changed key and account proxy before cr
   await f.instances.settled(instance.id)
   assert.equal(f.runtime.plans.length, 0)
   assert.equal(f.instances.views()[0].status, 'stopped')
+})
+
+desktopTest('API Desktop initializes its native configuration menu once and retains user choices across restart', async t => {
+  const f = fixture(t), { instance } = f.addApi(), login = f.add('Client sign-in')
+  const preference = join(instance.desktopDirectory, 'developer_settings.json')
+  f.instances.preview({ id: instance.id, revision: instance.revision })
+  assert.equal(existsSync(preference), false, 'preview must not enable the menu or create preferences')
+  await f.start(instance)
+  assert.deepEqual(JSON.parse(readFileSync(preference, 'utf8')), { allowDevTools: true })
+  assert.equal(lstatSync(preference).mode & 0o777, 0o600)
+  await f.instances.stop(instance.id)
+  const chosen = JSON.stringify({ allowDevTools: false, futurePreference: { retained: true } })
+  writeFileSync(preference, chosen)
+  await f.start(instance)
+  assert.equal(readFileSync(preference, 'utf8'), chosen, 'a native user opt-out must stay disabled')
+  await f.start(login)
+  assert.equal(existsSync(join(login.desktopDirectory, 'developer_settings.json')), false, 'client sign-in keeps its native preference')
+  assert.equal(existsSync(join(dirname(instance.directory), 'desktop', 'developer_settings.json')), false, 'API preference must stay inside the third-party profile')
+})
+
+desktopTest('Desktop API preference changes invalidate a preview and unsafe settings remain untouched', async t => {
+  const f = fixture(t), { instance } = f.addApi()
+  mkdirSync(instance.desktopDirectory, { recursive: true })
+  const preference = join(instance.desktopDirectory, 'developer_settings.json')
+  writeFileSync(preference, JSON.stringify({ futurePreference: true }))
+  const preview = f.instances.preview({ id: instance.id, revision: instance.revision })
+  const chosen = JSON.stringify({ allowDevTools: false, futurePreference: true })
+  writeFileSync(preference, chosen)
+  assert.throws(() => f.instances.start(preview.ticket), /配置或网络设置已变化/)
+  assert.equal(readFileSync(preference, 'utf8'), chosen)
+  assert.equal(f.runtime.plans.length, 0)
+  rmSync(preference)
+  const outside = join(f.root, 'unrelated-preferences.json'), bytes = '{"allowDevTools":false}'
+  writeFileSync(outside, bytes); symlinkSync(outside, preference)
+  assert.throws(() => f.instances.preview({ id: instance.id, revision: instance.revision }), /安全读取/)
+  assert.equal(readFileSync(outside, 'utf8'), bytes)
+  assert.equal(f.runtime.plans.length, 0)
+})
+
+desktopTest('Desktop API configuration menu defaults preserve other native preferences', async t => {
+  const f = fixture(t), { instance } = f.addApi()
+  mkdirSync(instance.desktopDirectory, { recursive: true })
+  const preference = join(instance.desktopDirectory, 'developer_settings.json')
+  writeFileSync(preference, JSON.stringify({ futurePreference: { value: 'keep' } }))
+  await f.start(instance)
+  assert.deepEqual(JSON.parse(readFileSync(preference, 'utf8')), { futurePreference: { value: 'keep' }, allowDevTools: true })
 })
 
 desktopTest('Desktop API account proxies are projected into the native gateway entry', async t => {
