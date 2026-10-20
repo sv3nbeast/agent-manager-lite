@@ -68,6 +68,34 @@ test('failures retain last success; cancellation closes active requests and neve
   await until(()=>held.every(res=>res.destroyed));assert.equal(f.store.read().accounts.length,0)
 })
 
+test('library quota retains a safe connection diagnosis without upstream errors or credentials',async t=>{
+  const f=fixture(t,'https://fixture.invalid/v1',async()=>{throw new Error('fixture-first-secret: private upstream failure')})
+  f.start();await f.service.settled()
+  assert.equal(f.service.snapshot().failed,1)
+  const usage=f.provider().keys[0].usage!
+  assert.equal(usage.unavailable,false)
+  assert.match(usage.error!,/连接或响应无效.*网络和代理/)
+  assert.equal(JSON.stringify(f.store.snapshot()).includes('fixture-first-secret'),false)
+  assert.equal(JSON.stringify(f.store.snapshot()).includes('private upstream failure'),false)
+})
+
+test('a stalled billing request reports timeout without discarding the last known quota',async t=>{
+  const deadline=new AbortController()
+  t.mock.method(AbortSignal,'timeout',()=>deadline.signal)
+  let started=false
+  const f=fixture(t,'https://fixture.invalid/v1',async(_url,init)=>new Promise((_resolve,reject)=>{
+    started=true
+    init!.signal!.addEventListener('abort',()=>reject(new Error('fixture-first-secret timeout')),{once:true})
+  }))
+  f.store.transaction(state=>{state.providers![0].keys[0].usage={checkedAt:1,summary:{source:'sub2api',updatedAt:1,remaining:7}}})
+  f.start();await until(()=>started);deadline.abort();await f.service.settled()
+  assert.equal(f.service.snapshot().failed,1)
+  assert.equal(f.service.snapshot().cancelled,false)
+  assert.equal(f.provider().keys[0].usage?.summary?.remaining,7)
+  assert.match(f.provider().keys[0].usage?.error??'',/额度查询超时/)
+  assert.equal(JSON.stringify(f.store.snapshot()).includes('fixture-first-secret'),false)
+})
+
 test('rotations, endpoint/integration edits, moves and removals discard stale quota without changing unrelated keys',async t=>{
   let release:((value:Record<string,unknown>)=>void)|undefined
   const f=fixture(t,'https://fixture.invalid/v1',async()=>new Promise(resolve=>{release=resolve}))

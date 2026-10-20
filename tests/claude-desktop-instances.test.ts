@@ -541,14 +541,20 @@ desktopTest('Desktop and CLI cannot reuse a saved instance or silently cross app
   await assert.rejects(f.instances.completeDesktopLogin(cli.id, 'claude://complete'), /Claude Desktop/)
 })
 
-desktopTest('Desktop sessions stay in the client and callbacks target only a running desktop instance', async t => {
+desktopTest('Desktop local Code sessions are readable while resume and login callbacks retain their client boundaries', async t => {
   const f = fixture(t), first = f.add(), second = f.add('Other Desktop')
   const project = join(first.directory, 'projects', 'fixture'); mkdirSync(project, { recursive: true })
-  writeFileSync(join(project, randomUUID() + '.jsonl'), JSON.stringify({ type: 'user', sessionId: randomUUID(), message: { role: 'user', content: 'must not be indexed as CLI' } }) + '\n')
-  const catalog = new SessionCatalog(f.store), result = await catalog.scan({ runId: randomUUID() })
-  assert.equal(result.sources?.some(source => source.id === first.id || source.id === second.id), false)
-  assert.equal(result.items.length, 0)
-  await assert.rejects(catalog.scan({ runId: randomUUID(), targetId: first.id }), /来源目录不存在/)
+  const sessionId=randomUUID()
+  writeFileSync(join(project, sessionId + '.jsonl'), JSON.stringify({ type: 'user', sessionId, cwd:f.root, message: { role: 'user', content: 'Synthetic local Desktop Code history' } }) + '\n')
+  const catalog = new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:null}), result = await catalog.scan({ runId: randomUUID() })
+  t.after(()=>catalog.stop())
+  assert.equal(result.sources?.filter(source => source.id === first.id || source.id === second.id).length, 2)
+  assert.equal(result.items.length, 1)
+  assert.equal(result.items[0].launchMode,'desktop');assert.equal(result.items[0].capabilities?.resume,false)
+  const selection={snapshotId:result.snapshotId,sessionId:result.items[0].id,targetId:first.id}
+  assert.equal((await catalog.content(selection)).messages[0].blocks[0].text,'Synthetic local Desktop Code history')
+  await assert.rejects(catalog.claudeResume(selection),/Claude Desktop/)
+  assert.equal((await catalog.scan({ runId: randomUUID(), targetId: first.id })).total,1)
   assert.throws(() => f.instances.previewHistory({ id: first.id, revision: first.revision }), /客户端内查看/)
   await assert.rejects(f.instances.completeDesktopLogin(first.id, 'claude://complete'), /先启动/)
   await f.start(first); await f.start(second)

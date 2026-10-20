@@ -5,12 +5,19 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path
 import { setImmediate } from 'node:timers/promises'
 import { claudeCodeConfigPaths } from './claudeCodeInstanceAdapter'
 import type { InstanceHistorySummary } from '../shared/instances'
+import { sessionContentSchema, type SessionContentBlock, type SessionContentMessage } from '../shared/sessions'
 
 const sessionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 const maxFiles = 100_000
 const maxBytesPerFile = 64 * 1024 * 1024
 const maxLineBytes = 2 * 1024 * 1024
 const chunkBytes = 64 * 1024
+const maxContentPageCharacters = 240_000
+const maxContentMessageCharacters = 12_000
+const maxContentBlocks = 64
+const maxToolInputDepth = 16
+const maxToolInputNodes = 2000
+const maxToolInputCharacters = 32_000
 
 export interface ClaudeSessionDirectoryIdentity {
   path: string
@@ -44,6 +51,8 @@ export interface ClaudeSessionLocation {
   title: string
   kind: 'conversation' | 'subagent'
   resumeBlockedReason?: string
+  /** Set only when a content search was requested; no transcript text is retained. */
+  contentMatched?: boolean
 }
 
 export interface ClaudeSessionRecord {
@@ -78,6 +87,7 @@ export interface ClaudeSessionScanOptions {
   instanceId?: string
   now?: () => number
   maxFiles?: number
+  contentQuery?: string
 }
 
 export interface ClaudeSessionResumeSelection {
@@ -109,6 +119,13 @@ interface TranscriptMetadata {
   kind: 'conversation' | 'subagent'
   incomplete?: boolean
   resumeBlockedReason?: string
+  contentMatched?: boolean
+  contentSearchTruncated?: boolean
+}
+
+interface TranscriptReadOptions {
+  contentQuery?: string
+  onRecord?: (record: JsonObject) => void
 }
 
 function object(value: unknown): JsonObject | undefined {
@@ -129,6 +146,13 @@ function timestamp(value: unknown): number | undefined {
   return undefined
 }
 
+/** Display cleanup must never choose a different project for a launch. */
+function workingDirectory(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return
+  if (typeof value !== 'string' || value.length > 4096 || /[\x00-\x1f\x7f]/.test(value) || !isAbsolute(value)) throw new Error('Claude Code 会话工作目录无效')
+  return value
+}
+
 function messageText(value: unknown): string | undefined {
   if (typeof value === 'string') return text(value)
   if (!Array.isArray(value)) return
@@ -138,6 +162,122 @@ function messageText(value: unknown): string | undefined {
     const record = object(item)
     return record?.type === 'text' ? [text(record.text) ?? ''] : []
   }).filter(Boolean).join('\n'))
+}
+
+/** Only native content fields are rendered/searched; metadata and binary
+ * attachments never become readable text or trigger an external fetch. */
+function binaryContent(value: JsonObject): boolean {
+  const source = object(value.source), image = object(value.image_url), resource = object(value.resource)
+  if ((value.type === 'image' || value.type === 'document') && source && (source.type === 'base64' && typeof source.data === 'string' || source.type === 'url' && typeof source.url === 'string')) return true
+  if (value.type === 'base64' && typeof value.data === 'string') return true
+  if ((value.type === 'image' || value.type === 'audio') && typeof value.data === 'string' && typeof (value.mimeType ?? value.media_type) === 'string') return true
+  if (value.type === 'image_url' && typeof image?.url === 'string' || value.type === 'input_image' && typeof value.image_url === 'string') return true
+  return value.type === 'resource' && typeof resource?.blob === 'string' && typeof resource.mimeType === 'string'
+}
+
+/** Project an untrusted tool payload iteratively before serializing. The tree
+ * handed to JSON.stringify has bounded depth, node count and text, so deeply
+ * nested input cannot amplify indentation or recursively exhaust the stack. */
+function toolInputPreview(input: unknown): { text: string; truncated: boolean } {
+  type Container = JsonObject | unknown[]
+  const root: unknown[] = [], stack: { value: unknown; depth: number; parent: Container; key: string | number }[] = [{ value: input, depth: 0, parent: root, key: 0 }]
+  let remaining = maxToolInputCharacters, nodes = 0, truncated = false
+  const assign = (parent: Container, key: string | number, value: unknown): void => { Object.defineProperty(parent, key, { value, enumerable: true, configurable: true, writable: true }) }
+  const string = (value: string): string => {
+    if (value.length <= remaining) { remaining -= value.length; return value }
+    truncated = true
+    const preview = value.slice(0, Math.max(0, remaining)); remaining = 0
+    return preview + '…'
+  }
+  while (stack.length) {
+    const { value, depth, parent, key } = stack.pop()!
+    if (++nodes > maxToolInputNodes || remaining <= 0) { assign(parent, key, '[内容超出预览上限]'); truncated = true; continue }
+    if (typeof value === 'string') { assign(parent, key, string(value)); continue }
+    if (!value || typeof value !== 'object') { assign(parent, key, value ?? null); remaining -= 8; continue }
+    const record = object(value)
+    if (record && binaryContent(record)) { assign(parent, key, '[附件内容未展开]'); remaining -= 12; continue }
+    if (depth >= maxToolInputDepth) { assign(parent, key, '[嵌套内容超出预览上限]'); truncated = true; continue }
+    const target: Container = Array.isArray(value) ? [] : Object.create(null)
+    assign(parent, key, target)
+    let count = 0
+    const budget = Math.max(0, maxToolInputNodes - nodes - stack.length)
+    // Reserve all children in the shared node budget before visiting them.
+    for (const child in value) {
+      if (!Object.hasOwn(value, child)) continue
+      if (count >= budget || remaining <= 0 || child.length > remaining) { truncated = true; break }
+      remaining -= child.length + 4
+      assign(target, Array.isArray(value) ? Number(child) : child, undefined)
+      stack.push({ value: (value as JsonObject)[child], depth: depth + 1, parent: target, key: Array.isArray(value) ? Number(child) : child })
+      count++
+    }
+  }
+  const serialized = JSON.stringify(root[0]) ?? ''
+  return { text: serialized.slice(0, maxToolInputCharacters), truncated: truncated || serialized.length > maxToolInputCharacters }
+}
+
+function hasReadableContent(record: JsonObject): boolean {
+  if (record.type === 'summary') return typeof record.summary === 'string'
+  if (record.type !== 'user' && record.type !== 'assistant') return false
+  const content = object(record.message)?.content
+  if (typeof content === 'string') return Boolean(content.trim())
+  return Array.isArray(content) && content.some(raw => {
+    const block = object(raw)
+    if (!block) return false
+    if (block.type === 'text') return typeof block.text === 'string'
+    if (block.type === 'thinking') return typeof block.thinking === 'string'
+    return ['redacted_thinking', 'tool_use', 'tool_result', 'image', 'document'].includes(String(block.type))
+  })
+}
+
+function* contentBlocks(record: JsonObject): Generator<SessionContentBlock> {
+  const message = object(record.message)
+  if ((record.type === 'user' || record.type === 'assistant') && message) {
+    const content = message.content
+    if (typeof content === 'string') { if (content.trim()) yield { type: 'text', text: content }; return }
+    if (!Array.isArray(content)) return
+    for (const raw of content) {
+      const block = object(raw)
+      if (!block) continue
+      if (block.type === 'text' && typeof block.text === 'string') yield { type: 'text', text: block.text }
+      else if (block.type === 'thinking' && typeof block.thinking === 'string') yield { type: 'thinking', text: block.thinking }
+      else if (block.type === 'redacted_thinking') yield { type: 'notice', text: '此思考内容由客户端隐藏' }
+      else if (block.type === 'tool_use') yield { type: 'tool_use', name: text(block.name, 200) ?? '工具调用', ...toolInputPreview(block.input) }
+      else if (block.type === 'tool_result') {
+        const parts: string[] = []
+        if (typeof block.content === 'string') parts.push(block.content)
+        else if (Array.isArray(block.content)) for (const child of block.content) {
+          const item = object(child)
+          if (item?.type === 'text' && typeof item.text === 'string') parts.push(item.text)
+          else if (item?.type === 'image' || item?.type === 'document') parts.push('[附件内容未展开]')
+        }
+        yield { type: 'tool_result', name: block.is_error === true ? '工具错误' : '工具结果', text: parts.join('\n') }
+      } else if (block.type === 'image' || block.type === 'document') yield { type: 'notice', text: '附件内容未展开，请在原客户端查看' }
+    }
+  } else if (record.type === 'summary' && typeof record.summary === 'string') yield { type: 'notice', text: record.summary }
+}
+
+function contentMatches(record: JsonObject, query: string, onTruncated?: () => void): boolean {
+  for (const block of contentBlocks(record)) {
+    if (block.truncated) onTruncated?.()
+    if (block.type !== 'notice' && (block.text.toLowerCase().includes(query) || block.name?.toLowerCase().includes(query))) return true
+  }
+  return false
+}
+
+function readableMessage(record: JsonObject, index: number, characterLimit: number): SessionContentMessage | undefined {
+  const blocks: SessionContentBlock[] = []
+  let remaining = characterLimit, truncated = false
+  for (const block of contentBlocks(record)) {
+    if (blocks.length >= maxContentBlocks || remaining <= 0) { truncated = true; break }
+    const safe = block.text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
+    const shortened = safe.length > remaining
+    blocks.push({ ...block, text: safe.slice(0, remaining), ...(shortened ? { truncated: true } : {}) })
+    remaining -= Math.min(safe.length, remaining)
+    truncated ||= shortened || block.truncated === true
+  }
+  if (!blocks.length) return
+  const message = object(record.message)
+  return { index, role: record.type === 'user' ? 'user' : record.type === 'assistant' ? 'assistant' : 'system', timestamp: timestamp(record.timestamp), model: text(message?.model, 200), blocks, ...(truncated ? { truncated: true } : {}) }
 }
 
 function sessionId(value: unknown): string | undefined {
@@ -172,7 +312,7 @@ function regularFile(stat: Stats): void {
  * Read through an owned descriptor with a bounded buffer. Check the lexical
  * path before canonicalisation, so an in-root symlink cannot hide itself.
  */
-function readTranscript(path: string, validateDirectories: () => void): { stat: Stats; sha256: string; metadata: TranscriptMetadata } {
+function readTranscript(path: string, validateDirectories: () => void, options: TranscriptReadOptions = {}): { stat: Stats; sha256: string; metadata: TranscriptMetadata } {
   validateDirectories()
   const expected = lstatSync(path)
   regularFile(expected)
@@ -180,7 +320,7 @@ function readTranscript(path: string, validateDirectories: () => void): { stat: 
   try {
     const stat = fstatSync(fd)
     if (!sameFile(expected, stat)) throw new Error('Claude Code 会话文件已被替换')
-    const metadata: TranscriptMetadata = { messageCount: 0, kind: 'conversation' }
+    const metadata: TranscriptMetadata = { messageCount: 0, kind: 'conversation', ...(options.contentQuery ? { contentMatched: false } : {}) }
     const digest = createHash('sha256'), buffer = Buffer.alloc(chunkBytes), decoder = new TextDecoder('utf-8', { fatal: true })
     let offset = 0, pending = Buffer.alloc(0), customTitle: string | undefined, summary: string | undefined, firstPrompt: string | undefined
     const parse = (line: Buffer, terminated: boolean): void => {
@@ -199,7 +339,7 @@ function readTranscript(path: string, validateDirectories: () => void): { stat: 
         if (!id || metadata.id && metadata.id !== id) throw new Error('Claude Code 会话文件混入不同会话 ID')
         metadata.id = id
       }
-      const cwd = text(record.cwd ?? record.projectPath ?? record.project_path, 4096)
+      const cwd = workingDirectory(record.cwd ?? record.projectPath ?? record.project_path)
       if (cwd) {
         if (!isAbsolute(cwd)) throw new Error('Claude Code 会话工作目录无效')
         if (metadata.cwd && resolve(metadata.cwd) !== resolve(cwd)) metadata.resumeBlockedReason = 'Claude Code 会话包含多个工作目录，请核对项目后恢复'
@@ -215,9 +355,14 @@ function readTranscript(path: string, validateDirectories: () => void): { stat: 
       if (record.type === 'summary') summary = text(record.summary) ?? summary
       const message = object(record.message)
       if ((record.type === 'user' || record.type === 'assistant') && message) metadata.messageCount++
-      if (record.type === 'user' && message && record.isMeta !== true && record.isSidechain !== true && !firstPrompt) firstPrompt = messageText(message.content)
+      if (record.type === 'user' && message && record.isMeta !== true && record.isSidechain !== true && !firstPrompt) {
+        const prompt = messageText(message.content)
+        if (prompt && !prompt.includes('<local-command-caveat>') && !prompt.startsWith('<command-name>')) firstPrompt = prompt
+      }
       if (record.type === 'assistant' && message) metadata.model = text(message.model, 200) ?? metadata.model
       metadata.gitBranch = text(record.gitBranch, 200) ?? metadata.gitBranch
+      if (options.contentQuery && !metadata.contentMatched) metadata.contentMatched = contentMatches(record, options.contentQuery.toLowerCase(), () => { metadata.contentSearchTruncated = true })
+      options.onRecord?.(record)
     }
     while (offset < stat.size) {
       const bytes = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset)
@@ -237,7 +382,7 @@ function readTranscript(path: string, validateDirectories: () => void): { stat: 
       }
     }
     if (pending.length) parse(pending, false)
-    metadata.title = customTitle ?? summary ?? firstPrompt
+    metadata.title = customTitle ?? firstPrompt ?? summary
     if (!sameFile(stat, fstatSync(fd)) || !sameFile(stat, lstatSync(path))) throw new Error('Claude Code 会话文件正在变化，请刷新列表')
     validateDirectories()
     return { stat, metadata, sha256: digest.digest('hex') }
@@ -259,6 +404,7 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
   const limit = options.maxFiles ?? maxFiles
   if (!Number.isInteger(limit) || limit < 1 || limit > maxFiles) throw new Error('Claude Code 会话扫描上限无效')
   if (options.instanceId !== undefined && (!options.instanceId || options.instanceId.length > 256 || /[\x00-\x1f\x7f]/.test(options.instanceId))) throw new Error('Claude Code 实例来源标识无效')
+  if (options.contentQuery !== undefined && (typeof options.contentQuery !== 'string' || options.contentQuery.length > 200)) throw new Error('Claude Code 会话搜索条件无效')
   const paths = claudeCodeConfigPaths(resolve(configDirectory), options.home ?? homedir())
   const result: ClaudeSessionScan = { configDirectory: paths.configDirectory, sessionsDirectory: paths.sessionsDirectory, instanceId: options.instanceId, scannedAt: options.now?.() ?? Date.now(), records: [], warnings: [], complete: true }
   let source: ClaudeSessionSource
@@ -272,11 +418,15 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
   }
   result.source = source
   const records = new Map<string, ClaudeSessionRecord>()
-  const warn = (message: string): void => { result.complete = false; if (result.warnings.length < 100) result.warnings.push(message) }
+  const note = (message: string): void => { if (result.warnings.length < 100 && !result.warnings.includes(message)) result.warnings.push(message) }
+  const warn = (message: string): void => { result.complete = false; note(message) }
   let count = 0
   const root = source.projects.canonicalPath, projects = readdirSync(root).sort()
   for (const projectName of projects) {
     yield
+    // Desktop stores SSH transcript caches beside local projects. These belong
+    // to another host and must not be presented as resumable local sessions.
+    if (projectName.startsWith('ssh-')) continue
     const projectPath = join(root, projectName)
     let project: ClaudeSessionDirectoryIdentity, files: string[]
     try {
@@ -289,20 +439,21 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
     const projectRows: ClaudeSessionRecord[] = []
     for (const fileName of files) {
       yield
-      if (extname(fileName).toLowerCase() !== '.jsonl' || fileName.startsWith('agent-')) continue
+      if (extname(fileName).toLowerCase() !== '.jsonl' || fileName.startsWith('agent-') || fileName === 'journal.jsonl' || fileName.includes('.superseded-')) continue
       if (++count > limit) throw new Error('Claude Code 会话文件超过扫描上限，请选择单个配置目录')
       const path = join(projectPath, fileName)
       try {
-        const { stat, metadata, sha256 } = readTranscript(path, validate)
+        const { stat, metadata, sha256 } = readTranscript(path, validate, { contentQuery: options.contentQuery })
         const fileId = sessionId(basename(fileName, extname(fileName))), id = metadata.id ?? fileId
         if (!id || !stat.size || metadata.kind === 'subagent') continue
         if (fileId !== id) metadata.resumeBlockedReason ??= 'Claude Code 会话 ID 与文件名不一致，请核对来源文件'
         if (!metadata.messageCount) metadata.resumeBlockedReason ??= 'Claude Code 会话缺少可恢复的消息记录'
         const location: ClaudeSessionLocation = {
           path, projectDirectory: projectPath, device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, sha256,
-          sourceId: sourceId(source, project, path, stat, sha256), source, project, cwd: metadata.cwd, title: metadata.title ?? id, kind: metadata.kind, resumeBlockedReason: metadata.resumeBlockedReason,
+          sourceId: sourceId(source, project, path, stat, sha256), source, project, cwd: metadata.cwd, title: metadata.title ?? (metadata.cwd ? basename(metadata.cwd) : id), kind: metadata.kind, resumeBlockedReason: metadata.resumeBlockedReason, contentMatched: metadata.contentMatched,
         }
         if (metadata.incomplete) warn('部分 Claude Code 会话尚未写入完整，请等待写入完成后刷新')
+        if (metadata.contentSearchTruncated) note('部分 Claude Code 工具参数超出读取上限，正文搜索未包含其省略部分；可打开源文件查看')
         projectRows.push({ id, title: location.title, cwd: metadata.cwd, projectDirectory: projectPath, createdAt: metadata.createdAt, updatedAt: metadata.updatedAt ?? stat.mtimeMs, model: metadata.model, gitBranch: metadata.gitBranch, messageCount: metadata.messageCount, locations: [location], conflict: false })
       } catch { warn('部分 Claude Code 会话文件无法安全读取，请刷新或检查来源文件') }
     }
@@ -345,6 +496,39 @@ export function verifyClaudeSessionLocation(location: ClaudeSessionLocation): st
   const current = readTranscript(location.path, validate)
   if (sourceId(location.source, location.project, location.path, current.stat, current.sha256) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
   return location.path
+}
+
+export interface ClaudeSessionContentPage {
+  page: number
+  pageSize: number
+  total: number
+  messages: SessionContentMessage[]
+  warnings: string[]
+}
+
+/** The requested page is projected while validating the entire transcript.
+ * No body is cached in a catalog snapshot, and stale reads return no content. */
+export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: { page?: number; pageSize?: number; query?: string } = {}): ClaudeSessionContentPage {
+  const input = sessionContentSchema.pick({ page: true, pageSize: true, query: true }).parse(raw)
+  const start = (input.page - 1) * input.pageSize, query = input.query.toLowerCase()
+  const result: ClaudeSessionContentPage = { page: input.page, pageSize: input.pageSize, total: 0, messages: [], warnings: [] }
+  let index = 0, searchTruncated = false
+  const validate = (): void => { unchangedDirectory(location.source.config); unchangedDirectory(location.source.projects); unchangedDirectory(location.project) }
+  const current = readTranscript(location.path, validate, { onRecord(record) {
+    // Unknown record types, indexes and title updates are not conversation text.
+    if (!hasReadableContent(record)) return
+    const messageIndex = index++
+    if (query && !contentMatches(record, query, () => { searchTruncated = true })) return
+    const position = result.total++
+    if (position < start || position >= start + input.pageSize) return
+    const message = readableMessage(record, messageIndex, Math.min(maxContentMessageCharacters, Math.floor(maxContentPageCharacters / input.pageSize)))
+    if (message) result.messages.push(message)
+  } })
+  if (sourceId(location.source, location.project, location.path, current.stat, current.sha256) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
+  if (current.metadata.incomplete) result.warnings.push('会话末尾仍在写入，仅显示已完整保存的消息；请稍后刷新')
+  if (searchTruncated) result.warnings.push('部分工具参数超出读取上限，搜索未包含其省略部分；可打开源文件查看')
+  if (result.messages.some(message => message.truncated)) result.warnings.push('部分长消息或工具输出已截断，可打开源文件查看完整内容')
+  return result
 }
 
 function currentResumeLocation(record: Pick<ClaudeSessionRecord, 'id' | 'locations' | 'conflict'>, targetPath?: string): ClaudeSessionLocation {

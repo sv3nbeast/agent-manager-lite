@@ -17,7 +17,7 @@ async function main(){
   assert.ok(binary&&isAbsolute(binary)&&existsSync(binary),'Set CML_TEST_CODEX_BINARY to the verified official executable')
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-trash-cli-'))),home=join(root,'home'),trash=join(root,'trash');mkdirSync(home);mkdirSync(trash)
   try{
-    const store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),target=configs.register(home),catalog=new SessionCatalog(store),program=sessionProgram({id:'fixture',path:binary,name:'Official CLI',kind:'cli'}),signal=new AbortController().signal
+    const store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),target=configs.register(home),catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null}),program=sessionProgram({id:'fixture',path:binary,name:'Official CLI',kind:'cli'}),signal=new AbortController().signal
     const parent=randomUUID(),child=randomUUID(),grandchild=randomUUID(),unrelated=randomUUID(),when='2026-10-01T08:00:00Z'
     const create=(id:string,parentId?:string,archived=false)=>{
       const folder=archived?join(home,'archived_sessions'):join(home,'sessions','2026','10','01');mkdirSync(folder,{recursive:true})

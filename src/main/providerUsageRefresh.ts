@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto'
 import {providerUsageInputSchema,type ProviderUsageRefresh,type ProviderUsageState} from '../shared/providerUsage'
 import type {Store,StoredAccount} from './store'
 import type {StoredProvider} from './providerLibrary'
-import {queryProviderUsage,ProviderUsageUnavailable,ProviderUsageRejected} from './providerUsage'
+import {queryProviderUsage,providerUsageIntegrationHint,ProviderUsageUnavailable,ProviderUsageRejected,ProviderUsageQueryError} from './providerUsage'
 import {HTTPError,requestJSON,type JSONRequest} from './network'
 import {providerNetworkTarget} from './providerNetworkTarget'
 
@@ -52,12 +52,16 @@ export class ProviderUsageQueries {
           // A transient transport target only. No account, gateway or model call
           // is created; library queries use the saved provider URL and key.
           let result:ProviderUsageState
-          try{const target=providerNetworkTarget(this.store.read(),provider,key);result={summary:await queryProviderUsage(target,signal,this.request),checkedAt:Date.now()}}
+          try{
+            const state=this.store.read(),target=providerNetworkTarget(state,provider,key)
+            const current=state.providers?.find(value=>value.id===provider.id&&value.revision===provider.revision)??provider
+            result={summary:await queryProviderUsage(target,signal,this.request,providerUsageIntegrationHint(current,key.id)),checkedAt:Date.now()}
+          }
           catch(error){
             if(signal.aborted||!this.current(provider)){this.invalidate();continue}
             failed=true
             result={checkedAt:Date.now(),unavailable:error instanceof ProviderUsageUnavailable,
-              error:error instanceof HTTPError||error instanceof ProviderUsageUnavailable||error instanceof ProviderUsageRejected?error.message:'额度查询失败，请检查连接或配置后重试'}
+              error:error instanceof HTTPError||error instanceof ProviderUsageUnavailable||error instanceof ProviderUsageRejected||error instanceof ProviderUsageQueryError?error.message:'额度查询失败，请检查连接或配置后重试'}
           }
           if(signal.aborted||!this.current(provider)){this.invalidate();continue}
           try{

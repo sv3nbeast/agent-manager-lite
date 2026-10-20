@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 import { captureClaudeExecutableIdentity, validateClaudeExecutableIdentity } from '../src/main/claudeCodeCapability'
 import { claudeCodeEnvironment, detectClaudeCodeApplications, projectClaudeCodeConfig } from '../src/main/claudeCodeInstanceAdapter'
 import { inspectClaudeCodeSessions, probeClaudeCodeCliCapabilities, probeClaudeCodeCliVersion, probeClaudeCodeLoginStatus } from '../src/main/claudeCodeVerification'
+import { scanClaudeCodeSessions, readClaudeSessionContent, previewClaudeSessionResume } from '../src/main/claudeCodeSessions'
 
 // A real native CLI acceptance test. All credentials, conversations, project
 // files and responses are synthetic. macOS blocks external network traffic
@@ -198,7 +199,16 @@ async function main(): Promise<void> {
       assert.ok(sessions.files.every(file => file.sessionId !== sessionIds[mode === 'api_key' ? 'bearer' : 'api_key']))
       assert.ok(existsSync(join(projections[mode].paths.configDirectory, '.claude.json')))
     }
-    const resumed = await run('api_key', [...printArgs, '--resume', sessionIds.api_key, 'fixture-follow-up-api_key'])
+    const instanceId=randomUUID(),configDirectory=projections.api_key.paths.configDirectory
+    const nativeScan=scanClaudeCodeSessions(configDirectory,{instanceId})
+    const nativeRecord=nativeScan.records.find(record=>record.id===sessionIds.api_key)!
+    assert.ok(nativeRecord);assert.equal(nativeRecord.conflict,false)
+    const nativeLocation=nativeRecord.locations[0],content=readClaudeSessionContent(nativeLocation,{page:1,pageSize:40})
+    assert.ok(content.messages.some(message=>message.role==='user'&&message.blocks.some(block=>block.text.includes('fixture-prompt-api_key'))))
+    assert.ok(content.messages.some(message=>message.role==='assistant'&&message.blocks.some(block=>block.text.includes('fixture-response-api_key'))))
+    const scopedResume=previewClaudeSessionResume(nativeScan,{instanceId,configDirectory,cwd:project,sessionId:nativeRecord.id,sourceId:nativeLocation.sourceId})
+    assert.equal(scopedResume.cwd,project)
+    const resumed = await run('api_key', [...printArgs, ...scopedResume.args, 'fixture-follow-up-api_key'])
     assert.equal(resumed.code, 0); assert.equal(JSON.parse(resumed.stdout).session_id, sessionIds.api_key)
     const replay = requests.at(-1)
     assert.ok(replay)

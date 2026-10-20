@@ -17,6 +17,7 @@ import type {ClientSwitchView,ClientSwitchPreview} from './clientSwitch'
 import type {ClientAuthorityView} from './clientAuthority'
 import type { WakeupView, WakeupTaskInput } from './wakeup'
 import type {SessionScanInput,SessionPageInput,SessionPage,SessionSelection,SessionTokenResult,SessionCopyPreviewInput,SessionCopyPreview,SessionTransferView,SessionTransferRecovery} from './sessions'
+import type {SessionContentInput,SessionContentPage} from './sessions'
 import type {SessionVisibilityRepairInput,SessionVisibilityRepairApplyInput,SessionVisibilityRepairInstanceList,SessionVisibilityRepairProviderList,SessionVisibilityRepairPreview,SessionVisibilityRepairSummary} from './sessionVisibility'
 import type {SyncPreviewInput,SyncPreview,SyncView,SyncRecovery} from './sessionSync'
 import type {ArchivePreview,ArchiveImportInput,ArchiveImportPreview,ArchiveProgress} from './sessionArchives'
@@ -244,6 +245,9 @@ export interface ManagerAPI {
   cancelSessionVisibilityRepair(ticket:string):Promise<void>
   scanSessions(input:SessionScanInput):Promise<SessionPage>
   sessionPage(input:SessionPageInput):Promise<SessionPage>
+  sessionContent(input:SessionContentInput):Promise<SessionContentPage>
+  previewClaudeSessionResume(input:SessionSelection):Promise<InstanceLaunchPreview & {sessionId:string}>
+  discardClaudeSessionResume(ticket:string):Promise<void>
   sessionTokenStats(input:{snapshotId:string;sessionIds:string[]}):Promise<SessionTokenResult[]>
   cancelSessionScan(runId:string):Promise<void>
   cancelSessionTokens(snapshotId:string):Promise<void>

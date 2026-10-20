@@ -358,7 +358,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
             <ClientConfigPanel v-else-if="page === 'config'" />
             <ProviderLibraryView id="provider-library-panel" role="tabpanel" aria-labelledby="provider-library-tab" ref="providerLibrary" v-else-if="page === 'providers'" @manage-connections="viewConnections" />
             <InstancesView v-else-if="page === 'instances'" :login-result="loginResult" @add-account="openAccountLogin" />
-            <SessionsView v-else-if="page === 'sessions'" />
+            <SessionsView v-else-if="page === 'sessions'" @show-instances="page='instances'" />
             <WakeupPanel v-else-if="page === 'wakeup'" :accounts="accounts" />
             <template v-else-if="page === 'settings'">
               <div class="page-heading">

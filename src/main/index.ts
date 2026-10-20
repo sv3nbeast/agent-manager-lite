@@ -165,7 +165,7 @@ async function main(): Promise<void> {
   },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages(),undefined,new NativeProxy(binary,proxyTunnels))
   const externalInstanceSources=new ExternalInstanceSources({managerRoot:realpathSync(store.directory),managedDirectories:()=>instances.views().map(instance=>instance.directory),...(isolatedTest?{home:join(realpathSync(store.directory),'external-source-home')}:{})})
   const localAccess=new LocalAccess(store,gateway,async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},ids=>effectiveKeyUsage(store.read(),history.keyTokenUsage(ids)))
-  const sessions=new SessionCatalog(store,id=>instances.inUse(id))
+  const sessions=new SessionCatalog(store,id=>instances.inUse(id),isolatedTest?{defaultClaudeDirectory:null}:{})
   sessionTransfers=new SessionTransfers(store,sessions,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionSync?.busy(id)||!!sessionTrash?.busy(id))
   sessionArchives=new SessionArchives(store,sessions,sessionTransfers,Date.now,id=>(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false))
   sessionSync=new SessionSync(store,sessionTransfers,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionTrash?.busy(id))
@@ -502,6 +502,9 @@ async function main(): Promise<void> {
       case 'discardSessionVisibilityRepair': sessionVisibility.discard(z.string().uuid().parse(input));return
       case 'cancelSessionVisibilityRepair': sessionVisibility.cancel(z.string().uuid().parse(input));return
       case 'sessionPage': return sessions.page(input)
+      case 'sessionContent': return sessions.content(input)
+      case 'previewClaudeSessionResume': return instances.previewClaudeSessionResume(await sessions.claudeResume(input))
+      case 'discardClaudeSessionResume': instances.discardClaudeSessionResume(z.string().uuid().parse(input));return
       case 'sessionTokenStats': return sessions.tokenStats(input)
       case 'cancelSessionScan': sessions.cancel(z.string().uuid().parse(input));return
       case 'cancelSessionTokens': sessions.cancelTokens(z.string().uuid().parse(input));return

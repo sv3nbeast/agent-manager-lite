@@ -201,9 +201,10 @@ test('API bulk refresh respects disabled groups and auto refresh starts only aft
   t.after(async () => { await service.stop(); await authority.stop() })
   service.schedule(); t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 0)
   service.startAll(); await service.settled(); assert.equal(calls, 2)
-  t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 4)
-  unavailable = true; t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 6)
-  t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 6)
+  // A successful source avoids rediscovering unrelated billing APIs next time.
+  t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 3)
+  unavailable = true; t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 5)
+  t.mock.timers.tick(60_000); await service.settled(); assert.equal(calls, 5)
   store.transaction(state => { state.groups.push({ id: 'disabled', name: 'disabled', accountIds: [a.id], quotaAutoRefreshMinutes: -1, sortOrder: 0, createdAt: 0 }) })
   assert.deepEqual(bulkRefreshIds(store.read()), [])
 })

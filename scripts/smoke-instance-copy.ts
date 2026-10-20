@@ -145,7 +145,7 @@ async function main(){
     const beforeDetach=files(source.directory)
     importedInstances.remove({id:attached.id,revision:attached.revision})
     assert.deepEqual(files(source.directory),beforeDetach,'Detaching must preserve every existing directory file')
-    const sessions=new SessionCatalog(store),page=await sessions.scan({runId:randomUUID(),titleQuery:'',contentQuery:'fixture-first-turn',kind:'all'})
+    const sessions=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null}),page=await sessions.scan({runId:randomUUID(),titleQuery:'',contentQuery:'fixture-first-turn',kind:'all'})
     assert.deepEqual(page.warnings,[]);assert.equal(page.total,1)
     assert.equal(page.items[0].id,event.thread_id);assert.equal(page.items[0].locations.length,2)
     assert.ok(page.items[0].title.includes('fixture-first-turn'),JSON.stringify(page.items))

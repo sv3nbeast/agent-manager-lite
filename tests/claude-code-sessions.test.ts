@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs, { appendFileSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { claudeSessionIdentity, claudeSessionResumeArgs, previewClaudeSessionResume, readClaudeCodeInstanceHistory, scanClaudeCodeSessions } from '../src/main/claudeCodeSessions'
+import { claudeSessionIdentity, claudeSessionResumeArgs, previewClaudeSessionResume, readClaudeCodeInstanceHistory, readClaudeSessionContent, scanClaudeCodeSessions } from '../src/main/claudeCodeSessions'
 
 test('Claude Code session scan is isolated from the Codex session layout and extracts stable metadata', () => {
   const root = mkdtempSync(join(tmpdir(), 'aml-claude-sessions-'))
@@ -247,5 +247,200 @@ test('Claude instance history reports its own projects and does not count Codex 
     assert.equal(history.unassigned, 0)
     assert.deepEqual(history.projects, [{ path: f.cwd, name: 'workspace', exists: true, sessions: 1 }])
     assert.deepEqual(history.issues, [])
+  } finally { f.dispose() }
+})
+
+test('Claude titles skip injected commands and prefer the first real prompt over later compact summaries', () => {
+  const f = fixture()
+  try {
+    writeFileSync(f.path, [
+      { ...f.event, message: { content: '<local-command-caveat>local only</local-command-caveat>' } },
+      { ...f.event, message: { content: '<command-name>/clear</command-name>' } },
+      f.event,
+      { type: 'summary', summary: 'Later compacted description' },
+    ].map(value => JSON.stringify(value)).join('\n'))
+    assert.equal(f.scan().records[0].title, f.event.message.content)
+  } finally { f.dispose() }
+})
+
+test('Claude reader paginates native message blocks and searches bodies without exposing binary or metadata fields', () => {
+  const f = fixture()
+  try {
+    writeFileSync(f.path, [
+      f.event,
+      { type: 'assistant', sessionId: f.id, timestamp: '2026-10-12T01:03:03.000Z', message: { model: 'claude-test', content: [
+        { type: 'thinking', thinking: 'Plan the implementation', signature: 'THINKING_SIGNATURE_NOT_TEXT' },
+        { type: 'tool_use', name: 'Read', input: { file_path: '/workspace/example.ts' } },
+      ] } },
+      { ...f.event, message: { content: [{ type: 'tool_result', content: [{ type: 'text', text: 'Needle inside tool result' }, { type: 'image', source: { type: 'base64', data: 'BINARY_ATTACHMENT_NOT_TEXT' } }] }] } },
+      { type: 'assistant', sessionId: f.id, message: { content: [{ type: 'text', text: '<script>plain text only</script>' }, { type: 'redacted_thinking', data: 'REDACTED_NOT_TEXT' }, { type: 'image', source: { type: 'url', url: 'https://unused.invalid/image' } }] } },
+      { type: 'file-history-snapshot', snapshot: { secret: 'METADATA_NOT_TEXT' } },
+    ].map(value => JSON.stringify(value)).join('\n'))
+    const location = f.scan().records[0].locations[0]
+    const first = readClaudeSessionContent(location, { pageSize: 2 }), second = readClaudeSessionContent(location, { page: 2, pageSize: 2 })
+    assert.equal(first.total, 4)
+    assert.deepEqual(first.messages.map(message => message.role), ['user', 'assistant'])
+    assert.equal(first.messages[1].model, 'claude-test')
+    assert.deepEqual(first.messages[1].blocks.map(block => block.type), ['thinking', 'tool_use'])
+    assert.deepEqual(second.messages.map(message => message.index), [2, 3])
+    assert.ok(second.messages[1].blocks.some(block => block.text === '<script>plain text only</script>'))
+    for (const secret of ['THINKING_SIGNATURE_NOT_TEXT', 'BINARY_ATTACHMENT_NOT_TEXT', 'REDACTED_NOT_TEXT', 'METADATA_NOT_TEXT', 'https://unused.invalid']) assert.ok(!JSON.stringify([first, second]).includes(secret))
+    const matches = readClaudeSessionContent(location, { query: 'NEEDLE' })
+    assert.equal(matches.total, 1); assert.equal(matches.messages[0].index, 2)
+    assert.equal(scanClaudeCodeSessions(f.config, { contentQuery: 'needle' }).records[0].locations[0].contentMatched, true)
+    assert.equal(scanClaudeCodeSessions(f.config, { contentQuery: 'METADATA_NOT_TEXT' }).records[0].locations[0].contentMatched, false)
+    assert.equal(readClaudeSessionContent(location, { query: 'BINARY_ATTACHMENT_NOT_TEXT' }).total, 0)
+  } finally { f.dispose() }
+})
+
+test('Claude content pages bound long tool outputs while searching beyond the visible preview', () => {
+  const f = fixture()
+  try {
+    const body = '中'.repeat(20_000) + 'matching-tail'
+    writeFileSync(f.path, Array.from({ length: 100 }, () => JSON.stringify({ ...f.event, message: { content: [{ type: 'tool_result', content: body }] } })).join('\n'))
+    const location = f.scan().records[0].locations[0], page = readClaudeSessionContent(location, { pageSize: 100, query: 'matching-tail' })
+    assert.equal(page.total, 100); assert.equal(page.messages.length, 100)
+    assert.ok(page.messages.every(message => message.truncated))
+    assert.ok(page.messages.flatMap(message => message.blocks).reduce((count, block) => count + block.text.length, 0) <= 240_000)
+    assert.ok(page.warnings.some(warning => warning.includes('截断')))
+    assert.throws(() => readClaudeSessionContent(location, { pageSize: 101 }))
+    assert.throws(() => readClaudeSessionContent(location, { page: 0 }))
+  } finally { f.dispose() }
+})
+
+test('Claude reader rejects changed snapshots, linked sources and concurrent writes without returning partial text', t => {
+  for (const kind of ['append', 'symlink', 'concurrent'] as const) {
+    const f = fixture()
+    try {
+      const location = f.scan().records[0].locations[0]
+      if (kind === 'append') appendFileSync(f.path, JSON.stringify(f.event) + '\n')
+      if (kind === 'symlink') { renameSync(f.path, f.path + '.saved'); symlinkSync(f.path + '.saved', f.path) }
+      let restore = () => {}
+      if (kind === 'concurrent') {
+        const original = fs.readSync
+        let mutated = false
+        const read = t.mock.method(fs, 'readSync', function (...args: Parameters<typeof fs.readSync>) {
+          const bytes = Reflect.apply(original, fs, args)
+          if (!mutated) { mutated = true; appendFileSync(f.path, JSON.stringify(f.event) + '\n') }
+          return bytes
+        })
+        restore = () => read.mock.restore()
+      }
+      try { assert.throws(() => readClaudeSessionContent(location), /变化|普通文件/) } finally { restore() }
+    } finally { f.dispose() }
+  }
+})
+
+test('Claude local catalog excludes native SSH caches, journals and superseded transcripts', () => {
+  const f = fixture()
+  try {
+    const remote = join(f.config, 'projects', 'ssh-sessions')
+    mkdirSync(remote)
+    copyFileSync(f.path, join(remote, f.id + '.jsonl'))
+    copyFileSync(f.path, join(f.project, 'journal.jsonl'))
+    copyFileSync(f.path, join(f.project, f.id + '.superseded-old.jsonl'))
+    const scan = f.scan()
+    assert.equal(scan.records.length, 1); assert.equal(scan.records[0].conflict, false)
+    assert.deepEqual(scan.warnings, [])
+  } finally { f.dispose() }
+})
+
+test('Claude reader retains complete messages when the current snapshot ends with a partial record', () => {
+  const f = fixture()
+  try {
+    appendFileSync(f.path, '{"type":"user","message":{"content":"PARTIAL_NOT_RETURNED')
+    const location = f.scan().records[0].locations[0], page = readClaudeSessionContent(location)
+    assert.equal(page.total, 1)
+    assert.ok(page.warnings.some(warning => warning.includes('末尾')))
+    assert.ok(!JSON.stringify(page).includes('PARTIAL_NOT_RETURNED'))
+  } finally { f.dispose() }
+})
+
+test('Claude tool previews redact nested binary schemas while retaining ordinary data, source and text fields', () => {
+  const f = fixture()
+  try {
+    const binary = Buffer.from('BINARY_FIXTURE_NOT_TEXT').toString('base64')
+    writeFileSync(f.path, JSON.stringify({ ...f.event, type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Inspect', input: {
+      data: 'plain data searchable', source: 'plain source searchable', text: 'plain text searchable',
+      image: { type: 'image', source: { type: 'base64', media_type: 'image/png', data: binary } },
+      nested: [{ source: { type: 'base64', media_type: 'image/png', data: binary } }, { type: 'image', mimeType: 'image/png', data: binary }],
+      document: { type: 'document', source: { type: 'url', url: 'https://attachment.invalid/private-doc' } },
+      remote: { type: 'image_url', image_url: { url: 'data:image/png;base64,' + binary } },
+    } }] } }) + '\n')
+    const location = f.scan().records[0].locations[0], page = readClaudeSessionContent(location)
+    assert.ok(!JSON.stringify(page).includes(binary)); assert.ok(!JSON.stringify(page).includes('attachment.invalid'))
+    for (const query of ['plain data searchable', 'plain source searchable', 'plain text searchable']) assert.equal(readClaudeSessionContent(location, { query }).total, 1)
+    assert.equal(readClaudeSessionContent(location, { query: binary }).total, 0)
+    const search = scanClaudeCodeSessions(f.config, { contentQuery: binary })
+    assert.equal(search.records[0].locations[0].contentMatched, false)
+    assert.equal(search.complete, true)
+  } finally { f.dispose() }
+})
+
+test('deep tool inputs are bounded before serialization and are not projected for other reader pages', t => {
+  const f = fixture()
+  try {
+    const deep = '{"nested":'.repeat(2200) + '"HIDDEN_DEEP_TAIL"' + '}'.repeat(2200)
+    const tool = JSON.stringify({ ...f.event, type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Deep', input: '__DEEP_INPUT__' }] } }).replace('"__DEEP_INPUT__"', deep)
+    writeFileSync(f.path, JSON.stringify(f.event) + '\n' + tool + '\n')
+    const location = f.scan().records[0].locations[0], original = JSON.stringify
+    let projections = 0
+    const stringify = t.mock.method(JSON, 'stringify', function (...args: Parameters<typeof JSON.stringify>) {
+      let value = args[0], depth = 0
+      while (value && typeof value === 'object' && Object.hasOwn(value, 'nested')) { depth++; value = value.nested }
+      if (depth) { projections++; assert.ok(depth <= 16, 'Only the bounded projection can reach JSON.stringify') }
+      return Reflect.apply(original, JSON, args)
+    })
+    try {
+      assert.equal(readClaudeSessionContent(location, { pageSize: 1 }).total, 2)
+      assert.equal(projections, 0, 'Messages outside the current page do not stringify tool inputs')
+      const page = readClaudeSessionContent(location, { page: 2, pageSize: 1 })
+      assert.equal(projections, 1); assert.equal(page.messages[0].truncated, true)
+      assert.ok(page.warnings.some(warning => warning.includes('截断')))
+      const search = readClaudeSessionContent(location, { query: 'HIDDEN_DEEP_TAIL' })
+      assert.equal(search.total, 0); assert.ok(search.warnings.some(warning => warning.includes('搜索未包含')))
+    } finally { stringify.mock.restore() }
+    const search = scanClaudeCodeSessions(f.config, { contentQuery: 'HIDDEN_DEEP_TAIL' })
+    assert.equal(search.complete, true); assert.ok(search.warnings.some(warning => warning.includes('搜索未包含')))
+  } finally { f.dispose() }
+})
+
+test('wide and long tool input projections stay bounded and disclose search truncation', () => {
+  const f = fixture()
+  try {
+    const input = { list: Array.from({ length: 10_000 }, (_, index) => ({ value: String(index) })), long: 'x'.repeat(100_000) + 'TAIL_NOT_SEARCHABLE' }
+    writeFileSync(f.path, JSON.stringify({ ...f.event, type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Large', input }] } }) + '\n')
+    const location = f.scan().records[0].locations[0], page = readClaudeSessionContent(location, { pageSize: 1 })
+    assert.equal(page.messages[0].truncated, true)
+    assert.ok(page.messages[0].blocks[0].text.length <= 12_000)
+    const search = readClaudeSessionContent(location, { query: 'TAIL_NOT_SEARCHABLE' })
+    assert.equal(search.total, 0); assert.ok(search.warnings.some(warning => warning.includes('搜索未包含')))
+  } finally { f.dispose() }
+})
+
+test('Claude transcript project paths preserve significant whitespace instead of choosing another real directory', () => {
+  const f = fixture()
+  try {
+    const significant = f.cwd + ' '; mkdirSync(significant)
+    for (const field of ['cwd', 'projectPath', 'project_path']) {
+      const event: Record<string, unknown> = { ...f.event }; delete event.cwd; event[field] = significant
+      writeFileSync(f.path, JSON.stringify(event) + '\n')
+      const scan = f.scan(), row = scan.records[0], location = row.locations[0]
+      assert.equal(row.cwd, significant); assert.notEqual(row.cwd, f.cwd)
+      const preview = previewClaudeSessionResume(scan, { instanceId: f.instanceId, configDirectory: f.config, cwd: significant, sessionId: f.id, sourceId: location.sourceId })
+      assert.equal(preview.cwd, significant)
+      assert.throws(() => previewClaudeSessionResume(scan, { ...preview, cwd: f.cwd }), /不属于当前项目/)
+    }
+  } finally { f.dispose() }
+})
+
+test('Claude transcript project paths reject invalid controls or excessive length without cleaning them into another path', () => {
+  const f = fixture()
+  try {
+    for (const cwd of [f.cwd + '\u0000', f.cwd + '\n', f.cwd + 'x'.repeat(4096), 7]) {
+      writeFileSync(f.path, JSON.stringify({ ...f.event, cwd }) + '\n')
+      const scan = f.scan()
+      assert.equal(scan.records.length, 0); assert.equal(scan.complete, false)
+    }
   } finally { f.dispose() }
 })

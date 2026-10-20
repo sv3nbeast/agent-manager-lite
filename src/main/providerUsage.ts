@@ -1,7 +1,7 @@
 // Adapted from Cockpit ee816002: codex_model_provider_commands.rs and
 // modelProviderUsageService.ts. See THIRD_PARTY_NOTICES.md for provenance.
 import { accountInputSchema } from '../shared/types'
-import type { ProviderUsage, ProviderUsageWindow } from '../shared/providerUsage'
+import type { ProviderUsage, ProviderUsageState, ProviderUsageWindow } from '../shared/providerUsage'
 import { supportsProviderUsageQuery } from '../shared/providerUsage'
 import type { StoredAccount } from './store'
 import { HTTPError, JSONResponseError, object, requestJSON, type JSONRequest } from './network'
@@ -11,6 +11,26 @@ export class ProviderUsageUnavailable extends Error {
 }
 export class ProviderUsageRejected extends Error {
   constructor() { super('服务商拒绝额度查询，请检查密钥或套餐状态') }
+}
+/** Only fixed, credential-free transport diagnostics may reach saved usage. */
+export class ProviderUsageQueryError extends Error {
+  constructor(readonly reason: 'timeout' | 'connection') {
+    super(reason === 'timeout' ? '服务商额度查询超时，请稍后重试' : '服务商额度查询失败：连接或响应无效，请检查网络和代理设置')
+  }
+}
+type BillingIntegration = 'sub2api' | 'new_api'
+const rememberedIntegration = (usage: ProviderUsageState | undefined): BillingIntegration | undefined => {
+  if (usage?.unavailable) return undefined
+  const source = usage?.summary?.source
+  return source === 'sub2api' || source === 'new_api' ? source : undefined
+}
+
+/** Reuse only a billing contract, never another key's balance or credentials. */
+export function providerUsageIntegrationHint(provider: { keys: { id: string; usage?: ProviderUsageState }[] }, keyId: string): BillingIntegration | undefined {
+  const own = rememberedIntegration(provider.keys.find(key => key.id === keyId)?.usage)
+  if (own) return own
+  const sources = new Set(provider.keys.map(key => rememberedIntegration(key.usage)).filter((source): source is BillingIntegration => !!source))
+  return sources.size === 1 ? sources.values().next().value : undefined
 }
 const finite = (value: unknown): number | undefined => {
   const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN
@@ -160,7 +180,7 @@ export function sameUsageAccount(current: StoredAccount | undefined, account: St
     && (current.providerUsageRevision ?? 0) === (account.providerUsageRevision ?? 0)
 }
 
-export async function queryProviderUsage(account: StoredAccount, signal: AbortSignal, request: JSONRequest = requestJSON): Promise<ProviderUsage> {
+export async function queryProviderUsage(account: StoredAccount, signal: AbortSignal, request: JSONRequest = requestJSON, integrationHint?: BillingIntegration): Promise<ProviderUsage> {
   if (!supportsProviderUsageQuery(account)) throw new ProviderUsageUnavailable()
   const base = new URL(accountInputSchema.shape.baseUrl.parse(account.baseUrl))
   const integrationType = accountInputSchema.shape.integrationType.parse(account.integrationType) ?? 'auto'
@@ -178,7 +198,21 @@ export async function queryProviderUsage(account: StoredAccount, signal: AbortSi
     return value
   }
   const prefix = base.pathname.replace(/\/+$/, '')
-  const prefixes = prefix ? [prefix] : ['', '/v1']
+  const prefixes = prefix.endsWith('/v1') ? [prefix] : [prefix, `${prefix}/v1`]
+  const preferred = integrationType === 'auto' ? rememberedIntegration(account.providerUsage) ?? integrationHint : integrationType
+  const probes: { integration: BillingIntegration; prefix: string }[] = []
+  const addProbe = (integration: BillingIntegration, prefix: string) => {
+    if (!probes.some(probe => probe.integration === integration && probe.prefix === prefix)) probes.push({ integration, prefix })
+  }
+  // Sub2API documents /v1/usage. A root base is common for Anthropic model
+  // requests; visiting its dashboard/usage web pages first wastes the shared
+  // timeout before this API is reached. Keep tenant prefixes and old deployments.
+  if (preferred === 'sub2api') for (const path of prefix.endsWith('/v1') ? [prefix] : [`${prefix}/v1`, prefix]) addProbe('sub2api', path)
+  if (preferred === 'new_api') for (const path of prefixes) addProbe('new_api', path)
+  for (const path of prefixes) {
+    if (integrationType !== 'sub2api') addProbe('new_api', path)
+    if (integrationType !== 'new_api') addProbe('sub2api', path)
+  }
   const result = (summary: ProviderUsage): ProviderUsage => {
     for (const key of ['unit','planName','modelName'] as const) if (summary[key]?.includes(account.credentials.apiKey!)) delete summary[key]
     return summary
@@ -193,8 +227,8 @@ export async function queryProviderUsage(account: StoredAccount, signal: AbortSi
       throw new ProviderUsageUnavailable()
     }
     if (['open.bigmodel.cn','bigmodel.cn','api.z.ai','z.ai'].includes(base.hostname)) return result(parseZhipuUsage(await get('/api/monitor/usage/quota/limit',true)))
-    for (const path of prefixes) {
-      if (integrationType !== 'sub2api') try {
+    for (const { integration, prefix: path } of probes) {
+      if (integration === 'new_api') try {
         const subscription = await get(`${path}/dashboard/billing/subscription`)
         // Reject generic HTTP 200/error documents before requesting more endpoints.
         if (!known([subscription.hard_limit_usd, subscription.soft_limit_usd, subscription.system_hard_limit_usd].map(finite))) throw new ProviderUsageUnavailable()
@@ -209,15 +243,15 @@ export async function queryProviderUsage(account: StoredAccount, signal: AbortSi
         }
         return result(parseNewAPIUsage(subscription, usage, tokenUsage))
       } catch (error) { if (!missing(error)) throw error }
-      if (integrationType !== 'new_api') try { return result(parseSub2APIUsage(await get(`${path}/usage`))) }
+      if (integration === 'sub2api') try { return result(parseSub2APIUsage(await get(`${path}/usage`))) }
       catch (error) { if (!missing(error)) throw error }
     }
     throw new ProviderUsageUnavailable()
   } catch (error) {
     if (signal.aborted) throw new Error('操作已取消')
-    if (timeout.aborted) throw new Error('服务商额度查询超时，请稍后重试')
+    if (timeout.aborted) throw new ProviderUsageQueryError('timeout')
     if (error instanceof HTTPError || error instanceof ProviderUsageUnavailable || error instanceof ProviderUsageRejected) throw error
     // Transport errors and invalid JSON never echo upstream text/credentials.
-    throw new Error('服务商额度查询失败：连接或响应无效')
+    throw new ProviderUsageQueryError('connection')
   }
 }

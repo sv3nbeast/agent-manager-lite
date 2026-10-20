@@ -13,7 +13,7 @@ import {instanceInputSchema} from '../src/shared/instances'
 
 const when='2026-10-01T08:00:00.000Z'
 function fixture(t:{after(fn:()=>void):void}){
-  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-sessions-'))),store=new Store(join(root,'manager'),{encrypt:text=>Buffer.from(text),decrypt:raw=>raw.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store)
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-sessions-'))),store=new Store(join(root,'manager'),{encrypt:text=>Buffer.from(text),decrypt:raw=>raw.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null})
   const source=(name:string)=>{const home=join(root,name);mkdirSync(home);const target=configs.register(home);return {home,target}}
   const scan=(extra:Record<string,unknown>={})=>catalog.scan({runId:randomUUID(),titleQuery:'',contentQuery:'',kind:'all',...extra})
   t.after(()=>{catalog.stop();rmSync(root,{recursive:true,force:true})})
@@ -370,15 +370,20 @@ test('Claude rows retain each conflicting project source while all Codex mutatio
   assert.ok(tokens.every(value=>!value.tokens&&value.error?.includes('尚未接入')))
 })
 
-test('Claude title filters preserve source counts and raw content filters explicitly omit unsupported Claude search',async t=>{
+test('Claude title and body filters preserve source counts and search native content',async t=>{
   const f=fixture(t),id=randomUUID(),a=claudeSource(f,'claude-search',id)
   let page=await f.scan({targetId:a.id,titleQuery:'CLAUDE-SEARCH'})
+  assert.equal(page.total,1)
+  page=await f.scan({targetId:a.id,titleQuery:id.toUpperCase()})
   assert.equal(page.total,1)
   page=await f.scan({targetId:a.id,titleQuery:'not-present'})
   assert.equal(page.total,0);assert.equal(page.sourceCounts?.[a.id],1)
   page=await f.scan({targetId:a.id,contentQuery:'ACCOUNT_CONVERSATION'})
-  assert.equal(page.total,0)
-  assert.ok(page.warnings.some(warning=>warning.includes('正文搜索未包含')))
+  assert.equal(page.total,1)
+  assert.equal(page.items[0].capabilities?.contentSearch,true)
+  assert.deepEqual(page.warnings,[])
+  page=await f.scan({targetId:a.id,contentQuery:'not-present'})
+  assert.equal(page.total,0);assert.equal(page.sourceCounts?.[a.id],1)
 })
 
 test('Claude opening rechecks the instance account binding, revision and safe managed directory',async t=>{
@@ -401,4 +406,146 @@ test('cancelled Claude scans never publish a partial catalog',async t=>{
   f.catalog.cancel(runId)
   await assert.rejects(pending,/已取消/)
   assert.throws(()=>f.catalog.page({snapshotId:before.snapshotId,page:1}),/已更新/)
+})
+
+test('unified client and project filters include only requested sources and retain full source counts',async t=>{
+  const f=fixture(t),codex=f.source('filtered-codex'),a=claudeSource(f,'filtered-claude',randomUUID())
+  rollout(codex.home,randomUUID())
+  let page=await f.scan({clientType:'claude_code',projectQuery:'CLAUDE-WORKSPACE'})
+  assert.equal(page.total,1);assert.equal(page.items[0].locations[0].targetId,a.id)
+  assert.equal(page.sourceCounts?.[a.id],1)
+  page=await f.scan({clientType:'codex',projectQuery:'/fixture/project'})
+  assert.equal(page.total,1);assert.equal(page.items[0].clientType,'codex')
+  page=await f.scan({clientType:'claude_code',projectQuery:'not-present'})
+  assert.equal(page.total,0);assert.equal(page.sourceCounts?.[a.id],1)
+  page=await f.scan({clientType:'codex',targetId:a.id})
+  assert.equal(page.total,0)
+})
+
+test('Claude body reading is scoped to a selected snapshot and retains all existing files',async t=>{
+  const f=fixture(t),id=randomUUID(),a=claudeSource(f,'reader-a',id),b=claudeSource(f,'reader-b',id),before=hashes(f.root)
+  const page=await f.scan(),row=page.items.find(record=>record.locations[0].targetId===a.id)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:a.id}
+  const content=await f.catalog.content({...selection,pageSize:1})
+  assert.equal(content.sourceSessionId,id);assert.equal(content.title,'reader-a history')
+  assert.equal(content.total,1);assert.equal(content.messages[0].blocks[0].text,'ACCOUNT_CONVERSATION_BODY_NOT_RETURNED')
+  assert.equal(content.sourceName,page.sources?.find(source=>source.id===a.id)?.name)
+  await assert.rejects(f.catalog.content({...selection,targetId:b.id}),/不属于/)
+  assert.deepEqual(hashes(f.root),before)
+  f.store.transaction(state=>{state.instances!.find(profile=>profile.id===a.id)!.revision++})
+  await assert.rejects(f.catalog.content(selection),/实例已变化/)
+  f.store.transaction(state=>{state.instances=[a.profile,b.profile]})
+  appendFileSync(a.path,JSON.stringify({type:'user',sessionId:id,cwd:a.cwd,message:{content:'next message'}})+'\n')
+  await assert.rejects(f.catalog.content(selection),/来源已变化/)
+  await f.scan()
+  await assert.rejects(f.catalog.content(selection),/列表已更新/)
+})
+
+test('Claude native and API Desktop list only their isolated local Code transcripts and do not offer CLI resume',async t=>{
+  const f=fixture(t),a=claudeSource(f,'desktop-api',randomUUID()),b=claudeSource(f,'desktop-login',randomUUID())
+  f.store.transaction(state=>{
+    state.instances=state.instances!.map(profile=>({...profile,launchMode:'desktop',...(profile.id===b.id?{connectionMode:'client_login',accountId:'',model:''}:{})}))
+  })
+  for(const source of [a,b]){
+    const remote=join(source.home,'projects','ssh-sessions'),cloud=join(f.store.directory,'instances',source.id,'desktop','local-agent-mode-sessions','account','task','.claude','projects','cloud')
+    mkdirSync(remote,{recursive:true});mkdirSync(cloud,{recursive:true})
+    writeFileSync(join(remote,randomUUID()+'.jsonl'),'REMOTE_BODY_MUST_NOT_BE_PARSED')
+    writeFileSync(join(cloud,randomUUID()+'.jsonl'),'CLOUD_BODY_MUST_NOT_BE_PARSED')
+  }
+  const page=await f.scan({clientType:'claude_code'})
+  assert.equal(page.total,2);assert.deepEqual(page.warnings,[])
+  for(const row of page.items){
+    assert.equal(row.launchMode,'desktop');assert.equal(row.capabilities?.content,true);assert.equal(row.capabilities?.resume,false)
+    assert.match(row.resumeBlockedReason!,/Claude Desktop/)
+    const selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId}
+    assert.equal((await f.catalog.content(selection)).total,1)
+    await assert.rejects(f.catalog.claudeResume(selection),/Claude Desktop/)
+  }
+})
+
+test('Claude resume plans bind instance revision, original project and source before every launch',async t=>{
+  const f=fixture(t),a=claudeSource(f,'resume-a',randomUUID()),b=claudeSource(f,'resume-b',randomUUID())
+  const page=await f.scan(),row=page.items.find(record=>record.locations[0].targetId===a.id)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:a.id}
+  assert.equal(row.capabilities?.resume,true)
+  const preview=await f.catalog.claudeResume(selection)
+  assert.equal(preview.instanceId,a.id);assert.equal(preview.instanceRevision,a.profile.revision);assert.equal(preview.cwd,a.cwd)
+  assert.equal(preview.profileFingerprint.length,64);assert.equal(preview.sourceId.length,64)
+  assert.deepEqual(preview.args,['--resume',row.sourceSessionId])
+  await assert.rejects(f.catalog.claudeResume({...selection,targetId:b.id}),/不属于/)
+  f.store.transaction(state=>{state.instances!.find(profile=>profile.id===a.id)!.accountId=randomUUID()})
+  await assert.rejects(f.catalog.claudeResume(selection),/实例已变化/)
+  f.store.transaction(state=>{state.instances=[a.profile,b.profile]})
+  const duplicate=join(a.home,'projects','new-copy');mkdirSync(duplicate);writeFileSync(join(duplicate,row.sourceSessionId+'.jsonl'),readFileSync(a.path))
+  await assert.rejects(f.catalog.claudeResume(selection),/冲突/)
+})
+
+test('Claude resume is disabled while running or when the original workspace has disappeared',async t=>{
+  const f=fixture(t),a=claudeSource(f,'resume-state',randomUUID())
+  let running=true
+  const catalog=new SessionCatalog(f.store,id=>id===a.id&&running,{defaultClaudeDirectory:null})
+  t.after(()=>catalog.stop())
+  let page=await catalog.scan({runId:randomUUID(),targetId:a.id}),selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id}
+  assert.equal(page.items[0].capabilities?.resume,false)
+  await assert.rejects(catalog.claudeResume(selection),/正在运行/)
+  running=false
+  assert.equal((await catalog.claudeResume(selection)).instanceId,a.id)
+  rmSync(a.cwd,{recursive:true})
+  page=await catalog.scan({runId:randomUUID(),targetId:a.id});selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id}
+  assert.equal(page.items[0].capabilities?.resume,false);assert.match(page.items[0].resumeBlockedReason!,/项目目录不可用/)
+  await assert.rejects(catalog.claudeResume(selection),/ENOENT/)
+})
+
+test('default Claude source is discovered only for an existing safe native projects directory',async t=>{
+  const f=fixture(t),directory=join(f.root,'default-claude'),catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory})
+  t.after(()=>catalog.stop())
+  let page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
+  assert.ok(!page.sources?.some(source=>source.clientType==='claude_code'))
+  mkdirSync(directory)
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
+  assert.ok(!page.sources?.some(source=>source.clientType==='claude_code'))
+  const external=join(f.root,'outside-projects');mkdirSync(external);symlinkSync(external,join(directory,'projects'))
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
+  assert.ok(!page.sources?.some(source=>source.clientType==='claude_code'))
+  rmSync(join(directory,'projects'));mkdirSync(join(directory,'projects'))
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
+  const source=page.sources?.find(source=>source.clientType==='claude_code')
+  assert.equal(source?.role,'default');assert.equal(source?.directory,directory)
+  assert.equal(source?.managed,false);assert.equal(source?.readOnly,true)
+  assert.equal(page.sourceCounts?.[source!.id],0)
+})
+
+test('default Claude conversations remain separate from managed instances and cannot inherit credentials or resume',async t=>{
+  const f=fixture(t),sessionId=randomUUID(),instance=claudeSource(f,'managed',sessionId),directory=join(f.root,'default-claude'),project=join(directory,'projects','default-project')
+  mkdirSync(project,{recursive:true})
+  const path=join(project,sessionId+'.jsonl')
+  writeFileSync(path,JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Default local conversation'}})+'\n')
+  writeFileSync(join(directory,'.credentials.json'),JSON.stringify({accessToken:'DEFAULT_CREDENTIAL_MUST_NOT_ENTER_CATALOG'}))
+  const before=hashes(f.root),state=f.store.read(),catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory})
+  t.after(()=>catalog.stop())
+  const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
+  assert.equal(page.total,2)
+  const source=page.sources!.find(source=>source.clientType==='claude_code'&&source.role==='default')!,row=page.items.find(record=>record.locations[0].targetId===source.id)!
+  assert.notEqual(row.id,page.items.find(record=>record.locations[0].targetId===instance.id)!.id)
+  assert.equal(row.sourceSessionId,sessionId);assert.equal(row.capabilities?.resume,false);assert.match(row.resumeBlockedReason!,/默认目录/)
+  const selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:source.id}
+  assert.equal(await catalog.location(selection),path)
+  assert.equal((await catalog.content(selection)).messages[0].blocks[0].text,'Default local conversation')
+  await assert.rejects(catalog.claudeResume(selection),/未绑定/)
+  assert.deepEqual(f.store.read(),state);assert.deepEqual(hashes(f.root),before)
+  assert.ok(!JSON.stringify(page).includes('DEFAULT_CREDENTIAL'))
+  const moved=directory+'-old';renameSync(directory,moved);mkdirSync(project,{recursive:true});writeFileSync(path,readFileSync(join(moved,'projects','default-project',sessionId+'.jsonl')))
+  await assert.rejects(catalog.content(selection),/已被替换|已变化/)
+})
+
+test('default Claude duplicate IDs retain independent files and stale or linked roots cannot be read',async t=>{
+  const f=fixture(t),directory=join(f.root,'default-claude'),project=join(directory,'projects','one'),other=join(directory,'projects','two'),sessionId=randomUUID()
+  mkdirSync(project,{recursive:true});mkdirSync(other)
+  const body=JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Default history'}})+'\n'
+  for(const parent of [project,other])writeFileSync(join(parent,sessionId+'.jsonl'),body)
+  const catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
+  const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
+  assert.equal(page.total,2);assert.ok(page.items.every(row=>row.locations[0].ambiguous))
+  const selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:page.items[0].locations[0].targetId}
+  assert.equal((await catalog.content(selection)).total,1)
+  renameSync(directory,directory+'-moved');symlinkSync(directory+'-moved',directory)
+  await assert.rejects(catalog.content(selection),/目录已变化/)
 })

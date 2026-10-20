@@ -19,7 +19,7 @@ import {textHash} from '../src/main/sessionTransferFiles'
 function fixture(t:{after(fn:()=>void|Promise<void>):void}){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-legacy-trash-'))),primary=join(root,'cockpit-data','cockpit-tools-codex-session-trash'),legacy=join(root,'.Trash','cockpit-tools-codex-session-trash');mkdirSync(primary,{recursive:true});mkdirSync(legacy,{recursive:true})
   const store=new Store(join(root,'manager'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),a=join(root,'target-a'),b=join(root,'target-b');mkdirSync(a);mkdirSync(b)
-  const targets=[configs.register(a),configs.register(b)],catalog=new SessionCatalog(store),binary=join(root,'codex');writeFileSync(binary,Buffer.from('cffaedfe00000000','hex'),{mode:0o700})
+  const targets=[configs.register(a),configs.register(b)],catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null}),binary=join(root,'codex');writeFileSync(binary,Buffer.from('cffaedfe00000000','hex'),{mode:0o700})
   const apps=[{id:'fixture',name:'Fixture',kind:'cli' as const,path:binary}]
   let calls=0,now=Date.now(),busy=false
   const runtime:TrashRuntime={plan:async()=>{calls++;return []},remove:async()=>{calls++;return{deletedIds:[],failedIds:[]}},verify:async()=>{calls++},rebuild:async()=>{calls++}}

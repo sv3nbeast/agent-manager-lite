@@ -53,7 +53,7 @@ test('manual quota integration uses only its protocol on a real dual-interface h
   for(const type of ['sub2api','new_api'] as const){
     paths.length=0
     await assert.rejects(queryProviderUsage(account(new URL(base).origin,type),new AbortController().signal),ProviderUsageUnavailable)
-    assert.deepEqual(paths,type==='sub2api'?['/usage','/v1/usage']:['/dashboard/billing/subscription','/v1/dashboard/billing/subscription'])
+    assert.deepEqual(paths,type==='sub2api'?['/v1/usage','/usage']:['/dashboard/billing/subscription','/v1/dashboard/billing/subscription'])
   }
   status=401;paths.length=0
   await assert.rejects(queryProviderUsage(account(base,'sub2api'),new AbortController().signal),/HTTP 401/)

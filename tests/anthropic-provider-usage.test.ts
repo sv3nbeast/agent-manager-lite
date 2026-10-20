@@ -108,6 +108,128 @@ test('one provider can query mixed OpenAI and Anthropic library keys without lin
   assert.deepEqual(new Set(requests.map(req => req.auth)), new Set(['Bearer fixture-openai', 'Bearer fixture-anthropic']))
 })
 
+test('an Anthropic library key reuses the provider billing contract and goes straight to Sub2API without reusing another key balance', async t => {
+  const requests: { path: string; auth?: string }[] = []
+  const base = await server(t, (req, res) => {
+    requests.push({ path: req.url!, auth: req.headers.authorization })
+    if (req.url === '/v1/usage') json(res, { remaining: 4, unit: 'USD' })
+    else res.writeHead(404).end()
+  })
+  const f = fixture(t, [])
+  mutateProvider(f.store, { action: 'create', details: { name: 'Shared root Sub2API', baseUrl: base, models: [], integrationType: 'auto' } })
+  const provider = () => f.store.read().providers![0]
+  for (const input of [
+    { name: 'OpenAI', apiKey: 'fixture-openai', protocol: 'openai_responses', credentialKind: 'openai_api_key' },
+    { name: 'Anthropic', apiKey: 'fixture-anthropic', protocol: 'anthropic_messages', credentialKind: 'anthropic_api_key' }
+  ]) mutateProvider(f.store, { action: 'addKey', id: provider().id, revision: provider().revision, models: ['any-model'], createConnection: true, ...input })
+  f.store.transaction(state => {
+    state.providers![0].keys[0].usage = { checkedAt: 1, summary: { source: 'sub2api', updatedAt: 1, remaining: 900, unit: 'USD' } }
+  })
+  const usage = new ProviderUsageQueries(f.store)
+  t.after(() => usage.stop())
+  usage.start({ providerId: provider().id, revision: provider().revision, keyIds: [provider().keys[1].id] })
+  await usage.settled()
+  assert.equal(usage.snapshot().failed, 0)
+  assert.deepEqual(requests, [{ path: '/v1/usage', auth: 'Bearer fixture-anthropic' }])
+  assert.deepEqual(provider().keys.map(key => key.usage?.summary?.remaining), [900, 4])
+  assert.deepEqual(provider().keys.map(key => key.protocol), ['openai_responses', 'anthropic_messages'])
+  assert.equal(f.store.read().accounts.every(value => value.providerUsage === undefined), true)
+  assert.equal(provider().integrationType, 'auto')
+})
+
+test('known Sub2API queries preserve tenant paths and fall back to legacy root usage when the versioned endpoint is missing', async t => {
+  for (const prefix of ['', '/tenant', '/tenant/v1']) {
+    const paths: string[] = []
+    const base = await server(t, (req, res) => {
+      paths.push(req.url!)
+      if (req.url === `${prefix}/usage`) json(res, { remaining: 6 })
+      else res.writeHead(404).end()
+    })
+    const result = await queryProviderUsage({ ...account(base + prefix), integrationType: 'sub2api' }, new AbortController().signal)
+    assert.equal(result.remaining, 6)
+    assert.deepEqual(paths, prefix.endsWith('/v1') ? [`${prefix}/usage`] : [`${prefix}/v1/usage`, `${prefix}/usage`])
+  }
+})
+
+test('a stale Sub2API hint falls back to automatic discovery only for absent endpoints and never repeats a request', async t => {
+  const paths: string[] = []
+  const base = await server(t, (req, res) => {
+    paths.push(req.url!)
+    if (req.url === '/dashboard/billing/subscription') json(res, { hard_limit_usd: 8 })
+    else if (req.url === '/dashboard/billing/usage') json(res, { total_usage: 300 })
+    else res.writeHead(404).end()
+  })
+  const a = account(base)
+  a.providerUsage = { checkedAt: 1, summary: { source: 'sub2api', updatedAt: 1, remaining: 50 } }
+  const result = await queryProviderUsage(a, new AbortController().signal)
+  assert.equal(result.source, 'new_api')
+  assert.equal(result.remaining, 5)
+  assert.deepEqual(paths, ['/v1/usage', '/usage', '/dashboard/billing/subscription', '/dashboard/billing/usage', '/api/usage/token/'])
+})
+
+test('a discovered billing contract preserves authentication, rate-limit and server failures instead of probing around them', async t => {
+  const paths: string[] = []
+  let status = 401
+  const base = await server(t, (req, res) => { paths.push(req.url!); res.writeHead(status).end('fixture-anthropic_api_key') })
+  const a = account(base)
+  a.providerUsage = { checkedAt: 1, summary: { source: 'sub2api', updatedAt: 1, remaining: 50 } }
+  for (const code of [401, 403, 429, 500]) {
+    paths.length = 0; status = code
+    await assert.rejects(queryProviderUsage(a, new AbortController().signal), error => {
+      assert.match(String(error), new RegExp(`HTTP ${code}`))
+      assert.equal(String(error).includes('fixture-anthropic_api_key'), false)
+      return true
+    })
+    assert.deepEqual(paths, ['/v1/usage'])
+  }
+})
+
+test('first automatic discovery preserves a tenant path before trying its versioned Sub2API endpoint',async t=>{
+  const paths:string[]=[]
+  const base=await server(t,(req,res)=>{
+    paths.push(req.url!)
+    assert.equal(req.headers.authorization,'Bearer fixture-anthropic_api_key')
+    if(req.url==='/tenant/v1/usage')json(res,{remaining:17,unit:'USD'})
+    else res.writeHead(404).end()
+  })
+  const summary=await queryProviderUsage(account(base+'/tenant'),new AbortController().signal)
+  assert.equal(summary.source,'sub2api');assert.equal(summary.remaining,17)
+  assert.ok(paths.includes('/tenant/v1/usage'))
+  assert.ok(paths.every(path=>path.startsWith('/tenant/')))
+  assert.equal(new Set(paths).size,paths.length)
+})
+
+test('conflicting key histories do not impose one supplier billing contract on an unqueried key', async t => {
+  const paths: string[] = []
+  const base = await server(t, (req, res) => {
+    paths.push(req.url!)
+    if (req.url === '/dashboard/billing/subscription') json(res, { hard_limit_usd: 8 })
+    else if (req.url === '/dashboard/billing/usage') json(res, { total_usage: 300 })
+    else if (req.url === '/api/usage/token/') res.writeHead(404).end()
+    else res.writeHead(403).end()
+  })
+  const f = fixture(t, [])
+  mutateProvider(f.store, { action: 'create', details: { name: 'Mixed billing provider', baseUrl: base, models: [], integrationType: 'auto' } })
+  const provider = () => f.store.read().providers![0]
+  for (const name of ['Sub2API', 'New API', 'Unqueried']) mutateProvider(f.store, {
+    action: 'addKey', id: provider().id, revision: provider().revision, name, apiKey: `fixture-${name}`, models: ['any-model'],
+    protocol: 'anthropic_messages', credentialKind: 'anthropic_api_key'
+  })
+  f.store.transaction(state => {
+    for (const [index, source] of (['sub2api', 'new_api'] as const).entries()) {
+      state.providers![0].keys[index].usage = { checkedAt: 1, summary: { source, updatedAt: 1, remaining: 900 } }
+    }
+  })
+  const usage = new ProviderUsageQueries(f.store)
+  t.after(() => usage.stop())
+  usage.start({ providerId: provider().id, revision: provider().revision, keyIds: [provider().keys[2].id] })
+  await usage.settled()
+  assert.equal(usage.snapshot().failed, 0)
+  assert.equal(provider().keys[2].usage?.summary?.source, 'new_api')
+  assert.equal(provider().keys[2].usage?.summary?.remaining, 5)
+  assert.deepEqual(paths, ['/dashboard/billing/subscription', '/dashboard/billing/usage', '/api/usage/token/'])
+})
+
 test('provider queries keep Claude subscriptions and cloud/profile credentials on their separate usage contracts', async t => {
   const original = account('https://fixture.invalid/v1')
   let calls = 0

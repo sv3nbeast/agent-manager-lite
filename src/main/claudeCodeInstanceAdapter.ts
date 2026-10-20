@@ -372,7 +372,7 @@ const foregroundValues=new Set(['--output-format','--input-format','--permission
 const managedCommands=new Set(['auth','login','logout','setup-token','install','update','upgrade','mcp','remote-control','config','desktop','web','doctor','plugin','plugins','serve','gateway','purge','agents','attach','respawn','auto-mode','import','logs','rm','stop','kill','ultrareview'])
 
 /** Validate options and the optional prompt without mistaking option values for commands. */
-export function validateClaudeCodeCliArgs(args: readonly string[], advertisedCommands: readonly string[]=[]): void {
+export function validateClaudeCodeCliArgs(args: readonly string[], advertisedCommands: readonly string[]=[], options: {interactiveResume?:boolean}={}): void {
   let prompt=false,endOfOptions=false
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]
@@ -380,6 +380,7 @@ export function validateClaudeCodeCliArgs(args: readonly string[], advertisedCom
     if(!endOfOptions&&arg==='--'){endOfOptions=true;continue}
     if(!endOfOptions&&arg.startsWith('-')){
       const separator=arg.indexOf('='),name=separator<0?arg:arg.slice(0,separator)
+      if(options.interactiveResume&&['--print','-p','--help','-h','--version','-v','--no-session-persistence','--input-format','--output-format'].includes(name))throw new Error('恢复会话需要交互终端，请先移除实例附加参数中的打印、退出或禁用历史选项')
       if(foregroundFlags.has(name)&&separator<0)continue
       if(foregroundValues.has(name)){
         const value=separator<0?args[++index]:arg.slice(separator+1)
@@ -389,6 +390,7 @@ export function validateClaudeCodeCliArgs(args: readonly string[], advertisedCom
       throw new Error('Claude Code 参数未通过前台实例边界验证；模型、配置、会话及启动方式请使用实例设置')
     }
     if(managedCommands.has(arg)||advertisedCommands.includes(arg))throw new Error('受管 Claude 实例不能执行登录、更新或管理子命令，请直接启动会话')
+    if(options.interactiveResume)throw new Error('恢复会话不会自动发送预设提示词，请先移除实例附加参数中的提示词')
     if(prompt||!arg.trim())throw new Error('Claude Code 参数只允许一个完整提示词；包含空格时请整体引用')
     prompt=true
   }

@@ -1,21 +1,25 @@
 import {createHash,randomUUID} from 'node:crypto'
 import {lstat} from 'node:fs/promises'
-import {realpathSync,type Stats} from 'node:fs'
-import {basename,relative,sep} from 'node:path'
+import {lstatSync,realpathSync,type Stats} from 'node:fs'
+import {homedir} from 'node:os'
+import {basename,isAbsolute,join,relative,resolve,sep} from 'node:path'
 import {z} from 'zod'
 import {Store} from './store'
 import {ClientConfigs} from './clientConfig'
-import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,sessionStatsSchema,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult,type SessionSource} from '../shared/sessions'
+import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,sessionContentSchema,sessionStatsSchema,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult,type SessionSource,type SessionContentPage} from '../shared/sessions'
 import {openSessionFile,rolloutFiles,firstSessionEvent,sessionActivity,sessionTokens,sessionContains,sessionDigest,cleanText,sessionIdentifier,safeSessionPath} from './sessionFiles'
 import {readSessionDisplay,readSessionRolloutIndex,displayTitle,displayProject} from './sessionDisplay'
 import {probeClientDaemon} from './clientDaemon'
-import {instanceHomePath,validateExternalHome} from './instancePaths'
-import {scanClaudeCodeSessionsAsync,verifyClaudeSessionLocation,type ClaudeSessionLocation} from './claudeCodeSessions'
+import {instanceHomePath,pathContains,validateExternalHome} from './instancePaths'
+import {scanClaudeCodeSessionsAsync,verifyClaudeSessionLocation,readClaudeSessionContent,previewClaudeSessionResume,type ClaudeSessionLocation,type ClaudeSessionRecord,type ClaudeSessionResumePreview} from './claudeCodeSessions'
 import {isClaudeDesktopProfile} from '../shared/instances'
 
 interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;record:SessionRecord;duplicateOf?:string}
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
-interface ClaudeSourceFile {target:SessionSource;profile:string;location:ClaudeSessionLocation;sessionId:string}
+interface ClaudeSourceFile {target:SessionSource;profile:string;location:ClaudeSessionLocation;sessionId:string;record:ClaudeSessionRecord}
+export interface CatalogClaudeResumePreview extends ClaudeSessionResumePreview {instanceRevision:number;profileFingerprint:string}
+export interface SessionCatalogOptions {defaultClaudeDirectory?:string|null}
+const defaultClaudeSourceId='4135f4e6-6db5-4bd4-95f7-06f4c667341a'
 interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;claudeFiles:Map<string,ClaudeSourceFile>;warnings:string[];sourceCounts:Record<string,number>;sources:SessionSource[]}
 class SessionLimitError extends Error {}
 export const classifySession=(title:string,cwd:string):SessionKind=>{
@@ -30,23 +34,47 @@ export class SessionCatalog {
   private statsController?:AbortController
   private readonly configs:ClientConfigs
   private readonly root:string
-  constructor(private readonly store:Store,private readonly running:(id:string)=>boolean=()=>false){this.configs=new ClientConfigs(store);this.root=realpathSync(store.directory)}
-  private claudeTargets():SessionSource[]{
-    return (this.store.read().instances??[]).filter(profile=>profile.clientType==='claude_code'&&!isClaudeDesktopProfile(profile)).map(profile=>({
-      id:profile.id,name:'实例 · '+profile.name+' · Claude Code',directory:instanceHomePath(this.root,profile),managed:!profile.externalHome,role:'instance',clientType:'claude_code',readOnly:true,
-      description:'Claude Code 历史只读预览；在对应实例内使用 /resume 恢复对话。',
-    }))
+  private readonly defaultClaudeDirectory:string|null
+  constructor(private readonly store:Store,private readonly running:(id:string)=>boolean=()=>false,options:SessionCatalogOptions={}){
+    this.configs=new ClientConfigs(store);this.root=realpathSync(store.directory)
+    this.defaultClaudeDirectory=options.defaultClaudeDirectory===undefined?join(homedir(),'.claude'):options.defaultClaudeDirectory
+    if(this.defaultClaudeDirectory!==null&&(!isAbsolute(this.defaultClaudeDirectory)||resolve(this.defaultClaudeDirectory)!==this.defaultClaudeDirectory))throw new Error('默认 Claude 会话目录必须是规范绝对路径')
   }
-  private async claudeTargetIdentity(target:SessionSource):Promise<{profile:string;root?:{device:number;inode:number}}>{
-    const profile=this.store.read().instances?.find(profile=>profile.id===target.id&&profile.clientType==='claude_code'&&!isClaudeDesktopProfile(profile))
+  private defaultClaudeTarget():SessionSource|undefined {
+    const directory=this.defaultClaudeDirectory
+    if(!directory)return
+    // Discover only the native local transcript tree. Neither credentials nor
+    // global Claude settings are needed to establish this read-only source.
+    try{
+      const root=lstatSync(directory),projects=lstatSync(join(directory,'projects'))
+      if(root.isSymbolicLink()||!root.isDirectory()||projects.isSymbolicLink()||!projects.isDirectory()||realpathSync(directory)!==directory)return
+      if(this.store.read().instances?.some(profile=>profile.clientType==='claude_code'&&(pathContains(directory,instanceHomePath(this.root,profile))||pathContains(instanceHomePath(this.root,profile),directory))))return
+      return {id:defaultClaudeSourceId,name:'默认 Claude Code 目录',directory,managed:false,role:'default',clientType:'claude_code',launchMode:'cli',readOnly:true,description:'本机默认目录中的本地 Claude Code 会话；账号和运行方式由原客户端管理。'}
+    }catch{return}
+  }
+  private claudeTargets():SessionSource[]{
+    const initial=this.defaultClaudeTarget()
+    return [...(initial?[initial]:[]),...(this.store.read().instances??[]).filter(profile=>profile.clientType==='claude_code').map(profile=>({
+      id:profile.id,name:'实例 · '+profile.name+(isClaudeDesktopProfile(profile)?' · Claude Desktop Code':' · Claude Code CLI'),directory:instanceHomePath(this.root,profile),managed:!profile.externalHome,role:'instance',clientType:'claude_code',readOnly:true,launchMode:isClaudeDesktopProfile(profile)?'desktop':'cli',
+      description:isClaudeDesktopProfile(profile)?'仅显示此实例已保存的本地 Code 会话；Chat、Cowork 和远程会话由原客户端管理。':'浏览、搜索本地 Claude Code 会话；可在停止的原实例中恢复对话。',
+    } satisfies SessionSource))]
+  }
+  private async claudeTargetIdentity(target:SessionSource):Promise<{profile:string;revision:number;root?:{device:number;inode:number}}>{
+    if(target.role==='default'){
+      const current=this.defaultClaudeTarget()
+      if(!current||current.id!==target.id||current.directory!==target.directory)throw new Error('默认 Claude Code 会话目录已变化，请刷新列表')
+      const stat=lstatSync(current.directory)
+      return {profile:JSON.stringify(current),revision:0,root:{device:stat.dev,inode:stat.ino}}
+    }
+    const profile=this.store.read().instances?.find(profile=>profile.id===target.id&&profile.clientType==='claude_code')
     if(!profile||instanceHomePath(this.root,profile)!==target.directory)throw new Error('Claude Code 会话来源实例已变化')
     if(profile.externalHome)validateExternalHome(this.root,profile.externalHome)
     try{
       const stat=profile.externalHome?await lstat(target.directory):await safeSessionPath(this.root,target.directory)
       if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error('Claude Code 实例目录不是稳定的普通目录')
-      return {profile:JSON.stringify(profile),root:{device:stat.dev,inode:stat.ino}}
+      return {profile:JSON.stringify(profile),revision:profile.revision,root:{device:stat.dev,inode:stat.ino}}
     }catch(error){
-      if(!profile.externalHome&&(error as NodeJS.ErrnoException).code==='ENOENT')return {profile:JSON.stringify(profile)}
+      if(!profile.externalHome&&(error as NodeJS.ErrnoException).code==='ENOENT')return {profile:JSON.stringify(profile),revision:profile.revision}
       throw error
     }
   }
@@ -55,8 +83,8 @@ export class SessionCatalog {
   stop():void{this.scanning?.controller.abort();this.statsController?.abort()}
   async scan(raw:unknown):Promise<SessionPage>{
     const input=sessionScanSchema.parse(raw),sources:SessionSource[]=[...this.configs.targets().map(target=>({...target,clientType:'codex' as const})),...this.claudeTargets()]
-    const selectedSources=sources.filter(target=>!input.targetId||input.targetId===target.id),targets=selectedSources.filter(target=>target.clientType==='codex')
-    if(input.targetId&&!selectedSources.length)throw new Error('会话来源目录不存在')
+    if(input.targetId&&!sources.some(target=>target.id===input.targetId))throw new Error('会话来源目录不存在')
+    const selectedSources=sources.filter(target=>(!input.targetId||input.targetId===target.id)&&(input.clientType==='all'||input.clientType===target.clientType)),targets=selectedSources.filter(target=>target.clientType==='codex')
     this.stop();this.snapshot=undefined
     const controller=new AbortController(),signal=controller.signal,run={id:input.runId,controller};this.scanning=run
     const warnings=new Set<string>(),files=new Map<string,SourceFile[]>(),claudeFiles=new Map<string,ClaudeSourceFile>(),records=new Map<string,SessionRecord>(),matches=new Set<string>(),digests=new Map<string,Promise<string>>()
@@ -105,7 +133,7 @@ export class SessionCatalog {
                 const historyMode=meta.payload?.history_mode==='paginated'?'paginated' as const:undefined
                 const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false,...historyMode?{historyMode}:{}}
                 const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',...historyMode?{historyMode}:{}}
-                const matched=title.toLowerCase().includes(input.titleQuery.toLowerCase())&&(!input.contentQuery||await sessionContains(file,stat.size,input.contentQuery,signal))
+                const matched=[title,id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase()))&&(!input.contentQuery||await sessionContains(file,stat.size,input.contentQuery,signal))
                 sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,size:stat.size,record:structuredClone(record)}})
               }finally{await file.close()}
             }catch(error){signal.throwIfAborted();warn(`部分会话文件无法读取（${basename(path)}），请刷新或检查文件`)}
@@ -160,30 +188,31 @@ export class SessionCatalog {
         const warn=(message:string)=>{if(warnings.size<99)warnings.add(target.name+'：'+message);else warnings.add('其他读取提示已省略，请选择单个目录检查')}
         try{
           const identity=await this.claudeTargetIdentity(target)
-          const scan=await scanClaudeCodeSessionsAsync(target.directory,{instanceId:target.id,signal})
+          const scan=await scanClaudeCodeSessionsAsync(target.directory,{instanceId:target.role==='instance'?target.id:undefined,signal,contentQuery:input.contentQuery})
           signal.throwIfAborted()
           const current=await this.claudeTargetIdentity(target)
           if(current.profile!==identity.profile||JSON.stringify(current.root)!==JSON.stringify(identity.root)||scan.source&&(scan.source.config.canonicalPath!==target.directory||scan.source.config.device!==identity.root?.device||scan.source.config.inode!==identity.root?.inode))throw new Error('Claude Code 会话来源实例已变化')
           for(const warning of scan.warnings)warn(warning)
-          if(input.contentQuery)warn('Claude Code 暂仅支持标题筛选，当前正文搜索未包含其会话')
           if(scan.complete)sourceCounts[target.id]=scan.records.reduce((count,record)=>count+record.locations.length,0)
           for(const session of scan.records)for(const location of session.locations){
             // A native session ID can recur in different instances and projects.
             // UI identity never grants Codex mutation capabilities to this file.
             const id='claude:'+createHash('sha256').update(JSON.stringify([target.id,location.projectDirectory,session.id,location.path])).digest('hex')
             if(records.has(id)){warn('会话标识冲突，未合并不同客户端的记录');continue}
+            let resumeBlockedReason=target.role==='default'?'此会话来自本机默认目录，请在原 Claude Code 终端中继续；管理器不会自动绑定账号或实例':target.launchMode==='desktop'?'请在原 Claude Desktop 的 Code 页面中继续此会话':this.running(target.id)?'实例正在运行，请先在实例内使用 /resume，或停止实例后从这里恢复':session.conflict?'同 ID 会话存在文件冲突，请先核对来源':!scan.complete?'会话来源尚未完整读取，请刷新后重试':location.resumeBlockedReason??(!location.cwd?'会话没有保存项目工作目录':undefined)
+            if(!resumeBlockedReason&&location.cwd)try{const cwd=lstatSync(location.cwd);if(cwd.isSymbolicLink()||!cwd.isDirectory())resumeBlockedReason='原项目目录不可用，请恢复目录后重试'}catch{resumeBlockedReason='原项目目录不可用，请恢复目录后重试'}
             const row:SessionRecord={
-              id,clientType:'claude_code',sourceSessionId:session.id,title:location.title,cwd:location.cwd??'未知工作目录',projectName:location.cwd?basename(location.cwd):undefined,updatedAt:session.updatedAt,kind:'conversation',
+              id,clientType:'claude_code',launchMode:target.launchMode,sourceSessionId:session.id,title:location.title,cwd:location.cwd??'未知工作目录',projectName:location.cwd?basename(location.cwd):undefined,updatedAt:session.updatedAt,kind:'conversation',messageCount:session.messageCount,model:session.model,resumeBlockedReason,
               locations:[{targetId:target.id,name:target.name,directory:target.directory,running:this.running(target.id),archived:false,ambiguous:session.conflict}],
-              capabilities:{open:true,transfer:false,archive:false,trash:false,visibilityRepair:false,tokens:false,contentSearch:false},
+              capabilities:{open:true,transfer:false,archive:false,trash:false,visibilityRepair:false,tokens:false,contentSearch:true,content:true,resume:!resumeBlockedReason},
             }
-            records.set(id,row);claudeFiles.set(id,{target,profile:identity.profile,location,sessionId:session.id})
-            if(!input.contentQuery&&row.title.toLowerCase().includes(input.titleQuery.toLowerCase()))matches.add(id)
+            records.set(id,row);claudeFiles.set(id,{target,profile:identity.profile,location,sessionId:session.id,record:session})
+            if((!input.contentQuery||location.contentMatched)&&[row.title,session.id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase())))matches.add(id)
           }
         }catch{signal.throwIfAborted();warn('实例目录已变化或无法安全读取，请刷新后重试')}
       }
       signal.throwIfAborted()
-      const sorted=[...records.values()].filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
+      const sorted=[...records.values()].filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)&&(!input.projectQuery||[record.cwd,record.projectName??''].some(value=>value.toLowerCase().includes(input.projectQuery.toLowerCase())))).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
       this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,claudeFiles,warnings:[...warnings].slice(0,100),sourceCounts,sources}
       return this.page({snapshotId:this.snapshot.id,page:1,pageSize:25})
     }catch(error){if(signal.aborted)throw new Error('会话读取已取消');throw error}
@@ -224,6 +253,30 @@ export class SessionCatalog {
     const sources=snapshot.files.get(input.sessionId)?.filter(value=>value.targetId===input.targetId&&!value.duplicateOf)??[]
     if(sources.length!==1)throw new Error(sources.length?'所选目录存在多个同 ID 会话，无法确定文件':'会话不属于所选目录')
     const opened=await this.verified(sources[0],input.sessionId,new AbortController().signal);await opened.file.close();this.current(input.snapshotId);return sources[0].path
+  }
+  async content(raw:unknown):Promise<SessionContentPage>{
+    const input=sessionContentSchema.parse(raw),snapshot=this.current(input.snapshotId),claude=snapshot.claudeFiles.get(input.sessionId),row=snapshot.records.find(record=>record.id===input.sessionId)
+    if(!claude||!row||claude.target.id!==input.targetId)throw new Error('所选会话不支持此正文阅读器，或不属于当前目录')
+    const current=await this.claudeTargetIdentity(claude.target)
+    if(current.profile!==claude.profile)throw new Error('Claude Code 会话来源实例已变化，请刷新列表')
+    const content=readClaudeSessionContent(claude.location,{page:input.page,pageSize:input.pageSize,query:input.query})
+    this.current(input.snapshotId)
+    return {snapshotId:input.snapshotId,sessionId:row.id,sourceSessionId:claude.sessionId,title:row.title,cwd:row.cwd,sourceName:claude.target.name,clientType:'claude_code',...content}
+  }
+  /** Resume plans are bound to the original instance/profile and snapshot.
+   * Launch tickets must call this again immediately before committing launch. */
+  async claudeResume(raw:unknown):Promise<CatalogClaudeResumePreview>{
+    const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),claude=snapshot.claudeFiles.get(input.sessionId),row=snapshot.records.find(record=>record.id===input.sessionId)
+    if(!claude||!row||claude.target.id!==input.targetId)throw new Error('Claude Code 会话不属于所选实例')
+    if(claude.target.role!=='instance')throw new Error('默认 Claude Code 会话未绑定管理器实例，请在原终端中继续')
+    const current=await this.claudeTargetIdentity(claude.target)
+    if(current.profile!==claude.profile)throw new Error('Claude Code 会话来源实例已变化，请刷新列表')
+    if(claude.target.launchMode==='desktop')throw new Error('请在原 Claude Desktop 的 Code 页面中继续此会话')
+    if(this.running(input.targetId))throw new Error('实例正在运行，请先在实例内使用 /resume，或停止实例后恢复')
+    const selection={instanceId:input.targetId,configDirectory:claude.target.directory,cwd:claude.location.cwd??'',sessionId:claude.sessionId,sourceId:claude.location.sourceId}
+    const preview=previewClaudeSessionResume({configDirectory:claude.target.directory,sessionsDirectory:claude.location.source.projects.path,instanceId:input.targetId,scannedAt:snapshot.scannedAt,records:[claude.record],warnings:[],complete:true},selection)
+    this.current(input.snapshotId)
+    return {...preview,instanceRevision:current.revision,profileFingerprint:createHash('sha256').update(current.profile).digest('hex')}
   }
   originalSessionId(raw:unknown):string{
     const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),row=snapshot.records.find(record=>record.id===input.sessionId)

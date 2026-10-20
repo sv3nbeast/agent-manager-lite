@@ -526,7 +526,7 @@ app.on('browser-window-created', (_event, window) => {
       await wait('document.querySelectorAll(".sessions-table tr[data-row-key]").length===1')
       assert.equal(await run('!!document.querySelector(".session-transfers,.session-archives,.session-sync,.session-trash")'), false)
       assert.equal(await run('Array.from(document.querySelectorAll(".sessions-panel .page-heading button")).some(el=>el.textContent.includes("修复可见性"))'), false)
-      assert.equal(await run('document.querySelector("[aria-label=会话内容搜索]").disabled'), true)
+      assert.equal(await run('document.querySelector("[aria-label=会话内容搜索]").disabled'), false)
       assert.equal(await run('!!document.querySelector(".session-note")'), false)
       await capture('claude-history-readonly.png')
       await click('.ant-menu-item', '供应商与密钥2')

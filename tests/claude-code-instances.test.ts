@@ -10,6 +10,9 @@ import type { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
 import { MacCliRuntime, MacInstanceRuntime } from '../src/main/cliInstanceRuntime'
 import { parseClaudeCodeAccountImport } from '../src/main/claudeCodeAccounts'
 import { createAPIAccount } from '../src/main/accounts'
+import { randomUUID } from 'node:crypto'
+import { SessionCatalog } from '../src/main/sessions'
+import { validateClaudeCodeCliArgs } from '../src/main/claudeCodeInstanceAdapter'
 
 const supported = process.platform === 'darwin'
 const build = realpathSync(mkdtempSync(join(tmpdir(), 'aml-claude-native-fixture-'))), binary = join(build, 'claude native fixture')
@@ -85,6 +88,168 @@ function fixture(t: TestContext, options: { open?: (script: string, launch: () =
   })
   return { root, store, executable, shellHome, instances, create, application, api, bearer, add, start, evidence, handoffs, children }
 }
+
+async function resumeFixture(t:TestContext,options:Parameters<typeof fixture>[1]={},subscription?:StoredAccount) {
+  const f=fixture(t,options)
+  if(subscription)f.store.transaction(state=>{state.accounts.push(subscription)})
+  const instance=f.add('Resume fixture',subscription??f.api,[]),sessionId=randomUUID()
+  const project=join(f.root,"project ' literal $(safe)");mkdirSync(project)
+  const projectDirectory=join(instance.directory,'projects','fixture-resume');mkdirSync(projectDirectory,{recursive:true})
+  const transcript=join(projectDirectory,sessionId+'.jsonl')
+  writeFileSync(transcript,JSON.stringify({type:'user',sessionId,cwd:project,message:{role:'user',content:'Synthetic previous conversation'},timestamp:new Date().toISOString()})+'\n')
+  const catalog=new SessionCatalog(f.store,id=>f.instances.inUse(id),{defaultClaudeDirectory:null})
+  const scan=await catalog.scan({runId:randomUUID(),targetId:instance.id})
+  const row=scan.items.find(row=>row.sourceSessionId===sessionId)!
+  assert.ok(row)
+  const selection={snapshotId:scan.snapshotId,sessionId:row.id,targetId:instance.id}
+  const resume=await catalog.claudeResume(selection)
+  return {...f,instance,sessionId,project,projectDirectory,transcript,catalog,selection,resume}
+}
+
+test('Claude resume launches the original instance and project without persisting launch overrides', {skip:!supported},async t=>{
+  const f=await resumeFixture(t),before=f.store.read(),transcript=readFileSync(f.transcript,'utf8')
+  const preview=f.instances.previewClaudeSessionResume(f.resume)
+  assert.equal(preview.workingDirectory,f.project);assert.equal(preview.sessionId,f.sessionId)
+  assert.deepEqual(preview.args,['--resume',f.sessionId]);assert.equal(preview.accountName,f.api.name)
+  assert.deepEqual(f.store.read(),before)
+  f.instances.start(preview.ticket);await f.instances.settled(f.instance.id)
+  const running=f.instances.views().find(instance=>instance.id===f.instance.id)!
+  assert.equal(running.status,'running',running.error)
+  assert.equal(running.workingDirectory,f.project)
+  const evidence=await f.evidence(f.instance.directory)
+  assert.equal(evidence.cwd,f.project);assert.equal(evidence.configDirectory,f.instance.directory)
+  assert.deepEqual(evidence.args.slice(-2),['--resume',f.sessionId])
+  assert.equal(evidence.apiKey,f.api.credentials.apiKey)
+  assert.deepEqual(f.store.read().instances,before.instances)
+  assert.equal(readFileSync(f.transcript,'utf8'),transcript)
+  assert.throws(()=>f.instances.start(preview.ticket),/过期/)
+  assert.throws(()=>f.instances.previewClaudeSessionResume(f.resume),/正在运行/)
+  await f.instances.stop(f.instance.id)
+})
+
+test('Claude resume accepts a real project path spelling while preserving its directory identity', {skip:!supported}, async t => {
+  const f = await resumeFixture(t)
+  const literalCwd = f.project + '/'
+  writeFileSync(f.transcript, JSON.stringify({ type: 'user', sessionId: f.sessionId, cwd: literalCwd, message: { role: 'user', content: 'Literal project path' }, timestamp: new Date().toISOString() }) + '\n')
+  const scan = await f.catalog.scan({ runId: randomUUID(), targetId: f.instance.id })
+  const row = scan.items.find(item => item.sourceSessionId === f.sessionId)!
+  const resume = await f.catalog.claudeResume({ snapshotId: scan.snapshotId, sessionId: row.id, targetId: f.instance.id })
+  assert.equal(resume.cwd, literalCwd)
+  const preview = f.instances.previewClaudeSessionResume(resume)
+  assert.equal(preview.workingDirectory, literalCwd)
+  f.instances.start(preview.ticket)
+  await f.instances.settled(f.instance.id)
+  assert.equal(f.instances.views().find(item => item.id === f.instance.id)?.status, 'running')
+  assert.equal((await f.evidence(f.instance.directory)).cwd, f.project)
+  await f.instances.stop(f.instance.id)
+})
+
+test('Claude resume rejects stale files, duplicate IDs, replaced projects and cancelled tickets', {skip:!supported},async t=>{
+  const f=await resumeFixture(t)
+  let preview=f.instances.previewClaudeSessionResume(f.resume)
+  f.instances.discardClaudeSessionResume(preview.ticket)
+  assert.throws(()=>f.instances.start(preview.ticket),/过期/)
+  preview=f.instances.previewClaudeSessionResume(f.resume)
+  const original=readFileSync(f.transcript,'utf8')
+  writeFileSync(f.transcript,original+JSON.stringify({type:'assistant',sessionId:f.sessionId,cwd:f.project,message:{content:'Changed'}})+'\n')
+  assert.throws(()=>f.instances.start(preview.ticket),/已变化|刷新/)
+  const scan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id})
+  const row=scan.items.find(row=>row.sourceSessionId===f.sessionId)!
+  const resume=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id})
+  preview=f.instances.previewClaudeSessionResume(resume)
+  const duplicate=join(f.instance.directory,'projects','duplicate');mkdirSync(duplicate)
+  copyFileSync(f.transcript,join(duplicate,f.sessionId+'.jsonl'))
+  assert.throws(()=>f.instances.start(preview.ticket),/冲突|已变化/)
+  rmSync(duplicate,{recursive:true})
+  const rescan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id})
+  const refreshed=await f.catalog.claudeResume({snapshotId:rescan.snapshotId,sessionId:row.id,targetId:f.instance.id})
+  preview=f.instances.previewClaudeSessionResume(refreshed)
+  renameSync(f.project,f.project+'-old');mkdirSync(f.project)
+  assert.throws(()=>f.instances.start(preview.ticket),/项目目录已被替换/)
+  assert.equal(f.children.length,0)
+})
+
+test('Claude resume rejects a different instance and changed account binding', {skip:!supported},async t=>{
+  const f=await resumeFixture(t),other=f.add('Other instance',f.bearer,[])
+  assert.throws(()=>f.instances.previewClaudeSessionResume({...f.resume,instanceId:other.id}),/已变化/)
+  const preview=f.instances.previewClaudeSessionResume(f.resume)
+  f.store.transaction(state=>{state.instances!.find(instance=>instance.id===f.instance.id)!.accountId=f.bearer.id})
+  assert.throws(()=>f.instances.start(preview.ticket),/已变化/)
+  assert.equal(f.children.length,0)
+})
+
+test('interactive resume preserves tool restrictions and refuses automatic prompts or exit modes',()=>{
+  assert.doesNotThrow(()=>validateClaudeCodeCliArgs(['--permission-mode','plan','--disallowed-tools','Bash','--effort','high'],[],{interactiveResume:true}))
+  for(const args of [['--print'],['--help'],['--no-session-persistence'],['--output-format=json'],['--','send a prompt'],['send a prompt']]){
+    assert.throws(()=>validateClaudeCodeCliArgs(args,[],{interactiveResume:true}),/恢复/)
+  }
+})
+
+for(const kind of ['workspace','registered'] as const)test(`Claude resume uses its existing original project after the default ${kind} directory is deleted`,{skip:!supported},async t=>{
+  const f=await resumeFixture(t)
+  let removed=join(f.store.directory,'instances',f.instance.id,'workspace')
+  if(kind==='registered'){
+    removed=join(f.root,'old-default-project');mkdirSync(removed)
+    const working=f.instances.registerWorkingDirectory(removed),{id,revision,createdAt:_,...details}=f.store.read().instances!.find(profile=>profile.id===f.instance.id)!
+    f.instances.save({id,revision,details:{...details,workingDirectoryId:working.id}})
+  }
+  const before=f.store.read().instances!,profile=before.find(profile=>profile.id===f.instance.id)!
+  rmSync(removed,{recursive:true})
+  assert.throws(()=>f.instances.preview({id:profile.id,revision:profile.revision}),/ENOENT/)
+  const scan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id}),row=scan.items.find(row=>row.sourceSessionId===f.sessionId)!
+  const resume=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id})
+  const preview=f.instances.previewClaudeSessionResume(resume)
+  assert.equal(preview.workingDirectory,f.project)
+  f.instances.start(preview.ticket);await f.instances.settled(f.instance.id)
+  const running=f.instances.views().find(instance=>instance.id===f.instance.id)!
+  assert.equal(running.status,'running',running.error)
+  assert.equal((await f.evidence(f.instance.directory)).cwd,f.project)
+  assert.deepEqual(f.store.read().instances,before);assert.equal(existsSync(removed),false)
+  const recovered=f.create();await recovered.recover()
+  assert.equal(recovered.views().find(instance=>instance.id===f.instance.id)!.workingDirectory,f.project)
+  assert.equal(recovered.views().find(instance=>instance.id===f.instance.id)!.pid,running.pid)
+  await recovered.stop(f.instance.id)
+  assert.equal(existsSync(join(f.store.directory,'instances',f.instance.id,'launch.json')),false)
+  assert.equal(existsSync(removed),false);assert.deepEqual(f.store.read().instances,before)
+})
+
+test('Claude resumed subscription keeps its project identity across renewal and manager recovery without the default workspace',{skip:!supported},async t=>{
+  let refreshes=0
+  const subscription=parseClaudeCodeAccountImport(JSON.stringify({accessToken:'resume-initial-access',refreshToken:'resume-vault-refresh',models:['fixture-sonnet']})).accounts[0]
+  const f=await resumeFixture(t,{ensure:async(id,store)=>{
+    store.transaction(state=>{const account=state.accounts.find(value=>value.id===id)!;account.credentials.accessToken=`resume-access-${++refreshes}`;account.generation=`resume-generation-${refreshes}`})
+    return store.read().accounts.find(value=>value.id===id)!
+  }},subscription)
+  const workspace=join(f.store.directory,'instances',f.instance.id,'workspace'),checkpoint=join(workspace,'..','launch.json'),credentials=join(f.instance.directory,'.credentials.json'),before=f.store.read().instances
+  rmSync(workspace,{recursive:true})
+  const preview=f.instances.previewClaudeSessionResume(f.resume)
+  f.instances.start(preview.ticket);await f.instances.settled(f.instance.id)
+  const running=f.instances.views().find(instance=>instance.id===f.instance.id)!
+  assert.equal(running.status,'running',running.error);assert.equal(refreshes,1)
+  assert.equal((await f.evidence(f.instance.directory)).cwd,f.project)
+  const saved=JSON.parse(readFileSync(checkpoint,'utf8')),stat=lstatSync(f.project)
+  assert.deepEqual(saved.claudeWorkingDirectory,{path:f.project,device:stat.dev,inode:stat.ino})
+  assert.equal(readFileSync(checkpoint,'utf8').includes('resume-access'),false)
+  // Transcript growth is expected after launch; credential renewal binds the
+  // original project and identity, not a permanently frozen conversation body.
+  writeFileSync(f.transcript,readFileSync(f.transcript,'utf8')+JSON.stringify({type:'assistant',sessionId:f.sessionId,cwd:f.project,message:{content:'Later completed reply'}})+'\n')
+  f.store.transaction(state=>{const account=state.accounts.find(value=>value.id===subscription.id)!;account.credentials.accessToken='resume-live-access';account.generation='resume-live-generation'})
+  await f.instances.updateCredentials(f.store.read().accounts.find(value=>value.id===subscription.id)!)
+  assert.equal(JSON.parse(readFileSync(credentials,'utf8')).claudeAiOauth.accessToken,'resume-live-access')
+  const recovered=f.create();await recovered.recover()
+  const recoveredView=recovered.views().find(instance=>instance.id===f.instance.id)!
+  assert.equal(recoveredView.status,'running',recoveredView.error);assert.equal(recoveredView.pid,running.pid);assert.equal(recoveredView.workingDirectory,f.project)
+  assert.equal(refreshes,2);assert.equal(JSON.parse(readFileSync(credentials,'utf8')).claudeAiOauth.accessToken,'resume-access-2')
+  assert.deepEqual(f.store.read().instances,before);assert.equal(existsSync(workspace),false)
+  renameSync(f.project,f.project+'-old');mkdirSync(f.project)
+  await assert.rejects(recovered.updateCredentials(f.store.read().accounts.find(value=>value.id===subscription.id)!),/项目目录已被替换/)
+  const replaced=f.create();await replaced.recover()
+  assert.equal(replaced.views().find(instance=>instance.id===f.instance.id)!.status,'error')
+  assert.equal(refreshes,2,'A replaced original project must block renewal before refreshing credentials')
+  await replaced.stop(f.instance.id)
+  assert.equal(existsSync(credentials),false);assert.equal(existsSync(checkpoint),false)
+  assert.deepEqual(f.store.read().instances,before)
+})
 
 test('Claude API and Bearer use concurrent owned native processes and consume a private secret handoff', { skip: !supported }, async t => {
   const f = fixture(t), first = f.add(), second = f.add('Claude Bearer', f.bearer)
