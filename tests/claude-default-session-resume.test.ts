@@ -15,7 +15,7 @@ test('default Claude continuation opens a revalidated fork using only the local 
   const id=randomUUID(),path=join(transcripts,id+'.jsonl'),body=JSON.stringify({type:'user',sessionId:id,cwd:project,message:{content:'Synthetic only'}})+'\n'
   writeFileSync(path,body)
   const store=new Store(join(root,'manager'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),before=store.read(),catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:config})
-  const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),source=page.sources?.find(value=>value.role==='default'&&value.clientType==='claude_code'),row=page.items.find(value=>value.locations.some(location=>location.targetId===source?.id)),selection={snapshotId:page.snapshotId,sessionId:row!.id,targetId:source!.id},opened:string[]=[]
+  const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),source=page.sources?.find(value=>value.role==='default'&&value.clientType==='claude_code'),row=page.items.find(value=>value.locations.some(location=>location.targetId===source?.id)),selection={snapshotId:page.snapshotId,sessionId:row!.id,targetId:source!.id,sourceId:row!.resumeSourceId!,cwd:row!.cwdAvailableCandidates![0]},opened:string[]=[]
   const launcher=new ClaudeDefaultSessionResume(catalog,{home,cliPath:cli,verifyCli:async()=>{},open:async script=>opened.push(script)})
   t.after(()=>{catalog.stop();rmSync(root,{recursive:true,force:true})})
   const preview=await launcher.preview(selection)
@@ -35,7 +35,7 @@ test('default fork tickets are single use and terminal failures clean the tempor
   const id=randomUUID(),path=join(transcripts,id+'.jsonl'),body=JSON.stringify({type:'user',sessionId:id,cwd:project,message:{content:'Fixture'}})+'\n';writeFileSync(path,body)
   const catalog=new SessionCatalog(new Store(join(root,'manager'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),undefined,{defaultClaudeDirectory:config})
   t.after(()=>{catalog.stop();rmSync(root,{recursive:true,force:true})})
-  const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),source=page.sources?.find(value=>value.role==='default'&&value.clientType==='claude_code'),row=page.items.find(value=>value.locations.some(location=>location.targetId===source?.id)),selection={snapshotId:page.snapshotId,sessionId:row!.id,targetId:source!.id}
+  const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),source=page.sources?.find(value=>value.role==='default'&&value.clientType==='claude_code'),row=page.items.find(value=>value.locations.some(location=>location.targetId===source?.id)),selection={snapshotId:page.snapshotId,sessionId:row!.id,targetId:source!.id,sourceId:row!.resumeSourceId!,cwd:row!.cwdAvailableCandidates![0]}
   let attemptedScript='';const launcher=new ClaudeDefaultSessionResume(catalog,{home,cliPath:cli,verifyCli:async()=>{},open:async script=>{attemptedScript=script;throw new Error('Terminal unavailable')}}),preview=await launcher.preview(selection)
   await assert.rejects(launcher.start(preview.ticket),/Terminal unavailable/)
   await assert.rejects(launcher.start(preview.ticket),/预览已过期/)

@@ -495,6 +495,8 @@ export class Instances {
       ||resume.location.cwd!==resume.cwd)throw new Error('Claude 会话或来源实例已变化，请刷新后重新预览')
     validateClaudeCodeCliArgs(profile.extraArgs,[],{interactiveResume:true})
     if(!isAbsolute(resume.cwd)||!isAbsolute(resume.cwdCanonicalPath)||/[\x00-\x1f\x7f]/.test(resume.cwd)||/[\x00-\x1f\x7f]/.test(resume.cwdCanonicalPath))throw new Error('会话项目目录已变化，请核对原项目路径')
+    const candidate=resume.location.cwdCandidateIdentities?.find(value=>value.path===resume.cwd)
+    if(!candidate||candidate.canonicalPath!==resume.cwdCanonicalPath||candidate.device!==resume.cwdDevice||candidate.inode!==resume.cwdInode)throw new Error('Claude 会话未授权所选项目目录，请刷新后重新选择')
     if(resolve(realpathSync(resume.cwd))!==resolve(resume.cwdCanonicalPath))throw new Error('会话项目目录已变化，请核对原项目路径')
     directory(resume.cwdCanonicalPath)
     const stat=statSync(resume.cwd),canonicalStat=statSync(resume.cwdCanonicalPath)

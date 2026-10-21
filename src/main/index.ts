@@ -55,7 +55,7 @@ import {SessionArchives} from './sessionArchives'
 import {SessionSync} from './sessionSync'
 import {SessionTrash} from './sessionTrash'
 import {SessionVisibilityRepair} from './sessionVisibility'
-import {sessionSelectionSchema} from '../shared/sessions'
+import {sessionSelectionSchema,claudeResumeSelectionSchema,sessionCopyIdSchema} from '../shared/sessions'
 import {AccountNetwork} from './accountNetwork'
 import {AccountProxies} from './accountProxy'
 import {UpstreamProxies} from './upstreamProxy'
@@ -505,22 +505,22 @@ async function main(): Promise<void> {
       case 'cancelSessionVisibilityRepair': sessionVisibility.cancel(z.string().uuid().parse(input));return
       case 'sessionPage': return sessions.page(input)
       case 'sessionContent': return sessions.content(input)
-      case 'previewClaudeSessionResume': return instances.previewClaudeSessionResume(await sessions.claudeResume(input))
+      case 'previewClaudeSessionResume': return instances.previewClaudeSessionResume(await sessions.claudeResume(claudeResumeSelectionSchema.parse(input)))
       case 'discardClaudeSessionResume': instances.discardClaudeSessionResume(z.string().uuid().parse(input));return
-      case 'previewDefaultClaudeSessionResume': return defaultClaudeSessionResume.preview(sessionSelectionSchema.parse(input))
+      case 'previewDefaultClaudeSessionResume': return defaultClaudeSessionResume.preview(claudeResumeSelectionSchema.parse(input))
       case 'startDefaultClaudeSessionResume': return defaultClaudeSessionResume.start(z.string().uuid().parse(input))
       case 'discardDefaultClaudeSessionResume': return defaultClaudeSessionResume.discard(z.string().uuid().parse(input))
       case 'sessionTokenStats': return sessions.tokenStats(input)
       case 'cancelSessionScan': sessions.cancel(z.string().uuid().parse(input));return
       case 'cancelSessionTokens': sessions.cancelTokens(z.string().uuid().parse(input));return
       case 'openSession': {
-        const parsed=sessionSelectionSchema.extend({action:z.enum(['location','file','copyId'])}).strict().parse(input)
+        const parsed=sessionSelectionSchema.extend({action:z.enum(['location','file'])}).strict().parse(input)
         const {action,...selection}=parsed,path=await sessions.location(selection)
-        if(action==='copyId')clipboard.writeText(sessions.originalSessionId(selection))
-        else if(action==='location')shell.showItemInFolder(path)
+        if(action==='location')shell.showItemInFolder(path)
         else if(await shell.openPath(path))throw new Error('无法打开会话文件，请检查默认应用')
         return
       }
+      case 'copySessionId': {const selection=sessionCopyIdSchema.parse(input);clipboard.writeText(sessions.originalSessionId(selection));return}
       case 'mutateLocalAccess': localAccess.mutate(input);break
       case 'startLocalAccess': localAccess.start();break
       case 'stopLocalAccess': await localAccess.stop();break

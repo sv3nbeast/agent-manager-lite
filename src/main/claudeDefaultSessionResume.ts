@@ -4,7 +4,7 @@ import {chmodSync,mkdtempSync,realpathSync,rmSync,statSync,writeFileSync} from '
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {promisify} from 'node:util'
-import type {DefaultClaudeSessionResumePreview,SessionSelection} from '../shared/sessions'
+import type {ClaudeResumeSelection,DefaultClaudeSessionResumePreview} from '../shared/sessions'
 import {captureClaudeExecutableIdentity,validateClaudeExecutableIdentity} from './claudeCodeCapability'
 import {detectClaudeCodeApplications} from './claudeCodeInstanceAdapter'
 import {validateClaudeNativeProgram} from './claudeCodeRuntime'
@@ -14,7 +14,7 @@ import type {SessionCatalog} from './sessions'
 const execFile=promisify(execFileCallback)
 const ttlMs=5*60_000
 type Selection=Awaited<ReturnType<SessionCatalog['defaultClaudeResume']>>
-interface Pending {ticket:string;selection:Selection;request:SessionSelection;executable:string;identity:ReturnType<typeof captureClaudeExecutableIdentity>;expiresAt:number}
+interface Pending {ticket:string;selection:Selection;request:ClaudeResumeSelection;executable:string;identity:ReturnType<typeof captureClaudeExecutableIdentity>;expiresAt:number}
 
 export function defaultClaudeResumeScript(input:{scriptPath:string;directory:string;homeDirectory:string;configCanonicalPath:string;configDevice:number;configInode:number;projectsDirectory:string;projectsDevice:number;projectsInode:number;projectDirectory:string;projectDevice:number;projectInode:number;executable:string;executableDevice:number;executableInode:number;executableSize:number;executableSha256:string;cwd:string;cwdCanonicalPath:string;cwdDevice:number;cwdInode:number;sessionPath:string;sessionDevice:number;sessionInode:number;sessionSize:number;sessionSha256:string;sessionId:string}):string {
   const q=shellQuote
@@ -80,7 +80,7 @@ export class ClaudeDefaultSessionResume {
     if(!app)throw new Error('未找到已安装的 Claude Code 官方原生 CLI')
     return app.path
   }
-  async preview(input:SessionSelection):Promise<DefaultClaudeSessionResumePreview>{
+  async preview(input:ClaudeResumeSelection):Promise<DefaultClaudeSessionResumePreview>{
     if(process.platform!=='darwin')throw new Error('默认 Claude CLI 分叉当前支持 macOS')
     for(const [ticket,pending] of this.pending)if(pending.expiresAt<this.now())this.pending.delete(ticket)
     const selection=await this.catalog.defaultClaudeResume(input),executable=this.cli(),identity=captureClaudeExecutableIdentity(executable)
@@ -88,7 +88,7 @@ export class ClaudeDefaultSessionResume {
     validateClaudeExecutableIdentity(identity)
     const ticket=randomUUID(),expiresAt=this.now()+ttlMs
     this.pending.set(ticket,{ticket,selection,request:{...input},executable,identity,expiresAt})
-    return {ticket,sessionId:selection.sessionId,cwd:selection.location.cwd!,cliApplication:executable,forkSession:true}
+    return {ticket,sessionId:selection.sessionId,cwd:selection.cwd,cwdCandidates:[...selection.cwdCandidates],cliApplication:executable,forkSession:true}
   }
   async discard(ticket:string):Promise<void>{this.pending.delete(ticket)}
   async start(ticket:string):Promise<{opened:true}>{
@@ -99,7 +99,7 @@ export class ClaudeDefaultSessionResume {
     await (this.options.verifyCli??verifyDefaultClaudeResumeCli)(pending.executable)
     validateClaudeExecutableIdentity(pending.identity,pending.executable)
     const current=await this.catalog.defaultClaudeResume(pending.request)
-    if(current.location.sourceId!==pending.selection.location.sourceId||current.cwdCanonicalPath!==pending.selection.cwdCanonicalPath||current.cwdDevice!==pending.selection.cwdDevice||current.cwdInode!==pending.selection.cwdInode||current.homeDirectory!==pending.selection.homeDirectory||current.configCanonicalPath!==pending.selection.configCanonicalPath||current.configDevice!==pending.selection.configDevice||current.configInode!==pending.selection.configInode||current.projectsDevice!==pending.selection.projectsDevice||current.projectsInode!==pending.selection.projectsInode||current.projectDevice!==pending.selection.projectDevice||current.projectInode!==pending.selection.projectInode)throw new Error('默认 Claude 会话文件、项目目录或配置目录已变化，请刷新后重试')
+    if(current.location.sourceId!==pending.selection.location.sourceId||current.sourceId!==pending.selection.sourceId||current.cwd!==pending.selection.cwd||current.cwdCanonicalPath!==pending.selection.cwdCanonicalPath||current.cwdDevice!==pending.selection.cwdDevice||current.cwdInode!==pending.selection.cwdInode||current.homeDirectory!==pending.selection.homeDirectory||current.configCanonicalPath!==pending.selection.configCanonicalPath||current.configDevice!==pending.selection.configDevice||current.configInode!==pending.selection.configInode||current.projectsDevice!==pending.selection.projectsDevice||current.projectsInode!==pending.selection.projectsInode||current.projectDevice!==pending.selection.projectDevice||current.projectInode!==pending.selection.projectInode)throw new Error('默认 Claude 会话文件、项目目录或配置目录已变化，请刷新后重试')
     const directory=mkdtempSync(join(tmpdir(),'aml-claude-default-resume-'))
     chmodSync(directory,0o700)
     let script=''

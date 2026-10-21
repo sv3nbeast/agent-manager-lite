@@ -16,7 +16,7 @@ import type {ClientIdentityInput,ClientIdentityView} from './clientIdentity'
 import type {ClientSwitchView,ClientSwitchPreview} from './clientSwitch'
 import type {ClientAuthorityView} from './clientAuthority'
 import type { WakeupView, WakeupTaskInput } from './wakeup'
-import type {SessionScanInput,SessionPageInput,SessionPage,SessionSelection,SessionTokenResult,SessionCopyPreviewInput,SessionCopyPreview,SessionTransferView,SessionTransferRecovery} from './sessions'
+import type {SessionScanInput,SessionPageInput,SessionPage,SessionSelection,SessionCopyIdInput,SessionTokenResult,SessionCopyPreviewInput,SessionCopyPreview,SessionTransferView,SessionTransferRecovery} from './sessions'
 import type {SessionContentInput,SessionContentPage} from './sessions'
 import type {SessionVisibilityRepairInput,SessionVisibilityRepairApplyInput,SessionVisibilityRepairInstanceList,SessionVisibilityRepairProviderList,SessionVisibilityRepairPreview,SessionVisibilityRepairSummary} from './sessionVisibility'
 import type {SyncPreviewInput,SyncPreview,SyncView,SyncRecovery} from './sessionSync'
@@ -246,15 +246,16 @@ export interface ManagerAPI {
   scanSessions(input:SessionScanInput):Promise<SessionPage>
   sessionPage(input:SessionPageInput):Promise<SessionPage>
   sessionContent(input:SessionContentInput):Promise<SessionContentPage>
-  previewClaudeSessionResume(input:SessionSelection):Promise<InstanceLaunchPreview & {sessionId:string}>
+  previewClaudeSessionResume(input:import('./sessions').ClaudeResumeSelection):Promise<InstanceLaunchPreview & {sessionId:string}>
   discardClaudeSessionResume(ticket:string):Promise<void>
-  previewDefaultClaudeSessionResume(input:SessionSelection):Promise<import('./sessions').DefaultClaudeSessionResumePreview>
+  previewDefaultClaudeSessionResume(input:import('./sessions').ClaudeResumeSelection):Promise<import('./sessions').DefaultClaudeSessionResumePreview>
   startDefaultClaudeSessionResume(ticket:string):Promise<{opened:true}>
   discardDefaultClaudeSessionResume(ticket:string):Promise<void>
   sessionTokenStats(input:{snapshotId:string;sessionIds:string[]}):Promise<SessionTokenResult[]>
   cancelSessionScan(runId:string):Promise<void>
   cancelSessionTokens(snapshotId:string):Promise<void>
-  openSession(input:SessionSelection&{action:'location'|'file'|'copyId'}):Promise<void>
+  openSession(input:SessionSelection&{action:'location'|'file'}):Promise<void>
+  copySessionId(input:SessionCopyIdInput):Promise<void>
   mutateLocalAccess(input:LocalAccessMutation):Promise<AppSnapshot>
   startLocalAccess():Promise<AppSnapshot>
   stopLocalAccess():Promise<AppSnapshot>

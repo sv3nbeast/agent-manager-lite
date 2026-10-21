@@ -20,6 +20,7 @@ const maxContentBlocks = 64
 const maxToolInputDepth = 16
 const maxToolInputNodes = 2000
 const maxToolInputCharacters = 32_000
+const maxWorkingDirectoryCandidates = 256
 
 export interface ClaudeSessionDirectoryIdentity {
   path: string
@@ -28,6 +29,13 @@ export interface ClaudeSessionDirectoryIdentity {
   inode: number
   mtimeMs: number
   ctimeMs: number
+}
+
+export interface ClaudeSessionWorkingDirectoryIdentity {
+  path: string
+  canonicalPath: string
+  device: number
+  inode: number
 }
 
 export interface ClaudeSessionSource {
@@ -50,6 +58,10 @@ export interface ClaudeSessionLocation {
   source: ClaudeSessionSource
   project: ClaudeSessionDirectoryIdentity
   cwd?: string
+  /** All absolute project directories observed for this session segment. */
+  cwdCandidates?: string[]
+  /** Stable identity captured when the session snapshot was scanned. */
+  cwdCandidateIdentities?: ClaudeSessionWorkingDirectoryIdentity[]
   title: string
   kind: 'conversation' | 'subagent'
   /** Only this session segment is exposed from a mixed-ID transcript. */
@@ -109,6 +121,8 @@ export interface ClaudeSessionResumePreview extends ClaudeSessionResumeSelection
   applicationKind: 'cli'
   projectDirectory: string
   cwdCanonicalPath: string
+  cwdDevice: number
+  cwdInode: number
   args: string[]
   location: ClaudeSessionLocation
 }
@@ -118,6 +132,7 @@ interface TranscriptMetadata {
   id?: string
   title?: string
   cwd?: string
+  cwdCandidates?: string[]
   createdAt?: number
   updatedAt?: number
   model?: string
@@ -166,6 +181,16 @@ function workingDirectory(value: unknown): string | undefined {
   if (value === undefined || value === null || value === '') return
   if (typeof value !== 'string' || value.length > 4096 || /[\x00-\x1f\x7f]/.test(value) || !isAbsolute(value)) throw new Error('Claude Code 会话工作目录无效')
   return value
+}
+
+function addWorkingDirectory(metadata: TranscriptMetadata, cwd: string): void {
+  const candidates = metadata.cwdCandidates ??= []
+  if (candidates.some(candidate => candidate === cwd)) return
+  if (candidates.length >= maxWorkingDirectoryCandidates) {
+    metadata.resumeBlockedReason ??= 'Claude Code 会话工作目录候选过多，无法安全恢复'
+    return
+  }
+  candidates.push(cwd)
 }
 
 function messageText(value: unknown): string | undefined {
@@ -389,7 +414,7 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
       const cwd = workingDirectory(record.cwd ?? record.projectPath ?? record.project_path)
       if (cwd) {
         if (!isAbsolute(cwd)) throw new Error('Claude Code 会话工作目录无效')
-        if (recordMetadata.cwd && resolve(recordMetadata.cwd) !== resolve(cwd)) recordMetadata.resumeBlockedReason = 'Claude Code 会话包含多个工作目录，请核对项目后恢复'
+        addWorkingDirectory(recordMetadata, cwd)
         recordMetadata.cwd ??= cwd
       }
       const time = timestamp(record.timestamp ?? record.updatedAt ?? record.updated_at)
@@ -450,6 +475,7 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
       if (!Number.isFinite(first.createdAt)) first.createdAt = undefined
       first.updatedAt = Math.max(first.updatedAt ?? 0, prefix.updatedAt ?? 0) || undefined
       first.cwd ??= prefix.cwd
+      for (const cwd of prefix.cwdCandidates ?? []) addWorkingDirectory(first, cwd)
       first.model ??= prefix.model
       first.gitBranch ??= prefix.gitBranch
       first.firstPrompt ??= prefix.firstPrompt
@@ -567,7 +593,7 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
           if (!current.messageCount) current.resumeBlockedReason ??= 'Claude Code 会话缺少可恢复的消息记录'
           const location: ClaudeSessionLocation = {
             path, projectDirectory: projectPath, device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, sha256,
-            sourceId: sourceId(source, project, path, stat, sha256, current.multipleSessionIds ? id : undefined), source, project, cwd: current.cwd, title: current.title ?? (current.cwd ? basename(current.cwd) : id), kind: current.kind, ...(current.multipleSessionIds ? { contentSessionId: id, ...(segments[0].id === id ? { contentIncludesPrefix: true } : {}) } : {}), resumeBlockedReason: current.resumeBlockedReason, contentMatched: current.contentMatched,
+            sourceId: sourceId(source, project, path, stat, sha256, current.multipleSessionIds ? id : undefined), source, project, cwd: current.cwd, cwdCandidates: current.cwdCandidates ? [...current.cwdCandidates] : current.cwd ? [current.cwd] : undefined, cwdCandidateIdentities: (current.cwdCandidates ?? (current.cwd ? [current.cwd] : [])).flatMap(candidate => { try { const identity = workingDirectoryIdentity(candidate); return [{ path: candidate, canonicalPath: identity.canonicalPath, device: identity.device, inode: identity.inode }] } catch { return [] } }), title: current.title ?? (current.cwd ? basename(current.cwd) : id), kind: current.kind, ...(current.multipleSessionIds ? { contentSessionId: id, ...(segments[0].id === id ? { contentIncludesPrefix: true } : {}) } : {}), resumeBlockedReason: current.resumeBlockedReason, contentMatched: current.contentMatched,
           }
           projectRows.push({ id, title: location.title, cwd: current.cwd, projectDirectory: projectPath, createdAt: current.createdAt, updatedAt: current.updatedAt ?? stat.mtimeMs, model: current.model, gitBranch: current.gitBranch, messageCount: current.messageCount, locations: [location], conflict: false })
         }
@@ -649,7 +675,7 @@ export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: {
   return result
 }
 
-function currentResumeLocation(record: Pick<ClaudeSessionRecord, 'id' | 'locations' | 'conflict'>, targetPath?: string): ClaudeSessionLocation {
+function currentResumeLocation(record: Pick<ClaudeSessionRecord, 'id' | 'locations' | 'conflict'>, targetPath?: string, selectedCwd?: string): ClaudeSessionLocation {
   const id = sessionId(record.id)
   if (!id) throw new Error('Claude Code 会话 ID 无效')
   if (record.conflict || record.locations.length !== 1) throw new Error('同 ID Claude Code 会话存在文件冲突，请先核对来源')
@@ -673,6 +699,16 @@ function currentResumeLocation(record: Pick<ClaudeSessionRecord, 'id' | 'locatio
   const selected = currentRecord?.locations[0]
   if (!selected || selected.sourceId !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
   if (selected.resumeBlockedReason) throw new Error(selected.resumeBlockedReason)
+  if (selectedCwd !== undefined) {
+    if (!isAbsolute(selectedCwd) || !(selected.cwdCandidates ?? (selected.cwd ? [selected.cwd] : [])).some(candidate => resolve(candidate) === resolve(selectedCwd))) throw new Error('Claude Code 会话不属于所选项目工作目录')
+    const candidate = (selected.cwdCandidates ?? []).find(value => resolve(value) === resolve(selectedCwd))
+    if (!candidate) throw new Error('Claude Code 会话不属于所选项目工作目录')
+    const originalIdentity = location.cwdCandidateIdentities?.find(value => resolve(value.path) === resolve(selectedCwd))
+    const candidateIdentity = selected.cwdCandidateIdentities?.find(value => resolve(value.path) === resolve(candidate))
+    if (!originalIdentity || !candidateIdentity || originalIdentity.canonicalPath !== candidateIdentity.canonicalPath || originalIdentity.device !== candidateIdentity.device || originalIdentity.inode !== candidateIdentity.inode) throw new Error('Claude Code 项目目录身份已变化，请重新预览')
+    const liveIdentity = workingDirectoryIdentity(candidate)
+    if (candidateIdentity.canonicalPath !== liveIdentity.canonicalPath || candidateIdentity.device !== liveIdentity.device || candidateIdentity.inode !== liveIdentity.inode) throw new Error('Claude Code 项目目录身份已变化，请重新预览')
+  }
   return selected
 }
 
@@ -691,11 +727,19 @@ export function previewClaudeSessionResume(scan: ClaudeSessionScan, input: Claud
   if (!isAbsolute(input.configDirectory) || resolve(input.configDirectory) !== scan.configDirectory || input.instanceId !== scan.instanceId) throw new Error('Claude Code 会话不属于当前实例配置目录')
   const record = scan.records.find(value => value.id === input.sessionId)
   if (!record || !record.locations.some(value => value.sourceId === input.sourceId)) throw new Error('Claude Code 会话来源不属于当前索引')
-  const location = currentResumeLocation(record)
-  if (!location.cwd || !isAbsolute(input.cwd)) throw new Error('Claude Code 会话不属于当前项目工作目录')
-  const cwdIdentity = workingDirectoryIdentity(location.cwd), selectedCwd = workingDirectoryIdentity(input.cwd)
+  const originalLocation = record.locations.find(value => value.sourceId === input.sourceId)
+  if (!originalLocation) throw new Error('Claude Code 会话来源不属于当前索引')
+  if (!isAbsolute(input.cwd) || !(originalLocation.cwdCandidates ?? (originalLocation.cwd ? [originalLocation.cwd] : [])).some(value => resolve(value) === resolve(input.cwd))) throw new Error('Claude Code 会话不属于当前项目工作目录')
+  const originalIdentity = originalLocation.cwdCandidateIdentities?.find(value => resolve(value.path) === resolve(input.cwd))
+  if (!originalIdentity) throw new Error('所选 Claude Code 项目目录在会话快照中没有稳定身份')
+  const location = currentResumeLocation(record, undefined, input.cwd)
+  const candidate = (location.cwdCandidates ?? (location.cwd ? [location.cwd] : [])).find(value => resolve(value) === resolve(input.cwd))
+  if (!candidate) throw new Error('Claude Code 会话不属于当前项目工作目录')
+  const cwdIdentity = workingDirectoryIdentity(candidate), selectedCwd = workingDirectoryIdentity(input.cwd)
   if (cwdIdentity.canonicalPath !== selectedCwd.canonicalPath || cwdIdentity.device !== selectedCwd.device || cwdIdentity.inode !== selectedCwd.inode) throw new Error('Claude Code 会话不属于当前项目工作目录')
-  return { clientType: 'claude_code', applicationKind: 'cli', instanceId: input.instanceId, configDirectory: scan.configDirectory, cwd: location.cwd, cwdCanonicalPath: cwdIdentity.canonicalPath, sessionId: record.id, sourceId: location.sourceId, projectDirectory: location.projectDirectory, args: ['--resume', record.id], location: structuredClone(location) }
+  if (cwdIdentity.canonicalPath !== originalIdentity.canonicalPath || cwdIdentity.device !== originalIdentity.device || cwdIdentity.inode !== originalIdentity.inode) throw new Error('Claude Code 项目目录已变化，请刷新会话列表')
+  const selectedLocation = { ...location, cwd: candidate }
+  return { clientType: 'claude_code', applicationKind: 'cli', instanceId: input.instanceId, configDirectory: scan.configDirectory, cwd: candidate, cwdCanonicalPath: cwdIdentity.canonicalPath, cwdDevice: cwdIdentity.device, cwdInode: cwdIdentity.inode, sessionId: record.id, sourceId: location.sourceId, projectDirectory: location.projectDirectory, args: ['--resume', record.id], location: structuredClone(selectedLocation) }
 }
 
 export function claudeSessionIdentity(path: string): { path: string; device: number; inode: number; sha256: string } {

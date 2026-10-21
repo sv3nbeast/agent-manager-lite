@@ -120,6 +120,25 @@ test('resume preview binds identical IDs to instance, config, project and exact 
   } finally { f.dispose() }
 })
 
+test('Claude Code preserves every cwd in a session segment and requires choosing a snapshot-bound directory identity', () => {
+  const f=fixture()
+  try {
+    const otherCwd=join(f.root,'second-worktree');mkdirSync(otherCwd)
+    writeFileSync(f.path,[
+      JSON.stringify({...f.event,message:{role:'user',content:'First project'}}),
+      JSON.stringify({type:'assistant',sessionId:f.id,cwd:otherCwd,message:{content:'Second project'}}),
+    ].join('\n')+'\n')
+    const scan=f.scan(),record=scan.records[0],location=record.locations[0]
+    assert.deepEqual(location.cwdCandidates,[f.cwd,otherCwd])
+    assert.equal(location.resumeBlockedReason,undefined)
+    assert.equal(location.cwdCandidateIdentities?.length,2)
+    assert.equal(previewClaudeSessionResume(scan,{instanceId:f.instanceId,configDirectory:f.config,cwd:otherCwd,sessionId:f.id,sourceId:location.sourceId}).cwd,otherCwd)
+    assert.throws(()=>previewClaudeSessionResume(scan,{instanceId:f.instanceId,configDirectory:f.config,cwd:f.root,sessionId:f.id,sourceId:location.sourceId}),/当前项目工作目录/)
+    renameSync(otherCwd,otherCwd+'-old');mkdirSync(otherCwd)
+    assert.throws(()=>previewClaudeSessionResume(scan,{instanceId:f.instanceId,configDirectory:f.config,cwd:otherCwd,sessionId:f.id,sourceId:location.sourceId}),/目录身份已变化|项目目录已变化/)
+  } finally { f.dispose() }
+})
+
 test('new identical copies after scanning still block ID resume even with an explicitly selected path', () => {
   const f = fixture()
   try {

@@ -20,7 +20,7 @@ const reader=ref<{record:SessionRecord;targetId:string}>(),resuming=ref<{record:
 const resumedInstance=computed(()=>manager.data?.instances?.find(instance=>instance.id===resumedInstanceId.value))
 const resumedStatus=computed(()=>{const instance=resumedInstance.value;if(!instance)return '';return instance.error?'会话恢复失败':instance.status==='running'?'会话已在原实例启动':instance.status==='stopped'?'会话实例已退出':'正在准备会话实例…'})
 const result=ref<SessionPage>(),busy=ref(false),readingTokens=ref(false),error=ref(''),tokens=ref<Record<string,SessionTokenResult>>({}),knownRecords=ref<Record<string,SessionRecord>>({}),visibilityRepairOpen=ref(false)
-const choosing=ref<{record:SessionRecord;action:'location'|'file'|'copyId'}>(),selectedTarget=ref<string>()
+const choosing=ref<{record:SessionRecord;action:'location'|'file'}>(),selectedTarget=ref<string>()
 const selectedIds=ref<string[]>([])
 const sourceCounts=ref<Record<string,number>>({})
 const catalogSources=ref<SessionSource[]>()
@@ -70,14 +70,20 @@ function resume(record:SessionRecord){if(!result.value||!canResume(record)||reco
 function forkDefault(record:SessionRecord){if(!result.value||!canDefaultFork(record)||record.locations.length!==1)return;reader.value=undefined;defaultResumeNotice.value='';defaultResuming.value={record,targetId:record.locations[0].targetId}}
 function defaultResumeStarted(){defaultResuming.value=undefined;defaultResumeNotice.value='已将新分叉会话交给 Terminal。它使用本机默认 Claude Code 身份；管理器不会控制该终端进程。'}
 function resumeStarted(instanceId:string){resumedInstanceId.value=instanceId;void reload()}
-function open(record:SessionRecord,action:'location'|'file'|'copyId'){
+function open(record:SessionRecord,action:'location'|'file'){
   choosing.value={record,action};selectedTarget.value=record.locations.length===1?record.locations[0].targetId:undefined
   if(record.locations.length===1&&(!record.locations[0].ambiguous||record.clientType==='claude_code'))void confirmOpen()
+}
+async function copyId(record:SessionRecord){
+  const snapshot=result.value,targetId=record.locations[0]?.targetId
+  if(!snapshot||!targetId)return
+  try{await window.manager.copySessionId({snapshotId:snapshot.snapshotId,sessionId:record.id,targetId});message.success({content:'会话 ID 已复制',key:'session-copy-id'})}
+  catch(cause){error.value=String(cause)}
 }
 async function confirmOpen(){
   if(!result.value||!choosing.value||!selectedTarget.value)return
   const choice=choosing.value
-  try{await window.manager.openSession({snapshotId:result.value.snapshotId,sessionId:choice.record.id,targetId:selectedTarget.value,action:choice.action});if(choice.action==='copyId')message.success('会话 ID 已复制');if(choosing.value===choice)choosing.value=undefined}
+  try{await window.manager.openSession({snapshotId:result.value.snapshotId,sessionId:choice.record.id,targetId:selectedTarget.value,action:choice.action});if(choosing.value===choice)choosing.value=undefined}
   catch(cause){error.value=String(cause);choosing.value=undefined}
 }
 onMounted(async()=>{try{targets.value=await window.manager.listClientConfigs();if(alive)await reload()}catch(cause){if(alive)error.value=String(cause)}})
@@ -122,7 +128,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
         <a-table-column key="locations" title="来源 / 所在目录" :width="220"><template #default="{record}"><div v-for="location in record.locations" :key="location.targetId" class="session-location" :title="location.directory">{{location.name}}<a-tag v-if="location.archived">已归档</a-tag><a-tag v-if="location.running" color="green">运行中</a-tag><a-tooltip v-if="location.ambiguous" :title="locationExplanation(location,record)"><a-tag color="orange">多个版本待核对</a-tag></a-tooltip><a-tooltip v-else-if="location.historyMode==='paginated'||location.historicalCopies" :title="locationExplanation(location,record)"><a-tag>{{location.historyMode==='paginated'?'分段记录 · '+((location.historicalCopies??0)+1):'历史副本 · '+location.historicalCopies}}</a-tag></a-tooltip></div></template></a-table-column>
         <a-table-column key="time" title="最近活动" :width="165"><template #default="{record}">{{date(record.updatedAt)}}</template></a-table-column>
         <a-table-column v-if="!claudeOnly" key="tokens" title="Token 用量" :width="170"><template #default="{record}"><span v-if="record.capabilities?.tokens===false" class="muted">暂不支持</span><template v-else-if="tokens[record.id]?.tokens"><strong>{{amount(tokens[record.id].tokens?.total)}}</strong><div class="muted session-meta">输入 {{amount(tokens[record.id].tokens?.input)}}<br>输出 {{amount(tokens[record.id].tokens?.output)}}</div></template><span v-else class="muted" :title="tokens[record.id]?.error">{{tokens[record.id]?.error?'读取失败':tokens[record.id]?'未知':'未读取'}}</span></template></a-table-column>
-        <a-table-column key="actions" title="操作" :width="180"><template #default="{record}"><a-button v-if="record.capabilities?.content" type="link" size="small" @click="viewContent(record)">查看对话</a-button><a-button v-if="canResume(record)" type="link" size="small" @click="resume(record)">恢复到原实例</a-button><a-button v-else-if="canDefaultFork(record)" type="link" size="small" @click="forkDefault(record)">在 Terminal 中分叉</a-button><div v-else-if="resumeReason(record)" class="muted session-resume-reason">{{resumeReason(record)}}</div><a-button type="link" size="small" @click="open(record,'location')">打开位置</a-button><a-button type="link" size="small" @click="open(record,'file')">打开会话文件</a-button><a-button type="link" size="small" @click="open(record,'copyId')">复制 ID</a-button></template></a-table-column>
+        <a-table-column key="actions" title="操作" :width="180"><template #default="{record}"><a-button v-if="record.capabilities?.content" type="link" size="small" @click="viewContent(record)">查看对话</a-button><a-button v-if="canResume(record)" type="link" size="small" @click="resume(record)">恢复到原实例</a-button><a-button v-else-if="canDefaultFork(record)" type="link" size="small" @click="forkDefault(record)">在 Terminal 中分叉</a-button><div v-else-if="resumeReason(record)" class="muted session-resume-reason">{{resumeReason(record)}}</div><a-button type="link" size="small" @click="open(record,'location')">打开位置</a-button><a-button type="link" size="small" @click="open(record,'file')">打开会话文件</a-button><a-button type="link" size="small" @click="copyId(record)">复制 ID</a-button></template></a-table-column>
       </a-table>
     </a-spin>
     <a-pagination v-if="result&&result.total>25" :current="result.page" :total="result.total" :page-size="25" :show-size-changer="false" :disabled="busy" class="pagination" @change="page" />

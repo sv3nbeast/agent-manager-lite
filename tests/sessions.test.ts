@@ -50,6 +50,7 @@ test('catalog merges duplicate sessions, preserves archived locations and applie
   assert.equal(Array.from(page.items.find(value=>value.id===previewId)!.title).length,60)
   assert.ok(page.items.find(value=>value.id===previewId)!.title.endsWith('…'));assert.equal(JSON.stringify(page).includes('private-body-never-in-snapshot'),false)
   assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),file)
+  assert.equal(f.catalog.originalSessionId({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),id,'Codex copies keep their existing native session ID')
   assert.deepEqual(await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[id,indexId]}),[{id,tokens:{input:100,output:25,total:125},targetId:a.target.id},{id:indexId}])
   assert.deepEqual(hashes(a.home),before)
 })
@@ -345,8 +346,12 @@ test('unified catalog isolates identical Claude session IDs by instance and neve
     const row=rows.find(row=>row.locations[0].targetId===source.id)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:source.id}
     assert.equal(await f.catalog.location(selection),source.path)
     assert.equal(f.catalog.originalSessionId(selection),id)
+    assert.throws(()=>f.catalog.originalSessionId({...selection,sessionId:randomUUID()}),/不属于/,'copy lookup rejects IDs absent from the current snapshot')
     await assert.rejects(f.catalog.location({...selection,targetId:codex.target.id}),/不属于/)
   }
+  const staleRow=rows[0],staleSelection={snapshotId:page.snapshotId,sessionId:staleRow.id,targetId:staleRow.locations[0].targetId}
+  await f.scan()
+  assert.throws(()=>f.catalog.originalSessionId(staleSelection),/已更新/,'copy lookup rejects expired snapshots')
   assert.deepEqual(hashes(f.root),before,'Indexing and opening metadata cannot mutate credentials or transcripts')
 })
 
@@ -458,24 +463,35 @@ test('Claude native and API Desktop list only their isolated local Code transcri
     assert.match(row.resumeBlockedReason!,/Claude Desktop/)
     const selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId}
     assert.equal((await f.catalog.content(selection)).total,1)
-    await assert.rejects(f.catalog.claudeResume(selection),/Claude Desktop/)
+    await assert.rejects(f.catalog.claudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}),/Claude Desktop/)
   }
 })
 
 test('Claude resume plans bind instance revision, original project and source before every launch',async t=>{
   const f=fixture(t),a=claudeSource(f,'resume-a',randomUUID()),b=claudeSource(f,'resume-b',randomUUID())
-  const page=await f.scan(),row=page.items.find(record=>record.locations[0].targetId===a.id)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:a.id}
+  const page=await f.scan(),row=page.items.find(record=>record.locations[0].targetId===a.id)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:a.id,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
   assert.equal(row.capabilities?.resume,true)
-  const preview=await f.catalog.claudeResume(selection)
+  const preview=await f.catalog.claudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]})
   assert.equal(preview.instanceId,a.id);assert.equal(preview.instanceRevision,a.profile.revision);assert.equal(preview.cwd,a.cwd)
   assert.equal(preview.profileFingerprint.length,64);assert.equal(preview.sourceId.length,64)
   assert.deepEqual(preview.args,['--resume',row.sourceSessionId])
   await assert.rejects(f.catalog.claudeResume({...selection,targetId:b.id}),/不属于/)
   f.store.transaction(state=>{state.instances!.find(profile=>profile.id===a.id)!.accountId=randomUUID()})
-  await assert.rejects(f.catalog.claudeResume(selection),/实例已变化/)
+  await assert.rejects(f.catalog.claudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}),/实例已变化/)
   f.store.transaction(state=>{state.instances=[a.profile,b.profile]})
   const duplicate=join(a.home,'projects','new-copy');mkdirSync(duplicate);writeFileSync(join(duplicate,row.sourceSessionId+'.jsonl'),readFileSync(a.path))
-  await assert.rejects(f.catalog.claudeResume(selection),/冲突/)
+  await assert.rejects(f.catalog.claudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}),/冲突/)
+})
+
+test('Claude session cwd choices remain bound to source snapshot and reject replacement before preview',async t=>{
+  const f=fixture(t),a=claudeSource(f,'multi-cwd',randomUUID()),alternate=join(f.root,'alternate-cwd')
+  mkdirSync(alternate)
+  appendFileSync(a.path,JSON.stringify({type:'assistant',sessionId:JSON.parse(readFileSync(a.path,'utf8').split('\n')[0]).sessionId,cwd:alternate,message:{content:'second recorded project'}})+'\n')
+  const page=await f.scan({targetId:a.id}),row=page.items[0]!
+  assert.deepEqual(row.cwdCandidates,[a.cwd,alternate]);assert.deepEqual(row.cwdAvailableCandidates,[a.cwd,alternate])
+  const selected={snapshotId:page.snapshotId,sessionId:row.id,targetId:a.id,sourceId:row.resumeSourceId!,cwd:alternate}
+  renameSync(alternate,alternate+'-old');mkdirSync(alternate)
+  await assert.rejects(f.catalog.claudeResume(selected),/项目目录身份已变化|项目目录已变化|来源已变化/)
 })
 
 test('Claude resume is disabled while running or when the original workspace has disappeared',async t=>{
@@ -483,15 +499,15 @@ test('Claude resume is disabled while running or when the original workspace has
   let running=true
   const catalog=new SessionCatalog(f.store,id=>id===a.id&&running,{defaultClaudeDirectory:null})
   t.after(()=>catalog.stop())
-  let page=await catalog.scan({runId:randomUUID(),targetId:a.id}),selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id}
+  let page=await catalog.scan({runId:randomUUID(),targetId:a.id}),selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id,sourceId:page.items[0].resumeSourceId!,cwd:page.items[0].cwdCandidates![0]}
   assert.equal(page.items[0].capabilities?.resume,false)
   await assert.rejects(catalog.claudeResume(selection),/正在运行/)
   running=false
   assert.equal((await catalog.claudeResume(selection)).instanceId,a.id)
   rmSync(a.cwd,{recursive:true})
-  page=await catalog.scan({runId:randomUUID(),targetId:a.id});selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id}
+  page=await catalog.scan({runId:randomUUID(),targetId:a.id});selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id,sourceId:page.items[0].resumeSourceId!,cwd:page.items[0].cwdCandidates![0]}
   assert.equal(page.items[0].capabilities?.resume,false);assert.match(page.items[0].resumeBlockedReason!,/项目目录不可用/)
-  await assert.rejects(catalog.claudeResume(selection),/ENOENT/)
+  await assert.rejects(catalog.claudeResume({...selection,sourceId:page.items[0].resumeSourceId!,cwd:page.items[0].cwdCandidates![0]}),/项目目录不可用/)
 })
 
 test('default Claude source is discovered only for an existing safe native projects directory',async t=>{
@@ -529,9 +545,9 @@ test('default Claude conversations remain separate from managed instances and ca
   const selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:source.id}
   assert.equal(await catalog.location(selection),path)
   assert.equal((await catalog.content(selection)).messages[0].blocks[0].text,'Default local conversation')
-  const defaultResume=await catalog.defaultClaudeResume(selection)
+  const defaultResume=await catalog.defaultClaudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]})
   assert.equal(defaultResume.sessionId,sessionId);assert.equal(defaultResume.location.cwd,f.root);assert.equal(defaultResume.homeDirectory,dirname(directory))
-  await assert.rejects(catalog.claudeResume(selection),/未绑定管理器实例/)
+  await assert.rejects(catalog.claudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}),/未绑定管理器实例/)
   assert.deepEqual(f.store.read(),state);assert.deepEqual(hashes(f.root),before)
   assert.ok(!JSON.stringify(page).includes('DEFAULT_CREDENTIAL'))
   const moved=directory+'-old';renameSync(directory,moved);mkdirSync(project,{recursive:true});writeFileSync(path,readFileSync(join(moved,'projects','default-project',sessionId+'.jsonl')))
@@ -544,13 +560,13 @@ test('default Claude fork is blocked for conflicts, mixed IDs, incomplete scans,
   const transcript=join(project,sessionId+'.jsonl')
   writeFileSync(transcript,JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Fixture'}})+'\n')
   const catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
-  let page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),row=page.items.find(value=>value.sourceSessionId===sessionId)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId}
+  let page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),row=page.items.find(value=>value.sourceSessionId===sessionId)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
   assert.equal((await catalog.defaultClaudeResume(selection)).sessionId,sessionId)
   mkdirSync(projectTwo);writeFileSync(join(projectTwo,sessionId+'.jsonl'),readFileSync(transcript))
   await assert.rejects(catalog.defaultClaudeResume(selection),/多个会话文件|冲突/)
   rmSync(projectTwo,{recursive:true})
   const otherId=randomUUID();appendFileSync(transcript,JSON.stringify({type:'user',sessionId:otherId,cwd:f.root,message:{content:'second'}})+'\n')
-  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'});row=page.items.find(value=>value.sourceSessionId===sessionId)!;selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId}
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'});row=page.items.find(value=>value.sourceSessionId===sessionId)!;selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
   assert.equal(row.capabilities?.resume,false);await assert.rejects(catalog.defaultClaudeResume(selection),/多个会话 ID|不能安全/)
   rmSync(f.root,{recursive:true,force:true});await assert.rejects(catalog.defaultClaudeResume(selection))
 })

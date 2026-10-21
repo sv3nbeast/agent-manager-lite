@@ -498,6 +498,23 @@ test('Desktop login callback input clears on success or close and stale errors d
   assert.equal(f.state.desktopLoginUrl, '')
 })
 
+test('copying a Claude session ID calls the direct API without opening a location picker', async t => {
+  const internalId = 'claude:fixture-internal-id', targetId = randomUUID()
+  const row = { id: internalId, clientType: 'claude_code', sourceSessionId: 'native-claude-session-id', title: 'Claude fixture', cwd: '/fixture/project', kind: 'conversation', locations: [{ targetId, name: 'Claude fixture', directory: '/fixture/claude', running: false, archived: false, ambiguous: true }] }
+  const page = { snapshotId: randomUUID(), scannedAt: 1, total: 1, page: 1, pageSize: 25, items: [row], warnings: [], sources: [{ id: targetId, name: 'Claude fixture', directory: '/fixture/claude', role: 'instance', clientType: 'claude_code', readOnly: true }] }
+  const copies: unknown[] = [], opens: unknown[] = []
+  const f = await component(t, 'SessionsView', {}, {
+    listClientConfigs: async () => [], scanSessions: async () => page,
+    cancelSessionScan: async () => {}, cancelSessionTokens: async () => {},
+    copySessionId: async (input: unknown) => { copies.push(input) }, openSession: async (input: unknown) => { opens.push(input) },
+  }, data())
+  await f.state.reload()
+  await f.state.copyId(row)
+  assert.deepEqual(copies, [{ snapshotId: page.snapshotId, sessionId: internalId, targetId }])
+  assert.deepEqual(opens, [])
+  assert.equal(f.state.choosing, undefined, 'copy must not briefly open the directory picker')
+})
+
 test('Claude session source capabilities remain visible while refreshing and after a failed refresh', async t => {
   const page = { snapshotId: 'fixture-snapshot', scannedAt: 1, total: 0, page: 1, pageSize: 25, items: [], warnings: [], sources: [
     { id: 'claude-source', name: 'Claude fixture', directory: '/fixture/claude', role: 'instance', clientType: 'claude_code', readOnly: true },

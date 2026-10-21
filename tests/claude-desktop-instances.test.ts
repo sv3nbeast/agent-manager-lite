@@ -553,7 +553,7 @@ desktopTest('Desktop local Code sessions are readable while resume and login cal
   assert.equal(result.items[0].launchMode,'desktop');assert.equal(result.items[0].capabilities?.resume,false)
   const selection={snapshotId:result.snapshotId,sessionId:result.items[0].id,targetId:first.id}
   assert.equal((await catalog.content(selection)).messages[0].blocks[0].text,'Synthetic local Desktop Code history')
-  await assert.rejects(catalog.claudeResume(selection),/Claude Desktop/)
+  await assert.rejects(catalog.claudeResume({...selection,sourceId:result.items[0].resumeSourceId!,cwd:result.items[0].cwdAvailableCandidates![0]}),/Claude Desktop/)
   assert.equal((await catalog.scan({ runId: randomUUID(), targetId: first.id })).total,1)
   assert.throws(() => f.instances.previewHistory({ id: first.id, revision: first.revision }), /客户端内查看/)
   await assert.rejects(f.instances.completeDesktopLogin(first.id, 'claude://complete'), /先启动/)

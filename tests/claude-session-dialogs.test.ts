@@ -9,14 +9,14 @@ import type { SessionContentPage, SessionRecord } from '../src/shared/sessions'
 import type { InstanceLaunchPreview } from '../src/shared/instances'
 
 const session = (id = 'claude:fixture', targetId = '00000000-0000-4000-8000-000000000001'): SessionRecord => ({
-  id, sourceSessionId: 'fixture-native-id', title: 'A conversation', cwd: '/fixture/project', clientType: 'claude_code', launchMode: 'cli', kind: 'conversation',
+  id, sourceSessionId: 'fixture-native-id', title: 'A conversation', cwd: '/fixture/project', cwdCandidates:['/fixture/project'],cwdAvailableCandidates:['/fixture/project'],resumeSourceId:'fixture-source',clientType: 'claude_code', launchMode: 'cli', kind: 'conversation',
   locations: [{ targetId, name: 'Source CLI', directory: '/fixture/claude', running: false, archived: false, ambiguous: false }],
   capabilities: { open: true, content: true, resume: true, transfer: false, archive: false, trash: false, visibilityRepair: false, tokens: false, contentSearch: true },
 })
 const preview = (ticket: string): InstanceLaunchPreview & { sessionId: string } => ({
   ticket, instanceId: session().locations[0].targetId, name: 'Source CLI', application: '/fixture/claude', directory: '/fixture/config', desktopDirectory: '/fixture/desktop',
   clientType: 'claude_code', launchMode: 'cli', workingDirectory: '/fixture/project', args: ['--resume', 'fixture-native-id'], accountName: 'Fixture API', model: 'fixture-model',
-  tierSource: 'instance', connectionMode: 'native', identityStatus: 'api_configured', sessionId: 'fixture-native-id',
+  tierSource: 'instance', connectionMode: 'native', identityStatus: 'api_configured', sessionId: 'fixture-native-id',cwd:'/fixture/project',
 })
 const content = (sessionId: string, text: string): SessionContentPage => ({
   snapshotId: 'snapshot', sessionId, sourceSessionId: 'fixture-native-id', title: 'A conversation', cwd: '/fixture/project', sourceName: 'Source CLI', clientType: 'claude_code',
@@ -80,7 +80,7 @@ test('reader highlights literal text without regular-expression interpretation a
 
 test('resume preview cancelled before completion discards the delayed ticket and never launches a process', async () => {
   const pending = deferred<ReturnType<typeof preview>>(), discards: string[] = [], starts: string[] = []
-  const ui = mount('SessionResumePanel', { previewClaudeSessionResume: () => pending.promise, discardClaudeSessionResume: async (ticket: string) => { discards.push(ticket) }, startInstance: async (ticket: string) => { starts.push(ticket) } })
+  const ui = mount('SessionResumePanel', { previewClaudeSessionResume: () => pending.promise, discardClaudeSessionResume: async (ticket: string) => { discards.push(ticket) } })
   await settle(); await ui.state.close(); ui.unmount()
   pending.resolve(preview('late-ticket')); await settle()
   assert.deepEqual(discards, ['late-ticket'])
@@ -97,6 +97,18 @@ test('changing resume source discards stale authorization and displays only the 
   second.resolve(preview('new-ticket')); await settle(); first.resolve(preview('old-ticket')); await settle()
   assert.equal(ui.state.preview.ticket, 'new-ticket')
   assert.deepEqual(discards, ['old-ticket'])
+})
+
+test('managed Claude resume binds the selected cwd to the current source snapshot',async t=>{
+  const selected=session('claude:multi-cwd'),second='/fixture/second-project';selected.cwdCandidates=['/fixture/project',second];selected.cwdAvailableCandidates=['/fixture/project',second]
+  const calls:unknown[]=[]
+  const ui=mount('SessionResumePanel',{previewClaudeSessionResume:async(input:any)=>{calls.push(structuredClone(input));return {...preview('multi-cwd-ticket'),workingDirectory:input.cwd}},discardClaudeSessionResume:async()=>{}},{record:selected})
+  t.after(ui.unmount);await settle()
+  assert.equal((calls[0] as any).cwd,'/fixture/project')
+  ui.state.selectedCwd=second;await ui.state.prepare();await settle()
+  assert.equal((calls.at(-1) as any).cwd,second)
+  assert.equal(ui.state.preview.workingDirectory,second)
+  assert.equal((calls.at(-1) as any).sourceId,selected.resumeSourceId)
 })
 
 test('resume confirmation starts once with its verified ticket and reports the instance for lifecycle feedback', async t => {

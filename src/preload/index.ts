@@ -98,6 +98,7 @@ const api: ManagerAPI = {
   cancelSessionScan: id=>ipcRenderer.invoke('manager:invoke','cancelSessionScan',id),
   cancelSessionTokens: id=>ipcRenderer.invoke('manager:invoke','cancelSessionTokens',id),
   openSession: input=>ipcRenderer.invoke('manager:invoke','openSession',input),
+  copySessionId: input=>ipcRenderer.invoke('manager:invoke','copySessionId',input),
   mutateLocalAccess: input => ipcRenderer.invoke('manager:invoke','mutateLocalAccess',input),
   startLocalAccess: () => ipcRenderer.invoke('manager:invoke','startLocalAccess'),
   stopLocalAccess: () => ipcRenderer.invoke('manager:invoke','stopLocalAccess'),

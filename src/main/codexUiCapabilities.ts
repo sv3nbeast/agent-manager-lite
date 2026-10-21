@@ -8,8 +8,23 @@ export type CodexUiFeatureSupports=Record<CodexUiFeature,CodexUiFeatureSupport>
 type Node={type:string;start:number;end:number;[key:string]:any}
 const label:Record<CodexUiFeature,string>={locale:'页面语言',speed:'普通 / Fast',ultra:'Ultra 推理'}
 const literal=(node:Node|undefined):unknown=>node?.type==='Literal'?node.value:node?.type==='TemplateLiteral'&&node.expressions.length===0?node.quasis[0].value.cooked:undefined
+const booleanLiteral=(node:Node|undefined):boolean|undefined=>{const value=literal(node);if(typeof value==='boolean')return value;if(node?.type==='UnaryExpression'&&node.operator==='!'&&typeof literal(node.argument)==='number')return !literal(node.argument);return undefined}
 const property=(node:Node|undefined):string|undefined=>node?.type==='MemberExpression'&&!node.computed?node.property.name:undefined
 const unwrap=(node:Node):Node=>node.type==='ChainExpression'?node.expression:node
+function memberPath(node:Node|undefined):string[]{if(!node)return[];node=unwrap(node);if(node.type==='Identifier')return[node.name];if(node.type!=='MemberExpression')return[];const key=node.computed?literal(node.property):node.property?.name;return typeof key==='string'?[...memberPath(node.object),key]:[]}
+function resolvedMemberPath(node:Node|undefined,scope:Node,seen=new Set<string>()):string[]{
+  if(!node)return[]
+  node=unwrap(node)
+  if(node.type==='Identifier'){
+    if(seen.has(node.name))return[]
+    seen.add(node.name)
+    const aliases=nodes(scope,n=>n.type==='VariableDeclarator'&&n.id?.type==='Identifier'&&n.id.name===node.name)
+    return aliases.length===1&&aliases[0].init?resolvedMemberPath(aliases[0].init,scope,seen):[node.name]
+  }
+  if(node.type!=='MemberExpression')return[]
+  const key=node.computed?literal(node.property):node.property?.name
+  return typeof key==='string'?[...resolvedMemberPath(node.object,scope,seen),key]:[]
+}
 const isFunction=(node:Node|undefined):boolean=>Boolean(node&&['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression'].includes(node.type))
 
 /**
@@ -74,10 +89,31 @@ function localBindings(fn:Node):Set<string> {
  * Every feature is a transaction: ambiguous/missing roles discard its complete
  * patch set. Model capability and upstream fast_mode requirements remain intact.
  */
-export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatureSupports;replacements:Record<CodexUiFeature,CodexUiReplacement[]>} {
+export function codexUiAccessMapperImportPaths(source:string):string[] {
+  try{
+    const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node
+    const functions=moduleFunctions(program)
+    const uiCandidates=functions.filter(fn=>textOf(source,fn).includes('authMethod')&&textOf(source,fn).includes('isLoading')&&nodes(fn,n=>n.type==='Property'&&n.key?.name==='serviceTierAccess').length===1)
+    const ui=one(uiCandidates.filter(fn=>{
+      const query=nodes(fn,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending'))
+      if(query.length!==1)return false
+      const data=query[0].id.properties.find((p:Node)=>p.key.name==='data')?.value?.name
+      return nodes(fn,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.arguments.length===1&&n.arguments[0].name===data).length===1
+    }))
+    const query=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending')))
+    const data=one<Node>(query.id.properties.filter((p:Node)=>p.key.name==='data')).value.name
+    const mapper=one(nodes(ui,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.arguments.length===1&&n.arguments[0].name===data).map((node:Node)=>node.callee.name))
+    const imports=(program.body??[]).filter((node:Node)=>node.type==='ImportDeclaration'&&node.specifiers.some((specifier:Node)=>specifier.local?.name===mapper))
+    if(imports.length!==1||typeof imports[0].source?.value!=='string'||!/^\.\/[\w.-]+\.js$/.test(imports[0].source.value))return[]
+    return [imports[0].source.value]
+  }catch{return []}
+}
+function textOf(source:string,node:Node):string{return source.slice(node.start,node.end)}
+
+export function detectCodexUiCapabilities(source:string,importedModules:Readonly<Record<string,string>>={}):{features:CodexUiFeatureSupports;replacements:Record<CodexUiFeature,CodexUiReplacement[]>} {
   const features={} as CodexUiFeatureSupports,replacements:Record<CodexUiFeature,CodexUiReplacement[]>={locale:[],speed:[],ultra:[]}
-  let functions:Node[]
-  try{functions=moduleFunctions(parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node)}
+  let functions:Node[],program:Node
+  try{program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node;functions=moduleFunctions(program)}
   catch{
     for(const feature of codexUiFeatures)features[feature]={supported:false,reason:`${label[feature]}：无法确认客户端页面结构`}
     return {features,replacements}
@@ -111,7 +147,14 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     // Newer clients expose an access object (Fast and Ultra Fast) instead of
     // one boolean. Follow the returned capability and its requirements mapper;
     // preserve the official tier rules rather than depending on build names.
-    const ui=one(functionsWith('authMethod','isLoading').filter(fn=>nodes(fn,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name)).length===1))
+    const uiCandidates=functionsWith('authMethod','isLoading').filter(fn=>nodes(fn,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name)).length===1)
+    const ui=one(uiCandidates.filter(fn=>{
+      if(!nodes(fn,n=>n.type==='Property'&&n.key.name==='serviceTierAccess').length)return true
+      const queries=nodes(fn,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending'))
+      if(queries.length!==1)return false
+      const dataName=queries[0].id.properties.find((p:Node)=>p.key.name==='data')?.value?.name
+      return nodes(fn,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.arguments.length===1&&n.arguments[0].name===dataName).length===1
+    }))
     const capability=one(nodes(ui,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name))).key.name
     const accessObject=capability==='serviceTierAccess'
     const auth=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.init&&text(n.init).includes('authMethod')&&nodes(n.init,c=>c.type==='BinaryExpression'&&c.operator==='==='&&literal(c.right)==='chatgpt').length===1))
@@ -124,15 +167,71 @@ export function detectCodexUiCapabilities(source:string):{features:CodexUiFeatur
     const loading=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.init&&text(n.init).includes('isLoading')))
     const queryPending=one(nodes(loading.init,n=>n.type==='LogicalExpression'&&n.operator==='&&'&&n.left.name===auth.id.name&&n.right.name===pending))
     const needsData=one(nodes(ui,n=>n.type==='BinaryExpression'&&n.operator==='!='&&n.left.name===data&&literal(n.right)===null))
-    const access=accessObject?one(nodes(ui,n=>n.type==='ConditionalExpression'&&n.consequent.type==='CallExpression'&&n.consequent.callee.type==='Identifier'&&n.consequent.arguments.length===1&&n.consequent.arguments[0].name===data&&literal(n.alternate)===null)):undefined
-    const mapper=access?.consequent.callee.name
+    const accessCall=accessObject?one(nodes(ui,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.arguments.length===1&&n.arguments[0].name===data)):undefined
+    const access=accessCall?.callee.name
+    const mapper=access
+    const confirmations=functionsWith('authMethod:').filter(fn=>fn.async&&text(fn).includes('fast_mode'))
+    // The newer menu obtains its access decision from the existing per-host
+    // requirements query and maps it with the client's fCe requirements
+    // function. Allow only an explicit API-key identity on the local host to
+    // use that same path. Do not invent an unauthenticated identity, bypass
+    // requirements loading, or alter the upstream Fast denial.
+    if(accessObject&&confirmations.length===0){
+      // The current composer gets its tier decision from the shared access
+      // mapper, with no request-time callback. Keep that server result as the
+      // entitlement source and extend only the explicit local API-key gate.
+      let accessMapper=functions.find(fn=>functionName(fn)===mapper)
+      if(!accessMapper){
+        const references=nodes(program,n=>n.type==='ImportDeclaration'&&n.specifiers.some((specifier:Node)=>specifier.local?.name===mapper))
+        const reference=one<Node>(references),specifier=one<Node>(reference.specifiers.filter((item:Node)=>item.local?.name===mapper))
+        const external=importedModules[reference.source.value]
+        if(!external||typeof specifier.imported?.name!=='string')throw new Error('missing imported access mapper')
+        const externalProgram=parse(external,{ecmaVersion:'latest',sourceType:'module'}) as Node
+        const importedName=specifier.imported.name as string
+        const exportedNodes=nodes(externalProgram,n=>n.type==='ExportNamedDeclaration'&&n.source==null&&n.specifiers?.some((item:Node)=>item.exported?.name===specifier.imported.name))
+        const directDeclarations=(externalProgram.body as Node[]).filter(node=>node.type==='ExportNamedDeclaration'&&node.declaration?.id?.name===importedName)
+        const exportCount=exportedNodes.reduce((count:number,declaration:Node)=>count+declaration.specifiers.filter((item:Node)=>item.exported?.name===importedName).length,0)+directDeclarations.length
+        if(exportCount!==1)throw new Error('ambiguous exported access mapper')
+        const localName=directDeclarations.length?importedName:one<Node>(exportedNodes.flatMap((declaration:Node)=>declaration.specifiers.filter((item:Node)=>item.exported?.name===importedName))).local?.name
+        accessMapper=one(moduleFunctions(externalProgram).filter(fn=>functionName(fn)===localName))
+      }
+      const mapperInput=accessMapper.params?.[0]?.type==='Identifier'?accessMapper.params[0].name:undefined
+      if(!mapperInput||accessMapper.params.length!==1)throw new Error('access mapper input contract')
+      const returns=nodes(accessMapper,n=>n.type==='ReturnStatement'&&n.argument?.type==='ObjectExpression')
+      const result=one(returns).argument
+      const fastValue=one<Node>(result.properties.filter((item:Node)=>item.type==='Property'&&item.key?.name==='fast')).value
+      const ultraValue=one<Node>(result.properties.filter((item:Node)=>item.type==='Property'&&item.key?.name==='ultrafast')).value
+      const resolveMode=(value:Node,mode:string,seen=new Set<string>()):boolean=>{
+        value=unwrap(value)
+        if(value.type==='Identifier'){
+          if(seen.has(value.name))return false
+          seen.add(value.name)
+          const declarations=nodes(accessMapper,n=>n.type==='VariableDeclarator'&&n.id?.type==='Identifier'&&n.id.name===value.name)
+          return declarations.length===1&&!!declarations[0].init&&resolveMode(declarations[0].init,mode,seen)
+        }
+        return value.type==='BinaryExpression'&&value.operator==='!=='&&booleanLiteral(value.right)===false&&resolvedMemberPath(value.left,accessMapper).join('.')===`${mapperInput}.requirements.featureRequirements.${mode}`
+      }
+      if(!resolveMode(fastValue,'fast_mode')||ultraValue.type!=='LogicalExpression'||ultraValue.operator!=='&&'||!resolveMode(ultraValue.right,'ultrafast_mode'))throw new Error('access mapper entitlement result')
+      const fastName=fastValue.type==='Identifier'?fastValue.name:undefined,left=ultraValue.left
+      const independentValues=nodes(left,n=>n.type==='BinaryExpression'&&n.operator==='==='&&((resolvedMemberPath(n.left,accessMapper).join('.')===`${mapperInput}.supportsIndependentSpeedModes`&&booleanLiteral(n.right)===true)||(resolvedMemberPath(n.right,accessMapper).join('.')===`${mapperInput}.supportsIndependentSpeedModes`&&booleanLiteral(n.left)===true)))
+      if(!fastName||left.type!=='LogicalExpression'||left.operator!=='||'||!nodes(left,n=>n.type==='Identifier'&&n.name===fastName).length||independentValues.length!==1)throw new Error('independent Ultra Fast entitlement')
+      const uiName=functionName(ui)
+      if(!uiName)throw new Error('access UI binding')
+      const providers=functions.filter(fn=>fn!==ui&&['serviceTierSettings','availableOptions','setServiceTier'].every(term=>text(fn).includes(term))&&nodes(fn,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.callee.name===uiName).length===1&&nodes(fn,n=>n.type==='Property'&&n.key?.name===capability).length>=1)
+      const provider=one(providers)
+      if(!functionName(provider))throw new Error('access consumer contract')
+      const verifiedLocalApi=`${host}===\`local\`&&(${account}?.authMethod===\`apikey\`||${account}?.authMethod===null&&${account}?.requiresAuth===!1)`
+      const edits=[edit(auth.init,`${text(auth.init)}||${verifiedLocalApi}`),edit(queryPending,`${text(queryPending)}&&!(${custom})`),edit(needsData,`(${text(needsData)}||(${custom}))`)]
+      if(accessCall)edits.push(edit(accessCall.arguments[0],`${data}??{requirements:{featureRequirements:{fast_mode:!0,ultrafast_mode:!1}}}`))
+      return edits
+    }
     const controls=one(functionsWith(capability,'serviceTierSettings','availableOptions','setServiceTier'))
     const controlQuery=one(nodes(controls,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='isPending')))
     const controlPending=one<Node>(controlQuery.id.properties.filter((p:Node)=>p.key.name==='isPending')).value.name
     const controlIdentity=one(nodes(controls,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name===capability)))
     const permitted=one<Node>(controlIdentity.id.properties.filter((p:Node)=>p.key.name===capability&&p.value.type==='Identifier')).value.name
     const controlLoading=one(nodes(controls,n=>n.type==='LogicalExpression'&&n.operator==='&&'&&n.right.name===controlPending&&n.left.type==='BinaryExpression'&&n.left.operator==='=='&&literal(n.left.right)===null))
-    const confirm=one(functionsWith('authMethod:').filter(fn=>fn.async&&(accessObject?nodes(fn,n=>n.type==='CallExpression'&&n.callee.name===mapper).length===1:text(fn).includes('fast_mode'))))
+    const confirm=one(confirmations)
     const denied=accessObject?'null':'!1'
     const guard=one(nodes(confirm,n=>n.type==='IfStatement'&&n.consequent.type==='ReturnStatement'&&text(n.test).includes('chatgpt')&&text(n.consequent.argument)===denied))
     const method=one(nodes(guard.test,n=>n.type==='BinaryExpression'&&literal(n.right)==='chatgpt'&&n.left.type==='Identifier')).left.name

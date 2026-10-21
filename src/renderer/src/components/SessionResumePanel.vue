@@ -7,7 +7,7 @@ import { useManager } from '../store'
 const props = defineProps<{ snapshotId: string; record: SessionRecord; targetId: string }>()
 const emit = defineEmits<{ close: []; started: [instanceId: string] }>()
 const manager = useManager()
-const preview = ref<InstanceLaunchPreview & { sessionId: string }>(), loading = ref(false), starting = ref(false), error = ref('')
+const preview = ref<InstanceLaunchPreview & { sessionId: string }>(), selectedCwd=ref(''), loading = ref(false), starting = ref(false), error = ref('')
 let generation = 0, alive = true
 async function discard(ticket?: string): Promise<void> {
   if (!ticket) return
@@ -19,7 +19,13 @@ async function prepare(): Promise<void> {
   await discard(previous)
   if (!alive || current !== generation) return
   try {
-    const next = await window.manager.previewClaudeSessionResume({ snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId })
+    const sourceId=props.record.resumeSourceId
+    if(!sourceId)throw new Error('Claude 会话来源已失效，请刷新列表')
+    const candidates=props.record.cwdAvailableCandidates??[]
+    const cwd=candidates.includes(selectedCwd.value)?selectedCwd.value:candidates[0]
+    if(!cwd)throw new Error('会话记录中的项目目录当前不可用，请恢复项目目录后重试')
+    selectedCwd.value=cwd
+    const next = await window.manager.previewClaudeSessionResume({ snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId, sourceId, cwd })
     if (!alive || current !== generation) { await discard(next.ticket); return }
     preview.value = next
   } catch (cause) { if (alive && current === generation) error.value = String(cause) }
@@ -41,7 +47,7 @@ async function start(): Promise<void> {
     preview.value = undefined; emit('started', selected.instanceId); emit('close')
   } finally { if (alive) starting.value = false }
 }
-watch(() => [props.snapshotId, props.record.id, props.targetId], () => { void prepare() })
+watch(() => [props.snapshotId, props.record.id, props.targetId], () => { selectedCwd.value='';void prepare() })
 onMounted(() => { void prepare() })
 onUnmounted(() => { alive = false; generation++; void discard(preview.value?.ticket) })
 </script>
@@ -53,6 +59,8 @@ onUnmounted(() => { alive = false; generation++; void discard(preview.value?.tic
       <a-spin :spinning="loading">
         <h3>{{record.title}}</h3>
         <p class="muted">从原项目目录启动此会话所属的 CLI 实例，继续已有对话。</p>
+        <a-form-item v-if="(props.record.cwdAvailableCandidates?.length??0)>1" label="选择项目目录"><a-select v-model:value="selectedCwd" aria-label="选择 Claude 会话项目目录" :disabled="loading||starting" :options="props.record.cwdAvailableCandidates!.map(path=>({value:path,label:path}))" @change="prepare" /></a-form-item>
+        <a-alert v-if="(props.record.cwdCandidates?.length??0)>(props.record.cwdAvailableCandidates?.length??0)" type="warning" message="部分记录中的工作目录当前不可用，已从候选项中排除；请先恢复相应目录后刷新。" />
         <a-descriptions v-if="preview" :column="1" bordered size="small">
           <a-descriptions-item label="实例">{{preview.name}}</a-descriptions-item>
           <a-descriptions-item label="客户端">Claude Code CLI · {{preview.application}}</a-descriptions-item>

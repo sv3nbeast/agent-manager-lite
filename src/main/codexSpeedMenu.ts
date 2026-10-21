@@ -5,7 +5,7 @@ import {createHash,randomUUID} from 'node:crypto'
 import * as nodeFS from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
-import {applyCodexUiReplacements,codexUiFeatures,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
+import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiFeatures,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
 export type CodexSpeedMenuEnhancements='speed'|'locale'|'speed-locale'
@@ -281,17 +281,25 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     const pkgBody=reader.archive(archive,'package.json',128*1024),pkg=JSON.parse(pkgBody.toString('utf8'))
     parts.push(digest(pkgBody));version=typeof pkg.version==='string'&&pkg.version.length<100?pkg.version:undefined
     if(pkg.name!=='openai-codex-electron'||pkg.main!=='.vite/build/early-bootstrap.js')return fail('所选客户端未使用兼容的 Codex 桌面入口')
+    // Package version is diagnostic only. Compatibility is decided from the
+    // verified Electron entry, Fuse, protocol resource and renderer roles below.
+    if(!version)return fail('无法读取当前 Codex 版本')
     const wires=reader.fuseWires(framework)
     parts.push(wires.map(w=>hash(w)))
-    if(!wires.length||wires.some(w=>w[0]!==1||w[1]<8||w.length!==w[1]+2||[...w.subarray(2)].some(bit=>![48,49].includes(bit)))||wires.some(w=>!w.equals(wires[0])))return fail('客户端启动兼容参数尚未识别')
+    const expectedFuse=Buffer.from([1,9,48,49,48,48,49,49,48,48,49])
+    if(wires.length!==1||!wires[0].equals(expectedFuse))return fail('此 Codex 的启动兼容参数与已审计版本不匹配')
     const html=reader.archive(archive,'webview/index.html',1024*1024).toString('utf8')
-    if(/<script\b[^>]*\bintegrity\s*=/i.test(html)||/strict-dynamic/i.test(html)||!/script-src\s+(?:&#39;|')self(?:&#39;|')/.test(html))return fail('Codex 页面完整性策略不兼容')
+    if(/<script\b[^>]*\bintegrity\s*=/i.test(html)||/strict-dynamic/i.test(html))return fail('Codex 页面完整性策略不兼容')
     const early=reader.archive(archive,pkg.main,1024*1024).toString('utf8')
     const bootstrapNames=[...early.matchAll(/require\(["']\.\/(bootstrap-[\w-]+\.js)["']\)/g)].map(m=>m[1])
     if(bootstrapNames.length!==1)return fail('Codex 桌面启动入口已变化')
     const bootstrap='.vite/build/'+bootstrapNames[0],boot=reader.archive(archive,bootstrap,16*1024*1024).toString('utf8')
     if(!boot.includes('require("electron")')||!boot.includes('CODEX_ELECTRON_USER_DATA_PATH'))return fail('Codex 桌面隔离接口已变化')
-    parts.push(digest(html),digest(early),digest(boot))
+    const protocolChunks=[...new Set([...boot.matchAll(/require\(["']\.\/([\w-]+\.js)["']\)/g)].map(m=>'.vite/build/'+m[1]))]
+    const protocolSources=[{path:bootstrap,body:boot},...protocolChunks.map(path=>({path,body:reader.archive(archive,path,16*1024*1024).toString('utf8')}))]
+      .filter(entry=>/\.protocol\.handle\(\s*["'`]app["'`]\s*,/.test(entry.body))
+    if(protocolSources.length!==1)return fail('Codex 应用协议注册方式尚未适配')
+    parts.push(digest(html),digest(early),digest(boot),protocolSources[0].path,digest(protocolSources[0].body))
     const audited=version?releaseByVersion.get(version):undefined
     let asset=audited?.asset,source:string|undefined
     if(asset)try{source=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{asset=undefined}
@@ -311,9 +319,15 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       const replacements={locale:audited.localeReplacement?[audited.localeReplacement]:[],speed:[...audited.speedReplacements],ultra:[...(audited.ultraReplacements??[])]}
       detected={replacements,features:Object.fromEntries(codexUiFeatures.map(f=>[f,{supported:replacements[f].length>0,reason:replacements[f].length?'已验证的功能结构':'此客户端未包含该功能的兼容结构'}])) as CodexUiFeatureSupports}
     }else{
-      detected=capabilityCache.get(sourceDigest)??detectCodexUiCapabilities(source!)
+      const imports=codexUiAccessMapperImportPaths(source!),importedModules:Record<string,string>={}
+      for(const specifier of imports){
+        const path='webview/assets/'+specifier.slice(2),body=reader.archive(archive,path,32*1024*1024).toString('utf8')
+        parts.push(path,digest(body));importedModules[specifier]=body
+      }
+      const cacheKey=hash(JSON.stringify([sourceDigest,Object.entries(importedModules).map(([path,body])=>[path,digest(body)])]))
+      detected=capabilityCache.get(cacheKey)??detectCodexUiCapabilities(source!,importedModules)
       if(capabilityCache.size>=4)capabilityCache.delete(capabilityCache.keys().next().value!)
-      capabilityCache.set(sourceDigest,detected)
+      capabilityCache.set(cacheKey,detected)
     }
     const featureSupport=structuredClone(detected.features),features=requested.filter(f=>featureSupport[f].supported)
     const replacements=features.flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))

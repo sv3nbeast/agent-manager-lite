@@ -73,8 +73,8 @@ async function main(): Promise<void> {
   if (requestedEvidence && !isAbsolute(requestedEvidence)) throw new Error('--evidence-dir must be an absolute path')
   const evidence = requestedEvidence ? resolve(requestedEvidence) : join(root, 'evidence')
   mkdirSync(evidence, { recursive: true, mode: 0o700 })
-  const homeDirectory = join(root, 'home'), project = join(root, 'project')
-  mkdirSync(homeDirectory, { mode: 0o700 }); mkdirSync(join(project, '.claude'), { recursive: true, mode: 0o700 })
+  const homeDirectory = join(root, 'home'), project = join(root, 'project'), secondProject = join(root, 'second-project')
+  mkdirSync(homeDirectory, { mode: 0o700 }); mkdirSync(join(project, '.claude'), { recursive: true, mode: 0o700 }); mkdirSync(secondProject, { mode: 0o700 })
   const defaultStateBefore = defaultStateMetadata()
   const projectHookMarker = join(root, 'project-hook-ran'), projectMcpMarker = join(root, 'project-mcp-ran')
   const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
@@ -148,8 +148,8 @@ async function main(): Promise<void> {
     writeFileSync(projections[mode].paths.settingsFile, JSON.stringify({ model: mode === 'api_key' ? 'claude-sonnet-4-5' : 'claude-haiku-4-5' }), { mode: 0o600 })
   }
   const environments = Object.fromEntries(modes.map(mode => [mode, claudeCodeEnvironment(commonEnvironment, projections[mode])])) as Record<Mode, NodeJS.ProcessEnv>
-  const run = (mode: Mode, args: string[], environment = environments[mode]): Promise<CliResult> => new Promise((resolveRun, reject) => {
-    const child = spawn('/usr/bin/sandbox-exec', ['-p', sandboxProfile, '/bin/bash', '-c', 'exec -a "$1" "$2" "${@:3}"', 'bash', `--cml-instance=claude-smoke-${mode}`, executable, ...args], { cwd: project, env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
+  const run = (mode: Mode, args: string[], environment = environments[mode], workingDirectory = project): Promise<CliResult> => new Promise((resolveRun, reject) => {
+    const child = spawn('/usr/bin/sandbox-exec', ['-p', sandboxProfile, '/bin/bash', '-c', 'exec -a "$1" "$2" "${@:3}"', 'bash', `--cml-instance=claude-smoke-${mode}`, executable, ...args], { cwd: workingDirectory, env: environment, stdio: ['ignore', 'pipe', 'pipe'] })
     children.add(child); activeModes.set(mode, child)
     let stdout = '', stderr = '', finished = false
     const timeout = setTimeout(() => { child.kill('SIGKILL'); finish(new Error('Claude Code smoke process timed out')) }, 30_000)
@@ -214,6 +214,18 @@ async function main(): Promise<void> {
     assert.ok(replay)
     assert.ok(replay.text.includes('fixture-prompt-api_key') && replay.text.includes('fixture-response-api_key') && replay.text.includes('fixture-follow-up-api_key'))
     assert.ok(!replay.text.includes('fixture-prompt-bearer'))
+    // Resume the same synthetic session from a second recorded project cwd.
+    // sandbox-exec still blocks all external traffic and allows only the mock.
+    const secondDirectoryResume = await run('api_key', [...printArgs, '--resume', sessionIds.api_key, 'fixture-follow-up-second-project'], environments.api_key, secondProject)
+    assert.equal(secondDirectoryResume.code, 0)
+    assert.equal(JSON.parse(secondDirectoryResume.stdout).session_id, sessionIds.api_key)
+    const secondDirectoryRequest = requests.at(-1)
+    assert.ok(secondDirectoryRequest)
+    assert.ok(secondDirectoryRequest.text.includes('fixture-prompt-api_key') && secondDirectoryRequest.text.includes('fixture-response-api_key') && secondDirectoryRequest.text.includes('fixture-follow-up-second-project'))
+    const afterSecondDirectoryResume=scanClaudeCodeSessions(configDirectory,{instanceId})
+    const afterSecondRecord=afterSecondDirectoryResume.records.find(record=>record.id===sessionIds.api_key)!
+    assert.ok(afterSecondRecord.locations[0].cwdCandidates?.includes(project))
+    assert.ok(afterSecondRecord.locations[0].cwdCandidates?.includes(secondProject))
     const requestCount = requests.length
     const crossResume = await run('bearer', [...printArgs, '--resume', sessionIds.api_key, 'fixture-cross-instance-must-not-run'])
     assert.equal(crossResume.code, 1); assert.match(crossResume.stderr, /No conversation found/)
@@ -229,7 +241,7 @@ async function main(): Promise<void> {
       result: 'passed', version: version.version, executableSha256: identity.sha256, executableSize: identity.size,
       platform: process.platform, architecture: process.arch, checkedAt: new Date().toISOString(),
       login, capabilityFlags: capabilities.flags,
-      checks: ['two-concurrent-native-processes', 'api-key-header', 'bearer-header', 'per-instance-user-settings', 'per-instance-global-state', 'project-env-and-hooks-excluded', 'project-mcp-excluded', 'transcripts-isolated', 'same-instance-resume', 'cross-instance-resume-rejected-before-request', 'argv0-and-native-binary-ownership', 'default-store-metadata-unchanged', 'external-network-denied-by-os'],
+      checks: ['two-concurrent-native-processes', 'api-key-header', 'bearer-header', 'per-instance-user-settings', 'per-instance-global-state', 'project-env-and-hooks-excluded', 'project-mcp-excluded', 'transcripts-isolated', 'same-instance-resume', 'same-session-resume-from-second-recorded-cwd', 'cross-instance-resume-rejected-before-request', 'argv0-and-native-binary-ownership', 'default-store-metadata-unchanged', 'external-network-denied-by-os'],
       messagesRequests: requests.length, upstreamRequests: 0,
       notVerified: ['subscription-browser-login', 'subscription-refresh-and-revocation', 'cloud-provider-and-federation-login', 'desktop-profile-cookie-keychain-and-session-isolation'],
     }

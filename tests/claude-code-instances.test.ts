@@ -94,16 +94,17 @@ async function resumeFixture(t:TestContext,options:Parameters<typeof fixture>[1]
   if(subscription)f.store.transaction(state=>{state.accounts.push(subscription)})
   const instance=f.add('Resume fixture',subscription??f.api,[]),sessionId=randomUUID()
   const project=join(f.root,"project ' literal $(safe)");mkdirSync(project)
+  const alternateProject=join(f.root,'alternate-project');mkdirSync(alternateProject)
   const projectDirectory=join(instance.directory,'projects','fixture-resume');mkdirSync(projectDirectory,{recursive:true})
   const transcript=join(projectDirectory,sessionId+'.jsonl')
-  writeFileSync(transcript,JSON.stringify({type:'user',sessionId,cwd:project,message:{role:'user',content:'Synthetic previous conversation'},timestamp:new Date().toISOString()})+'\n')
+  writeFileSync(transcript,[JSON.stringify({type:'user',sessionId,cwd:project,message:{role:'user',content:'Synthetic previous conversation'},timestamp:new Date().toISOString()}),JSON.stringify({type:'assistant',sessionId,cwd:alternateProject,message:{content:'Synthetic response from second project'},timestamp:new Date().toISOString()})].join('\n')+'\n')
   const catalog=new SessionCatalog(f.store,id=>f.instances.inUse(id),{defaultClaudeDirectory:null})
   const scan=await catalog.scan({runId:randomUUID(),targetId:instance.id})
   const row=scan.items.find(row=>row.sourceSessionId===sessionId)!
   assert.ok(row)
   const selection={snapshotId:scan.snapshotId,sessionId:row.id,targetId:instance.id}
-  const resume=await catalog.claudeResume(selection)
-  return {...f,instance,sessionId,project,projectDirectory,transcript,catalog,selection,resume}
+  const resume=await catalog.claudeResume({...selection,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]})
+  return {...f,instance,sessionId,project,alternateProject,projectDirectory,transcript,catalog,selection,resume}
 }
 
 test('Claude resume launches the original instance and project without persisting launch overrides', {skip:!supported},async t=>{
@@ -133,7 +134,7 @@ test('Claude resume accepts a real project path spelling while preserving its di
   writeFileSync(f.transcript, JSON.stringify({ type: 'user', sessionId: f.sessionId, cwd: literalCwd, message: { role: 'user', content: 'Literal project path' }, timestamp: new Date().toISOString() }) + '\n')
   const scan = await f.catalog.scan({ runId: randomUUID(), targetId: f.instance.id })
   const row = scan.items.find(item => item.sourceSessionId === f.sessionId)!
-  const resume = await f.catalog.claudeResume({ snapshotId: scan.snapshotId, sessionId: row.id, targetId: f.instance.id })
+  const resume = await f.catalog.claudeResume({ snapshotId: scan.snapshotId, sessionId: row.id, targetId: f.instance.id,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0] })
   assert.equal(resume.cwd, literalCwd)
   const preview = f.instances.previewClaudeSessionResume(resume)
   assert.equal(preview.workingDirectory, literalCwd)
@@ -141,6 +142,26 @@ test('Claude resume accepts a real project path spelling while preserving its di
   await f.instances.settled(f.instance.id)
   assert.equal(f.instances.views().find(item => item.id === f.instance.id)?.status, 'running')
   assert.equal((await f.evidence(f.instance.directory)).cwd, f.project)
+  await f.instances.stop(f.instance.id)
+})
+
+test('Claude transcript retains multiple cwd choices and starts from the selected directory; stale cwd identity is rejected',{skip:!supported},async t=>{
+  const f=await resumeFixture(t),scan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id}),row=scan.items.find(item=>item.sourceSessionId===f.sessionId)!
+  assert.deepEqual(row.cwdCandidates,[f.project,f.alternateProject])
+  assert.deepEqual(row.cwdAvailableCandidates,[f.project,f.alternateProject])
+  const selected=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id,sourceId:row.resumeSourceId!,cwd:f.alternateProject})
+  const preview=f.instances.previewClaudeSessionResume(selected)
+  assert.equal(preview.workingDirectory,f.alternateProject)
+  const changed=join(f.root,'alternate-project-replaced');renameSync(f.alternateProject,changed);mkdirSync(f.alternateProject)
+  assert.throws(()=>f.instances.start(preview.ticket),/目录已被替换|身份|变化/)
+  assert.equal(f.children.length,0)
+  const fresh=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id}),freshRow=fresh.items.find(item=>item.sourceSessionId===f.sessionId)!
+  const freshSelection=await f.catalog.claudeResume({snapshotId:fresh.snapshotId,sessionId:freshRow.id,targetId:f.instance.id,sourceId:freshRow.resumeSourceId!,cwd:f.project})
+  const freshPreview=f.instances.previewClaudeSessionResume(freshSelection)
+  assert.equal(freshPreview.workingDirectory,f.project)
+  f.instances.start(freshPreview.ticket);await f.instances.settled(f.instance.id)
+  const evidence=await f.evidence(f.instance.directory)
+  assert.equal(evidence.cwd,f.project)
   await f.instances.stop(f.instance.id)
 })
 
@@ -155,14 +176,15 @@ test('Claude resume rejects stale files, duplicate IDs, replaced projects and ca
   assert.throws(()=>f.instances.start(preview.ticket),/已变化|刷新/)
   const scan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id})
   const row=scan.items.find(row=>row.sourceSessionId===f.sessionId)!
-  const resume=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id})
+  const resume=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]})
   preview=f.instances.previewClaudeSessionResume(resume)
   const duplicate=join(f.instance.directory,'projects','duplicate');mkdirSync(duplicate)
   copyFileSync(f.transcript,join(duplicate,f.sessionId+'.jsonl'))
   assert.throws(()=>f.instances.start(preview.ticket),/冲突|已变化/)
   rmSync(duplicate,{recursive:true})
   const rescan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id})
-  const refreshed=await f.catalog.claudeResume({snapshotId:rescan.snapshotId,sessionId:row.id,targetId:f.instance.id})
+  const refreshedRow=rescan.items.find(row=>row.sourceSessionId===f.sessionId)!
+  const refreshed=await f.catalog.claudeResume({snapshotId:rescan.snapshotId,sessionId:refreshedRow.id,targetId:f.instance.id,sourceId:refreshedRow.resumeSourceId!,cwd:refreshedRow.cwdAvailableCandidates![0]})
   preview=f.instances.previewClaudeSessionResume(refreshed)
   renameSync(f.project,f.project+'-old');mkdirSync(f.project)
   assert.throws(()=>f.instances.start(preview.ticket),/项目目录已被替换/)
@@ -197,7 +219,7 @@ for(const kind of ['workspace','registered'] as const)test(`Claude resume uses i
   rmSync(removed,{recursive:true})
   assert.throws(()=>f.instances.preview({id:profile.id,revision:profile.revision}),/ENOENT/)
   const scan=await f.catalog.scan({runId:randomUUID(),targetId:f.instance.id}),row=scan.items.find(row=>row.sourceSessionId===f.sessionId)!
-  const resume=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id})
+  const resume=await f.catalog.claudeResume({snapshotId:scan.snapshotId,sessionId:row.id,targetId:f.instance.id,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]})
   const preview=f.instances.previewClaudeSessionResume(resume)
   assert.equal(preview.workingDirectory,f.project)
   f.instances.start(preview.ticket);await f.instances.settled(f.instance.id)

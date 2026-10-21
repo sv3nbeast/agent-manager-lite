@@ -54,6 +54,12 @@ async function main(){
   try{
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
     const catalog=buildModelCatalog([{modelId:'gpt-6.1-sol',displayName:'GPT-6.1 Sol',reasoningEfforts:null,contextWindow:null,autoCompactTokenLimit:null,supportsVision:null}],builtInCatalog,null,'gpt-6.1-sol')
+    const model=catalog.models.find(entry=>entry.slug==='gpt-6.1-sol')
+    assert.ok(model,'compatibility model must be present in the isolated catalog')
+    // The default fixture previously erased the bundled model's speed tiers,
+    // which made the current picker hide its speed control even though the UI
+    // capability patch had loaded. Preserve only the actual Fast entitlement.
+    model.service_tiers=structuredClone(builtInCatalog.models.find(entry=>entry.slug==='gpt-6.1-sol')?.service_tiers??[])
     writeFileSync(join(directory,'catalog.json'),JSON.stringify(catalog))
     writeFileSync(join(directory,'.codex-global-state.json'),JSON.stringify({'electron-saved-workspace-roots':[root],'electron-active-workspace-roots':[root],'electron-persisted-atom-state':{'electron:onboarding-override':'app','electron:onboarding-projectless-completed':true}}))
     writeFileSync(join(directory,'config.toml'),`model="gpt-6.1-sol"\nmodel_provider="fixture"\nmodel_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.fixture]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nexperimental_bearer_token="fixture-only-key"\n`)
