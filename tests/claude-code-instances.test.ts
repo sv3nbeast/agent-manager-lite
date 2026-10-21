@@ -228,7 +228,7 @@ test('Claude resumed subscription keeps its project identity across renewal and 
   assert.equal(running.status,'running',running.error);assert.equal(refreshes,1)
   assert.equal((await f.evidence(f.instance.directory)).cwd,f.project)
   const saved=JSON.parse(readFileSync(checkpoint,'utf8')),stat=lstatSync(f.project)
-  assert.deepEqual(saved.claudeWorkingDirectory,{path:f.project,device:stat.dev,inode:stat.ino})
+  assert.deepEqual(saved.claudeWorkingDirectory,{path:f.project,canonicalPath:f.project,device:stat.dev,inode:stat.ino})
   assert.equal(readFileSync(checkpoint,'utf8').includes('resume-access'),false)
   // Transcript growth is expected after launch; credential renewal binds the
   // original project and identity, not a permanently frozen conversation body.

@@ -248,6 +248,9 @@ export interface ManagerAPI {
   sessionContent(input:SessionContentInput):Promise<SessionContentPage>
   previewClaudeSessionResume(input:SessionSelection):Promise<InstanceLaunchPreview & {sessionId:string}>
   discardClaudeSessionResume(ticket:string):Promise<void>
+  previewDefaultClaudeSessionResume(input:SessionSelection):Promise<import('./sessions').DefaultClaudeSessionResumePreview>
+  startDefaultClaudeSessionResume(ticket:string):Promise<{opened:true}>
+  discardDefaultClaudeSessionResume(ticket:string):Promise<void>
   sessionTokenStats(input:{snapshotId:string;sessionIds:string[]}):Promise<SessionTokenResult[]>
   cancelSessionScan(runId:string):Promise<void>
   cancelSessionTokens(snapshotId:string):Promise<void>

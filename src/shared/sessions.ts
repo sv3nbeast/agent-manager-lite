@@ -22,7 +22,8 @@ export interface SessionLocation {targetId:string;name:string;directory:string;r
 export interface SessionTokens {input:number;output:number;total:number}
 export interface SessionCapabilities {open:boolean;transfer:boolean;archive:boolean;trash:boolean;visibilityRepair:boolean;tokens:boolean;contentSearch:boolean;content?:boolean;resume?:boolean}
 export interface SessionSource extends ClientConfigTarget {clientType:'codex'|'claude_code';readOnly?:boolean;launchMode?:'cli'|'desktop'}
-export interface SessionRecord {id:string;title:string;cwd:string;projectName?:string;updatedAt?:number;kind:SessionKind;locations:SessionLocation[];historyMode?:'paginated';clientType?:'codex'|'claude_code';launchMode?:'cli'|'desktop';sourceSessionId?:string;capabilities?:SessionCapabilities;messageCount?:number;model?:string;resumeBlockedReason?:string}
+export interface SessionRecord {id:string;title:string;cwd:string;projectName?:string;updatedAt?:number;kind:SessionKind;locations:SessionLocation[];historyMode?:'paginated';clientType?:'codex'|'claude_code';launchMode?:'cli'|'desktop';sourceSessionId?:string;resumeMode?:'managed'|'default_fork';capabilities?:SessionCapabilities;messageCount?:number;model?:string;resumeBlockedReason?:string}
+export interface DefaultClaudeSessionResumePreview {ticket:string;sessionId:string;cwd:string;cliApplication:string;forkSession:true}
 export interface SessionPage {snapshotId:string;scannedAt:number;total:number;page:number;pageSize:number;items:SessionRecord[];warnings:string[];sourceCounts?:Record<string,number>;sources?:SessionSource[]}
 export interface SessionTokenResult {id:string;tokens?:SessionTokens;targetId?:string;error?:string}
 

@@ -10,7 +10,9 @@ import { sessionContentSchema, type SessionContentBlock, type SessionContentMess
 const sessionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 const maxFiles = 100_000
 const maxBytesPerFile = 64 * 1024 * 1024
-const maxLineBytes = 2 * 1024 * 1024
+// Claude stores large tool outputs as one compact JSONL record. Keep the line
+// bound below the transcript bound, but allow current native transcripts.
+const maxLineBytes = 16 * 1024 * 1024
 const chunkBytes = 64 * 1024
 const maxContentPageCharacters = 240_000
 const maxContentMessageCharacters = 12_000
@@ -50,6 +52,10 @@ export interface ClaudeSessionLocation {
   cwd?: string
   title: string
   kind: 'conversation' | 'subagent'
+  /** Only this session segment is exposed from a mixed-ID transcript. */
+  contentSessionId?: string
+  /** ID-less prefix records are attributed to the first session segment. */
+  contentIncludesPrefix?: boolean
   resumeBlockedReason?: string
   /** Set only when a content search was requested; no transcript text is retained. */
   contentMatched?: boolean
@@ -102,6 +108,7 @@ export interface ClaudeSessionResumePreview extends ClaudeSessionResumeSelection
   clientType: 'claude_code'
   applicationKind: 'cli'
   projectDirectory: string
+  cwdCanonicalPath: string
   args: string[]
   location: ClaudeSessionLocation
 }
@@ -117,14 +124,22 @@ interface TranscriptMetadata {
   gitBranch?: string
   messageCount: number
   kind: 'conversation' | 'subagent'
+  firstPrompt?: string
+  customTitle?: string
+  summary?: string
   incomplete?: boolean
+  multipleSessionIds?: boolean
+  sessionIds?: string[]
   resumeBlockedReason?: string
   contentMatched?: boolean
   contentSearchTruncated?: boolean
 }
+interface TranscriptSegment { id: string; metadata: TranscriptMetadata }
 
 interface TranscriptReadOptions {
   contentQuery?: string
+  sessionId?: string
+  includeUnscopedFor?: string
   onRecord?: (record: JsonObject) => void
 }
 
@@ -293,6 +308,15 @@ function directoryIdentity(path: string, label: string): ClaudeSessionDirectoryI
   return { path, canonicalPath, device: stat.dev, inode: stat.ino, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs }
 }
 
+function workingDirectoryIdentity(path: string): ClaudeSessionDirectoryIdentity {
+  if (!isAbsolute(path)) throw new Error('Claude Code 项目工作目录必须是绝对路径')
+  const stat = lstatSync(path)
+  if (!stat.isDirectory()) throw new Error('Claude Code 项目工作目录不是普通目录')
+  const canonicalPath = resolve(realpathSync(path)), resolved = lstatSync(canonicalPath)
+  if (!resolved.isDirectory() || stat.dev !== resolved.dev || stat.ino !== resolved.ino) throw new Error('Claude Code 项目工作目录已变化')
+  return { path, canonicalPath, device: stat.dev, inode: stat.ino, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs }
+}
+
 function unchangedDirectory(expected: ClaudeSessionDirectoryIdentity, entries = false): void {
   const actual = directoryIdentity(expected.path, 'Claude Code 会话目录')
   if (actual.canonicalPath !== expected.canonicalPath || actual.device !== expected.device || actual.inode !== expected.inode) throw new Error('Claude Code 会话目录已被替换，请刷新列表')
@@ -312,7 +336,7 @@ function regularFile(stat: Stats): void {
  * Read through an owned descriptor with a bounded buffer. Check the lexical
  * path before canonicalisation, so an in-root symlink cannot hide itself.
  */
-function readTranscript(path: string, validateDirectories: () => void, options: TranscriptReadOptions = {}): { stat: Stats; sha256: string; metadata: TranscriptMetadata } {
+function readTranscript(path: string, validateDirectories: () => void, options: TranscriptReadOptions = {}): { stat: Stats; sha256: string; metadata: TranscriptMetadata; segments: TranscriptSegment[] } {
   validateDirectories()
   const expected = lstatSync(path)
   regularFile(expected)
@@ -322,47 +346,70 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
     if (!sameFile(expected, stat)) throw new Error('Claude Code 会话文件已被替换')
     const metadata: TranscriptMetadata = { messageCount: 0, kind: 'conversation', ...(options.contentQuery ? { contentMatched: false } : {}) }
     const digest = createHash('sha256'), buffer = Buffer.alloc(chunkBytes), decoder = new TextDecoder('utf-8', { fatal: true })
-    let offset = 0, pending = Buffer.alloc(0), customTitle: string | undefined, summary: string | undefined, firstPrompt: string | undefined
+    let offset = 0, pendingChunks: Buffer[] = [], pendingLength = 0
+    const ids = new Set<string>(), segmentMetadata = new Map<string, TranscriptMetadata>()
+    let activeSessionId: string | undefined
+    const emptyMetadata = (): TranscriptMetadata => ({ messageCount: 0, kind: 'conversation', ...(options.contentQuery ? { contentMatched: false } : {}) })
+    const unscopedMetadata = emptyMetadata()
     const parse = (line: Buffer, terminated: boolean): void => {
       if (line.length > maxLineBytes) throw new Error('Claude Code 会话单行超过安全读取上限')
       if (!line.length) return
-      let record: JsonObject | undefined
-      try { const decoded = decoder.decode(line).trim(); if (!decoded) return; record = object(JSON.parse(decoded)) } catch {
+      let decoded: string
+      try { decoded = decoder.decode(line).trim() } catch { throw new Error('Claude Code 会话记录不是有效 UTF-8') }
+      if (!decoded) return
+      let parsed: unknown
+      try { parsed = JSON.parse(decoded) } catch {
         if (!terminated) { metadata.incomplete = true; metadata.resumeBlockedReason = 'Claude Code 会话末尾记录不完整，请等待写入完成后刷新'; return }
-        throw new Error('Claude Code 会话记录损坏，请检查来源文件')
+        throw new Error('Claude Code 会话记录不是有效 JSON')
       }
+      const record = object(parsed)
       if (!record) throw new Error('Claude Code 会话记录格式无效')
       // uuid/id identify individual messages and snapshots, never a session.
       const rawId = record.sessionId ?? record.session_id
+      let recordMetadata = activeSessionId ? segmentMetadata.get(activeSessionId) : unscopedMetadata
       if (rawId !== undefined) {
         const id = sessionId(rawId)
-        if (!id || metadata.id && metadata.id !== id) throw new Error('Claude Code 会话文件混入不同会话 ID')
+        if (!id) throw new Error('Claude Code 会话记录 ID 格式无效')
+        ids.add(id)
+        if (ids.size > 32) throw new Error('Claude Code 会话文件包含过多不同会话 ID')
+        activeSessionId = id
+        recordMetadata = segmentMetadata.get(id) ?? emptyMetadata()
+        segmentMetadata.set(id, recordMetadata)
+        // Some Claude transcripts retain multiple conversations in one file.
+        // Each ID is projected as a separate row below.
+        if (ids.size > 1) metadata.multipleSessionIds = true
         metadata.id = id
+        recordMetadata.id = id
       }
+      recordMetadata ??= metadata
+      // If the file contains multiple conversation IDs, associate ID-less
+      // records with the preceding segment and never project another session's
+      // content into the selected conversation.
+      if (options.sessionId && activeSessionId !== options.sessionId && !(activeSessionId === undefined && options.includeUnscopedFor === options.sessionId)) return
       const cwd = workingDirectory(record.cwd ?? record.projectPath ?? record.project_path)
       if (cwd) {
         if (!isAbsolute(cwd)) throw new Error('Claude Code 会话工作目录无效')
-        if (metadata.cwd && resolve(metadata.cwd) !== resolve(cwd)) metadata.resumeBlockedReason = 'Claude Code 会话包含多个工作目录，请核对项目后恢复'
-        metadata.cwd ??= cwd
+        if (recordMetadata.cwd && resolve(recordMetadata.cwd) !== resolve(cwd)) recordMetadata.resumeBlockedReason = 'Claude Code 会话包含多个工作目录，请核对项目后恢复'
+        recordMetadata.cwd ??= cwd
       }
       const time = timestamp(record.timestamp ?? record.updatedAt ?? record.updated_at)
       if (time !== undefined) {
-        metadata.createdAt = Math.min(metadata.createdAt ?? time, time)
-        metadata.updatedAt = Math.max(metadata.updatedAt ?? time, time)
+        recordMetadata.createdAt = Math.min(recordMetadata.createdAt ?? time, time)
+        recordMetadata.updatedAt = Math.max(recordMetadata.updatedAt ?? time, time)
       }
-      if (record.isSidechain === true) metadata.kind = 'subagent'
-      if (record.type === 'custom-title') customTitle = text(record.customTitle ?? record.title ?? record.name) ?? customTitle
-      if (record.type === 'summary') summary = text(record.summary) ?? summary
+      if (record.isSidechain === true) recordMetadata.kind = 'subagent'
+      if (record.type === 'custom-title') recordMetadata.customTitle = text(record.customTitle ?? record.title ?? record.name) ?? recordMetadata.customTitle
+      if (record.type === 'summary') recordMetadata.summary = text(record.summary) ?? recordMetadata.summary
       const message = object(record.message)
-      if ((record.type === 'user' || record.type === 'assistant') && message) metadata.messageCount++
-      if (record.type === 'user' && message && record.isMeta !== true && record.isSidechain !== true && !firstPrompt) {
+      if ((record.type === 'user' || record.type === 'assistant') && message) recordMetadata.messageCount++
+      if (record.type === 'user' && message && record.isMeta !== true && record.isSidechain !== true && !recordMetadata.firstPrompt) {
         const prompt = messageText(message.content)
-        if (prompt && !prompt.includes('<local-command-caveat>') && !prompt.startsWith('<command-name>')) firstPrompt = prompt
+        if (prompt && !prompt.includes('<local-command-caveat>') && !prompt.startsWith('<command-name>')) recordMetadata.firstPrompt = prompt
       }
-      if (record.type === 'assistant' && message) metadata.model = text(message.model, 200) ?? metadata.model
-      metadata.gitBranch = text(record.gitBranch, 200) ?? metadata.gitBranch
-      if (options.contentQuery && !metadata.contentMatched) metadata.contentMatched = contentMatches(record, options.contentQuery.toLowerCase(), () => { metadata.contentSearchTruncated = true })
-      options.onRecord?.(record)
+      if (record.type === 'assistant' && message) recordMetadata.model = text(message.model, 200) ?? recordMetadata.model
+      recordMetadata.gitBranch = text(record.gitBranch, 200) ?? recordMetadata.gitBranch
+      if (options.contentQuery && !recordMetadata.contentMatched) recordMetadata.contentMatched = contentMatches(record, options.contentQuery.toLowerCase(), () => { recordMetadata.contentSearchTruncated = true })
+      if (!options.sessionId || activeSessionId === options.sessionId || activeSessionId === undefined && options.includeUnscopedFor === options.sessionId) options.onRecord?.(record)
     }
     while (offset < stat.size) {
       const bytes = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset)
@@ -372,26 +419,59 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
       let start = 0
       for (let end = 0; end < bytes; end++) if (buffer[end] === 10) {
         const part = buffer.subarray(start, end)
-        if (pending.length + part.length > maxLineBytes) throw new Error('Claude Code 会话单行超过安全读取上限')
-        parse(pending.length ? Buffer.concat([pending, part]) : part, true)
-        pending = Buffer.alloc(0); start = end + 1
+        const lineLength = pendingLength + part.length
+        if (lineLength > maxLineBytes) throw new Error('Claude Code 会话单行超过安全读取上限')
+        parse(pendingLength ? Buffer.concat([...pendingChunks, part], lineLength) : part, true)
+        pendingChunks = []; pendingLength = 0; start = end + 1
       }
       if (start < bytes) {
-        if (pending.length + bytes - start > maxLineBytes) throw new Error('Claude Code 会话单行超过安全读取上限')
-        pending = Buffer.concat([pending, buffer.subarray(start, bytes)])
+        const part = buffer.subarray(start, bytes), lineLength = pendingLength + part.length
+        if (lineLength > maxLineBytes) throw new Error('Claude Code 会话单行超过安全读取上限')
+        // readSync reuses the same buffer; retain one copy per chunk and only
+        // concatenate once when this bounded JSONL line is complete.
+        pendingChunks.push(Buffer.from(part)); pendingLength = lineLength
       }
     }
-    if (pending.length) parse(pending, false)
-    metadata.title = customTitle ?? firstPrompt ?? summary
+    if (pendingLength) parse(Buffer.concat(pendingChunks, pendingLength), false)
+    const segments = [...segmentMetadata].map(([id, value]) => {
+      const segment = { ...value, multipleSessionIds: ids.size > 1 || undefined }
+      segment.title = segment.customTitle ?? segment.firstPrompt ?? segment.summary
+      if (ids.size > 1) segment.resumeBlockedReason ??= 'Claude Code 会话文件包含多个会话 ID；详情可查看，但不能安全继续对话'
+      if (metadata.incomplete) { segment.incomplete = true; segment.resumeBlockedReason ??= metadata.resumeBlockedReason }
+      return { id, metadata: segment }
+    })
+    if (segments.length) {
+      // Older Claude transcripts can begin with unscoped control/message
+      // records before the first sessionId. Keep those records with that
+      // first segment rather than dropping the visible conversation prefix.
+      const first = segments[0].metadata, prefix = unscopedMetadata
+      first.messageCount += prefix.messageCount
+      first.createdAt = Math.min(first.createdAt ?? Infinity, prefix.createdAt ?? Infinity)
+      if (!Number.isFinite(first.createdAt)) first.createdAt = undefined
+      first.updatedAt = Math.max(first.updatedAt ?? 0, prefix.updatedAt ?? 0) || undefined
+      first.cwd ??= prefix.cwd
+      first.model ??= prefix.model
+      first.gitBranch ??= prefix.gitBranch
+      first.firstPrompt ??= prefix.firstPrompt
+      first.customTitle ??= prefix.customTitle
+      first.summary ??= prefix.summary
+      first.contentMatched ||= prefix.contentMatched
+      first.contentSearchTruncated ||= prefix.contentSearchTruncated
+      first.resumeBlockedReason ??= prefix.resumeBlockedReason
+      first.incomplete ||= prefix.incomplete
+    }
+    if (segments.length === 1) Object.assign(metadata, segments[0].metadata)
+    else if (!segments.length) Object.assign(metadata, unscopedMetadata, { sessionIds: [...ids] })
+    else Object.assign(metadata, { sessionIds: [...ids], multipleSessionIds: true, incomplete: metadata.incomplete, resumeBlockedReason: metadata.resumeBlockedReason })
     if (!sameFile(stat, fstatSync(fd)) || !sameFile(stat, lstatSync(path))) throw new Error('Claude Code 会话文件正在变化，请刷新列表')
     validateDirectories()
-    return { stat, metadata, sha256: digest.digest('hex') }
+    return { stat, metadata, segments, sha256: digest.digest('hex') }
   } finally { closeSync(fd) }
 }
 
-function sourceId(source: ClaudeSessionSource, project: ClaudeSessionDirectoryIdentity, path: string, stat: Stats, sha256: string): string {
+function sourceId(source: ClaudeSessionSource, project: ClaudeSessionDirectoryIdentity, path: string, stat: Stats, sha256: string, sessionIdValue?: string): string {
   const directory = (value: ClaudeSessionDirectoryIdentity) => [value.path, value.canonicalPath, value.device, value.inode]
-  return createHash('sha256').update(JSON.stringify([source.instanceId ?? null, directory(source.config), directory(source.projects), directory(project), path, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs, sha256])).digest('hex')
+  return createHash('sha256').update(JSON.stringify([source.instanceId ?? null, directory(source.config), directory(source.projects), directory(project), path, sessionIdValue ?? null, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs, sha256])).digest('hex')
 }
 
 /**
@@ -420,6 +500,34 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
   const records = new Map<string, ClaudeSessionRecord>()
   const note = (message: string): void => { if (result.warnings.length < 100 && !result.warnings.includes(message)) result.warnings.push(message) }
   const warn = (message: string): void => { result.complete = false; note(message) }
+  const skipped = new Map<string, number>()
+  let mixedIdFiles = 0
+  const skip = (error: unknown): void => {
+    const err = error as NodeJS.ErrnoException
+    const message = error instanceof Error ? error.message : ''
+    let category = '读取校验失败'
+    if (err.code === 'EACCES' || err.code === 'EPERM') category = '系统权限限制'
+    else if (err.code === 'ENOENT') category = '文件在扫描时消失'
+    else if (err.code === 'ELOOP' || /普通文件|普通目录/.test(message)) category = '检测到符号链接或非普通文件'
+    else if (/超过安全读取上限/.test(message) && /单行/.test(message)) category = '单行超过安全读取上限'
+    else if (/超过安全读取上限/.test(message) && /文件/.test(message)) category = '文件超过安全读取上限'
+    else if (/超过安全读取上限/.test(message)) category = '超过安全读取上限'
+    else if (/不是有效 UTF-8/.test(message)) category = '文本编码无效'
+    else if (/不是有效 JSON/.test(message)) category = 'JSONL 记录格式损坏'
+    else if (/会话记录格式无效/.test(message)) category = 'JSONL 记录不是对象'
+    else if (/过多不同会话 ID/.test(message)) category = '文件包含过多不同会话 ID'
+    else if (/工作目录无效/.test(message)) category = '会话工作目录字段无效'
+    else if (err.code === 'ENOTDIR') category = '目录结构格式异常'
+    else if (err.code === 'EMFILE' || err.code === 'ENFILE') category = '系统可用文件描述符不足'
+    else if (err.code === 'EIO') category = '磁盘读取错误'
+    else if (/变化|截断|替换/.test(message)) category = '文件在读取期间发生变化'
+    skipped.set(category, (skipped.get(category) ?? 0) + 1)
+  }
+  const reportSkipped = (): void => {
+    if (!skipped.size) return
+    const summary = [...skipped].sort(([a], [b]) => a.localeCompare(b)).map(([category, count]) => `${category} ${count} 个`).join('；')
+    warn(`部分 Claude Code 会话未显示：${summary}。请检查本地 Claude 配置目录与会话文件。未输出文件名或会话内容。`)
+  }
   let count = 0
   const root = source.projects.canonicalPath, projects = readdirSync(root).sort()
   for (const projectName of projects) {
@@ -434,7 +542,7 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
       if (!stat.isDirectory() && !stat.isSymbolicLink()) continue
       project = directoryIdentity(projectPath, 'Claude Code 项目目录')
       files = readdirSync(projectPath).sort()
-    } catch { warn('部分 Claude Code 项目目录无法安全读取，请刷新或检查目录'); continue }
+    } catch (error) { skip(error); continue }
     const validate = (): void => { unchangedDirectory(source.config); unchangedDirectory(source.projects); unchangedDirectory(project) }
     const projectRows: ClaudeSessionRecord[] = []
     for (const fileName of files) {
@@ -443,21 +551,29 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
       if (++count > limit) throw new Error('Claude Code 会话文件超过扫描上限，请选择单个配置目录')
       const path = join(projectPath, fileName)
       try {
-        const { stat, metadata, sha256 } = readTranscript(path, validate, { contentQuery: options.contentQuery })
-        const fileId = sessionId(basename(fileName, extname(fileName))), id = metadata.id ?? fileId
-        if (!id || !stat.size || metadata.kind === 'subagent') continue
-        if (fileId !== id) metadata.resumeBlockedReason ??= 'Claude Code 会话 ID 与文件名不一致，请核对来源文件'
-        if (!metadata.messageCount) metadata.resumeBlockedReason ??= 'Claude Code 会话缺少可恢复的消息记录'
-        const location: ClaudeSessionLocation = {
-          path, projectDirectory: projectPath, device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, sha256,
-          sourceId: sourceId(source, project, path, stat, sha256), source, project, cwd: metadata.cwd, title: metadata.title ?? (metadata.cwd ? basename(metadata.cwd) : id), kind: metadata.kind, resumeBlockedReason: metadata.resumeBlockedReason, contentMatched: metadata.contentMatched,
-        }
+        const fileId = sessionId(basename(fileName, extname(fileName)))
+        const { stat, metadata, segments, sha256 } = readTranscript(path, validate, { contentQuery: options.contentQuery })
+        if (!stat.size) continue
         if (metadata.incomplete) warn('部分 Claude Code 会话尚未写入完整，请等待写入完成后刷新')
-        if (metadata.contentSearchTruncated) note('部分 Claude Code 工具参数超出读取上限，正文搜索未包含其省略部分；可打开源文件查看')
-        projectRows.push({ id, title: location.title, cwd: metadata.cwd, projectDirectory: projectPath, createdAt: metadata.createdAt, updatedAt: metadata.updatedAt ?? stat.mtimeMs, model: metadata.model, gitBranch: metadata.gitBranch, messageCount: metadata.messageCount, locations: [location], conflict: false })
-      } catch { warn('部分 Claude Code 会话文件无法安全读取，请刷新或检查来源文件') }
+        if (metadata.contentSearchTruncated || segments.some(segment => segment.metadata.contentSearchTruncated)) note('部分 Claude Code 工具参数超出读取上限，正文搜索未包含其省略部分；可打开源文件查看')
+        if (segments.length > 1) mixedIdFiles++
+        const sessionSegments = segments.length ? segments : [{ id: metadata.id ?? fileId ?? '', metadata }]
+        for (const segment of sessionSegments) {
+          const id = sessionId(segment.id)
+          if (!id || segment.metadata.kind === 'subagent') continue
+          const current = segment.metadata
+          if (fileId && fileId !== id) current.resumeBlockedReason ??= current.multipleSessionIds ? 'Claude Code 会话文件包含多个会话 ID；详情可查看，但不能安全继续对话' : 'Claude Code 会话 ID 与文件名不一致，请核对来源文件'
+          if (current.multipleSessionIds) current.resumeBlockedReason ??= 'Claude Code 会话文件包含多个会话 ID；详情可查看，但不能安全继续对话'
+          if (!current.messageCount) current.resumeBlockedReason ??= 'Claude Code 会话缺少可恢复的消息记录'
+          const location: ClaudeSessionLocation = {
+            path, projectDirectory: projectPath, device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, sha256,
+            sourceId: sourceId(source, project, path, stat, sha256, current.multipleSessionIds ? id : undefined), source, project, cwd: current.cwd, title: current.title ?? (current.cwd ? basename(current.cwd) : id), kind: current.kind, ...(current.multipleSessionIds ? { contentSessionId: id, ...(segments[0].id === id ? { contentIncludesPrefix: true } : {}) } : {}), resumeBlockedReason: current.resumeBlockedReason, contentMatched: current.contentMatched,
+          }
+          projectRows.push({ id, title: location.title, cwd: current.cwd, projectDirectory: projectPath, createdAt: current.createdAt, updatedAt: current.updatedAt ?? stat.mtimeMs, model: current.model, gitBranch: current.gitBranch, messageCount: current.messageCount, locations: [location], conflict: false })
+        }
+      } catch (error) { skip(error) }
     }
-    try { validate(); unchangedDirectory(project, true) } catch { warn('Claude Code 项目目录已变化，已丢弃该目录的读取结果'); continue }
+    try { validate(); unchangedDirectory(project, true) } catch (error) { skip(error); warn('Claude Code 项目目录在扫描期间发生变化，已丢弃该目录的读取结果'); continue }
     for (const row of projectRows) {
       const previous = records.get(row.id)
       if (!previous) records.set(row.id, row)
@@ -466,6 +582,8 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
   }
   unchangedDirectory(source.config)
   unchangedDirectory(source.projects, true)
+  reportSkipped()
+  if (mixedIdFiles) note(`${mixedIdFiles} 个 Claude Code 会话文件包含多个会话 ID：详情仍可查看，但这些文件不能安全继续对话。`)
   result.records = [...records.values()].sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
   return result
 }
@@ -494,7 +612,7 @@ export async function scanClaudeCodeSessionsAsync(configDirectory: string, optio
 export function verifyClaudeSessionLocation(location: ClaudeSessionLocation): string {
   const validate = (): void => { unchangedDirectory(location.source.config); unchangedDirectory(location.source.projects); unchangedDirectory(location.project) }
   const current = readTranscript(location.path, validate)
-  if (sourceId(location.source, location.project, location.path, current.stat, current.sha256) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
+  if (sourceId(location.source, location.project, location.path, current.stat, current.sha256, location.contentSessionId ?? undefined) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
   return location.path
 }
 
@@ -514,7 +632,7 @@ export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: {
   const result: ClaudeSessionContentPage = { page: input.page, pageSize: input.pageSize, total: 0, messages: [], warnings: [] }
   let index = 0, searchTruncated = false
   const validate = (): void => { unchangedDirectory(location.source.config); unchangedDirectory(location.source.projects); unchangedDirectory(location.project) }
-  const current = readTranscript(location.path, validate, { onRecord(record) {
+  const current = readTranscript(location.path, validate, { sessionId: location.contentSessionId, includeUnscopedFor: location.contentIncludesPrefix ? location.contentSessionId : undefined, onRecord(record) {
     // Unknown record types, indexes and title updates are not conversation text.
     if (!hasReadableContent(record)) return
     const messageIndex = index++
@@ -524,7 +642,7 @@ export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: {
     const message = readableMessage(record, messageIndex, Math.min(maxContentMessageCharacters, Math.floor(maxContentPageCharacters / input.pageSize)))
     if (message) result.messages.push(message)
   } })
-  if (sourceId(location.source, location.project, location.path, current.stat, current.sha256) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
+  if (sourceId(location.source, location.project, location.path, current.stat, current.sha256, location.contentSessionId ?? undefined) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
   if (current.metadata.incomplete) result.warnings.push('会话末尾仍在写入，仅显示已完整保存的消息；请稍后刷新')
   if (searchTruncated) result.warnings.push('部分工具参数超出读取上限，搜索未包含其省略部分；可打开源文件查看')
   if (result.messages.some(message => message.truncated)) result.warnings.push('部分长消息或工具输出已截断，可打开源文件查看完整内容')
@@ -574,9 +692,10 @@ export function previewClaudeSessionResume(scan: ClaudeSessionScan, input: Claud
   const record = scan.records.find(value => value.id === input.sessionId)
   if (!record || !record.locations.some(value => value.sourceId === input.sourceId)) throw new Error('Claude Code 会话来源不属于当前索引')
   const location = currentResumeLocation(record)
-  if (!location.cwd || !isAbsolute(input.cwd) || resolve(input.cwd) !== resolve(location.cwd)) throw new Error('Claude Code 会话不属于当前项目工作目录')
-  directoryIdentity(resolve(input.cwd), 'Claude Code 项目工作目录')
-  return { clientType: 'claude_code', applicationKind: 'cli', instanceId: input.instanceId, configDirectory: scan.configDirectory, cwd: location.cwd, sessionId: record.id, sourceId: location.sourceId, projectDirectory: location.projectDirectory, args: ['--resume', record.id], location: structuredClone(location) }
+  if (!location.cwd || !isAbsolute(input.cwd)) throw new Error('Claude Code 会话不属于当前项目工作目录')
+  const cwdIdentity = workingDirectoryIdentity(location.cwd), selectedCwd = workingDirectoryIdentity(input.cwd)
+  if (cwdIdentity.canonicalPath !== selectedCwd.canonicalPath || cwdIdentity.device !== selectedCwd.device || cwdIdentity.inode !== selectedCwd.inode) throw new Error('Claude Code 会话不属于当前项目工作目录')
+  return { clientType: 'claude_code', applicationKind: 'cli', instanceId: input.instanceId, configDirectory: scan.configDirectory, cwd: location.cwd, cwdCanonicalPath: cwdIdentity.canonicalPath, sessionId: record.id, sourceId: location.sourceId, projectDirectory: location.projectDirectory, args: ['--resume', record.id], location: structuredClone(location) }
 }
 
 export function claudeSessionIdentity(path: string): { path: string; device: number; inode: number; sha256: string } {

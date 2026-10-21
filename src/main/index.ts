@@ -49,6 +49,7 @@ import { Instances } from './instances'
 import {ExternalInstanceSources} from './externalInstanceSources'
 import { LocalAccess } from './localAccess'
 import {SessionCatalog} from './sessions'
+import {ClaudeDefaultSessionResume} from './claudeDefaultSessionResume'
 import {SessionTransfers} from './sessionTransfers'
 import {SessionArchives} from './sessionArchives'
 import {SessionSync} from './sessionSync'
@@ -165,7 +166,8 @@ async function main(): Promise<void> {
   },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages(),undefined,new NativeProxy(binary,proxyTunnels))
   const externalInstanceSources=new ExternalInstanceSources({managerRoot:realpathSync(store.directory),managedDirectories:()=>instances.views().map(instance=>instance.directory),...(isolatedTest?{home:join(realpathSync(store.directory),'external-source-home')}:{})})
   const localAccess=new LocalAccess(store,gateway,async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},ids=>effectiveKeyUsage(store.read(),history.keyTokenUsage(ids)))
-  const sessions=new SessionCatalog(store,id=>instances.inUse(id),isolatedTest?{defaultClaudeDirectory:null}:{})
+  const sessions=new SessionCatalog(store,id=>instances.inUse(id),isolatedTest?{defaultClaudeDirectory:process.env.CML_TEST_DEFAULT_CLAUDE_DIRECTORY??null}:{})
+  const defaultClaudeSessionResume=new ClaudeDefaultSessionResume(sessions)
   sessionTransfers=new SessionTransfers(store,sessions,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionSync?.busy(id)||!!sessionTrash?.busy(id))
   sessionArchives=new SessionArchives(store,sessions,sessionTransfers,Date.now,id=>(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false))
   sessionSync=new SessionSync(store,sessionTransfers,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionTrash?.busy(id))
@@ -505,6 +507,9 @@ async function main(): Promise<void> {
       case 'sessionContent': return sessions.content(input)
       case 'previewClaudeSessionResume': return instances.previewClaudeSessionResume(await sessions.claudeResume(input))
       case 'discardClaudeSessionResume': instances.discardClaudeSessionResume(z.string().uuid().parse(input));return
+      case 'previewDefaultClaudeSessionResume': return defaultClaudeSessionResume.preview(sessionSelectionSchema.parse(input))
+      case 'startDefaultClaudeSessionResume': return defaultClaudeSessionResume.start(z.string().uuid().parse(input))
+      case 'discardDefaultClaudeSessionResume': return defaultClaudeSessionResume.discard(z.string().uuid().parse(input))
       case 'sessionTokenStats': return sessions.tokenStats(input)
       case 'cancelSessionScan': sessions.cancel(z.string().uuid().parse(input));return
       case 'cancelSessionTokens': sessions.cancelTokens(z.string().uuid().parse(input));return

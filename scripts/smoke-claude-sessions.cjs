@@ -18,8 +18,8 @@ const output = resolve(process.env.CML_CLAUDE_SESSIONS_EVIDENCE_DIR || '.local/c
 fs.mkdirSync(output, { recursive: true, mode: 0o700 })
 fs.rmSync(join(output, 'validation.json'), { force: true })
 
-const cliId = randomUUID(), otherCliId = randomUUID(), desktopId = randomUUID(), codexId = randomUUID(), accountId = randomUUID()
-const sessionId = randomUUID(), desktopSessionId = randomUUID(), codexSessionId = randomUUID()
+const cliId = randomUUID(), otherCliId = randomUUID(), desktopId = randomUUID(), codexId = randomUUID(), accountId = randomUUID(), defaultSourceId = '4135f4e6-6db5-4bd4-95f7-06f4c667341a'
+const sessionId = randomUUID(), desktopSessionId = randomUUID(), codexSessionId = randomUUID(), defaultSessionId = randomUUID()
 const primaryProject = join(directory, 'projects', 'alpha'), otherProject = join(directory, 'projects', 'beta')
 fs.mkdirSync(primaryProject, { recursive: true }); fs.mkdirSync(otherProject, { recursive: true })
 const executable = join(directory, 'synthetic-claude')
@@ -49,12 +49,22 @@ entries[0].message.content = [{ type: 'text', text: 'A literal <img src="https:/
 entries[1].message.content = [{ type: 'text', text: 'I will inspect the synthetic project.' }, { type: 'thinking', thinking: 'Synthetic reasoning, no model request.' }, { type: 'tool_use', id: 'synthetic-tool', name: 'Read', input: { file_path: '/fixture/only.txt' } }]
 entries[2].message.content = [{ type: 'tool_result', tool_use_id: 'synthetic-tool', content: [{ type: 'text', text: 'Synthetic tool result' }] }, { type: 'image', source: { type: 'url', url: 'https://blocked-image.invalid/attachment' } }]
 const files = [writeClaude(cliId, sessionId, primaryProject, 'Alpha conversation', entries), writeClaude(otherCliId, sessionId, otherProject, 'Beta conversation with same native ID', [{ type: 'user', message: { content: 'Beta private body' } }]), writeClaude(desktopId, desktopSessionId, primaryProject, 'Desktop Code conversation', [{ type: 'user', message: { content: 'Desktop local Code body' } }])]
+const defaultHome = process.env.CML_TEST_DEFAULT_CLAUDE_DIRECTORY
+assert.ok(defaultHome)
+const defaultProject = join(directory, 'default-workspace'), defaultTranscriptFolder = join(defaultHome, 'projects', 'default-fixture')
+fs.mkdirSync(defaultHome, { recursive: true })
+fs.mkdirSync(defaultProject, { recursive: true }); fs.mkdirSync(defaultTranscriptFolder, { recursive: true })
+const defaultTranscript = join(defaultTranscriptFolder, defaultSessionId + '.jsonl')
+fs.writeFileSync(defaultTranscript, [
+  { type: 'user', sessionId: defaultSessionId, cwd: defaultProject, message: { content: 'Synthetic default local conversation' } },
+  { type: 'custom-title', sessionId: defaultSessionId, customTitle: 'Default local Claude conversation' },
+].map(value => JSON.stringify(value)).join('\n') + '\n', { mode: 0o600 })
 const codexHome = join(directory, 'instances', codexId, 'home'), codexFile = join(codexHome, 'sessions', 'rollout-fixture.jsonl')
 fs.mkdirSync(join(codexHome, 'sessions'))
 fs.writeFileSync(codexFile, JSON.stringify({ type: 'session_meta', payload: { id: codexSessionId, cwd: primaryProject } }) + '\n' + JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Codex reference body' } }) + '\n')
 fs.writeFileSync(join(codexHome, 'session_index.jsonl'), JSON.stringify({ id: codexSessionId, thread_name: 'Codex reference conversation' }) + '\n')
 files.push(codexFile, join(codexHome, 'session_index.jsonl'))
-const original = new Map(files.map(file => [file, fs.readFileSync(file)])), opened = [], networkAttempts = [], starts = [], previews = [], discarded = []
+const original = new Map([...files, defaultTranscript].map(file => [file, fs.readFileSync(file)])), opened = [], networkAttempts = [], starts = [], previews = [], defaultStarts = [], defaultPreviews = [], defaultDiscarded = [], discarded = []
 shell.openPath = async path => { opened.push(path); return '' }
 shell.showItemInFolder = path => { opened.push(path) }
 const denyNetwork = kind => { networkAttempts.push(kind); throw new Error('Claude sessions UI smoke forbids network requests') }
@@ -75,6 +85,12 @@ ipcMain.handle = (channel, listener) => handle(channel, async (event, ...args) =
     await listener(event, 'discardClaudeSessionResume', args[1])
     return withLaunchState(await listener(event, 'load'))
   }
+  if (args[0] === 'previewDefaultClaudeSessionResume') {
+    const preview = { ticket: randomUUID(), sessionId: defaultSessionId, cwd: defaultProject, cliApplication: '/synthetic/official-claude', forkSession: true }
+    defaultPreviews.push(preview); return preview
+  }
+  if (args[0] === 'discardDefaultClaudeSessionResume') { defaultDiscarded.push(args[1]); return }
+  if (args[0] === 'startDefaultClaudeSessionResume') { defaultStarts.push(args[1]); return { opened: true } }
   const value = await listener(event, ...args)
   if (args[0] === 'scanSessions') lastPage = value
   if (args[0] === 'previewClaudeSessionResume') previews.push(value)
@@ -102,17 +118,30 @@ app.on('browser-window-created', (_event, window) => {
     const capture = async name => { await run('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))'); fs.writeFileSync(join(output, name), (await window.webContents.capturePage()).toPNG()) }
     const closeReader = async () => { await run(`${visible('.session-content-modal .ant-modal-close')}[0].click()`); await wait(`!${visible('.session-reader')}.length`) }
     try {
-      await click('.ant-menu-item', '会话管理'); await wait('document.querySelectorAll(".sessions-table tr[data-row-key]").length===4')
+      await click('.ant-menu-item', '会话管理'); await wait('document.querySelectorAll(".sessions-table tr[data-row-key]").length>=4')
+      assert.ok(lastPage.sources?.some(value => value.clientType === 'claude_code' && value.role === 'default'), 'isolated default Claude source is registered')
       const alpha = lastPage.items.find(item => item.locations[0].targetId === cliId), beta = lastPage.items.find(item => item.locations[0].targetId === otherCliId), desktop = lastPage.items.find(item => item.locations[0].targetId === desktopId)
       assert.notEqual(alpha.id, beta.id); assert.equal(alpha.sourceSessionId, beta.sourceSessionId)
       assert.equal(await run('document.querySelector(".sessions-panel").textContent.includes("BROWSER_TEXT_NEEDLE")'), false)
       assert.equal(await run(`document.querySelector(${JSON.stringify(row(alpha.id))}).querySelector('input[type=checkbox]').disabled`), true)
       assert.equal(await run(`document.querySelector(${JSON.stringify(row(codexSessionId))}).querySelector('input[type=checkbox]').disabled`), false)
-      await select('会话客户端', 'Claude'); await click('.session-filters button', '应用筛选'); await wait('document.querySelectorAll(".sessions-table tr[data-row-key]").length===3')
+      await select('会话客户端', 'Claude'); await click('.session-filters button', '应用筛选'); await wait('document.querySelectorAll(".sessions-table tr[data-row-key]").length===4')
+      const defaultRecord = lastPage.items.find(item => item.locations.some(location => location.targetId === defaultSourceId))
+      assert.ok(defaultRecord); assert.equal(defaultRecord.resumeMode, 'default_fork'); assert.equal(defaultRecord.capabilities.resume, true)
       assert.equal(await run('!!document.querySelector(".session-transfers,.session-archives,.session-sync,.session-trash")'), false)
       assert.equal(await run('Array.from(document.querySelectorAll(".sessions-panel button")).some(el=>el.textContent.includes("修复可见性"))'), false)
       assert.equal(await run('document.querySelector("[aria-label=会话内容搜索]").disabled'), false)
       await capture('claude-sources.png')
+
+      await click(row(defaultRecord.id) + ' button', '查看对话'); await wait('document.querySelector(".session-reader-body")?.textContent.includes("Synthetic default local conversation")')
+      await click('.session-reader-heading button', '在 Terminal 中分叉'); await wait('Array.from(document.querySelectorAll(".ant-modal-content")).some(el=>el.textContent.includes("在 Terminal 中继续 Claude 会话"))')
+      assert.equal(defaultPreviews.length, 1); assert.equal(defaultStarts.length, 0)
+      await click('.ant-modal-footer button', '取消'); await wait('!Array.from(document.querySelectorAll(".ant-modal-content")).some(el=>el.textContent.includes("在 Terminal 中继续 Claude 会话"))')
+      assert.ok(defaultDiscarded.includes(defaultPreviews[0].ticket))
+      await click(row(defaultRecord.id) + ' button', '查看对话'); await wait('document.querySelector(".session-reader-body")?.textContent.includes("Synthetic default local conversation")')
+      await click('.session-reader-heading button', '在 Terminal 中分叉'); await wait('Array.from(document.querySelectorAll(".ant-modal-content")).some(el=>el.textContent.includes("在 Terminal 中继续 Claude 会话"))')
+      await click('.ant-modal-footer button', '在 Terminal 中分叉继续'); await wait('document.querySelector(".sessions-panel").textContent.includes("已将新分叉会话交给 Terminal")')
+      assert.equal(defaultStarts.length, 1); assert.equal(defaultStarts[0], defaultPreviews[1].ticket)
 
       await click(row(alpha.id) + ' button', '查看对话'); await wait('document.querySelector(".session-reader-body")?.textContent.includes("BROWSER_TEXT_NEEDLE")')
       assert.equal(await run('document.querySelectorAll(".session-reader img,.session-reader iframe,.session-reader script").length'), 0)
@@ -122,6 +151,10 @@ app.on('browser-window-created', (_event, window) => {
       await wait('document.querySelector(".session-block-tool_use[open]")?.textContent.includes("/fixture/only.txt")')
       await capture('claude-transcript-tools.png')
       await run('document.querySelector(".session-reader .ant-pagination-next button").click()'); await wait('document.querySelector(".session-reader-body")?.textContent.includes("Synthetic message 44")')
+      assert.equal(await run('document.querySelector(".session-reader-export").textContent.includes("第 2 / 2 页")'), true)
+      assert.equal(await run('Array.from(document.querySelectorAll(".session-reader-export button")).some(el=>el.textContent.includes("复制本页 Markdown"))'), true)
+      assert.equal(await run('Array.from(document.querySelectorAll(".session-reader-export button")).some(el=>el.textContent.includes("下载本页 Markdown"))'), true)
+      assert.equal(await run('document.querySelector(".session-reader-export").textContent.includes("只包含当前页")'), true)
       await fill('当前会话内容搜索', 'BROWSER_TEXT_NEEDLE'); await click('.session-reader-search button', '查找')
       await wait('document.querySelectorAll(".session-reader mark").length===1')
       assert.equal(await run('document.querySelectorAll(".session-message").length'), 1)
@@ -139,13 +172,13 @@ app.on('browser-window-created', (_event, window) => {
       await capture('desktop-local-code-boundary.png'); await closeReader()
 
       await select('会话来源', 'Claude Alpha'); await click('.session-filters button', '应用筛选'); await wait('document.querySelectorAll(".sessions-table tr[data-row-key]").length===1')
-      await click(row(alpha.id) + ' button', '恢复会话'); await wait('document.querySelector(".session-resume-preview .ant-descriptions")?.textContent.includes("Synthetic Claude connection")')
+      await click(row(alpha.id) + ' button', '恢复到原实例'); await wait('document.querySelector(".session-resume-preview .ant-descriptions")?.textContent.includes("Synthetic Claude connection")')
       assert.equal(previews.at(-1).sessionId, sessionId); assert.equal(previews.at(-1).workingDirectory, primaryProject)
       assert.equal(await run('document.querySelector(".session-resume-preview").textContent.includes("synthetic-not-a-real-key")'), false)
       const cancelledTicket = previews.at(-1).ticket
       await capture('claude-resume-preview.png'); await click('.ant-modal-footer button', '取消'); await wait(`!${visible('.session-resume-preview')}.length`)
       assert.ok(discarded.includes(cancelledTicket)); assert.equal(starts.length, 0)
-      await click(row(alpha.id) + ' button', '恢复会话'); await wait('document.querySelector(".session-resume-preview .ant-descriptions")?.textContent.includes("Synthetic Claude connection")')
+      await click(row(alpha.id) + ' button', '恢复到原实例'); await wait('document.querySelector(".session-resume-preview .ant-descriptions")?.textContent.includes("Synthetic Claude connection")')
       await click('.ant-modal-footer button', '在原实例恢复'); await wait('document.querySelector(".session-resume-status")?.textContent.includes("正在准备会话实例")')
       assert.equal(starts.length, 1)
       launchState = 'error'; await wait('document.querySelector(".session-resume-status")?.textContent.includes("Synthetic preparation failure")')
@@ -155,7 +188,7 @@ app.on('browser-window-created', (_event, window) => {
       for (const [file, bytes] of original) assert.deepEqual(fs.readFileSync(file), bytes, 'Session browsing and preview preserve original transcript bytes')
       assert.deepEqual(networkAttempts, [])
       assert.equal(fs.existsSync(join(directory, 'instances', cliId, 'launch.json')), false)
-      fs.writeFileSync(join(output, 'validation.json'), JSON.stringify({ passed: true, realRendererAndCatalog: true, clientProjectSourceFilters: true, sameIdSourcesSeparated: true, transcriptPaginationAndSearch: true, untrustedMarkupRenderedAsText: true,
+      fs.writeFileSync(join(output, 'validation.json'), JSON.stringify({ passed: true, realRendererAndCatalog: true, clientProjectSourceFilters: true, sameIdSourcesSeparated: true, transcriptPaginationAndSearch: true, untrustedMarkupRenderedAsText: true, defaultClaudeForkPreviewCancelAndConfirm: defaultStarts.length === 1,
         desktopCodeReadOnly: true, resumePreviewCancelled: true, resumeConfirmationObservedWithoutLaunch: starts.length, preparationFailureVisible: true, sourcesUnchanged: true, externalNetworkRequests: networkAttempts.length }, null, 2))
       console.log('Claude sessions UI passed: unified client/project/source/ID/content filters; text-safe paged transcript and tools; separate Desktop Code source; original-instance resume preview/cancel/confirmation/status; unchanged source files and no network or Agent launch.')
       clearTimeout(timer); window.destroy(); app.exit(0)

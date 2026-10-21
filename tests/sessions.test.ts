@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,renameSync,symlinkSync,readdirSync,appendFileSync,existsSync} from 'node:fs'
-import {join} from 'node:path'
+import {dirname,join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {randomUUID,createHash} from 'node:crypto'
 import {DatabaseSync} from 'node:sqlite'
@@ -525,15 +525,34 @@ test('default Claude conversations remain separate from managed instances and ca
   assert.equal(page.total,2)
   const source=page.sources!.find(source=>source.clientType==='claude_code'&&source.role==='default')!,row=page.items.find(record=>record.locations[0].targetId===source.id)!
   assert.notEqual(row.id,page.items.find(record=>record.locations[0].targetId===instance.id)!.id)
-  assert.equal(row.sourceSessionId,sessionId);assert.equal(row.capabilities?.resume,false);assert.match(row.resumeBlockedReason!,/默认目录/)
+  assert.equal(row.sourceSessionId,sessionId);assert.equal(row.capabilities?.resume,true);assert.equal(row.resumeMode,'default_fork')
   const selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:source.id}
   assert.equal(await catalog.location(selection),path)
   assert.equal((await catalog.content(selection)).messages[0].blocks[0].text,'Default local conversation')
-  await assert.rejects(catalog.claudeResume(selection),/未绑定/)
+  const defaultResume=await catalog.defaultClaudeResume(selection)
+  assert.equal(defaultResume.sessionId,sessionId);assert.equal(defaultResume.location.cwd,f.root);assert.equal(defaultResume.homeDirectory,dirname(directory))
+  await assert.rejects(catalog.claudeResume(selection),/未绑定管理器实例/)
   assert.deepEqual(f.store.read(),state);assert.deepEqual(hashes(f.root),before)
   assert.ok(!JSON.stringify(page).includes('DEFAULT_CREDENTIAL'))
   const moved=directory+'-old';renameSync(directory,moved);mkdirSync(project,{recursive:true});writeFileSync(path,readFileSync(join(moved,'projects','default-project',sessionId+'.jsonl')))
   await assert.rejects(catalog.content(selection),/已被替换|已变化/)
+})
+
+test('default Claude fork is blocked for conflicts, mixed IDs, incomplete scans, Desktop records and vanished projects',async t=>{
+  const f=fixture(t),directory=join(f.root,'default-claude'),project=join(directory,'projects','one'),projectTwo=join(directory,'projects','two'),sessionId=randomUUID()
+  mkdirSync(project,{recursive:true})
+  const transcript=join(project,sessionId+'.jsonl')
+  writeFileSync(transcript,JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Fixture'}})+'\n')
+  const catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
+  let page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),row=page.items.find(value=>value.sourceSessionId===sessionId)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId}
+  assert.equal((await catalog.defaultClaudeResume(selection)).sessionId,sessionId)
+  mkdirSync(projectTwo);writeFileSync(join(projectTwo,sessionId+'.jsonl'),readFileSync(transcript))
+  await assert.rejects(catalog.defaultClaudeResume(selection),/多个会话文件|冲突/)
+  rmSync(projectTwo,{recursive:true})
+  const otherId=randomUUID();appendFileSync(transcript,JSON.stringify({type:'user',sessionId:otherId,cwd:f.root,message:{content:'second'}})+'\n')
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'});row=page.items.find(value=>value.sourceSessionId===sessionId)!;selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId}
+  assert.equal(row.capabilities?.resume,false);await assert.rejects(catalog.defaultClaudeResume(selection),/多个会话 ID|不能安全/)
+  rmSync(f.root,{recursive:true,force:true});await assert.rejects(catalog.defaultClaudeResume(selection))
 })
 
 test('default Claude duplicate IDs retain independent files and stale or linked roots cannot be read',async t=>{

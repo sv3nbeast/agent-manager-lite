@@ -1,7 +1,7 @@
 import type {NativeProxyService,NativeProxyLease} from './nativeProxy'
 import {accountProxyURL,defaultProxyURL} from './proxyPolicy'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, realpathSync, renameSync, rmSync, readdirSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync, statSync, renameSync, rmSync, readdirSync } from 'node:fs'
 import {mkdir,rename,rm} from 'node:fs/promises'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { z } from 'zod'
@@ -46,7 +46,7 @@ export interface InstanceSkillsServices {prepare:typeof prepareCodexSharedSkills
 const defaultSkillsServices:InstanceSkillsServices={prepare:codexInstanceAdapter.prepareSharedSkills}
 const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspectCodexDesktopUi,inspect:inspectCodexSpeedMenu,inspectLocale:options=>inspectCodexSpeedMenu({...options,enhancements:'locale'}),inspectCombined:options=>inspectCodexSpeedMenu({...options,enhancements:'speed-locale'}),prepare:prepareCodexSpeedMenu,readStatus:readCodexSpeedMenuStatus}
 type ClaudeResumeLaunch=CatalogClaudeResumePreview & {cwdDevice:number;cwdInode:number}
-const claudeWorkingDirectorySchema=z.object({path:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)),device:z.number().int().nonnegative(),inode:z.number().int().nonnegative()}).strict()
+const claudeWorkingDirectorySchema=z.object({path:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)),canonicalPath:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)).optional(),device:z.number().int().nonnegative(),inode:z.number().int().nonnegative()}).strict()
 type ClaudeWorkingDirectory=z.infer<typeof claudeWorkingDirectorySchema>
 type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string;claudeSubscriptionFingerprint?:string;claudeResume?:ClaudeResumeLaunch;claudeWorkingDirectory?:ClaudeWorkingDirectory}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -359,14 +359,15 @@ export class Instances {
     if(claudeWorkingDirectory){
       if(profile.clientType!=='claude_code'||isClaudeDesktopProfile(profile)||profile.externalHome)throw new Error('会话项目目录覆盖仅适用于原 Claude CLI 实例')
       claudeWorkingDirectorySchema.parse(claudeWorkingDirectory)
-      directory(claudeWorkingDirectory.path)
-      const stat=lstatSync(claudeWorkingDirectory.path)
-      const canonical=resolve(claudeWorkingDirectory.path)
-      if(realpathSync(canonical)!==canonical||stat.dev!==claudeWorkingDirectory.device||stat.ino!==claudeWorkingDirectory.inode)throw new Error('会话项目目录已被替换，请重新预览')
+      const canonical=claudeWorkingDirectory.canonicalPath??claudeWorkingDirectory.path
+      if(resolve(realpathSync(claudeWorkingDirectory.path))!==resolve(canonical))throw new Error('会话项目目录已被替换，请重新预览')
+      directory(canonical)
+      const stat=statSync(claudeWorkingDirectory.path),canonicalStat=statSync(canonical)
+      if(stat.dev!==claudeWorkingDirectory.device||stat.ino!==claudeWorkingDirectory.inode||canonicalStat.dev!==stat.dev||canonicalStat.ino!==stat.ino)throw new Error('会话项目目录已被替换，请重新预览')
     }
     const folder=this.folder(profile.id,false,!claudeWorkingDirectory)
     const runtime=adapter.launchRuntime(application),workingDirectory=claudeWorkingDirectory?.path??this.workingDirectory(profile,folder)
-    directory(workingDirectory)
+    if(!claudeWorkingDirectory)directory(workingDirectory)
     const home=profile.externalHome?validateExternalHome(this.root,profile.externalHome):join(folder,'home')
     return {clientType:adapter.client.id,application:application.path,...runtime,directory:home,desktopDirectory:join(folder,'desktop'),workingDirectory,args:profile.extraArgs,nonce,mode,...isClaudeDesktopProfile(profile)&&profile.connectionMode==='native'?{claudeDesktopConnection:'api' as const}:{}}
   }
@@ -473,7 +474,7 @@ export class Instances {
     if(!selection.instanceId)throw new Error('Claude 会话缺少来源实例，请刷新列表')
     const profile=this.profile(selection.instanceId)
     if(this.inUse(profile.id))throw new Error('实例正在运行，请在原终端使用 /resume，或停止实例后重试')
-    const stat=lstatSync(selection.cwd),resume:ClaudeResumeLaunch={...structuredClone(selection),cwdDevice:stat.dev,cwdInode:stat.ino}
+    const stat=statSync(selection.cwd),resume:ClaudeResumeLaunch={...structuredClone(selection),cwdDevice:stat.dev,cwdInode:stat.ino}
     this.validateClaudeResume(profile,resume)
     const context=this.claudeContext(profile,undefined,{path:resume.cwd,device:resume.cwdDevice,inode:resume.cwdInode}),preview:InstanceLaunchPreview & {sessionId:string}={
       ...claudeLaunchPreview(context),ticket:randomUUID(),instanceId:profile.id,name:profile.name,model:profile.model,
@@ -493,12 +494,11 @@ export class Instances {
       ||resume.location.source.config.canonicalPath!==resume.configDirectory||resume.location.sourceId!==resume.sourceId
       ||resume.location.cwd!==resume.cwd)throw new Error('Claude 会话或来源实例已变化，请刷新后重新预览')
     validateClaudeCodeCliArgs(profile.extraArgs,[],{interactiveResume:true})
-    if(!isAbsolute(resume.cwd)||/[\x00-\x1f\x7f]/.test(resume.cwd))throw new Error('会话项目目录已变化，请核对原项目路径')
-    const canonical=resolve(resume.cwd)
-    if(realpathSync(canonical)!==canonical)throw new Error('会话项目目录已变化，请核对原项目路径')
-    directory(resume.cwd)
-    const stat=lstatSync(resume.cwd)
-    if(stat.dev!==resume.cwdDevice||stat.ino!==resume.cwdInode)throw new Error('会话项目目录已被替换，请重新预览')
+    if(!isAbsolute(resume.cwd)||!isAbsolute(resume.cwdCanonicalPath)||/[\x00-\x1f\x7f]/.test(resume.cwd)||/[\x00-\x1f\x7f]/.test(resume.cwdCanonicalPath))throw new Error('会话项目目录已变化，请核对原项目路径')
+    if(resolve(realpathSync(resume.cwd))!==resolve(resume.cwdCanonicalPath))throw new Error('会话项目目录已变化，请核对原项目路径')
+    directory(resume.cwdCanonicalPath)
+    const stat=statSync(resume.cwd),canonicalStat=statSync(resume.cwdCanonicalPath)
+    if(stat.dev!==resume.cwdDevice||stat.ino!==resume.cwdInode||canonicalStat.dev!==stat.dev||canonicalStat.ino!==stat.ino)throw new Error('会话项目目录已被替换，请重新预览')
     // --resume performs an ID lookup. Recheck duplicate IDs and the exact file
     // snapshot after the user reviews the preview and immediately before spawn.
     claudeSessionResumeArgs({id:resume.sessionId,locations:[resume.location],conflict:false})
@@ -521,7 +521,7 @@ export class Instances {
       if(this.inUse(id))throw new Error('实例已有启动或运行任务')
       this.previews.delete(id)
       if(pending.claudeResume)this.validateClaudeResume(profile,pending.claudeResume)
-      const claudeWorkingDirectory=pending.claudeResume?{path:pending.claudeResume.cwd,device:pending.claudeResume.cwdDevice,inode:pending.claudeResume.cwdInode}:undefined
+      const claudeWorkingDirectory=pending.claudeResume?{path:pending.claudeResume.cwd,canonicalPath:pending.claudeResume.cwdCanonicalPath,device:pending.claudeResume.cwdDevice,inode:pending.claudeResume.cwdInode}:undefined
       const context=this.claudeContext(profile,undefined,claudeWorkingDirectory)
       if(context.fingerprint!==pending.fingerprint)throw new Error('Claude 账号、配置或程序已变化，请重新预览')
       const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),claudeResume:pending.claudeResume,claudeWorkingDirectory}

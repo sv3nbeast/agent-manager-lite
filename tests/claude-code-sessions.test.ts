@@ -193,13 +193,69 @@ test('truncated trailing JSON is visible as incomplete metadata but is never res
   } finally { f.dispose() }
 })
 
-test('mixed session IDs cannot be indexed as a single account conversation', () => {
+test('mixed-ID Claude transcript remains readable but is explicitly blocked from unsafe ID-based resume', () => {
   const f = fixture()
   try {
-    appendFileSync(f.path, JSON.stringify({ ...f.event, sessionId: '66666666-6666-4666-8666-666666666666' }) + '\n')
+    const oldId = '66666666-6666-4666-8666-666666666666'
+    // Claude may retain an older session prefix in a reused transcript file;
+    // the session ID in the filename is the current conversation.
+    writeFileSync(f.path, [
+      JSON.stringify({ ...f.event, sessionId: oldId, message: { content: 'OLDER_CONVERSATION_DETAIL' } }),
+      JSON.stringify({ ...f.event, message: { content: 'CURRENT_CONVERSATION_DETAIL' } }),
+    ].join('\n') + '\n')
+    const scan = f.scan()
+    assert.equal(scan.records.length, 2)
+    assert.equal(scan.complete, true)
+    const old = scan.records.find(record => record.id === oldId)!, current = scan.records.find(record => record.id === f.id)!
+    assert.ok(old); assert.ok(current)
+    assert.match(old.locations[0].resumeBlockedReason!, /包含多个会话 ID/)
+    assert.match(current.locations[0].resumeBlockedReason!, /包含多个会话 ID/)
+    assert.ok(scan.warnings.some(warning => warning.includes('详情仍可查看，但这些文件不能安全继续对话')))
+    const oldPage = readClaudeSessionContent(old.locations[0]), currentPage = readClaudeSessionContent(current.locations[0])
+    assert.equal(oldPage.total, 1); assert.equal(currentPage.total, 1)
+    assert.ok(JSON.stringify(oldPage).includes('OLDER_CONVERSATION_DETAIL'))
+    assert.ok(!JSON.stringify(oldPage).includes('CURRENT_CONVERSATION_DETAIL'))
+    assert.ok(JSON.stringify(currentPage).includes('CURRENT_CONVERSATION_DETAIL'))
+    assert.ok(!JSON.stringify(currentPage).includes('OLDER_CONVERSATION_DETAIL'))
+    assert.throws(() => claudeSessionResumeArgs(current), /包含多个会话 ID/)
+  } finally { f.dispose() }
+})
+
+
+test('too many distinct session IDs stop parsing at the first ID over the bound', t => {
+  const f = fixture()
+  try {
+    const rows = Array.from({ length: 33 }, (_, index) => JSON.stringify({ ...f.event, sessionId: 'bounded-id-' + index, message: { content: 'bounded fixture' } }))
+    writeFileSync(f.path, rows.join(String.fromCharCode(10)) + String.fromCharCode(10))
     const scan = f.scan()
     assert.equal(scan.records.length, 0)
     assert.equal(scan.complete, false)
+    assert.ok(scan.warnings.some(warning => warning.includes('文件包含过多不同会话 ID 1 个')))
+  } finally { f.dispose() }
+})
+
+test('large native tool-result lines within the bounded reader limit remain discoverable', () => {
+  const f = fixture()
+  try {
+    const output = 'L'.repeat(8 * 1024 * 1024 + 1)
+    writeFileSync(f.path, JSON.stringify({ ...f.event, message: { content: [{ type: 'tool_result', content: output }] } }) + '\n')
+    const scan = f.scan()
+    assert.equal(scan.complete, true)
+    assert.equal(scan.records.length, 1)
+    assert.equal(scan.records[0].messageCount, 1)
+  } finally { f.dispose() }
+})
+
+test('native tool-result lines above the bounded reader limit produce a specific safe warning', () => {
+  const f = fixture()
+  try {
+    const output = 'L'.repeat(16 * 1024 * 1024)
+    writeFileSync(f.path, JSON.stringify({ ...f.event, message: { content: [{ type: 'tool_result', content: output }] } }) + '\n')
+    const scan = f.scan()
+    assert.equal(scan.complete, false)
+    assert.equal(scan.records.length, 0)
+    assert.ok(scan.warnings.some(warning => warning.includes('单行超过安全读取上限 1 个')))
+    assert.ok(!JSON.stringify(scan).includes('L'.repeat(100)))
   } finally { f.dispose() }
 })
 
@@ -431,6 +487,21 @@ test('Claude transcript project paths preserve significant whitespace instead of
       assert.equal(preview.cwd, significant)
       assert.throws(() => previewClaudeSessionResume(scan, { ...preview, cwd: f.cwd }), /不属于当前项目/)
     }
+  } finally { f.dispose() }
+})
+
+test('Claude resume preview accepts a stable absolute alias through a symlinked parent directory', () => {
+  const f = fixture()
+  try {
+    const aliasParent = join(f.root, 'workspace-parent-alias')
+    symlinkSync(f.root, aliasParent, 'dir')
+    const aliasCwd = join(aliasParent, 'workspace')
+    writeFileSync(f.path, JSON.stringify({ ...f.event, cwd: aliasCwd }) + '\n')
+    const scan = f.scan(), row = scan.records[0], location = row.locations[0]
+    assert.notEqual(realpathSync(aliasCwd), aliasCwd)
+    const preview = previewClaudeSessionResume(scan, { instanceId: f.instanceId, configDirectory: f.config, cwd: aliasCwd, sessionId: row.id, sourceId: location.sourceId })
+    assert.equal(preview.cwd, aliasCwd)
+    assert.equal(preview.cwdCanonicalPath, f.cwd)
   } finally { f.dispose() }
 })
 

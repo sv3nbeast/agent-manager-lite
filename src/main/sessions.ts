@@ -1,8 +1,8 @@
 import {createHash,randomUUID} from 'node:crypto'
 import {lstat} from 'node:fs/promises'
-import {lstatSync,realpathSync,type Stats} from 'node:fs'
+import {lstatSync,realpathSync,statSync,type Stats} from 'node:fs'
 import {homedir} from 'node:os'
-import {basename,isAbsolute,join,relative,resolve,sep} from 'node:path'
+import {basename,dirname,isAbsolute,join,relative,resolve,sep} from 'node:path'
 import {z} from 'zod'
 import {Store} from './store'
 import {ClientConfigs} from './clientConfig'
@@ -199,10 +199,10 @@ export class SessionCatalog {
             // UI identity never grants Codex mutation capabilities to this file.
             const id='claude:'+createHash('sha256').update(JSON.stringify([target.id,location.projectDirectory,session.id,location.path])).digest('hex')
             if(records.has(id)){warn('会话标识冲突，未合并不同客户端的记录');continue}
-            let resumeBlockedReason=target.role==='default'?'此会话来自本机默认目录，请在原 Claude Code 终端中继续；管理器不会自动绑定账号或实例':target.launchMode==='desktop'?'请在原 Claude Desktop 的 Code 页面中继续此会话':this.running(target.id)?'实例正在运行，请先在实例内使用 /resume，或停止实例后从这里恢复':session.conflict?'同 ID 会话存在文件冲突，请先核对来源':!scan.complete?'会话来源尚未完整读取，请刷新后重试':location.resumeBlockedReason??(!location.cwd?'会话没有保存项目工作目录':undefined)
-            if(!resumeBlockedReason&&location.cwd)try{const cwd=lstatSync(location.cwd);if(cwd.isSymbolicLink()||!cwd.isDirectory())resumeBlockedReason='原项目目录不可用，请恢复目录后重试'}catch{resumeBlockedReason='原项目目录不可用，请恢复目录后重试'}
+            let resumeBlockedReason=target.launchMode==='desktop'?'请在原 Claude Desktop 的 Code 页面中继续此会话':target.role==='instance'&&this.running(target.id)?'实例正在运行，请先在实例内使用 /resume，或停止实例后从这里恢复':session.conflict?'同 ID 会话存在文件冲突，请先核对来源':!scan.complete?'会话来源尚未完整读取，请刷新后重试':location.resumeBlockedReason??(!location.cwd?'会话没有保存项目工作目录':undefined)
+            if(!resumeBlockedReason&&location.cwd)try{const cwd=statSync(location.cwd);if(!cwd.isDirectory())resumeBlockedReason='原项目目录不可用，请恢复目录后重试'}catch{resumeBlockedReason='原项目目录不可用，请恢复目录后重试'}
             const row:SessionRecord={
-              id,clientType:'claude_code',launchMode:target.launchMode,sourceSessionId:session.id,title:location.title,cwd:location.cwd??'未知工作目录',projectName:location.cwd?basename(location.cwd):undefined,updatedAt:session.updatedAt,kind:'conversation',messageCount:session.messageCount,model:session.model,resumeBlockedReason,
+              id,clientType:'claude_code',launchMode:target.launchMode,sourceSessionId:session.id,title:location.title,cwd:location.cwd??'未知工作目录',projectName:location.cwd?basename(location.cwd):undefined,updatedAt:session.updatedAt,kind:'conversation',messageCount:session.messageCount,model:session.model,resumeMode:target.role==='default'?'default_fork':'managed',resumeBlockedReason,
               locations:[{targetId:target.id,name:target.name,directory:target.directory,running:this.running(target.id),archived:false,ambiguous:session.conflict}],
               capabilities:{open:true,transfer:false,archive:false,trash:false,visibilityRepair:false,tokens:false,contentSearch:true,content:true,resume:!resumeBlockedReason},
             }
@@ -277,6 +277,28 @@ export class SessionCatalog {
     const preview=previewClaudeSessionResume({configDirectory:claude.target.directory,sessionsDirectory:claude.location.source.projects.path,instanceId:input.targetId,scannedAt:snapshot.scannedAt,records:[claude.record],warnings:[],complete:true},selection)
     this.current(input.snapshotId)
     return {...preview,instanceRevision:current.revision,profileFingerprint:createHash('sha256').update(current.profile).digest('hex')}
+  }
+  /** Freshly revalidate a default-profile session without ever resolving an account or managed instance. */
+  async defaultClaudeResume(raw:unknown):Promise<{snapshotId:string;sessionId:string;targetId:string;location:ClaudeSessionLocation;homeDirectory:string;cwdCanonicalPath:string;cwdDevice:number;cwdInode:number;configCanonicalPath:string;configDevice:number;configInode:number;projectsDevice:number;projectsInode:number;projectDevice:number;projectInode:number}>{
+    const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),claude=snapshot.claudeFiles.get(input.sessionId),row=snapshot.records.find(record=>record.id===input.sessionId)
+    if(!claude||!row||claude.target.id!==input.targetId||claude.target.role!=='default'||claude.target.launchMode!=='cli'||row.resumeMode!=='default_fork')throw new Error('所选会话不是本机默认 Claude Code CLI 会话')
+    if(row.capabilities?.resume!==true)throw new Error(row.resumeBlockedReason??'此会话当前不能安全继续')
+    const before=await this.claudeTargetIdentity(claude.target)
+    if(before.profile!==claude.profile)throw new Error('默认 Claude Code 会话目录已变化，请刷新列表')
+    const scan=await scanClaudeCodeSessionsAsync(claude.target.directory)
+    if(!scan.complete)throw new Error('默认 Claude Code 会话目录尚未完整读取，请刷新后重试')
+    const selected=scan.records.find(value=>value.id===claude.sessionId)
+    if(!selected||selected.conflict||selected.locations.length!==1)throw new Error('同 ID Claude Code 会话存在文件冲突，请先核对来源')
+    const location=selected.locations[0]
+    if(location.sourceId!==claude.location.sourceId)throw new Error('默认 Claude Code 会话文件已变化，请刷新列表')
+    if(location.resumeBlockedReason)throw new Error(location.resumeBlockedReason)
+    if(!location.cwd||!isAbsolute(location.cwd))throw new Error('会话没有有效的项目工作目录')
+    const cwdCanonicalPath=realpathSync(location.cwd),cwd=statSync(location.cwd),canonical=statSync(cwdCanonicalPath)
+    if(!cwd.isDirectory()||cwd.dev!==canonical.dev||cwd.ino!==canonical.ino)throw new Error('会话项目目录不可用，请恢复目录后重试')
+    const after=await this.claudeTargetIdentity(claude.target)
+    if(after.profile!==before.profile||JSON.stringify(after.root)!==JSON.stringify(before.root))throw new Error('默认 Claude Code 会话目录已变化，请刷新列表')
+    this.current(input.snapshotId)
+    return {snapshotId:input.snapshotId,sessionId:claude.sessionId,targetId:input.targetId,location:structuredClone(location),homeDirectory:dirname(location.source.config.canonicalPath),cwdCanonicalPath,cwdDevice:cwd.dev,cwdInode:cwd.ino,configCanonicalPath:location.source.config.canonicalPath,configDevice:location.source.config.device,configInode:location.source.config.inode,projectsDevice:location.source.projects.device,projectsInode:location.source.projects.inode,projectDevice:location.project.device,projectInode:location.project.inode}
   }
   originalSessionId(raw:unknown):string{
     const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),row=snapshot.records.find(record=>record.id===input.sessionId)

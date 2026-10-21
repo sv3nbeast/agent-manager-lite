@@ -10,12 +10,13 @@ import SessionTrashPanel from './SessionTrashPanel.vue'
 import SessionVisibilityRepairPanel from './SessionVisibilityRepairPanel.vue'
 import SessionContentPanel from './SessionContentPanel.vue'
 import SessionResumePanel from './SessionResumePanel.vue'
+import DefaultClaudeResumePanel from './DefaultClaudeResumePanel.vue'
 import {useManager} from '../store'
 
 const emit=defineEmits<{showInstances:[]}>()
 const manager=useManager()
 const targets=ref<ClientConfigTarget[]>([]),targetId=ref<string>(),clientType=ref<'all'|'codex'|'claude_code'>('all'),projectQuery=ref(''),title=ref(''),content=ref(''),kind=ref<'all'|'conversation'|'external'|'subagent'>('all')
-const reader=ref<{record:SessionRecord;targetId:string}>(),resuming=ref<{record:SessionRecord;targetId:string}>(),resumedInstanceId=ref<string>()
+const reader=ref<{record:SessionRecord;targetId:string}>(),resuming=ref<{record:SessionRecord;targetId:string}>(),defaultResuming=ref<{record:SessionRecord;targetId:string}>(),resumedInstanceId=ref<string>(),defaultResumeNotice=ref('')
 const resumedInstance=computed(()=>manager.data?.instances?.find(instance=>instance.id===resumedInstanceId.value))
 const resumedStatus=computed(()=>{const instance=resumedInstance.value;if(!instance)return '';return instance.error?'会话恢复失败':instance.status==='running'?'会话已在原实例启动':instance.status==='stopped'?'会话实例已退出':'正在准备会话实例…'})
 const result=ref<SessionPage>(),busy=ref(false),readingTokens=ref(false),error=ref(''),tokens=ref<Record<string,SessionTokenResult>>({}),knownRecords=ref<Record<string,SessionRecord>>({}),visibilityRepairOpen=ref(false)
@@ -29,8 +30,9 @@ const sourceDescription=computed(()=>sources.value.find(target=>target.id===targ
 const claudeOnly=computed(()=>clientType.value==='claude_code'||sources.value.find(target=>target.id===targetId.value)?.clientType==='claude_code')
 const hasClaude=computed(()=>claudeOnly.value||result.value?.items.some(record=>record.clientType==='claude_code'))
 const clientName=(record:SessionRecord)=>record.clientType==='claude_code'?(record.launchMode==='desktop'?'Claude Desktop · Code':'Claude Code CLI'):'Codex'
-const canResume=(record:SessionRecord)=>record.capabilities?.resume===true&&!record.locations.some(location=>location.running)&&!['preparing','starting','running','stopping'].includes(manager.data?.instances?.find(instance=>record.locations.some(location=>location.targetId===instance.id))?.status??'')
-const resumeReason=(record:SessionRecord)=>!canResume(record)&&record.capabilities?.resume?'实例正在运行或准备启动，请在对应实例终端中使用 /resume 恢复会话。':record.resumeBlockedReason
+const canResume=(record:SessionRecord)=>record.resumeMode==='managed'&&record.capabilities?.resume===true&&!record.locations.some(location=>location.running)&&!['preparing','starting','running','stopping'].includes(manager.data?.instances?.find(instance=>record.locations.some(location=>location.targetId===instance.id))?.status??'')
+const canDefaultFork=(record:SessionRecord)=>record.resumeMode==='default_fork'&&record.capabilities?.resume===true
+const resumeReason=(record:SessionRecord)=>!canResume(record)&&record.resumeMode==='managed'&&record.capabilities?.resume?'实例正在运行或准备启动，请在对应实例终端中使用 /resume 恢复会话。':record.resumeBlockedReason
 const codexSelectedIds=computed(()=>selectedIds.value.filter(id=>knownRecords.value[id]?.clientType!=='claude_code'))
 const tokenIds=computed(()=>(selectedIds.value.length?selectedIds.value:result.value?.items.map(item=>item.id)??[]).filter(id=>knownRecords.value[id]?.capabilities?.tokens!==false))
 const locationExplanation=(location:SessionLocation,record?:SessionRecord)=>record?.clientType==='claude_code'?'同一实例存在多个相同 ID 的 Claude 会话文件，已按来源分别展示。恢复前请先核对文件。':location.ambiguous?'此目录有多个同 ID 记录，客户端索引未能明确当前文件。保留全部文件，避免打开或复制错误版本。':location.historyMode==='paginated'?'Codex 将这段长对话分段保存。按客户端索引打开当前分段，其他分段仍完整保留；复制完整对话请从实例页面复制。':'按客户端索引打开当前文件，其他历史版本仍完整保留。'
@@ -65,6 +67,8 @@ async function readTokens(){
 async function cancelTokens(){if(result.value)await window.manager.cancelSessionTokens(result.value.snapshotId)}
 function viewContent(record:SessionRecord){if(!result.value||!record.capabilities?.content||record.locations.length!==1)return;reader.value={record,targetId:record.locations[0].targetId}}
 function resume(record:SessionRecord){if(!result.value||!canResume(record)||record.locations.length!==1)return;reader.value=undefined;resuming.value={record,targetId:record.locations[0].targetId}}
+function forkDefault(record:SessionRecord){if(!result.value||!canDefaultFork(record)||record.locations.length!==1)return;reader.value=undefined;defaultResumeNotice.value='';defaultResuming.value={record,targetId:record.locations[0].targetId}}
+function defaultResumeStarted(){defaultResuming.value=undefined;defaultResumeNotice.value='已将新分叉会话交给 Terminal。它使用本机默认 Claude Code 身份；管理器不会控制该终端进程。'}
 function resumeStarted(instanceId:string){resumedInstanceId.value=instanceId;void reload()}
 function open(record:SessionRecord,action:'location'|'file'|'copyId'){
   choosing.value={record,action};selectedTarget.value=record.locations.length===1?record.locations[0].targetId:undefined
@@ -87,9 +91,10 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
 
 <template>
   <section class="sessions-panel">
-    <div class="page-heading"><div><h1>会话</h1><p>按客户端、项目和来源查找会话，浏览 Claude 对话并在原 CLI 实例恢复。</p></div><a-space><a-button v-if="!claudeOnly" :disabled="busy" @click="chooseDirectory">选择会话目录</a-button><a-button v-if="!claudeOnly" :disabled="busy" @click="visibilityRepairOpen=true">修复可见性</a-button><a-button v-if="busy&&runId" @click="cancel">取消读取</a-button><a-button v-else type="primary" :loading="busy" @click="reload">刷新会话</a-button></a-space></div>
+    <div class="page-heading"><div><h1>会话</h1><p>按客户端、项目和来源查找会话，查看 Claude 对话并继续 CLI 会话。</p></div><a-space><a-button v-if="!claudeOnly" :disabled="busy" @click="chooseDirectory">选择会话目录</a-button><a-button v-if="!claudeOnly" :disabled="busy" @click="visibilityRepairOpen=true">修复可见性</a-button><a-button v-if="busy&&runId" @click="cancel">取消读取</a-button><a-button v-else type="primary" :loading="busy" @click="reload">刷新会话</a-button></a-space></div>
     <a-alert v-if="error" type="error" :message="error" class="error-banner" />
     <a-alert v-if="resumedInstance" :type="resumedInstance.error?'error':resumedInstance.status==='running'?'success':'info'" :message="resumedStatus" class="error-banner session-resume-status"><template #description><span>{{resumedInstance.name}}<template v-if="resumedInstance.error"> · {{resumedInstance.error}}</template></span><a-button type="link" @click="emit('showInstances')">查看实例</a-button></template></a-alert>
+    <a-alert v-if="defaultResumeNotice" type="success" :message="defaultResumeNotice" class="error-banner" />
     <a-card class="session-filters" size="small">
       <a-form layout="vertical" :model="{targetId,clientType,projectQuery,title,content,kind}" @finish="reload"><div class="session-filter-grid">
         <a-form-item label="客户端"><a-select v-model:value="clientType" aria-label="会话客户端" :disabled="busy" :options="[{value:'all',label:'全部客户端'},{value:'codex',label:'Codex'},{value:'claude_code',label:'Claude'}]" /></a-form-item>
@@ -100,8 +105,8 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
         <a-form-item label="文件内容"><a-input v-model:value="content" aria-label="会话内容搜索" placeholder="搜索会话中的文本" :maxlength="200" :disabled="busy" allow-clear /></a-form-item>
       </div><a-button html-type="submit" :disabled="busy">应用筛选</a-button><span class="muted session-filter-note">可组合客户端、来源、项目与文本筛选。Codex 类型按标题和工作目录识别。</span></a-form>
     </a-card>
-    <a-alert v-if="result?.warnings.length" type="warning" class="error-banner"><template #message>部分目录或文件未能完整读取</template><template #description><ul><li v-for="warning in result.warnings" :key="warning">{{warning}}</li></ul></template></a-alert>
-    <a-alert v-if="hasClaude" type="info" message="Claude 支持对话浏览和内容搜索；停止的 CLI 实例可恢复会话。Desktop 仅展示本地 Code 记录，Chat / Cowork 历史请在客户端查看。" class="error-banner" />
+    <a-alert v-if="result?.warnings.length" type="warning" class="error-banner"><template #message>会话读取提示</template><template #description><ul><li v-for="warning in result.warnings" :key="warning">{{warning}}</li></ul></template></a-alert>
+    <a-alert v-if="hasClaude" type="info" message="Claude CLI 支持本地对话浏览。受管实例停止后可在原配置中恢复；本机默认目录可在 Terminal 中创建新分叉。Desktop 仅展示本地 Code 记录，Chat / Cowork 历史请在客户端查看。" class="error-banner" />
     <template v-if="!claudeOnly">
       <p v-if="hasClaude" class="muted session-codex-tools-note">以下批量管理与用量功能适用于 Codex，会话选择框仅选择 Codex 记录。</p>
       <SessionTransferPanel :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
@@ -117,7 +122,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
         <a-table-column key="locations" title="来源 / 所在目录" :width="220"><template #default="{record}"><div v-for="location in record.locations" :key="location.targetId" class="session-location" :title="location.directory">{{location.name}}<a-tag v-if="location.archived">已归档</a-tag><a-tag v-if="location.running" color="green">运行中</a-tag><a-tooltip v-if="location.ambiguous" :title="locationExplanation(location,record)"><a-tag color="orange">多个版本待核对</a-tag></a-tooltip><a-tooltip v-else-if="location.historyMode==='paginated'||location.historicalCopies" :title="locationExplanation(location,record)"><a-tag>{{location.historyMode==='paginated'?'分段记录 · '+((location.historicalCopies??0)+1):'历史副本 · '+location.historicalCopies}}</a-tag></a-tooltip></div></template></a-table-column>
         <a-table-column key="time" title="最近活动" :width="165"><template #default="{record}">{{date(record.updatedAt)}}</template></a-table-column>
         <a-table-column v-if="!claudeOnly" key="tokens" title="Token 用量" :width="170"><template #default="{record}"><span v-if="record.capabilities?.tokens===false" class="muted">暂不支持</span><template v-else-if="tokens[record.id]?.tokens"><strong>{{amount(tokens[record.id].tokens?.total)}}</strong><div class="muted session-meta">输入 {{amount(tokens[record.id].tokens?.input)}}<br>输出 {{amount(tokens[record.id].tokens?.output)}}</div></template><span v-else class="muted" :title="tokens[record.id]?.error">{{tokens[record.id]?.error?'读取失败':tokens[record.id]?'未知':'未读取'}}</span></template></a-table-column>
-        <a-table-column key="actions" title="操作" :width="160"><template #default="{record}"><a-button v-if="record.capabilities?.content" type="link" size="small" @click="viewContent(record)">查看对话</a-button><a-button v-if="canResume(record)" type="link" size="small" @click="resume(record)">恢复会话</a-button><div v-else-if="resumeReason(record)" class="muted session-resume-reason">{{resumeReason(record)}}</div><a-button type="link" size="small" @click="open(record,'location')">打开位置</a-button><a-button type="link" size="small" @click="open(record,'file')">打开会话文件</a-button><a-button type="link" size="small" @click="open(record,'copyId')">复制 ID</a-button></template></a-table-column>
+        <a-table-column key="actions" title="操作" :width="180"><template #default="{record}"><a-button v-if="record.capabilities?.content" type="link" size="small" @click="viewContent(record)">查看对话</a-button><a-button v-if="canResume(record)" type="link" size="small" @click="resume(record)">恢复到原实例</a-button><a-button v-else-if="canDefaultFork(record)" type="link" size="small" @click="forkDefault(record)">在 Terminal 中分叉</a-button><div v-else-if="resumeReason(record)" class="muted session-resume-reason">{{resumeReason(record)}}</div><a-button type="link" size="small" @click="open(record,'location')">打开位置</a-button><a-button type="link" size="small" @click="open(record,'file')">打开会话文件</a-button><a-button type="link" size="small" @click="open(record,'copyId')">复制 ID</a-button></template></a-table-column>
       </a-table>
     </a-spin>
     <a-pagination v-if="result&&result.total>25" :current="result.page" :total="result.total" :page-size="25" :show-size-changer="false" :disabled="busy" class="pagination" @change="page" />
@@ -125,8 +130,9 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
     <a-modal :open="!!choosing" title="选择会话所在目录" ok-text="继续" cancel-text="取消" :ok-button-props="{disabled:!selectedTarget||choosing?.record.clientType!=='claude_code'&&choosing?.record.locations.find(value=>value.targetId===selectedTarget)?.ambiguous}" @ok="confirmOpen" @cancel="choosing=undefined">
       <p>{{choosing?.record.title}}</p><a-radio-group v-model:value="selectedTarget" class="session-location-picker"><a-radio v-for="location in choosing?.record.locations??[]" :key="location.targetId" :value="location.targetId" :disabled="location.ambiguous">{{location.name}}<div class="muted session-meta">{{location.directory}}</div><small v-if="location.ambiguous||location.historyMode==='paginated'">{{locationExplanation(location)}}</small></a-radio></a-radio-group>
     </a-modal>
-    <SessionContentPanel v-if="reader&&result" :snapshot-id="result.snapshotId" :record="reader.record" :target-id="reader.targetId" :initial-query="content" :can-resume="canResume(reader.record)" :resume-reason="resumeReason(reader.record)" @close="reader=undefined" @resume="resume" />
+    <SessionContentPanel v-if="reader&&result" :snapshot-id="result.snapshotId" :record="reader.record" :target-id="reader.targetId" :initial-query="content" :can-resume="canResume(reader.record)" :can-fork-default="canDefaultFork(reader.record)" :resume-reason="resumeReason(reader.record)" @close="reader=undefined" @resume="resume" @fork-default="forkDefault" />
     <SessionResumePanel v-if="resuming&&result" :snapshot-id="result.snapshotId" :record="resuming.record" :target-id="resuming.targetId" @close="resuming=undefined" @started="resumeStarted" />
+    <DefaultClaudeResumePanel v-if="defaultResuming&&result" :snapshot-id="result.snapshotId" :record="defaultResuming.record" :target-id="defaultResuming.targetId" @close="defaultResuming=undefined" @started="defaultResumeStarted" />
     <SessionVisibilityRepairPanel v-model:open="visibilityRepairOpen" :session-ids="codexSelectedIds" @completed="reload" />
   </section>
 </template>
