@@ -78,8 +78,13 @@ onMounted(() => run(async () => { targets.value = await window.manager.listClien
     <div class="page-heading"><div><h1>客户端配置</h1><p>管理模型、服务等级与上下文设置，保存前查看改动。</p></div><a-button :disabled="busy" @click="choose">选择已有配置目录</a-button></div>
     <a-alert v-if="error" type="error" show-icon :message="error" class="error-banner" />
     <a-card title="配置位置" class="settings-card">
-      <a-space wrap><a-select v-model:value="selected" aria-label="配置目录" :disabled="busy" :options="targets.map(target => ({ value: target.id, label: target.managed ? target.name : target.directory }))" style="width: 360px" @change="reload" /><a-button :loading="busy" @click="reload">重新读取</a-button></a-space>
-      <p v-if="view?.target.description" class="muted">{{view.target.description}}</p>
+      <div class="config-target-picker">
+        <div class="config-target-controls">
+          <a-select v-model:value="selected" class="config-target-select" aria-label="配置目录" :disabled="busy" :options="targets.map(target => ({ value: target.id, label: target.managed ? target.name : target.directory }))" @change="reload" />
+          <a-button :loading="busy" @click="reload">重新读取</a-button>
+        </div>
+        <p v-if="view?.target.description" class="muted config-target-help">{{view.target.description}}</p>
+      </div>
       <p class="config-path"><code>{{ view?.target.directory }}/config.toml</code></p>
       <p class="muted">{{ view?.target.managed ? '独立的受管配置目录，可供受管实例使用。' : '此目录由你选择，预览并确认后才会写入。' }}{{ view?.exists ? '' : '文件尚未创建。' }}</p>
       <a-alert v-if="view?.activeProfile" type="info" show-icon :message="`当前默认 Profile：${view.activeProfile}，其中的设置可能覆盖下面的默认值。`" />
@@ -120,6 +125,10 @@ onMounted(() => run(async () => { targets.value = await window.manager.listClien
 
 <style scoped>
 .config-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 28px; }
+.config-target-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; min-width: 0; }
+.config-target-select { flex: 0 1 360px; width: 360px; max-width: 100%; min-width: 0; }
+.config-target-controls > :deep(.ant-btn) { flex: 0 0 auto; }
+.config-target-help { margin: 8px 0 0; line-height: 1.6; }
 .config-path { margin: 16px 0 8px; overflow-wrap: anywhere; font-size: 12px; }
 .config-value { overflow-wrap: anywhere; white-space: pre-wrap; }
 @media (max-width: 1050px) { .config-form-grid { grid-template-columns: 1fr; } }

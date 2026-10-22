@@ -216,7 +216,8 @@ test('the real six-hour entitlement boundary remains a web date after fresh toke
 })
 
 test('an expired web date may recover from a current token without requiring a new token request', async t => {
-  const store = vault(t), account = saveOAuthAccount(store, credentials())
+  const currentExpiry = Math.ceil((Date.now() + 60 * 60_000) / 1000) * 1000
+  const store = vault(t), account = saveOAuthAccount(store, credentials(new Date(currentExpiry).toISOString()))
   store.transaction(state => {
     state.accounts[0].subscriptionActiveUntil = Date.now() - 1000
     state.accounts[0].subscriptionSource = 'web'
@@ -224,7 +225,7 @@ test('an expired web date may recover from a current token without requiring a n
   })
   const authority = new TokenAuthority(store, async () => { throw new Error('No refresh needed') })
   t.after(() => authority.stop())
-  assert.equal((await authority.ensure(account.id)).subscriptionActiveUntil, expiryMs)
+  assert.equal((await authority.ensure(account.id)).subscriptionActiveUntil, currentExpiry)
   assert.equal(store.snapshot().accounts[0].subscriptionSource, 'token')
 })
 
