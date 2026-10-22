@@ -482,17 +482,19 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
       const segment = { ...value, multipleSessionIds: ids.size > 1 || undefined }
       segment.title = segment.customTitle ?? segment.firstPrompt ?? segment.summary
       if (ids.size > 1) {
-        if (id === fileSessionId && latestSegmentIsSafe && ancestryTrackingComplete) {
-          const leafUuid = latestConversationUuid.get(id)
-          if (leafUuid && !ambiguousMessageUuids.has(leafUuid)) {
-            const seen = new Set([leafUuid])
-            let parentUuid = messageParents.get(leafUuid)?.parentUuid
-            while (parentUuid && !ambiguousMessageUuids.has(parentUuid) && !seen.has(parentUuid)) {
-              seen.add(parentUuid)
-              const parent = messageParents.get(parentUuid)
-              if (!parent) break
-              if (parent.sessionId && parent.sessionId !== id) { segment.resumeIncludesAncestors = true; break }
-              parentUuid = parent.parentUuid
+        if (id === fileSessionId && latestSegmentIsSafe) {
+          if (ancestryTrackingComplete) {
+            const leafUuid = latestConversationUuid.get(id)
+            if (leafUuid && !ambiguousMessageUuids.has(leafUuid)) {
+              const seen = new Set([leafUuid])
+              let parentUuid = messageParents.get(leafUuid)?.parentUuid
+              while (parentUuid && !ambiguousMessageUuids.has(parentUuid) && !seen.has(parentUuid)) {
+                seen.add(parentUuid)
+                const parent = messageParents.get(parentUuid)
+                if (!parent) break
+                if (parent.sessionId && parent.sessionId !== id) { segment.resumeIncludesAncestors = true; break }
+                parentUuid = parent.parentUuid
+              }
             }
           }
         }
