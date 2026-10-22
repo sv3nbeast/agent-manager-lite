@@ -546,7 +546,7 @@ desktopTest('Desktop local Code sessions are readable while resume and login cal
   const project = join(first.directory, 'projects', 'fixture'); mkdirSync(project, { recursive: true })
   const sessionId=randomUUID()
   writeFileSync(join(project, sessionId + '.jsonl'), JSON.stringify({ type: 'user', sessionId, cwd:f.root, message: { role: 'user', content: 'Synthetic local Desktop Code history' } }) + '\n')
-  const catalog = new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:null}), result = await catalog.scan({ runId: randomUUID() })
+  const catalog = new SessionCatalog(f.store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null}), result = await catalog.scan({ runId: randomUUID() })
   t.after(()=>catalog.stop())
   assert.equal(result.sources?.filter(source => source.id === first.id || source.id === second.id).length, 2)
   assert.equal(result.items.length, 1)

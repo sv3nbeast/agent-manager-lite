@@ -18,7 +18,7 @@ function rollout(home:string,id:string,parent?:string,title='Fixture'){
 }
 function fixture(t:{after(fn:()=>void|Promise<void>):void}){
   const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-trash-service-'))),a=join(root,'a'),b=join(root,'b');mkdirSync(a);mkdirSync(b)
-  const store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),targets=[configs.register(a),configs.register(b)],catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null}),binary=join(root,'codex');writeFileSync(binary,Buffer.from('cffaedfe00000000','hex'),{mode:0o700})
+  const store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),targets=[configs.register(a),configs.register(b)],catalog=new SessionCatalog(store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null}),binary=join(root,'codex');writeFileSync(binary,Buffer.from('cffaedfe00000000','hex'),{mode:0o700})
   const apps=[{id:'fixture',name:'Fixture',kind:'cli' as const,path:binary}],runtime:TrashRuntime={plan:async(_p,_h,ids)=>ids.map(id=>({id,descendant:false})),remove:async(_p,_h,ids)=>({deletedIds:ids,failedIds:[]}),verify:async()=>{},rebuild:async()=>{}}
   let trash:SessionTrash,busy=false,now=Date.now();const transfers=new SessionTransfers(store,catalog,()=>apps,id=>trash?.busy(id)??false)
   const create=()=>new SessionTrash(store,catalog,transfers,()=>apps,()=>busy,runtime,()=>now);trash=create()

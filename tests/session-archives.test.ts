@@ -17,7 +17,7 @@ import {SessionZip,archiveMaxBytes,writeSessionZip,type SessionManifest} from '.
 
 const signal=()=>new AbortController().signal,hash=(data:Buffer|string)=>createHash('sha256').update(data).digest('hex')
 function fixture(t:{after(fn:()=>void|Promise<void>):void},indexer:ConstructorParameters<typeof SessionTransfers>[4]=async()=>{}){
-  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-archives-'))),store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null})
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-archives-'))),store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null})
   const source=join(root,'source'),target=join(root,'target');mkdirSync(source);mkdirSync(target)
   const a=configs.register(source),b=configs.register(target),program=join(root,'codex');writeFileSync(program,Buffer.from('cffaedfe00000000','hex'),{mode:0o700})
   const apps=[{id:'fixture-cli',name:'Fixture CLI',kind:'cli' as const,path:program}];let now=Date.now(),archives:SessionArchives
@@ -58,7 +58,7 @@ test('ZIP round trip preserves original rollout bytes, SHA256, source/unknown me
   assert.equal(existsSync(join(f.target,'sessions')),false)
   f.archives.startImport({ticket:preview.ticket,clientsClosed:true});await f.archives.settled()
   assert.equal(f.archives.view()?.status,'completed',JSON.stringify(f.archives.view()));assert.equal(indexed.length,1);assert.deepEqual(new Set(indexed[0]),new Set([id,archived]))
-  const targetCatalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:null}),page=await targetCatalog.scan({runId:randomUUID(),targetId:f.b.id});assert.equal(page.total,2);assert.ok(page.items.find(row=>row.id===archived)?.locations[0].archived)
+  const targetCatalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null}),page=await targetCatalog.scan({runId:randomUUID(),targetId:f.b.id});assert.equal(page.total,2);assert.ok(page.items.find(row=>row.id===archived)?.locations[0].archived)
   const imported=await targetCatalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:f.b.id}),data=readFileSync(imported,'utf8')
   assert.equal(data.slice(data.indexOf('\n')),before.toString().slice(before.toString().indexOf('\n')));assert.equal(JSON.parse(data.split('\n')[0]).payload.model_provider,'openai')
   assert.equal(existsSync(join(f.target,'auth.json')),false);assert.equal(existsSync(join(f.target,'config.toml')),false);assert.deepEqual(readFileSync(file),before);assert.ok(existsSync(old))

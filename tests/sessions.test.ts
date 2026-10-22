@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,renameSync,symlinkSync,readdirSync,appendFileSync,existsSync} from 'node:fs'
-import {dirname,join} from 'node:path'
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,renameSync,symlinkSync,readdirSync,appendFileSync,existsSync,lstatSync} from 'node:fs'
+import {dirname,join,relative} from 'node:path'
 import {tmpdir} from 'node:os'
 import {randomUUID,createHash} from 'node:crypto'
 import {DatabaseSync} from 'node:sqlite'
@@ -13,7 +13,7 @@ import {instanceInputSchema} from '../src/shared/instances'
 
 const when='2026-10-01T08:00:00.000Z'
 function fixture(t:{after(fn:()=>void):void}){
-  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-sessions-'))),store=new Store(join(root,'manager'),{encrypt:text=>Buffer.from(text),decrypt:raw=>raw.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null})
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-sessions-'))),store=new Store(join(root,'manager'),{encrypt:text=>Buffer.from(text),decrypt:raw=>raw.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null})
   const source=(name:string)=>{const home=join(root,name);mkdirSync(home);const target=configs.register(home);return {home,target}}
   const scan=(extra:Record<string,unknown>={})=>catalog.scan({runId:randomUUID(),titleQuery:'',contentQuery:'',kind:'all',...extra})
   t.after(()=>{catalog.stop();rmSync(root,{recursive:true,force:true})})
@@ -27,6 +27,7 @@ function rollout(home:string,id:string,extra:Record<string,unknown>[]=[] ,folder
 }
 const usage=(input=100,output=25)=>({type:'event_msg',timestamp:when,payload:{type:'token_count',info:{total_token_usage:{input_tokens:input,output_tokens:output,total_tokens:input+output}}}})
 function hashes(root:string):Record<string,string>{const result:Record<string,string>={};for(const entry of readdirSync(root,{withFileTypes:true})){const file=join(root,entry.name);if(entry.isDirectory())Object.assign(result,hashes(file));else if(entry.isFile())result[file]=createHash('sha256').update(readFileSync(file)).digest('hex')}return result}
+function treeState(root:string):Record<string,unknown>{const result:Record<string,unknown>={};const visit=(path:string)=>{const stat=lstatSync(path),key=relative(root,path)||'.';result[key]={mode:stat.mode,dev:stat.dev,ino:stat.ino,size:stat.size,mtimeMs:stat.mtimeMs,ctimeMs:stat.ctimeMs,...stat.isFile()?{sha256:createHash('sha256').update(readFileSync(path)).digest('hex')}:{}};if(stat.isDirectory())for(const entry of readdirSync(path))visit(join(path,entry))};visit(root);return result}
 
 test('catalog merges duplicate sessions, preserves archived locations and applies real display/title/project precedence without changing source files',async t=>{
   const f=fixture(t),a=f.source('a'),b=f.source('b'),id=randomUUID(),indexId=randomUUID(),previewId=randomUUID()
@@ -295,6 +296,85 @@ test('corrupt display databases fall back visibly, links outside the home are sk
   assert.deepEqual(hashes(a.home),before)
 })
 
+test('the native default Codex home is a discoverable read-only session source and never becomes a mutation target',async t=>{
+  const f=fixture(t),registered=f.source('registered'),home=join(f.root,'native-codex-home'),id=randomUUID()
+  mkdirSync(home);const file=rollout(home,id,[{type:'event_msg',payload:{type:'user_message',message:'测试会话：忽略指定的临时文件并继续'}},usage()])
+  const lines=readFileSync(file,'utf8').split('\n'),meta=JSON.parse(lines[0]);meta.payload.cwd='/fixture/other-project';lines[0]=JSON.stringify(meta);writeFileSync(file,lines.join('\n'))
+  const catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:home,defaultClaudeDirectory:null});t.after(()=>catalog.stop())
+  const before=hashes(home),page=await catalog.scan({runId:randomUUID(),clientType:'codex',contentQuery:'忽略指定的临时文件并继续'})
+  assert.equal(page.total,1);assert.equal(page.items[0].id,id);assert.equal(page.items[0].cwd,'/fixture/other-project')
+  const source=page.sources?.find(value=>value.directory===home)!
+  assert.equal(source.name,'本机默认 Codex 会话目录');assert.equal(source.role,'default');assert.equal(source.readOnly,true);assert.equal(page.sourceCounts?.[source.id],1)
+  assert.ok(!f.configs.targets().some(target=>target.directory===home),'the auto-discovered home must not join writable configuration targets')
+  assert.equal(await catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:source.id}),file)
+  assert.throws(()=>catalog.selectedRecords(page.snapshotId,[id]),/只读查看/)
+  await assert.rejects(catalog.transferSources(page.snapshotId,[id]),/只读查看/)
+  assert.deepEqual(await catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[id]}),[{id,tokens:{input:100,output:25,total:125},targetId:source.id}])
+  assert.deepEqual(await catalog.syncSources(page.snapshotId,new AbortController().signal),[],'full sync only receives registered sources')
+  assert.deepEqual(hashes(home),before,'discovery, content search, opening and token parsing must not modify the native home')
+  assert.ok(registered.target.id!==source.id)
+})
+
+test('default Codex discovery rejects linked homes, de-duplicates registered homes and rechecks replaced roots',async t=>{
+  const f=fixture(t),home=join(f.root,'native-codex-home'),linked=join(f.root,'linked-codex-home')
+  mkdirSync(home);const id=randomUUID(),file=rollout(home,id)
+  symlinkSync(home,linked,'dir')
+  const linkedCatalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:linked,defaultClaudeDirectory:null})
+  t.after(()=>linkedCatalog.stop())
+  assert.ok(!(await linkedCatalog.scan({runId:randomUUID()})).sources?.some(source=>source.directory===linked),'a symlink is never auto-discovered')
+
+  const registered=f.configs.register(home),registeredCatalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:home,defaultClaudeDirectory:null})
+  t.after(()=>registeredCatalog.stop())
+  let page=await registeredCatalog.scan({runId:randomUUID(),targetId:registered.id})
+  assert.equal(page.total,1);assert.equal(page.items[0].locations.length,1);assert.equal(page.items[0].locations[0].targetId,registered.id)
+  assert.equal(page.sources?.filter(source=>source.directory===home).length,1,'a registered home appears only once')
+
+  const isolatedHome=join(f.root,'second-native-codex-home');mkdirSync(isolatedHome);const isolatedId=randomUUID(),isolatedFile=rollout(isolatedHome,isolatedId)
+  const readonlyCatalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:isolatedHome,defaultClaudeDirectory:null})
+  t.after(()=>readonlyCatalog.stop())
+  page=await readonlyCatalog.scan({runId:randomUUID()})
+  const readOnlyRow=page.items.find(row=>row.id===isolatedId)!
+  const selection={snapshotId:page.snapshotId,sessionId:isolatedId,targetId:readOnlyRow.locations[0].targetId}
+  renameSync(isolatedHome,isolatedHome+'-old');mkdirSync(isolatedHome)
+  await assert.rejects(readonlyCatalog.location(selection),/已被替换|已变化/)
+  assert.equal(existsSync(join(isolatedHome+'-old',relative(isolatedHome,isolatedFile))),true,'the old rollout remains with the renamed original root')
+})
+
+test('read-only default Codex discovery never opens SQLite or changes cold/live WAL sidecars',async t=>{
+  const f=fixture(t),createHome=(name:string,live:boolean)=>{
+    const home=join(f.root,name);mkdirSync(home);const id=randomUUID();rollout(home,id,[{type:'event_msg',payload:{type:'user_message',message:'WAL fixture body'}}])
+    const path=join(home,'state_5.sqlite'),db=new DatabaseSync(path);db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads(id TEXT,name TEXT,rollout_path TEXT)');db.prepare('INSERT INTO threads VALUES(?,?,?)').run('fixture','SQLite title must not be read','sessions/unused.jsonl')
+    if(!live)db.close()
+    return {home,id,path,db:live?db:undefined}
+  }
+  const cold=createHome('cold-wal-home',false),live=createHome('live-wal-home',true)
+  t.after(()=>{live.db?.close()})
+  assert.equal(existsSync(cold.path+'-wal'),false,'cold fixture starts without a WAL file')
+  assert.equal(existsSync(cold.path+'-shm'),false,'cold fixture starts without a SHM file')
+  assert.equal(existsSync(live.path+'-wal'),true,'live fixture includes a WAL file')
+  assert.equal(existsSync(live.path+'-shm'),true,'live fixture includes a SHM file')
+  for(const fixture of [cold,live]){
+    const before=treeState(fixture.home),catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:fixture.home,defaultClaudeDirectory:null});t.after(()=>catalog.stop())
+    const page=await catalog.scan({runId:randomUUID(),clientType:'codex',contentQuery:'WAL fixture body'})
+    assert.equal(page.total,1);assert.equal(page.items[0].id,fixture.id);assert.equal(page.items[0].title,fixture.id,'SQLite display data is skipped for filesystem-level read-only sources')
+    assert.deepEqual(treeState(fixture.home),before,'cold and live SQLite files, sidecars, timestamps and directory entries remain unchanged')
+  }
+})
+
+test('a registered copy remains manageable when its conversation ID also exists in the read-only default Codex home',async t=>{
+  const f=fixture(t),native=join(f.root,'native-codex-home'),managed=f.source('registered-copy'),id=randomUUID()
+  mkdirSync(native);const nativeFile=rollout(native,id,[{type:'event_msg',payload:{type:'user_message',message:'same ID in default home'}}]),managedFile=rollout(managed.home,id,[{type:'event_msg',payload:{type:'user_message',message:'same ID in registered copy'}}])
+  const nativeBefore=treeState(native),managedBefore=treeState(managed.home),catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:native,defaultClaudeDirectory:null});t.after(()=>catalog.stop())
+  const page=await catalog.scan({runId:randomUUID(),clientType:'codex'}),row=page.items.find(value=>value.id===id)!
+  assert.equal(row.locations.length,2)
+  assert.doesNotThrow(()=>catalog.selectedRecords(page.snapshotId,[id]))
+  const sources=await catalog.transferSources(page.snapshotId,[id])
+  assert.equal(sources.length,1);assert.equal(sources[0].targetId,managed.target.id);assert.equal(sources[0].path,managedFile)
+  assert.ok(row.locations.some(location=>location.targetId===page.sources?.find(source=>source.directory===native)?.id))
+  assert.equal(nativeFile.startsWith(native),true)
+  assert.deepEqual(treeState(native),nativeBefore);assert.deepEqual(treeState(managed.home),managedBefore)
+})
+
 test('source counts describe whole scanned directories and distinguish empty defaults from unreadable sources',async t=>{
   const f=fixture(t),source=f.source('counted'),id=randomUUID()
   rollout(source.home,id)
@@ -497,7 +577,7 @@ test('Claude session cwd choices remain bound to source snapshot and reject repl
 test('Claude resume is disabled while running or when the original workspace has disappeared',async t=>{
   const f=fixture(t),a=claudeSource(f,'resume-state',randomUUID())
   let running=true
-  const catalog=new SessionCatalog(f.store,id=>id===a.id&&running,{defaultClaudeDirectory:null})
+  const catalog=new SessionCatalog(f.store,id=>id===a.id&&running,{defaultCodexDirectory:null,defaultClaudeDirectory:null})
   t.after(()=>catalog.stop())
   let page=await catalog.scan({runId:randomUUID(),targetId:a.id}),selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:a.id,sourceId:page.items[0].resumeSourceId!,cwd:page.items[0].cwdCandidates![0]}
   assert.equal(page.items[0].capabilities?.resume,false)
@@ -511,7 +591,7 @@ test('Claude resume is disabled while running or when the original workspace has
 })
 
 test('default Claude source is discovered only for an existing safe native projects directory',async t=>{
-  const f=fixture(t),directory=join(f.root,'default-claude'),catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory})
+  const f=fixture(t),directory=join(f.root,'default-claude'),catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:directory})
   t.after(()=>catalog.stop())
   let page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
   assert.ok(!page.sources?.some(source=>source.clientType==='claude_code'))
@@ -535,7 +615,7 @@ test('default Claude conversations remain separate from managed instances and ca
   const path=join(project,sessionId+'.jsonl')
   writeFileSync(path,JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Default local conversation'}})+'\n')
   writeFileSync(join(directory,'.credentials.json'),JSON.stringify({accessToken:'DEFAULT_CREDENTIAL_MUST_NOT_ENTER_CATALOG'}))
-  const before=hashes(f.root),state=f.store.read(),catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory})
+  const before=hashes(f.root),state=f.store.read(),catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:directory})
   t.after(()=>catalog.stop())
   const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
   assert.equal(page.total,2)
@@ -559,7 +639,7 @@ test('default Claude fork permits a verified latest fork but blocks conflicts, a
   mkdirSync(project,{recursive:true})
   const transcript=join(project,sessionId+'.jsonl')
   writeFileSync(transcript,JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Fixture'}})+'\n')
-  const catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
+  const catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
   let page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'}),row=page.items.find(value=>value.sourceSessionId===sessionId)!,selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
   assert.equal((await catalog.defaultClaudeResume(selection)).sessionId,sessionId)
   mkdirSync(projectTwo);writeFileSync(join(projectTwo,sessionId+'.jsonl'),readFileSync(transcript))
@@ -589,7 +669,7 @@ test('default Claude duplicate IDs retain independent files and stale or linked 
   mkdirSync(project,{recursive:true});mkdirSync(other)
   const body=JSON.stringify({type:'user',sessionId,cwd:f.root,message:{content:'Default history'}})+'\n'
   for(const parent of [project,other])writeFileSync(join(parent,sessionId+'.jsonl'),body)
-  const catalog=new SessionCatalog(f.store,undefined,{defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
+  const catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:directory});t.after(()=>catalog.stop())
   const page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'})
   assert.equal(page.total,2);assert.ok(page.items.every(row=>row.locations[0].ambiguous))
   const selection={snapshotId:page.snapshotId,sessionId:page.items[0].id,targetId:page.items[0].locations[0].targetId}

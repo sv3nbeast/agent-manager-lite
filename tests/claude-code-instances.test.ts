@@ -98,7 +98,7 @@ async function resumeFixture(t:TestContext,options:Parameters<typeof fixture>[1]
   const projectDirectory=join(instance.directory,'projects','fixture-resume');mkdirSync(projectDirectory,{recursive:true})
   const transcript=join(projectDirectory,sessionId+'.jsonl')
   writeFileSync(transcript,[JSON.stringify({type:'user',sessionId,cwd:project,message:{role:'user',content:'Synthetic previous conversation'},timestamp:new Date().toISOString()}),JSON.stringify({type:'assistant',sessionId,cwd:alternateProject,message:{content:'Synthetic response from second project'},timestamp:new Date().toISOString()})].join('\n')+'\n')
-  const catalog=new SessionCatalog(f.store,id=>f.instances.inUse(id),{defaultClaudeDirectory:null})
+  const catalog=new SessionCatalog(f.store,id=>f.instances.inUse(id),{defaultCodexDirectory:null,defaultClaudeDirectory:null})
   const scan=await catalog.scan({runId:randomUUID(),targetId:instance.id})
   const row=scan.items.find(row=>row.sourceSessionId===sessionId)!
   assert.ok(row)
