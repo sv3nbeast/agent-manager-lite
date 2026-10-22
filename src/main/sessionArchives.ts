@@ -62,7 +62,7 @@ export class SessionArchives {
     z.string().uuid().parse(ticket);this.available();const pending=this.exportPending
     if(!pending||pending.view.ticket!==ticket||pending.expires<this.now())throw new Error('会话导出预览已过期')
     path=selectedPath(path)
-    if([realpathSync(this.store.directory),...this.configs.targets().map(target=>target.directory)].some(root=>within(root,path)))throw new Error('导出位置须在应用数据和已登记的 Codex 目录以外')
+    if([realpathSync(this.store.directory),...this.configs.targets().map(target=>target.directory)].some(root=>within(root,path))||this.catalog.isReadOnlySourcePath(path))throw new Error('导出位置须在应用数据、只读会话来源和已登记的 Codex 目录以外')
     for(const source of pending.sources){this.sourceCurrent(source);if(this.transfers.busy(source.targetId)||this.inUse(source.targetId))throw new Error('来源目录有正在执行或等待恢复的会话操作')}
     this.exportPending=undefined;clearTimeout(this.timer);const job=this.begin('export','running');job.sourceIds=new Set(pending.sources.map(source=>source.targetId));Object.assign(job.view,{totalFiles:pending.sources.length,totalBytes:pending.view.totalBytes*2})
     void this.execute(job,async()=>{

@@ -18,8 +18,12 @@ export function displayProject(display:Display,cwd:string):string|undefined{cons
  * session ID. Only the database actually configured for this home can identify
  * its current segment; display-title fallbacks must not choose that segment.
  */
-export async function readSessionRolloutIndex(root:string,signal:AbortSignal,warn:(message:string)=>void):Promise<Map<string,string>>{
+export async function readSessionRolloutIndex(root:string,signal:AbortSignal,warn:(message:string)=>void,options:{sqlite?:boolean}={}):Promise<Map<string,string>>{
   const result=new Map<string,string>(),configPath=join(root,'config.toml')
+  // A read-only SQLite connection can still create or update WAL/SHM sidecars.
+  // Virtual default homes promise filesystem-level read-only access, so do not
+  // open client databases there; unresolved rollout duplicates stay ambiguous.
+  if(options.sqlite===false)return result
   let db:DatabaseSync|undefined
   const config=async():Promise<string|null>=>{
     try{
@@ -66,7 +70,7 @@ export async function readSessionRolloutIndex(root:string,signal:AbortSignal,war
   }catch{signal.throwIfAborted();warn('当前会话索引无法安全读取，保留多文件选择保护');return new Map()}
   finally{db?.close()}
 }
-export async function readSessionDisplay(root:string,signal:AbortSignal,warn:(message:string)=>void):Promise<Display>{
+export async function readSessionDisplay(root:string,signal:AbortSignal,warn:(message:string)=>void,options:{sqlite?:boolean}={}):Promise<Display>{
   const result:Display={catalog:new Map(),names:new Map(),previews:new Map(),index:new Map(),projects:[]},local=new Set<string>()
   try{
     const {file,stat}=await openSessionFile(root,join(root,'session_index.jsonl'))
@@ -78,6 +82,9 @@ export async function readSessionDisplay(root:string,signal:AbortSignal,warn:(me
       result.index.set(id,{title,updatedAt})
     }}finally{await file.close()}
   }catch(error){signal.throwIfAborted();if((error as NodeJS.ErrnoException).code!=='ENOENT')warn('会话标题索引无法完整读取，已使用其他展示信息')}
+  // Keep the virtual ~/.codex source byte-for-byte read-only. SQLite may
+  // materialize WAL/SHM files even with readOnly/query_only enabled.
+  if(options.sqlite===false)return result
   const candidates:string[]=[]
   for(const sub of ['sqlite','']){
     const folder=join(root,sub)

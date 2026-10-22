@@ -71,7 +71,7 @@ test('merge supports giant Unicode lines, cancels while reading and rejects chan
 
 test('strict sync catalog retains same-home duplicate files while selected copy uses the canonical body',async t=>{
   const f=fixture(t),id=randomUUID();source(f.home,id,header(id)+'\n');source(f.home,id,header(id)+'\n')
-  const store=new Store(join(f.root,'data'),{encrypt:text=>Buffer.from(text),decrypt:data=>data.toString()}),configs=new ClientConfigs(store),target=configs.register(f.home),catalog=new SessionCatalog(store,undefined,{defaultClaudeDirectory:null}),page=await catalog.scan({runId:randomUUID(),targetId:target.id})
+  const store=new Store(join(f.root,'data'),{encrypt:text=>Buffer.from(text),decrypt:data=>data.toString()}),configs=new ClientConfigs(store),target=configs.register(f.home),catalog=new SessionCatalog(store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null}),page=await catalog.scan({runId:randomUUID(),targetId:target.id})
   assert.equal((await catalog.syncSources(page.snapshotId,signal())).length,2);assert.equal((await catalog.transferSources(page.snapshotId,[id])).length,1)
 })
 
