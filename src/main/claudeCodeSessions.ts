@@ -69,6 +69,8 @@ export interface ClaudeSessionLocation {
   /** ID-less prefix records are attributed to the first session segment. */
   contentIncludesPrefix?: boolean
   resumeBlockedReason?: string
+  /** The transcript contains a verified message-parent link from this fork to an earlier session. */
+  resumeIncludesAncestors?: boolean
   /** Set only when a content search was requested; no transcript text is retained. */
   contentMatched?: boolean
 }
@@ -144,6 +146,7 @@ interface TranscriptMetadata {
   summary?: string
   incomplete?: boolean
   multipleSessionIds?: boolean
+  resumeIncludesAncestors?: boolean
   sessionIds?: string[]
   resumeBlockedReason?: string
   contentMatched?: boolean
@@ -372,7 +375,9 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
     const metadata: TranscriptMetadata = { messageCount: 0, kind: 'conversation', ...(options.contentQuery ? { contentMatched: false } : {}) }
     const digest = createHash('sha256'), buffer = Buffer.alloc(chunkBytes), decoder = new TextDecoder('utf-8', { fatal: true })
     let offset = 0, pendingChunks: Buffer[] = [], pendingLength = 0
-    const ids = new Set<string>(), segmentMetadata = new Map<string, TranscriptMetadata>()
+    const ids = new Set<string>(), segmentMetadata = new Map<string, TranscriptMetadata>(), reappearedIds = new Set<string>()
+    const messageParents = new Map<string, { sessionId?: string; parentUuid?: string }>(), ambiguousMessageUuids = new Set<string>(), latestConversationUuid = new Map<string, string>()
+    let ancestryTrackingComplete = true
     let activeSessionId: string | undefined
     const emptyMetadata = (): TranscriptMetadata => ({ messageCount: 0, kind: 'conversation', ...(options.contentQuery ? { contentMatched: false } : {}) })
     const unscopedMetadata = emptyMetadata()
@@ -390,11 +395,14 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
       const record = object(parsed)
       if (!record) throw new Error('Claude Code 会话记录格式无效')
       // uuid/id identify individual messages and snapshots, never a session.
-      const rawId = record.sessionId ?? record.session_id
+      const explicitId = record.sessionId, alternateId = record.session_id
+      if (explicitId !== undefined && alternateId !== undefined && explicitId !== alternateId) throw new Error('Claude Code 会话记录包含冲突的会话 ID 字段')
+      const rawId = explicitId ?? alternateId
       let recordMetadata = activeSessionId ? segmentMetadata.get(activeSessionId) : unscopedMetadata
       if (rawId !== undefined) {
         const id = sessionId(rawId)
         if (!id) throw new Error('Claude Code 会话记录 ID 格式无效')
+        if (id !== activeSessionId && segmentMetadata.has(id)) reappearedIds.add(id)
         ids.add(id)
         if (ids.size > 32) throw new Error('Claude Code 会话文件包含过多不同会话 ID')
         activeSessionId = id
@@ -405,6 +413,16 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
         if (ids.size > 1) metadata.multipleSessionIds = true
         metadata.id = id
         recordMetadata.id = id
+      }
+      const uuid = text(record.uuid, 256)
+      if (uuid) {
+        const parentUuid = text(record.parentUuid, 256)
+        if (messageParents.size < 100_000 || messageParents.has(uuid)) {
+          const previous = messageParents.get(uuid)
+          if (previous && (previous.sessionId !== activeSessionId || previous.parentUuid !== parentUuid)) ambiguousMessageUuids.add(uuid)
+          else messageParents.set(uuid, { sessionId: activeSessionId, parentUuid })
+        } else ancestryTrackingComplete = false
+        if (activeSessionId && (record.type === 'user' || record.type === 'assistant') && object(record.message)) latestConversationUuid.set(activeSessionId, uuid)
       }
       recordMetadata ??= metadata
       // If the file contains multiple conversation IDs, associate ID-less
@@ -458,10 +476,29 @@ function readTranscript(path: string, validateDirectories: () => void, options: 
       }
     }
     if (pendingLength) parse(Buffer.concat(pendingChunks, pendingLength), false)
+    const fileSessionId = sessionId(basename(path, extname(path)))
+    const latestSegmentIsSafe = Boolean(fileSessionId && activeSessionId === fileSessionId && !reappearedIds.has(fileSessionId))
     const segments = [...segmentMetadata].map(([id, value]) => {
       const segment = { ...value, multipleSessionIds: ids.size > 1 || undefined }
       segment.title = segment.customTitle ?? segment.firstPrompt ?? segment.summary
-      if (ids.size > 1) segment.resumeBlockedReason ??= 'Claude Code 会话文件包含多个会话 ID；详情可查看，但不能安全继续对话'
+      if (ids.size > 1) {
+        if (id === fileSessionId && latestSegmentIsSafe && ancestryTrackingComplete) {
+          const leafUuid = latestConversationUuid.get(id)
+          if (leafUuid && !ambiguousMessageUuids.has(leafUuid)) {
+            const seen = new Set([leafUuid])
+            let parentUuid = messageParents.get(leafUuid)?.parentUuid
+            while (parentUuid && !ambiguousMessageUuids.has(parentUuid) && !seen.has(parentUuid)) {
+              seen.add(parentUuid)
+              const parent = messageParents.get(parentUuid)
+              if (!parent) break
+              if (parent.sessionId && parent.sessionId !== id) { segment.resumeIncludesAncestors = true; break }
+              parentUuid = parent.parentUuid
+            }
+          }
+        }
+        else if (id === fileSessionId) segment.resumeBlockedReason ??= 'Claude Code 会话 ID 顺序或文件名无法确认当前分叉，详情可查看，但不能安全继续对话'
+        else segment.resumeBlockedReason ??= '此 ID 是同一文件中的较早 Claude 会话；CLI 无法按文件片段指定恢复，详情可查看，但不能安全继续对话'
+      }
       if (metadata.incomplete) { segment.incomplete = true; segment.resumeBlockedReason ??= metadata.resumeBlockedReason }
       return { id, metadata: segment }
     })
@@ -588,12 +625,12 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
           const id = sessionId(segment.id)
           if (!id || segment.metadata.kind === 'subagent') continue
           const current = segment.metadata
-          if (fileId && fileId !== id) current.resumeBlockedReason ??= current.multipleSessionIds ? 'Claude Code 会话文件包含多个会话 ID；详情可查看，但不能安全继续对话' : 'Claude Code 会话 ID 与文件名不一致，请核对来源文件'
-          if (current.multipleSessionIds) current.resumeBlockedReason ??= 'Claude Code 会话文件包含多个会话 ID；详情可查看，但不能安全继续对话'
+          if (!current.id && fileId) current.resumeBlockedReason ??= 'Claude Code 会话记录没有 transcript 会话 ID，仅凭文件名无法安全继续对话'
+          if (fileId && fileId !== id) current.resumeBlockedReason ??= current.multipleSessionIds ? 'Claude Code 会话 ID 顺序或文件名无法确认当前分叉，详情可查看，但不能安全继续对话' : 'Claude Code 会话 ID 与文件名不一致，请核对来源文件'
           if (!current.messageCount) current.resumeBlockedReason ??= 'Claude Code 会话缺少可恢复的消息记录'
           const location: ClaudeSessionLocation = {
             path, projectDirectory: projectPath, device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, sha256,
-            sourceId: sourceId(source, project, path, stat, sha256, current.multipleSessionIds ? id : undefined), source, project, cwd: current.cwd, cwdCandidates: current.cwdCandidates ? [...current.cwdCandidates] : current.cwd ? [current.cwd] : undefined, cwdCandidateIdentities: (current.cwdCandidates ?? (current.cwd ? [current.cwd] : [])).flatMap(candidate => { try { const identity = workingDirectoryIdentity(candidate); return [{ path: candidate, canonicalPath: identity.canonicalPath, device: identity.device, inode: identity.inode }] } catch { return [] } }), title: current.title ?? (current.cwd ? basename(current.cwd) : id), kind: current.kind, ...(current.multipleSessionIds ? { contentSessionId: id, ...(segments[0].id === id ? { contentIncludesPrefix: true } : {}) } : {}), resumeBlockedReason: current.resumeBlockedReason, contentMatched: current.contentMatched,
+            sourceId: sourceId(source, project, path, stat, sha256, current.multipleSessionIds ? id : undefined), source, project, cwd: current.cwd, cwdCandidates: current.cwdCandidates ? [...current.cwdCandidates] : current.cwd ? [current.cwd] : undefined, cwdCandidateIdentities: (current.cwdCandidates ?? (current.cwd ? [current.cwd] : [])).flatMap(candidate => { try { const identity = workingDirectoryIdentity(candidate); return [{ path: candidate, canonicalPath: identity.canonicalPath, device: identity.device, inode: identity.inode }] } catch { return [] } }), title: current.title ?? (current.cwd ? basename(current.cwd) : id), kind: current.kind, ...(current.multipleSessionIds ? { contentSessionId: id, ...(segments[0].id === id ? { contentIncludesPrefix: true } : {}) } : {}), resumeBlockedReason: current.resumeBlockedReason, resumeIncludesAncestors: current.resumeIncludesAncestors, contentMatched: current.contentMatched,
           }
           projectRows.push({ id, title: location.title, cwd: current.cwd, projectDirectory: projectPath, createdAt: current.createdAt, updatedAt: current.updatedAt ?? stat.mtimeMs, model: current.model, gitBranch: current.gitBranch, messageCount: current.messageCount, locations: [location], conflict: false })
         }
@@ -609,7 +646,7 @@ function* scanClaudeCodeSessionSteps(configDirectory: string, options: ClaudeSes
   unchangedDirectory(source.config)
   unchangedDirectory(source.projects, true)
   reportSkipped()
-  if (mixedIdFiles) note(`${mixedIdFiles} 个 Claude Code 会话文件包含多个会话 ID：详情仍可查看，但这些文件不能安全继续对话。`)
+  if (mixedIdFiles) note(mixedIdFiles + ' 个 Claude Code 会话文件包含分叉或历史 ID：文件名对应且顺序明确的当前会话可以继续；较早或顺序不明确的 ID 仅可查看。若当前分叉的原生消息父链指向较早记录，Claude CLI 会带入可达的祖先上下文。')
   result.records = [...records.values()].sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
   return result
 }

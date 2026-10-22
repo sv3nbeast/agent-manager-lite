@@ -138,7 +138,7 @@ async function main(): Promise<void> {
   const sandboxProfile = '(version 1)(allow default)(deny network*)(allow network-outbound (remote ip "localhost:*"))(allow network-inbound (local ip "localhost:*"))'
   const commonEnvironment: NodeJS.ProcessEnv = {
     PATH: '/usr/bin:/bin', HOME: homeDirectory, SHELL: '/bin/bash',
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1',
+    USERPROFILE: homeDirectory, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '256',
     DISABLE_AUTOUPDATER: '1', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1',
     HTTP_PROXY: baseUrl, HTTPS_PROXY: baseUrl, ALL_PROXY: baseUrl, NO_PROXY: '127.0.0.1,localhost',
   }
@@ -226,6 +226,34 @@ async function main(): Promise<void> {
     const afterSecondRecord=afterSecondDirectoryResume.records.find(record=>record.id===sessionIds.api_key)!
     assert.ok(afterSecondRecord.locations[0].cwdCandidates?.includes(project))
     assert.ok(afterSecondRecord.locations[0].cwdCandidates?.includes(secondProject))
+    // Exercise Claude's native parentUuid handling with a synthetic mixed-ID
+    // transcript. Only the filename/current ID is resumable; linked ancestors
+    // are intentionally included by Claude in the request context.
+    const ancestorId=randomUUID(),forkId=randomUUID(),ancestorUser=randomUUID(),ancestorAssistant=randomUUID(),forkUser=randomUUID()
+    const mixedProjectDirectory=join(configDirectory,'projects',secondProject.replaceAll('/','-'))
+    mkdirSync(mixedProjectDirectory,{recursive:true,mode:0o700})
+    const mixedTranscript=join(mixedProjectDirectory,`${forkId}.jsonl`)
+    writeFileSync(mixedTranscript,[
+      {type:'user',sessionId:ancestorId,uuid:ancestorUser,parentUuid:null,cwd:project,timestamp:new Date().toISOString(),message:{role:'user',content:'fixture-ancestor-context-marker'}},
+      {type:'assistant',sessionId:ancestorId,uuid:ancestorAssistant,parentUuid:ancestorUser,cwd:project,timestamp:new Date().toISOString(),message:{role:'assistant',model:'claude-sonnet-4-5',content:[{type:'text',text:'fixture-ancestor-answer-marker'}],stop_reason:'end_turn',usage:{input_tokens:1,output_tokens:1}}},
+      {type:'user',sessionId:forkId,uuid:forkUser,parentUuid:ancestorAssistant,cwd:secondProject,timestamp:new Date().toISOString(),message:{role:'user',content:'fixture-current-fork-marker'}},
+    ].map(value=>JSON.stringify(value)).join('\n')+'\n',{mode:0o600})
+    const mixedScan=scanClaudeCodeSessions(configDirectory,{instanceId})
+    const ancestorRecord=mixedScan.records.find(record=>record.id===ancestorId)!,forkRecord=mixedScan.records.find(record=>record.id===forkId)!
+    assert.ok(ancestorRecord);assert.ok(forkRecord)
+    assert.ok(ancestorRecord.locations[0].resumeBlockedReason)
+    assert.equal(forkRecord.locations[0].resumeBlockedReason,undefined)
+    assert.equal(forkRecord.locations[0].resumeIncludesAncestors,true)
+    assert.deepEqual(ancestorRecord.locations[0].cwdCandidates,[project])
+    assert.deepEqual(forkRecord.locations[0].cwdCandidates,[secondProject])
+    const mixedPreview=previewClaudeSessionResume(mixedScan,{instanceId,configDirectory,cwd:secondProject,sessionId:forkId,sourceId:forkRecord.locations[0].sourceId})
+    assert.throws(()=>previewClaudeSessionResume(mixedScan,{instanceId,configDirectory,cwd:project,sessionId:ancestorId,sourceId:ancestorRecord.locations[0].sourceId}),/较早 Claude 会话/)
+    const mixedResume=await run('api_key',['--resume',forkId,'--print','fixture-follow-up-mixed-fork'],environments.api_key,secondProject)
+    assert.equal(mixedResume.code,0,mixedResume.stderr)
+    assert.ok(mixedResume.stdout.includes('fixture-response-api_key'))
+    const mixedRequests=requests.filter(request=>request.text.includes('fixture-follow-up-mixed-fork'))
+    assert.ok(mixedRequests.some(request=>request.text.includes('fixture-ancestor-context-marker')&&request.text.includes('fixture-ancestor-answer-marker')&&request.text.includes('fixture-current-fork-marker')))
+    assert.ok(mixedRequests.every(request=>!request.text.includes('fixture-prompt-bearer')))
     const requestCount = requests.length
     const crossResume = await run('bearer', [...printArgs, '--resume', sessionIds.api_key, 'fixture-cross-instance-must-not-run'])
     assert.equal(crossResume.code, 1); assert.match(crossResume.stderr, /No conversation found/)
@@ -241,7 +269,7 @@ async function main(): Promise<void> {
       result: 'passed', version: version.version, executableSha256: identity.sha256, executableSize: identity.size,
       platform: process.platform, architecture: process.arch, checkedAt: new Date().toISOString(),
       login, capabilityFlags: capabilities.flags,
-      checks: ['two-concurrent-native-processes', 'api-key-header', 'bearer-header', 'per-instance-user-settings', 'per-instance-global-state', 'project-env-and-hooks-excluded', 'project-mcp-excluded', 'transcripts-isolated', 'same-instance-resume', 'same-session-resume-from-second-recorded-cwd', 'cross-instance-resume-rejected-before-request', 'argv0-and-native-binary-ownership', 'default-store-metadata-unchanged', 'external-network-denied-by-os'],
+      checks: ['two-concurrent-native-processes', 'api-key-header', 'bearer-header', 'per-instance-user-settings', 'per-instance-global-state', 'project-env-and-hooks-excluded', 'project-mcp-excluded', 'transcripts-isolated', 'same-instance-resume', 'same-session-resume-from-second-recorded-cwd', 'mixed-id-latest-fork-resume-includes-parentUuid-ancestors', 'mixed-id-earlier-session-remains-blocked', 'mixed-id-working-directories-stay-segment-scoped', 'cross-instance-resume-rejected-before-request', 'argv0-and-native-binary-ownership', 'default-store-metadata-unchanged', 'external-network-denied-by-os'],
       messagesRequests: requests.length, upstreamRequests: 0,
       notVerified: ['subscription-browser-login', 'subscription-refresh-and-revocation', 'cloud-provider-and-federation-login', 'desktop-profile-cookie-keychain-and-session-isolation'],
     }
@@ -256,4 +284,4 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch(() => { console.error('Claude Code isolation smoke failed; no credential values or raw CLI output were logged.'); process.exitCode = 1 })
+void main().catch(error => { console.error(error instanceof Error ? error.stack : 'Claude Code isolation smoke failed.'); process.exitCode = 1 })
