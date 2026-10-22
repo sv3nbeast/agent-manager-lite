@@ -59,6 +59,7 @@ onUnmounted(() => { alive = false; generation++; void discard(preview.value?.tic
       <a-spin :spinning="loading">
         <h3>{{record.title}}</h3>
         <p class="muted">从原项目目录启动此会话所属的 CLI 实例，继续已有对话。</p>
+        <a-alert v-if="record.resumeIncludesAncestors" type="warning" message="此会话的消息父链连接到较早记录" description="继续时官方 CLI 会沿原生消息父链带入可达的祖先上下文，其中可能包含较早会话的消息；原会话和 transcript 文件不会被管理器改写。" class="resume-ancestor-note" />
         <a-form-item v-if="(props.record.cwdAvailableCandidates?.length??0)>1" label="选择项目目录"><a-select v-model:value="selectedCwd" aria-label="选择 Claude 会话项目目录" :disabled="loading||starting" :options="props.record.cwdAvailableCandidates!.map(path=>({value:path,label:path}))" @change="prepare" /></a-form-item>
         <a-alert v-if="(props.record.cwdCandidates?.length??0)>(props.record.cwdAvailableCandidates?.length??0)" type="warning" message="部分记录中的工作目录当前不可用，已从候选项中排除；请先恢复相应目录后刷新。" />
         <a-descriptions v-if="preview" :column="1" bordered size="small">
@@ -77,5 +78,5 @@ onUnmounted(() => { alive = false; generation++; void discard(preview.value?.tic
 </template>
 
 <style scoped>
-.session-resume-preview h3{overflow-wrap:anywhere}.session-resume-preview>p{font-size:12px;line-height:1.7}.session-resume-preview :deep(.ant-descriptions-item-content){overflow-wrap:anywhere}.session-resume-preview :deep(.ant-descriptions-item-label){white-space:nowrap}
+.session-resume-preview h3{overflow-wrap:anywhere}.session-resume-preview>p{font-size:12px;line-height:1.7}.session-resume-preview :deep(.ant-descriptions-item-content){overflow-wrap:anywhere}.session-resume-preview :deep(.ant-descriptions-item-label){white-space:nowrap}.resume-ancestor-note{margin:12px 0}
 </style>

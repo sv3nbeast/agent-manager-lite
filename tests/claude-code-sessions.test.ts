@@ -212,31 +212,99 @@ test('truncated trailing JSON is visible as incomplete metadata but is never res
   } finally { f.dispose() }
 })
 
-test('mixed-ID Claude transcript remains readable but is explicitly blocked from unsafe ID-based resume', () => {
+test('mixed-ID fork exposes only the latest filename ID for resume and keeps each segment cwd and content separate', () => {
   const f = fixture()
   try {
     const oldId = '66666666-6666-4666-8666-666666666666'
-    // Claude may retain an older session prefix in a reused transcript file;
-    // the session ID in the filename is the current conversation.
+    const oldCwd = join(f.root, 'older-worktree'), currentCwd = join(f.root, 'current-worktree')
+    mkdirSync(oldCwd); mkdirSync(currentCwd)
+    // Claude keeps fork ancestry in the same transcript. The current file ID
+    // names the resumable branch; the older branch remains display-only.
     writeFileSync(f.path, [
-      JSON.stringify({ ...f.event, sessionId: oldId, message: { content: 'OLDER_CONVERSATION_DETAIL' } }),
-      JSON.stringify({ ...f.event, message: { content: 'CURRENT_CONVERSATION_DETAIL' } }),
+      JSON.stringify({ ...f.event, sessionId: oldId, uuid: 'older-message', cwd: oldCwd, message: { content: 'OLDER_CONVERSATION_DETAIL' } }),
+      JSON.stringify({ ...f.event, sessionId: oldId, uuid: 'older-leaf', parentUuid: 'older-message', cwd: oldCwd, message: { content: 'OLDER_FOLLOWUP_DETAIL' } }),
+      JSON.stringify({ ...f.event, sessionId: f.id, uuid: 'current-message', parentUuid: 'older-leaf', cwd: currentCwd, message: { content: 'CURRENT_CONVERSATION_DETAIL' } }),
     ].join('\n') + '\n')
     const scan = f.scan()
     assert.equal(scan.records.length, 2)
     assert.equal(scan.complete, true)
     const old = scan.records.find(record => record.id === oldId)!, current = scan.records.find(record => record.id === f.id)!
     assert.ok(old); assert.ok(current)
-    assert.match(old.locations[0].resumeBlockedReason!, /包含多个会话 ID/)
-    assert.match(current.locations[0].resumeBlockedReason!, /包含多个会话 ID/)
-    assert.ok(scan.warnings.some(warning => warning.includes('详情仍可查看，但这些文件不能安全继续对话')))
+    assert.match(old.locations[0].resumeBlockedReason!, /较早 Claude 会话/)
+    assert.equal(current.locations[0].resumeBlockedReason, undefined)
+    assert.equal(current.locations[0].resumeIncludesAncestors, true)
+    assert.deepEqual(old.locations[0].cwdCandidates, [oldCwd])
+    assert.deepEqual(current.locations[0].cwdCandidates, [currentCwd])
+    assert.ok(scan.warnings.some(warning => warning.includes('文件名对应且顺序明确的当前会话可以继续')))
     const oldPage = readClaudeSessionContent(old.locations[0]), currentPage = readClaudeSessionContent(current.locations[0])
-    assert.equal(oldPage.total, 1); assert.equal(currentPage.total, 1)
+    assert.equal(oldPage.total, 2); assert.equal(currentPage.total, 1)
     assert.ok(JSON.stringify(oldPage).includes('OLDER_CONVERSATION_DETAIL'))
     assert.ok(!JSON.stringify(oldPage).includes('CURRENT_CONVERSATION_DETAIL'))
     assert.ok(JSON.stringify(currentPage).includes('CURRENT_CONVERSATION_DETAIL'))
     assert.ok(!JSON.stringify(currentPage).includes('OLDER_CONVERSATION_DETAIL'))
-    assert.throws(() => claudeSessionResumeArgs(current), /包含多个会话 ID/)
+    assert.deepEqual(claudeSessionResumeArgs(current), ['--resume', f.id])
+    assert.throws(() => claudeSessionResumeArgs(old), /较早 Claude 会话/)
+  } finally { f.dispose() }
+})
+
+test('interleaved IDs, a mismatched final filename ID and ambiguous tails remain blocked', () => {
+  for (const rows of [
+    (f: ReturnType<typeof fixture>, oldId: string) => [
+      { ...f.event, sessionId: f.id, uuid: 'a1' },
+      { ...f.event, sessionId: oldId, uuid: 'b1' },
+      { ...f.event, sessionId: f.id, uuid: 'a2' },
+    ],
+    (f: ReturnType<typeof fixture>, oldId: string) => [
+      { ...f.event, sessionId: f.id, uuid: 'a1' },
+      { ...f.event, sessionId: oldId, uuid: 'b1' },
+    ],
+  ]) {
+    const f = fixture()
+    try {
+      const oldId = '77777777-7777-4777-8777-777777777777'
+      writeFileSync(f.path, rows(f, oldId).map(value => JSON.stringify(value)).join('\n') + '\n')
+      const scan = f.scan(), current = scan.records.find(record => record.id === f.id)!
+      assert.ok(current)
+      assert.ok(current.locations[0].resumeBlockedReason)
+      assert.throws(() => claudeSessionResumeArgs(current), /无法确认当前分叉|较早 Claude 会话/)
+      const finalId = scan.records.find(record => record.id === oldId)!
+      assert.ok(finalId.locations[0].resumeBlockedReason)
+      assert.throws(() => claudeSessionResumeArgs(finalId), /无法确认当前分叉|较早 Claude 会话/)
+    } finally { f.dispose() }
+  }
+})
+
+test('latest mixed-ID sessions without a verified parent chain can resume without an ancestor claim', () => {
+  for (const parentUuid of [undefined, 'unknown-parent-uuid', 'current-with-cycle']) {
+    const f = fixture()
+    try {
+      const oldId = '88888888-8888-4888-8888-888888888888'
+      writeFileSync(f.path, [
+        JSON.stringify({ ...f.event, sessionId: oldId, uuid: 'unlinked-parent', message: { content: 'OLDER' } }),
+        JSON.stringify({ ...f.event, sessionId: f.id, uuid: 'current-with-cycle', ...(parentUuid ? { parentUuid } : {}), message: { content: 'CURRENT' } }),
+      ].join('\n') + '\n')
+      const scan = f.scan(), latest = scan.records.find(record => record.id === f.id)!
+      assert.equal(latest.locations[0].resumeBlockedReason, undefined)
+      assert.notEqual(latest.locations[0].resumeIncludesAncestors, true)
+      assert.deepEqual(claudeSessionResumeArgs(latest), ['--resume', f.id])
+    } finally { f.dispose() }
+  }
+})
+
+test('conflicting transcript ID fields and filename-only identities fail closed for resume', () => {
+  const f = fixture()
+  try {
+    writeFileSync(f.path, JSON.stringify({ ...f.event, session_id: '99999999-9999-4999-8999-999999999999' }) + '\n')
+    const conflict = f.scan()
+    assert.equal(conflict.records.length, 0)
+    assert.equal(conflict.complete, false)
+
+    const { sessionId: _sessionId, ...withoutSessionId } = f.event
+    writeFileSync(f.path, JSON.stringify(withoutSessionId) + '\n')
+    const filenameOnly = f.scan(), row = filenameOnly.records.find(record => record.id === f.id)!
+    assert.ok(row)
+    assert.match(row.locations[0].resumeBlockedReason!, /没有 transcript 会话 ID/)
+    assert.throws(() => claudeSessionResumeArgs(row), /没有 transcript 会话 ID/)
   } finally { f.dispose() }
 })
 

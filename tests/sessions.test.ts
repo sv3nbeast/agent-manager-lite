@@ -554,7 +554,7 @@ test('default Claude conversations remain separate from managed instances and ca
   await assert.rejects(catalog.content(selection),/已被替换|已变化/)
 })
 
-test('default Claude fork is blocked for conflicts, mixed IDs, incomplete scans, Desktop records and vanished projects',async t=>{
+test('default Claude fork permits a verified latest fork but blocks conflicts, ambiguous IDs, incomplete scans and vanished projects',async t=>{
   const f=fixture(t),directory=join(f.root,'default-claude'),project=join(directory,'projects','one'),projectTwo=join(directory,'projects','two'),sessionId=randomUUID()
   mkdirSync(project,{recursive:true})
   const transcript=join(project,sessionId+'.jsonl')
@@ -565,9 +565,22 @@ test('default Claude fork is blocked for conflicts, mixed IDs, incomplete scans,
   mkdirSync(projectTwo);writeFileSync(join(projectTwo,sessionId+'.jsonl'),readFileSync(transcript))
   await assert.rejects(catalog.defaultClaudeResume(selection),/多个会话文件|冲突/)
   rmSync(projectTwo,{recursive:true})
-  const otherId=randomUUID();appendFileSync(transcript,JSON.stringify({type:'user',sessionId:otherId,cwd:f.root,message:{content:'second'}})+'\n')
-  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'});row=page.items.find(value=>value.sourceSessionId===sessionId)!;selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
-  assert.equal(row.capabilities?.resume,false);await assert.rejects(catalog.defaultClaudeResume(selection),/多个会话 ID|不能安全/)
+  rmSync(join(projectTwo,sessionId+'.jsonl'),{force:true})
+  const otherId=randomUUID(),parentUuid=randomUUID()
+  appendFileSync(transcript,[JSON.stringify({type:'assistant',sessionId:sessionId,uuid:parentUuid,cwd:f.root,message:{content:'parent'}}),JSON.stringify({type:'user',sessionId:otherId,uuid:randomUUID(),parentUuid,cwd:f.root,message:{content:'latest fork'}})].join('\n')+'\n')
+  // Keep the filename aligned with the last ID so this is a valid current fork.
+  const forkTranscript=join(project,otherId+'.jsonl');renameSync(transcript,forkTranscript)
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'});row=page.items.find(value=>value.sourceSessionId===otherId)!;selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
+  assert.equal(row.capabilities?.resume,true);assert.equal(row.resumeIncludesAncestors,true)
+  assert.equal((await catalog.defaultClaudeResume(selection)).sessionId,otherId)
+  const earlier=page.items.find(value=>value.sourceSessionId===sessionId)!
+  assert.equal(earlier.capabilities?.resume,false)
+  await assert.rejects(catalog.defaultClaudeResume({...selection,sessionId:earlier.id,sourceId:earlier.resumeSourceId!}),/较早 Claude 会话/)
+  const thirdId=randomUUID()
+  appendFileSync(forkTranscript,JSON.stringify({type:'user',sessionId:thirdId,uuid:randomUUID(),cwd:f.root,message:{content:'interleaved tail'}})+'\n')
+  appendFileSync(forkTranscript,JSON.stringify({type:'assistant',sessionId:otherId,uuid:randomUUID(),cwd:f.root,message:{content:'interleaved return'}})+'\n')
+  page=await catalog.scan({runId:randomUUID(),clientType:'claude_code'});row=page.items.find(value=>value.sourceSessionId===otherId)!;selection={snapshotId:page.snapshotId,sessionId:row.id,targetId:row.locations[0].targetId,sourceId:row.resumeSourceId!,cwd:row.cwdAvailableCandidates![0]}
+  assert.equal(row.capabilities?.resume,false);await assert.rejects(catalog.defaultClaudeResume(selection),/无法确认当前分叉/)
   rmSync(f.root,{recursive:true,force:true});await assert.rejects(catalog.defaultClaudeResume(selection))
 })
 
