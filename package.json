@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.15.5",
+  "version": "0.15.6",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -25,6 +25,7 @@
     "test:desktop:sessions": "node scripts/run-desktop-smoke.cjs --sessions",
     "test:desktop:default-codex-sessions": "node scripts/run-desktop-smoke.cjs --default-codex-sessions",
     "test:desktop:codex-session-conflicts": "node scripts/run-desktop-smoke.cjs --codex-session-conflicts",
+    "test:desktop:codex-session-content": "node scripts/smoke-codex-session-content.cjs",
     "test:desktop:session-visibility": "node scripts/run-desktop-smoke.cjs --session-visibility",
     "test:desktop:tray": "node scripts/run-tray-smoke.cjs",
     "test:desktop:local-access": "node scripts/run-desktop-smoke.cjs --local-access",

@@ -42,6 +42,36 @@ test('single-session copy refuses paginated history before writing a truncated d
   f.transfers.start({ticket:preview.ticket,clientsClosed:true});await f.transfers.settled();assert.equal(f.transfers.view().transfer?.status,'completed');assert.equal(f.transfers.view().transfer?.skipped,1);assert.deepEqual(readFileSync(existing),existingBefore)
 })
 
+test('explicit conflict source copy transfers only the selected rollout and still skips a target ID without overwriting it',async t=>{
+  const f=fixture(t),id=randomUUID(),active=rollout(f.source,id,'sessions','active','active branch body'),archived=rollout(f.source,id,'archived_sessions','archived','archived branch body'),activeBefore=readFileSync(active),archivedBefore=readFileSync(archived)
+  const page=await f.scan(),row=page.items.find(item=>item.id===id)!,location=row.locations.find(item=>item.targetId===f.a.id)!,version=location.versions?.find(item=>item.label===relative(f.source,archived).split('\\').join('/'))
+  assert.ok(version);assert.equal(location.ambiguous,true)
+  await assert.rejects(f.transfers.preview({snapshotId:page.snapshotId,sourceSelections:[{sessionId:id,targetId:f.a.id}],targetId:f.b.id,applicationId:f.apps[0].id}),/选择具体版本/)
+  await assert.rejects(f.transfers.preview({snapshotId:page.snapshotId,sourceSelections:[{sessionId:id,targetId:f.a.id,versionId:'0'.repeat(32)}],targetId:f.b.id,applicationId:f.apps[0].id}),/不属于指定来源目录/)
+  await assert.rejects(f.transfers.preview({snapshotId:page.snapshotId,sourceSelections:[{sessionId:id,targetId:f.a.id,versionId:version.id},{sessionId:id,targetId:f.a.id,versionId:version.id}],targetId:f.b.id,applicationId:f.apps[0].id}),/只能选择一个来源目录和文件版本/)
+  const preview=await f.transfers.preview({snapshotId:page.snapshotId,sourceSelections:[{sessionId:id,targetId:f.a.id,versionId:version.id}],targetId:f.b.id,applicationId:f.apps[0].id})
+  assert.equal(preview.items.length,1);assert.equal(preview.items[0].sourcePath,relative(f.source,archived).split('\\').join('/'));assert.equal(preview.items[0].sourceVersionId,version.id);assert.equal(preview.items[0].sourceConflict,true)
+  f.transfers.start({ticket:preview.ticket,clientsClosed:true});await f.transfers.settled();assert.equal(f.transfers.view().transfer?.status,'completed')
+  const copied=journal(f).files[0],copiedPath=join(f.target,copied.relative),text=readFileSync(copiedPath,'utf8')
+  assert.match(text,/archived branch body/);assert.doesNotMatch(text,/active branch body/);assert.deepEqual(readFileSync(active),activeBefore);assert.deepEqual(readFileSync(archived),archivedBefore)
+
+  const other=randomUUID(),otherSource=rollout(f.source,other,'sessions','target-existing-source','new source version'),existing=rollout(f.target,other,'archived_sessions','target-existing','keep existing target')
+  const otherPage=await f.scan(),otherRow=otherPage.items.find(item=>item.id===other)!,sourceLocation=otherRow.locations.find(item=>item.targetId===f.a.id)!,existingBefore=readFileSync(existing)
+  const skipped=await f.transfers.preview({snapshotId:otherPage.snapshotId,sourceSelections:[{sessionId:other,targetId:f.a.id}],targetId:f.b.id,applicationId:f.apps[0].id})
+  assert.equal(skipped.items[0].status,'existing');f.transfers.start({ticket:skipped.ticket,clientsClosed:true});await f.transfers.settled()
+  assert.equal(f.transfers.view().transfer?.skipped,1);assert.deepEqual(readFileSync(existing),existingBefore);assert.deepEqual(readFileSync(otherSource).includes(Buffer.from('new source version')),true)
+  assert.ok(sourceLocation)
+})
+
+test('selected conflict rollout is revalidated after preview and a replaced source is never copied',async t=>{
+  const f=fixture(t),id=randomUUID(),active=rollout(f.source,id,'sessions','active','keep active'),archived=rollout(f.source,id,'archived_sessions','selected','selected before preview'),page=await f.scan(),location=page.items.find(item=>item.id===id)!.locations.find(item=>item.targetId===f.a.id)!,version=location.versions?.find(item=>item.label===relative(f.source,archived).split('\\').join('/'))!
+  const preview=await f.transfers.preview({snapshotId:page.snapshotId,sourceSelections:[{sessionId:id,targetId:f.a.id,versionId:version.id}],targetId:f.b.id,applicationId:f.apps[0].id})
+  appendFileSync(archived,'replacement after preview')
+  f.transfers.start({ticket:preview.ticket,clientsClosed:true});await f.transfers.settled()
+  assert.equal(f.transfers.view().transfer?.status,'failed');assert.match(f.transfers.view().transfer?.error??'',/变化|替换/)
+  assert.deepEqual(readdirSync(f.target),[]);assert.match(readFileSync(active,'utf8'),/keep active/);assert.match(readFileSync(archived,'utf8'),/replacement after preview/)
+})
+
 test('selected copy keeps source bytes, archived layout, Unicode and unknown metadata; only changes rollout provider and relocates index paths',async t=>{
   const indexed:{home:string;ids:string[]}[]=[],f=fixture(t,async(_program,home,ids)=>{indexed.push({home,ids})}),id=randomUUID(),archived=randomUUID(),existing=randomUUID()
   const path=rollout(f.source,id),archivedPath=rollout(f.source,archived,'archived_sessions'),skip=rollout(f.source,existing),existingPath=rollout(f.target,existing)

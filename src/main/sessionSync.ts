@@ -7,6 +7,7 @@ import {z} from 'zod'
 import {Store} from './store'
 import {ClientConfigs,atomic,directory,readBounded} from './clientConfig'
 import {SessionCatalog,type SessionTransferSource} from './sessions'
+import type {SessionRecord} from '../shared/sessions'
 import {SessionTransfers,sessionDestination} from './sessionTransfers'
 import {rolloutFiles,safeSessionPath} from './sessionFiles'
 import {fileIdentity,textHash,verifySource,copySessionRollout} from './sessionTransferFiles'
@@ -15,7 +16,7 @@ import {mergeSessionCopies,type MergedSession} from './sessionMerge'
 import {syncMetadata} from './sessionSyncMetadata'
 import {createSyncJournal,encodeSyncJournal,syncJournalSchema,syncStage,verifySyncRoot,verifySyncFile,publishSync,rollbackSync,cleanupSync,type SyncJournal} from './sessionSyncFiles'
 import {sessionProgram,verifySessionProgram,rebuildSessionMetadata,type SessionProgram} from './officialSessions'
-import {legacySyncPreviewSchema,directionalSyncPreviewSchema,syncStartSchema,type SyncPreview,type SyncView,type SyncRecovery,type SyncTargetPreview,type DirectionalSyncPreviewInput} from '../shared/sessionSync'
+import {legacySyncPreviewSchema,directionalSyncPreviewSchema,syncConflictScanSchema,syncStartSchema,type SyncConflictScanInput,type SyncConflictSession,type SyncPreview,type SyncView,type SyncRecovery,type SyncTargetPreview,type DirectionalSyncPreviewInput} from '../shared/sessionSync'
 import type {ClientConfigTarget} from '../shared/clientConfig'
 import type {InstanceApplication} from '../shared/instances'
 import {assertUnpagedSessionSources} from './sessionPaging'
@@ -29,6 +30,7 @@ function officialLocation(source:SessionTransferSource):boolean{
   const path=relative(source.root,source.path).split(sep).join('/'),match=path.match(/^(archived_sessions|sessions\/(\d{4})\/(\d{2})\/(\d{2}))\/rollout-(\d{4})-(\d{2})-(\d{2})T\d{2}-\d{2}-\d{2}-([a-fA-F0-9-]+)(?:_([a-fA-F0-9-]+))?\.jsonl$/)
   return !!match&&match[8].toLowerCase()===source.record.id.toLowerCase()&&(!match[9]||z.string().uuid().safeParse(match[9]).success)&&(match[1]==='archived_sessions'||match.slice(2,5).join('-')===match.slice(5,8).join('-'))
 }
+function paginatedSession(record:SessionRecord):boolean{return record.historyMode==='paginated'||record.locations.some(location=>location.historyMode==='paginated'||location.versions?.some(version=>version.historyMode==='paginated'))}
 const overlap=(a:string,b:string)=>a===b||a.startsWith(b+sep)||b.startsWith(a+sep)
 const safeError=(error:unknown)=>error instanceof Error&&/^(同步|会话|来源|目标|所选|请选择|相关|部分|Codex|已有|单个|合并|已提交)/.test(error.message)?error.message:'会话同步失败，请检查目录变化、权限和可用磁盘空间'
 export class SessionSync {
@@ -39,6 +41,7 @@ export class SessionSync {
   private job?:Job
   private timer?:NodeJS.Timeout
   private readonly recovery=new Map<string,SyncRecovery>()
+  private readonly conflictScans=new Map<string,AbortController>()
   constructor(private readonly store:Store,private readonly transfers:SessionTransfers,private readonly applications:()=>InstanceApplication[],private readonly inUse:(id:string)=>boolean=()=>false,private readonly rebuild:typeof rebuildSessionMetadata=rebuildSessionMetadata,private readonly now:()=>number=Date.now){
     this.configs=new ClientConfigs(store);const root=realpathSync(store.directory);this.root=join(root,'session-sync');this.scratch=join(root,'session-sync-previews')
     if(existsSync(this.scratch)){directory(this.scratch);for(const entry of readdirSync(this.scratch,{withFileTypes:true}))if(entry.isDirectory()&&z.string().uuid().safeParse(entry.name).success)rmSync(join(this.scratch,entry.name),{recursive:true})}
@@ -58,6 +61,54 @@ export class SessionSync {
     for await(const path of rolloutFiles(root,signal)){const stat=await safeSessionPath(root,path);rows.push(JSON.stringify([relative(root,path),stat.dev,stat.ino,stat.size,stat.mtimeMs,stat.ctimeMs]));if(rows.length>100000)throw new Error('同步目录超过 10 万个文件')}
     return textHash(rows.sort().join('\n'))
   }
+  async conflicts(raw:unknown,signal=new AbortController().signal):Promise<SyncConflictSession[]>{
+    const input=syncConflictScanSchema.parse(raw) as SyncConflictScanInput
+    if(input.sourceIds.includes(input.targetId))throw new Error('目标实例不能同时作为来源')
+    for(const id of [input.targetId,...input.sourceIds])if(this.busy(id)||this.transfers.busy(id))throw new Error('相关目录正在执行会话操作或等待恢复，请稍后刷新冲突列表')
+    const targets=input.sourceIds.map(id=>this.configs.identityTarget(id)),target=this.configs.identityTarget(input.targetId)
+    if([...targets,target].some(value=>value.role!=='instance'))throw new Error('来源和目标必须是已登记的 Codex 实例目录')
+    const directories=[...targets.map(value=>value.directory),target.directory]
+    for(let i=0;i<directories.length;i++)for(const other of directories.slice(i+1))if(overlap(directories[i],other))throw new Error('同步来源和目标目录不能相互包含或别名重叠')
+    if(this.conflictScans.has(input.requestId))throw new Error('冲突检查请求 ID 重复')
+    const controller=new AbortController(),cancel=()=>controller.abort();signal.addEventListener('abort',cancel,{once:true});this.conflictScans.set(input.requestId,controller)
+    const scanSignal=controller.signal
+    const result=new Map<string,SyncConflictSession>();let versionCount=0,choiceCount=0
+    let scannedRecords=0
+    try{for(const source of targets){
+      scanSignal.throwIfAborted()
+      const catalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true})
+      try{
+        const stopCatalog=()=>catalog.stop();scanSignal.addEventListener('abort',stopCatalog,{once:true})
+        let scanned
+        try{scanned=await catalog.scan({runId:input.requestId,targetId:source.id,clientType:'codex'})}finally{scanSignal.removeEventListener('abort',stopCatalog)}
+        scanSignal.throwIfAborted()
+        if(scanned.warnings.length)throw new Error('部分会话来源未读取完整：'+scanned.warnings[0])
+        scannedRecords+=scanned.total
+        if(scannedRecords>100000)throw new Error('冲突检查扫描超过 10 万条会话，请减少来源实例后重试')
+        const first=catalog.page({snapshotId:scanned.snapshotId,page:1,pageSize:100}),pages=Math.ceil(first.total/100)
+        for(let pageNumber=1;pageNumber<=pages;pageNumber++){
+          scanSignal.throwIfAborted()
+          const page=pageNumber===1?first:catalog.page({snapshotId:first.snapshotId,page:pageNumber,pageSize:100})
+          for(const record of page.items){
+            const locations=record.locations.filter(location=>location.targetId===source.id&&location.ambiguous&&location.versions?.length).map(location=>({targetId:location.targetId,name:location.name,directory:location.directory,ambiguous:true as const,versions:location.versions!.map(version=>({id:version.id,label:version.label,archived:version.archived,updatedAt:version.updatedAt}))}))
+            if(!locations.length)continue
+            versionCount+=locations.reduce((sum,location)=>sum+location.versions.length,0)
+            if(versionCount>10000)throw new Error('同 ID 冲突文件版本超过 10000 个，请缩小同步范围后重试')
+            choiceCount+=locations.length
+            if(choiceCount>1000)throw new Error('同 ID 冲突来源超过 1000 项，请缩小同步范围后重试')
+            const existing=result.get(record.id)
+            if(existing){for(const location of locations)if(!existing.locations.some(value=>value.targetId===location.targetId))existing.locations.push(location)}
+            else result.set(record.id,{id:record.id,title:record.title,locations})
+            if(result.size>1000)throw new Error('同 ID 冲突会话超过 1000 条，请缩小同步范围后重试')
+          }
+        }
+      }finally{catalog.stop()}
+      }
+      scanSignal.throwIfAborted()
+      return [...result.values()].sort((a,b)=>a.title.localeCompare(b.title)||a.id.localeCompare(b.id))
+    }finally{signal.removeEventListener('abort',cancel);if(this.conflictScans.get(input.requestId)===controller)this.conflictScans.delete(input.requestId)}
+  }
+  cancelConflicts(raw:unknown):void{const id=z.string().uuid().parse(raw);this.conflictScans.get(id)?.abort()}
   private validate(plan:Plan):ClientConfigTarget{
     const target=this.configs.identityTarget(plan.target.id)
     if(target.directory!==plan.target.directory||this.profileHash(target.id)!==plan.profileHash||this.transfers.config(target).hash!==plan.configHash)throw new Error('同步目标配置或实例在预览后发生变化')
@@ -114,7 +165,7 @@ export class SessionSync {
         }
         for(const plan of plans){this.validate(plan);if(await this.inventory(plan.target.directory,signal)!==plan.inventory)throw new Error('同步准备期间会话文件发生变化')}
         verifySessionProgram(program);signal.throwIfAborted()
-        const view:SyncPreview={ticket:randomUUID(),sessionCount:merged.length,sourceFiles:sources.length,totalBytes:bytes,targets:plans.map(plan=>plan.view)}
+        const view:SyncPreview={ticket:randomUUID(),canStart:true,sessionCount:merged.length,sourceFiles:sources.length,totalBytes:bytes,targets:plans.map(plan=>plan.view)}
         this.pending={view,root,plans,guards:[],sources,program,applicationId:input.applicationId,expires:this.now()+300000};Object.assign(job.view,{status:'ready',targets:view.targets})
         this.timer=setTimeout(()=>{if(!this.job?.task)this.clear()},300000);this.timer.unref();return structuredClone(view)
       }catch(error){directory(root);rmSync(root,{recursive:true});throw error}
@@ -132,19 +183,33 @@ export class SessionSync {
       const application=this.applications().find(app=>app.id===input.applicationId);if(!application)throw new Error('请选择已登记的 Codex 程序')
       const program=sessionProgram(application),config=this.transfers.config(target),targetExisting=existsSync(target.directory),targetRootIdentity=targetExisting?fileIdentity(lstatSync(target.directory)):undefined,targetInventory=await this.inventory(target.directory,signal),targetIndexBefore=readBounded(join(target.directory,'session_index.jsonl'),16*1024**2),targetGlobalBefore=readBounded(join(target.directory,'.codex-global-state.json'),16*1024**2)
       if(targetExisting)await this.transfers.closed(target,signal)
-      const guards:SourceGuard[]=[],sourceCopies:SessionTransferSource[]=[];let activeCatalog:SessionCatalog|undefined;const stop=()=>activeCatalog?.stop();signal.addEventListener('abort',stop,{once:true})
+      const guards:SourceGuard[]=[],sourceCopies:SessionTransferSource[]=[],sourceScopeIds=new Set<string>(),paginatedById=new Map<string,{title:string;sourceIds:string[]}>(),validatedUnsupportedChoices=new Set<string>();let activeCatalog:SessionCatalog|undefined;const stop=()=>activeCatalog?.stop();signal.addEventListener('abort',stop,{once:true})
       try{
         for(const source of sourceTargets){
           signal.throwIfAborted();await this.transfers.closed(source,signal);const profileHash=this.profileHash(source.id),inventory=await this.inventory(source.directory,signal),identity=existsSync(source.directory)?fileIdentity(lstatSync(source.directory)):undefined,guard:SourceGuard={target:source,rootIdentity:identity,profileHash,configHash:this.transfers.config(source).hash,inventory,indexBefore:readBounded(join(source.directory,'session_index.jsonl'),16*1024**2),globalBefore:readBounded(join(source.directory,'.codex-global-state.json'),16*1024**2)}
-          const catalog=activeCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true});try{const page=await catalog.scan({runId:randomUUID(),targetId:source.id,clientType:'codex'});if(page.warnings.length)throw new Error('部分会话来源未读取完整：'+page.warnings[0]);sourceCopies.push(...await catalog.directionalSyncSources(page.snapshotId,input.scope==='selected'?input.sessionIds:[],[source.id],signal,false))}finally{catalog.stop();activeCatalog=undefined}
+          const catalog=activeCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true});try{const page=await catalog.scan({runId:randomUUID(),targetId:source.id,clientType:'codex'});if(page.warnings.length)throw new Error('部分会话来源未读取完整：'+page.warnings[0]);const records=catalog.recordsForSync(page.snapshotId,input.scope==='selected'?input.sessionIds:[],[source.id]),internalSelections=[...(input.sourceSelections??[]).filter(selection=>selection.targetId===source.id)];for(const record of records){sourceScopeIds.add(record.id);const location=record.locations.find(value=>value.targetId===source.id);if(!location)continue;const paginated=paginatedSession(record);if(paginated){const existing=paginatedById.get(record.id);if(existing){if(!existing.sourceIds.includes(source.id))existing.sourceIds.push(source.id)}else paginatedById.set(record.id,{title:record.title,sourceIds:[source.id]})}const selected=(input.sourceSelections??[]).find(selection=>selection.sessionId===record.id&&selection.targetId===source.id);if(paginated&&location.ambiguous){if(!selected?.versionId)throw new Error('分页会话存在多个同 ID 文件，请选择具体版本后再同步');if(!location.versions?.some(version=>version.id===selected.versionId))throw new Error('所选会话版本不属于指定来源目录，请刷新列表');validatedUnsupportedChoices.add(record.id+'|'+source.id+'|'+selected.versionId)}else if(selected&&!location.ambiguous)throw new Error('会话来源文件版本已变化，请刷新列表')}sourceCopies.push(...await catalog.directionalSyncSources(page.snapshotId,input.scope==='selected'?input.sessionIds:[],[source.id],signal,false,internalSelections,true))}finally{catalog.stop();activeCatalog=undefined}
           guards.push(guard)
           if(await this.inventory(source.directory,signal)!==inventory)throw new Error('同步扫描期间来源会话文件发生变化')
         }
-        if(input.scope==='selected'){const found=new Set(sourceCopies.map(source=>source.record.id)),missing=input.sessionIds.find(id=>!found.has(id));if(missing)throw new Error(`所选会话未在所选来源中找到：${missing}`)}
+        if(input.scope==='selected'){const missing=input.sessionIds.find(id=>!sourceScopeIds.has(id));if(missing)throw new Error(`所选会话未在所选来源中找到：${missing}`)}
         const ids=[...new Set(sourceCopies.map(source=>source.record.id))]
-        if(!ids.length)throw new Error('所选来源目录中没有可同步的 Codex 会话')
-        const targetCatalog=activeCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true});let targetCopies:SessionTransferSource[]=[];try{const targetPage=await targetCatalog.scan({runId:randomUUID(),targetId:target.id,clientType:'codex'});if(targetPage.warnings.length)throw new Error('部分目标会话未读取完整：'+targetPage.warnings[0]);targetCopies=await targetCatalog.directionalSyncSources(targetPage.snapshotId,ids,[target.id],signal,false)}finally{targetCatalog.stop();activeCatalog=undefined}
-        const sources=[...sourceCopies,...targetCopies],bytes=sources.reduce((sum,source)=>sum+source.size,0)
+        if(!ids.length&&!paginatedById.size)throw new Error('所选来源目录中没有可同步的 Codex 会话')
+        const targetCatalog=activeCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true});let targetCopies:SessionTransferSource[]=[];try{const targetPage=await targetCatalog.scan({runId:randomUUID(),targetId:target.id,clientType:'codex'});if(targetPage.warnings.length)throw new Error('部分目标会话未读取完整：'+targetPage.warnings[0]);for(const unsupported of targetCatalog.directionalSyncUnsupported(targetPage.snapshotId,[...sourceScopeIds],[target.id])){const existing=paginatedById.get(unsupported.id);if(existing){if(!existing.sourceIds.includes(target.id))existing.sourceIds.push(target.id)}else paginatedById.set(unsupported.id,{title:unsupported.title,sourceIds:[target.id]})}const unsupportedIds=new Set(paginatedById.keys()),supportedIds=ids.filter(id=>!unsupportedIds.has(id));if(supportedIds.length)targetCopies=await targetCatalog.directionalSyncSources(targetPage.snapshotId,supportedIds,[target.id],signal,false)}finally{targetCatalog.stop();activeCatalog=undefined}
+        for(const selection of input.sourceSelections??[]){const copied=sourceCopies.some(source=>source.record.id===selection.sessionId&&source.targetId===selection.targetId&&source.sourceVersionId===selection.versionId),paginated=validatedUnsupportedChoices.has(selection.sessionId+'|'+selection.targetId+'|'+selection.versionId);if(!copied&&!paginated)throw new Error('所选会话来源版本未能唯一匹配，请刷新来源列表')}
+        // A session is an indivisible import unit. If any chosen source or the
+        // target copy uses native paginated history, skip that logical ID while
+        // continuing with ordinary JSONL sessions in the same preview.
+        const unsupportedSessions=[...paginatedById].map(([id,records])=>{
+          const locations=[...new Set([...records.sourceIds,...sourceCopies.filter(record=>record.record.id===id).map(record=>record.targetId),...targetCopies.filter(record=>record.record.id===id).map(record=>record.targetId)])],names=locations.map(locationId=>[...sourceTargets,target].find(item=>item.id===locationId)?.name??locationId)
+          return {id,title:records.title,sourceIds:locations,reason:'Codex 分段历史依赖 rollout lineage 与 SQLite 数据库组；当前尚未支持整组迁移，因此跳过此会话（涉及：'+names.join('、')+'）。'}
+        })
+        const unsupportedIds=new Set(paginatedById.keys()),supportedSourceCopies=sourceCopies.filter(source=>!unsupportedIds.has(source.record.id)),supportedIds=[...new Set(supportedSourceCopies.map(source=>source.record.id))],supportedTargetCopies=targetCopies.filter(source=>!unsupportedIds.has(source.record.id))
+        if(!supportedIds.length){
+          const view:SyncPreview={canStart:false,sessionCount:0,sourceFiles:0,totalBytes:0,targets:[],unsupportedSessions,directional:{sourceIds,targetId:target.id,scope:input.scope,sources:sourceTargets.map(source=>({id:source.id,name:source.name,directory:source.directory})),sessions:[]}}
+          job.view.status='ready'
+          return structuredClone(view)
+        }
+        const sources=[...supportedSourceCopies,...supportedTargetCopies],bytes=sources.reduce((sum,source)=>sum+source.size,0)
         if(sources.length>10000||bytes>100*1024**3)throw new Error('同步范围超过暂存限制（1 万份副本或 100 GiB），请选择更少会话')
         await assertUnpagedSessionSources(sources,signal);Object.assign(job.view,{sourceFiles:sources.length,totalBytes:bytes})
         directory(this.scratch,true);const root=join(this.scratch,randomUUID());mkdirSync(root,{mode:0o700})
@@ -162,7 +227,7 @@ export class SessionSync {
           if(Buffer.byteLength(JSON.stringify(targetPlan.metadata))>38*1024**2)throw new Error('同步恢复索引超过 38 MiB，请整理索引')
           this.validate(targetPlan);if(await this.inventory(target.directory,signal)!==targetPlan.inventory)throw new Error('同步准备期间目标会话文件发生变化')
           await this.guardSources(guards,signal);verifySessionProgram(program);signal.throwIfAborted()
-          const view:SyncPreview={ticket:randomUUID(),sessionCount:merged.length,sourceFiles:sourceCopies.length,totalBytes:sourceCopies.reduce((sum,source)=>sum+source.size,0),targets:[targetPlan.view],directional:{sourceIds,targetId:target.id,scope:input.scope,sources:sourceTargets.map(source=>({id:source.id,name:source.name,directory:source.directory})),sessions:merged.map(item=>({id:item.source.record.id,title:item.source.record.title,sourceIds:[...new Set(item.originals.filter(source=>source.targetId!==target.id).map(source=>source.targetId))],sourceFiles:item.originals.filter(source=>source.targetId!==target.id).length,targetFiles:item.originals.filter(source=>source.targetId===target.id).length,action:targetPlan.files.find(file=>file.merged.source.record.id===item.source.record.id)?.changed?(item.originals.some(source=>source.targetId===target.id)?'merge':'add'):'unchanged'}))}}
+          const view:SyncPreview={ticket:randomUUID(),canStart:true,sessionCount:merged.length,sourceFiles:supportedSourceCopies.length,totalBytes:supportedSourceCopies.reduce((sum,source)=>sum+source.size,0),targets:[targetPlan.view],unsupportedSessions,directional:{sourceIds,targetId:target.id,scope:input.scope,sources:sourceTargets.map(source=>({id:source.id,name:source.name,directory:source.directory})),sessions:merged.map(item=>({id:item.source.record.id,title:item.source.record.title,sourceIds:[...new Set(item.originals.filter(source=>source.targetId!==target.id).map(source=>source.targetId))],sourceFiles:item.originals.filter(source=>source.targetId!==target.id).length,targetFiles:item.originals.filter(source=>source.targetId===target.id).length,action:targetPlan.files.find(file=>file.merged.source.record.id===item.source.record.id)?.changed?(item.originals.some(source=>source.targetId===target.id)?'merge':'add'):'unchanged'}))}}
           this.pending={view,root,plans:[targetPlan],guards,sources,program,applicationId:input.applicationId,expires:this.now()+300000};Object.assign(job.view,{status:'ready',targets:view.targets});this.timer=setTimeout(()=>{if(!this.job?.task)this.clear()},300000);this.timer.unref();return structuredClone(view)
         }catch(error){directory(root);rmSync(root,{recursive:true});throw error}
       }finally{signal.removeEventListener('abort',stop);activeCatalog?.stop()}
@@ -225,7 +290,7 @@ export class SessionSync {
   }
   async settled():Promise<void>{await this.job?.task?.catch(()=>{})}
   async cancel(id:string):Promise<void>{z.string().uuid().parse(id);if(this.job?.view.id!==id)throw new Error('同步任务已变化');this.job.controller.abort();await this.settled();if(this.pending)this.clear()}
-  async stop():Promise<void>{this.job?.controller.abort();await this.settled();this.clear()}
+  async stop():Promise<void>{for(const controller of this.conflictScans.values())controller.abort();this.job?.controller.abort();await this.settled();this.clear()}
   async recover():Promise<void>{
     if(!existsSync(this.root))return;directory(this.root)
     for(const entry of readdirSync(this.root,{withFileTypes:true})){

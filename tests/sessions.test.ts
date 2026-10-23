@@ -92,6 +92,51 @@ function rolloutIndex(path:string,entries:{id:string;path:string}[]){
   for(const entry of entries)db.prepare('INSERT INTO threads VALUES(?,?)').run(entry.id,entry.path)
   db.close()
 }
+function paginatedHistory(home:string,id:string,indexedPath:string,text:string,duplicateIndex=false){
+  const state=new DatabaseSync(join(home,'state_5.sqlite'))
+  state.exec('CREATE TABLE threads(id TEXT,rollout_path TEXT,history_mode TEXT)')
+  state.prepare('INSERT INTO threads VALUES(?,?,?)').run(id,indexedPath,'paginated')
+  if(duplicateIndex)state.prepare('INSERT INTO threads VALUES(?,?,?)').run(id,indexedPath,'paginated')
+  state.close()
+  const history=new DatabaseSync(join(home,'thread_history_1.sqlite'))
+  history.exec('CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_byte_offset INTEGER NOT NULL,next_rollout_ordinal INTEGER NOT NULL); CREATE TABLE thread_items(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,item_id TEXT NOT NULL,rollout_ordinal INTEGER NOT NULL,created_at_ms INTEGER NOT NULL,item_json TEXT NOT NULL,item_type TEXT NOT NULL,updated_at_ordinal INTEGER NOT NULL DEFAULT 0,started_at_ms INTEGER,completed_at_ms INTEGER,PRIMARY KEY(thread_id,turn_id,item_id))')
+  history.prepare('INSERT INTO thread_history_projection_state VALUES(?,?,?)').run(id,1024,2)
+  const item={type:'userMessage',id:'history-only-item',content:[{type:'text',text}]}
+  history.prepare('INSERT INTO thread_items(thread_id,turn_id,item_id,rollout_ordinal,created_at_ms,item_json,item_type) VALUES(?,?,?,?,?,?,?)').run(id,'turn-1','history-only-item',1,1000,JSON.stringify(item),'userMessage')
+  history.close()
+}
+
+test('Codex content search follows and verifies the managed paginated history lineage',async t=>{
+  const f=fixture(t),profileId=randomUUID(),profile={...instanceInputSchema.parse({name:'paginated-search',applicationId:'fixture-codex',accountId:randomUUID(),connectionMode:'native',model:'gpt-fixture'}),id:profileId,revision:0,createdAt:Date.now()}
+  f.store.transaction(state=>{state.instances=[profile]})
+  const target=f.configs.targets().find(value=>value.id===profileId)!,home=target.directory;mkdirSync(home,{recursive:true})
+  const rolloutDirectory=join(home,'sessions','2026','10','01');mkdirSync(rolloutDirectory,{recursive:true})
+  const id=randomUUID(),parentId=randomUUID(),currentRollout=randomUUID(),source=join(home,'sessions','2026','10','01','rollout-2026-10-01T08-00-00-'+id+'_'+parentId+'.jsonl'),current=join(home,'sessions','2026','10','01','rollout-2026-10-01T09-00-00-'+id+'_'+currentRollout+'.jsonl')
+  const parentLines=[{type:'session_meta',ordinal:0,payload:{id,cwd:'/fixture/project/src',history_mode:'paginated'}},{type:'event_msg',ordinal:1,payload:{type:'user_message',message:'PROJECTION_OLD_ONLY_TOKEN'}}]
+  writeFileSync(source,parentLines.map(value=>JSON.stringify(value)).join('\n')+'\n')
+  const endByteOffset=Buffer.byteLength(readFileSync(source))
+  writeFileSync(current,[JSON.stringify({type:'session_meta',ordinal:2,payload:{id,cwd:'/fixture/project/src',history_mode:'paginated',history_base:{thread_id:parentId,end_ordinal_exclusive:2,end_byte_offset:endByteOffset}}}),JSON.stringify({type:'event_msg',ordinal:3,payload:{type:'user_message',message:'current latest message'}})].join('\n')+'\n')
+  const state=new DatabaseSync(join(home,'state_5.sqlite'));state.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,history_mode TEXT)');state.prepare('INSERT INTO threads VALUES(?,?,?)').run(id,relative(home,current),'paginated');state.close()
+  const page=await f.scan({targetId:target.id,contentQuery:'PROJECTION_OLD_ONLY_TOKEN'})
+  assert.equal(page.total,1,JSON.stringify(page.warnings));assert.equal(page.items[0].id,id)
+  const content=await f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:target.id,page:1,pageSize:10})
+  assert.equal(content.total,2);assert.match(content.messages[0].blocks[0].text,/PROJECTION_OLD_ONLY_TOKEN/);assert.match(content.messages[1].blocks[0].text,/current latest message/)
+  assert.equal((await f.scan({targetId:target.id,titleQuery:'title-that-does-not-match',contentQuery:'PROJECTION_OLD_ONLY_TOKEN'})).total,0,'title and body filters remain conjunctive for lineage search')
+})
+
+test('Codex content search does not guess historical projection for stale or ambiguous rollout indexes',async t=>{
+  for(const mode of ['stale','ambiguous'] as const){
+    const f=fixture(t),profileId=randomUUID(),profile={...instanceInputSchema.parse({name:'paginated-search-'+mode,applicationId:'fixture-codex',accountId:randomUUID(),connectionMode:'native',model:'gpt-fixture'}),id:profileId,revision:0,createdAt:Date.now()}
+    f.store.transaction(state=>{state.instances=[profile]})
+    const target=f.configs.targets().find(value=>value.id===profileId)!,home=target.directory;mkdirSync(home,{recursive:true})
+    const id=randomUUID(),current=paginatedRollout(home,id,200,'current'),otherId=randomUUID(),foreignRollout=rollout(home,otherId,[],'sessions','different-thread')
+    const indexedPath=mode==='stale'?relative(home,foreignRollout):relative(home,current)
+    paginatedHistory(home,id,indexedPath,'PROJECTION_OLD_ONLY_TOKEN',mode==='ambiguous')
+    const page=await f.scan({targetId:target.id,contentQuery:'PROJECTION_OLD_ONLY_TOKEN'})
+    assert.equal(page.total,0,mode+' index must not make unverified projection text searchable')
+    assert.ok(current.startsWith(home))
+  }
+})
 
 test('active state index resolves native paginated segments while retaining every physical rollout',async t=>{
   const f=fixture(t),a=f.source('paginated'),id=randomUUID(),paths:string[]=[]
@@ -121,6 +166,10 @@ test('ambiguous Codex rollout versions are listed and can only be opened or prev
   const selected=location.versions!.find(value=>value.label===relative(a.home,first).split('\\').join('/'))!,contents=await f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id,versionId:selected.id})
   assert.equal(contents.clientType,'codex');assert.equal(contents.total,1);assert.match(contents.messages[0].blocks[0].text,/first version body/);assert.equal(contents.sourceName,location.name+' · '+selected.label)
   assert.equal(contents.title,record.title);assert.equal(contents.cwd,'/fixture/project/src')
+  await assert.rejects(f.catalog.selectedTransferSources(page.snapshotId,[{sessionId:id,targetId:a.target.id}]),/选择具体版本/)
+  await assert.rejects(f.catalog.selectedTransferSources(page.snapshotId,[{sessionId:id,targetId:randomUUID(),versionId:selected.id}]),/不属于指定来源/)
+  const selectedSource=await f.catalog.selectedTransferSources(page.snapshotId,[{sessionId:id,targetId:a.target.id,versionId:selected.id}])
+  assert.equal(selectedSource.length,1);assert.equal(selectedSource[0].path,first);assert.equal(selectedSource[0].sourceConflict,true);assert.equal(selectedSource[0].sourceVersionId,selected.id)
   const archivedVersion=location.versions!.find(value=>value.label===relative(a.home,second).split('\\').join('/'))!,archivedContent=await f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id,versionId:archivedVersion.id})
   assert.equal(archivedContent.cwd,'/fixture/archived-version-project');assert.equal(archivedContent.sourceName,location.name+' · '+archivedVersion.label)
   assert.deepEqual(await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[id]}),[{id,error:'此会话存在同 ID 文件冲突，请先逐个核对版本'}])
@@ -336,6 +385,46 @@ test('the native default Codex home is a discoverable read-only session source a
   assert.ok(registered.target.id!==source.id)
 })
 
+test('read-only default Codex paginated rollouts show verified full lineage after explicit version selection without opening SQLite',async t=>{
+  const f=fixture(t),home=join(f.root,'native-paginated-codex-home'),threadId=randomUUID(),parentId=randomUUID(),currentRolloutId=randomUUID()
+  mkdirSync(home)
+  const directory=join(home,'sessions','2026','10','01');mkdirSync(directory,{recursive:true})
+  const parent=join(directory,'rollout-2026-10-01T08-00-00-'+threadId+'_'+parentId+'.jsonl')
+  const parentLines=[
+    {type:'session_meta',ordinal:0,payload:{id:threadId,cwd:'/fixture/read-only-project',history_mode:'paginated'}},
+    {type:'event_msg',ordinal:1,payload:{type:'user_message',message:'READ_ONLY_ANCESTOR_NEEDLE: inherited question'}},
+    {type:'event_msg',ordinal:2,payload:{type:'agent_message',message:'inherited answer'}},
+  ]
+  writeFileSync(parent,parentLines.map(value=>JSON.stringify(value)).join('\n')+'\n')
+  const endByteOffset=Buffer.byteLength(readFileSync(parent))
+  const current=join(directory,'rollout-2026-10-01T09-00-00-'+threadId+'_'+currentRolloutId+'.jsonl')
+  writeFileSync(current,[
+    {type:'session_meta',ordinal:3,payload:{id:threadId,cwd:'/fixture/read-only-project',history_mode:'paginated',history_base:{thread_id:parentId,end_ordinal_exclusive:3,end_byte_offset:endByteOffset}}},
+    {type:'event_msg',ordinal:4,payload:{type:'user_message',message:'current rollout follow-up'}},
+  ].map(value=>JSON.stringify(value)).join('\n')+'\n')
+  const catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:home,defaultClaudeDirectory:null});t.after(()=>catalog.stop())
+  const before=treeState(home),page=await catalog.scan({runId:randomUUID(),clientType:'codex'})
+  assert.equal(page.total,1);assert.equal(page.items[0].id,threadId)
+  const source=page.sources?.find(value=>value.directory===home)!
+  const row=page.items[0],location=row.locations[0]
+  assert.equal(location.ambiguous,true,'read-only discovery has no authority to inspect SQLite and keeps multiple physical rollouts explicit')
+  const selected=location.versions?.find(version=>version.label.endsWith(threadId+'_'+currentRolloutId+'.jsonl'))
+  assert.ok(selected)
+  const content=await catalog.content({snapshotId:page.snapshotId,sessionId:threadId,targetId:source.id,versionId:selected.id,page:1,pageSize:1})
+  assert.equal(content.total,3)
+  assert.match(content.messages[0].blocks[0].text,/READ_ONLY_ANCESTOR_NEEDLE/)
+  const second=await catalog.content({snapshotId:page.snapshotId,sessionId:threadId,targetId:source.id,versionId:selected.id,page:2,pageSize:2})
+  assert.match(second.messages[0].blocks[0].text,/current rollout follow-up/)
+  assert.deepEqual(content.warnings,[])
+  assert.deepEqual(treeState(home),before,'lineage view and body search do not open or modify the read-only home or its SQLite files')
+  assert.throws(()=>catalog.selectedRecords(page.snapshotId,[threadId]),/只读查看/)
+  await assert.rejects(catalog.transferSources(page.snapshotId,[threadId]),/冲突/)
+  const searched=await catalog.scan({runId:randomUUID(),clientType:'codex',contentQuery:'READ_ONLY_ANCESTOR_NEEDLE'})
+  assert.equal(searched.total,1,'read-only search checks each lineage without choosing an active version')
+  assert.equal(searched.items[0].locations[0].ambiguous,true,'matching one version must not resolve the source conflict')
+  assert.ok(searched.warnings.every(value=>!value.includes('跳过正文搜索')))
+})
+
 test('default Codex discovery rejects linked homes, de-duplicates registered homes and rechecks replaced roots',async t=>{
   const f=fixture(t),home=join(f.root,'native-codex-home'),linked=join(f.root,'linked-codex-home')
   mkdirSync(home);const id=randomUUID(),file=rollout(home,id)
@@ -411,6 +500,8 @@ test('Codex same-ID conflicts across a default read-only home and managed instan
   assert.equal(conflictRow.locations.find(location=>location.targetId===managed.target.id)?.ambiguous,false)
   assert.equal(conflictRow.locations.find(location=>location.targetId===page.sources?.find(source=>source.directory===native)?.id)?.ambiguous,true)
   assert.equal(conflictRow.capabilities?.transfer,false,'a conflicted source prevents fallback to another copy until explicitly reviewed')
+  assert.equal(conflictRow.capabilities?.syncSource,true,'an explicit read-only sync source choice remains available for a writable managed instance')
+  assert.equal(conflictRow.capabilities?.archive,false);assert.equal(conflictRow.capabilities?.trash,false);assert.equal(conflictRow.capabilities?.visibilityRepair,false)
   assert.throws(()=>catalog.selectedRecords(conflictPage.snapshotId,[id]),/同 ID 文件冲突/)
   await assert.rejects(catalog.transferSources(conflictPage.snapshotId,[id]),/冲突/)
   assert.ok(conflict)

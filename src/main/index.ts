@@ -469,6 +469,8 @@ async function main(): Promise<void> {
       case 'recoverSessionTrash': await sessionTrash.recoverBatch(input);return sessionTrash.state()
       case 'openSessionTrashBackup': shell.showItemInFolder(sessionTrash.backupLocation(z.string().uuid().parse(input)));return
       case 'sessionSyncState': return sessionSync.view()
+      case 'sessionSyncConflicts': return sessionSync.conflicts(input)
+      case 'cancelSessionSyncConflicts': sessionSync.cancelConflicts(input);return
       case 'previewSessionSync': return sessionSync.preview(input)
       case 'startSessionSync': sessionSync.start(input);return sessionSync.view()
       case 'discardSessionSync': await sessionSync.discard();return

@@ -541,7 +541,24 @@ test('Codex session conflict UI selects a physical rollout before content and fi
   assert.deepEqual(opens.at(-1), { snapshotId: page.snapshotId, sessionId: id, targetId, action: 'file', versionId })
   f.state.open(row, 'location'); await f.state.confirmOpen(); await nextTick()
   assert.deepEqual(opens.at(-1), { snapshotId: page.snapshotId, sessionId: id, targetId, action: 'location', versionId: undefined })
-  f.state.selectRows([id]);assert.deepEqual(f.state.selectedIds,[],'conflict rows must not enter bulk mutation selections')
+  f.state.selectRows([id]);assert.deepEqual(f.state.selectedIds,[id],'conflict sessions remain selectable as sync sources; destructive bulk operations filter them separately')
+})
+
+test('Codex and Claude session rows expose the same transcript viewer entry point', async t => {
+  const codexId=randomUUID(),claudeId='claude:'+randomUUID(),codexTarget=randomUUID(),claudeTarget=randomUUID(),snapshotId=randomUUID()
+  const page={snapshotId,scannedAt:1,total:2,page:1,pageSize:25,items:[
+    {id:codexId,clientType:'codex',title:'Codex fixture',cwd:'/fixture/codex',kind:'conversation',locations:[{targetId:codexTarget,name:'Codex fixture',directory:'/fixture/codex',running:false,archived:false,ambiguous:false}],capabilities:{content:true}},
+    {id:claudeId,clientType:'claude_code',title:'Claude fixture',cwd:'/fixture/claude',kind:'conversation',locations:[{targetId:claudeTarget,name:'Claude fixture',directory:'/fixture/claude',running:false,archived:false,ambiguous:false}],capabilities:{content:true}},
+  ],warnings:[],sources:[
+    {id:codexTarget,name:'Codex fixture',directory:'/fixture/codex',role:'instance',clientType:'codex'},
+    {id:claudeTarget,name:'Claude fixture',directory:'/fixture/claude',role:'instance',clientType:'claude_code',readOnly:true},
+  ]}
+  const f=await component(t,'SessionsView',{}, {listClientConfigs:async()=>[],scanSessions:async()=>page,cancelSessionScan:async()=>{},cancelSessionTokens:async()=>{}},data())
+  await f.state.reload()
+  assert.equal(f.state.knownRecords[codexId].capabilities.content,true)
+  assert.equal(f.state.knownRecords[claudeId].capabilities.content,true)
+  f.state.open(f.state.knownRecords[codexId],'content');assert.equal(f.state.reader.record.id,codexId);assert.equal(f.state.reader.targetId,codexTarget)
+  f.state.reader=undefined;f.state.open(f.state.knownRecords[claudeId],'content');assert.equal(f.state.reader.record.id,claudeId);assert.equal(f.state.reader.targetId,claudeTarget)
 })
 
 test('Claude session source capabilities remain visible while refreshing and after a failed refresh', async t => {

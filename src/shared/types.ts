@@ -19,7 +19,7 @@ import type { WakeupView, WakeupTaskInput } from './wakeup'
 import type {SessionScanInput,SessionPageInput,SessionPage,SessionSelection,SessionCopyIdInput,SessionTokenResult,SessionCopyPreviewInput,SessionCopyPreview,SessionTransferView,SessionTransferRecovery} from './sessions'
 import type {SessionContentInput,SessionContentPage} from './sessions'
 import type {SessionVisibilityRepairInput,SessionVisibilityRepairApplyInput,SessionVisibilityRepairInstanceList,SessionVisibilityRepairProviderList,SessionVisibilityRepairPreview,SessionVisibilityRepairSummary} from './sessionVisibility'
-import type {SyncPreviewInput,SyncPreview,SyncView,SyncRecovery} from './sessionSync'
+import type {SyncPreviewInput,SyncPreview,SyncConflictSession,SyncView,SyncRecovery} from './sessionSync'
 import type {ArchivePreview,ArchiveImportInput,ArchiveImportPreview,ArchiveProgress} from './sessionArchives'
 import type {AccountRecyclePage,AccountRecycleInput,AccountRecyclePreview,AccountRecycleResult} from './accountRecycle'
 import type {StartTempLogin,TempLoginView,TempLoginCleanup} from './tempLogin'
@@ -216,6 +216,8 @@ export interface ManagerAPI {
   recoverSessionTrash(input:{id:string;mode:'resume'|'restore'|'discard';applicationId?:string;clientsClosed:true}):Promise<TrashState>
   openSessionTrashBackup(id:string):Promise<void>
   sessionSyncState():Promise<{sync?:SyncView;recoveries:SyncRecovery[]}>
+  sessionSyncConflicts(input:{requestId:string;sourceIds:string[];targetId:string}):Promise<SyncConflictSession[]>
+  cancelSessionSyncConflicts(id:string):Promise<void>
   previewSessionSync(input:SyncPreviewInput):Promise<SyncPreview>
   startSessionSync(input:{ticket:string;clientsClosed:true}):Promise<{sync?:SyncView;recoveries:SyncRecovery[]}>
   discardSessionSync():Promise<void>

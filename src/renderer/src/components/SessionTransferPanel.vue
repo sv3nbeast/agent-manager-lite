@@ -5,10 +5,12 @@ import type {ClientConfigTarget} from '../../../shared/clientConfig'
 import type {InstanceApplication} from '../../../shared/instances'
 import type {SessionCopyPreview,SessionTransferView,SessionTransferRecovery} from '../../../shared/sessions'
 
+type SessionTransferSelection={sessionId:string;targetId:string;versionId?:string}
 const props=defineProps<{targets:ClientConfigTarget[];snapshotId?:string;selectedIds:string[];reading:boolean}>()
 const emit=defineEmits<{completed:[]}>()
 const transfer=ref<SessionTransferView>(),recoveries=ref<SessionTransferRecovery[]>([]),applications=ref<InstanceApplication[]>([])
 const open=ref(false),targetId=ref<string>(),applicationId=ref<string>(),preview=ref<SessionCopyPreview>(),retryId=ref<string>(),clientsClosed=ref(false),loading=ref(false),error=ref('')
+const sourceSelection=ref<SessionTransferSelection>(),sourceLabel=ref('')
 useFormFeedback(()=>error.value,{active:()=>open.value})
 const running=computed(()=>!!transfer.value&&['copying','committing','indexing'].includes(transfer.value.status))
 const labels={copying:'正在复制',committing:'正在保存文件',indexing:'正在更新 Codex 会话列表',completed:'复制已完成',cancelled:'操作已取消',failed:'复制失败',recovery_required:'需要处理恢复记录'}
@@ -24,8 +26,12 @@ function apply(state:{transfer?:SessionTransferView;recoveries:SessionTransferRe
 }
 async function poll(){if(polling)return;polling=true;try{apply(await window.manager.sessionTransferState())}catch(cause){if(alive)error.value=String(cause)}finally{polling=false}}
 function invalidate(){generation++;preview.value=undefined;clientsClosed.value=false;void window.manager.discardSessionCopy().catch(cause=>{if(alive)error.value=String(cause)})}
-function close(){open.value=false;retryId.value=undefined;invalidate()}
-function begin(id?:string){invalidate();error.value='';retryId.value=id;targetId.value=undefined;applicationId.value=applications.value[0]?.id;open.value=true}
+function close(){open.value=false;retryId.value=undefined;sourceSelection.value=undefined;sourceLabel.value='';invalidate()}
+function begin(id?:string){invalidate();error.value='';retryId.value=id;sourceSelection.value=undefined;sourceLabel.value='';targetId.value=undefined;applicationId.value=applications.value[0]?.id;open.value=true}
+function beginFromSource(selection:SessionTransferSelection,label='所选来源文件'){
+  invalidate();error.value='';retryId.value=undefined;sourceSelection.value={...selection};sourceLabel.value=label;targetId.value=undefined;applicationId.value=applications.value[0]?.id;open.value=true
+}
+defineExpose({beginFromSource})
 async function choose(kind:'cli'|'desktop'){
   const current=generation
   try{
@@ -41,7 +47,7 @@ async function chooseApp(){await choose('desktop')}
 async function prepare(){
   if(!props.snapshotId||!targetId.value||!applicationId.value)return
   const current=++generation;loading.value=true;error.value=''
-  try{const result=await window.manager.previewSessionCopy({snapshotId:props.snapshotId,sessionIds:[...props.selectedIds],targetId:targetId.value,applicationId:applicationId.value});if(alive&&open.value&&current===generation)preview.value=result}
+  try{const result=await window.manager.previewSessionCopy(sourceSelection.value?{snapshotId:props.snapshotId,sourceSelections:[{...sourceSelection.value}],targetId:targetId.value,applicationId:applicationId.value}:{snapshotId:props.snapshotId,sessionIds:[...props.selectedIds],targetId:targetId.value,applicationId:applicationId.value});if(alive&&open.value&&current===generation)preview.value=result}
   catch(cause){if(alive&&current===generation)error.value=String(cause)}finally{if(alive)loading.value=false}
 }
 async function confirm(){
@@ -72,18 +78,19 @@ onUnmounted(()=>{alive=false;generation++;clearInterval(timer);void window.manag
       <p v-if="transfer.status==='indexing'" class="muted">停止更新会保留已复制文件，可稍后重试。</p>
     </a-card>
     <a-alert v-for="entry in recoveries" :key="entry.id" type="warning" class="transfer-recovery"><template #message>{{entry.targetName}} · 有待恢复的会话操作</template><template #description><p>{{entry.message}}</p><p v-if="!entry.targetId">恢复记录无法读取，已暂停新的目录写入。请先打开备份目录检查记录。</p><a-space><a-button :disabled="running||loading||!entry.targetId" @click="begin(entry.id)">重试恢复</a-button><a-button @click="backup(entry.id)">打开备份目录</a-button></a-space></template></a-alert>
-    <a-modal :open="open" :width="720" :title="retryId?'恢复会话操作':'复制选中的会话'" :body-style="{maxHeight:'60vh',overflowY:'auto'}" @cancel="close">
+    <a-modal :open="open" :width="720" :title="retryId?'恢复会话操作':sourceSelection?'复制选定的会话来源':'复制选中的会话'" :body-style="{maxHeight:'60vh',overflowY:'auto'}" @cancel="close">
       <div class="session-copy-editor">
         <a-alert v-if="error" type="error" :message="error" class="error-banner" />
         <a-form layout="vertical">
           <a-form-item v-if="!retryId" label="目标目录"><a-select v-model:value="targetId" aria-label="会话复制目标" :options="targets.map(target=>({value:target.id,label:target.name+' · '+target.directory}))" placeholder="选择已登记目录" :disabled="loading" @change="invalidate" /></a-form-item>
           <a-form-item label="用于更新会话列表的 Codex 程序"><a-select v-model:value="applicationId" aria-label="会话索引程序" :options="applications.map(app=>({value:app.id,label:app.name+' · '+app.path}))" placeholder="选择 Codex 桌面应用或 CLI" :disabled="loading" @change="invalidate" /><a-space><a-button type="link" :disabled="loading" @click="chooseCli">选择 CLI 程序</a-button><a-button type="link" :disabled="loading" @click="chooseApp">选择桌面应用</a-button></a-space></a-form-item>
         </a-form>
+        <a-alert v-if="sourceSelection" type="info" show-icon class="selected-source" message="本次只复制明确选定的来源文件"><template #description><div>{{sourceLabel}}</div><small class="muted">来源目录 ID：{{sourceSelection.targetId}}<template v-if="sourceSelection.versionId"> · 文件版本：{{sourceSelection.versionId}}</template></small></template></a-alert>
         <template v-if="preview">
           <p class="copy-destination">复制到 {{preview.targetName}}：{{preview.directory}}</p><p class="muted">{{preview.items.filter(item=>item.status==='ready').length}} 个新会话 · {{bytes(preview.totalBytes)}}。保留来源，目标已有的同 ID 会话会跳过。</p>
           <a-table :data-source="preview.items" row-key="id" size="small" :pagination="preview.items.length>10?{pageSize:10,showSizeChanger:false}:false" class="copy-preview-table">
             <a-table-column key="title" title="会话"><template #default="{record}"><div class="copy-title">{{record.title}}</div><small class="muted">{{record.id}}</small></template></a-table-column>
-            <a-table-column key="source" title="来源"><template #default="{record}"><span :title="record.sourceDirectory">{{record.sourceName}}</span></template></a-table-column>
+            <a-table-column key="source" title="来源文件"><template #default="{record}"><div>{{record.sourceName}}</div><small class="muted" :title="record.sourceDirectory">{{record.sourcePath??record.sourceDirectory}}</small><small v-if="record.sourceVersionId" class="muted source-version">版本 {{record.sourceVersionId}}</small></template></a-table-column>
             <a-table-column key="status" title="处理"><template #default="{record}"><a-tag :color="record.status==='ready'?'purple':undefined">{{record.status==='ready'?'复制':'已有，跳过'}}</a-tag></template></a-table-column>
           </a-table>
         </template>
@@ -95,5 +102,5 @@ onUnmounted(()=>{alive=false;generation++;clearInterval(timer);void window.manag
 </template>
 
 <style scoped>
-.transfer-toolbar{display:flex;align-items:center;gap:14px;margin-bottom:12px}.transfer-progress,.transfer-recovery{margin-bottom:16px}.transfer-progress p{margin:6px 0;font-size:12px}.session-copy-editor :deep(.ant-select){width:100%}.copy-destination,.copy-title{overflow-wrap:anywhere}.copy-preview-table small{overflow-wrap:anywhere;font-size:10px}.copy-closed{margin:20px 0 8px}.copy-actions{display:flex;justify-content:flex-end;gap:12px;margin-top:18px}.session-copy-editor>.muted{font-size:12px;line-height:1.7}
+.transfer-toolbar{display:flex;align-items:center;gap:14px;margin-bottom:12px}.transfer-progress,.transfer-recovery{margin-bottom:16px}.transfer-progress p{margin:6px 0;font-size:12px}.session-copy-editor :deep(.ant-select){width:100%}.copy-destination,.copy-title{overflow-wrap:anywhere}.copy-preview-table small{display:block;overflow-wrap:anywhere;font-size:10px}.source-version{opacity:.8}.copy-closed{margin:20px 0 8px}.copy-actions{display:flex;justify-content:flex-end;gap:12px;margin-top:18px}.session-copy-editor>.muted{font-size:12px;line-height:1.7}.selected-source{margin:8px 0 18px}.selected-source small{overflow-wrap:anywhere}
 </style>

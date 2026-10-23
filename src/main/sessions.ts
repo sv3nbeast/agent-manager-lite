@@ -7,23 +7,25 @@ import {z} from 'zod'
 import {Store} from './store'
 import {ClientConfigs} from './clientConfig'
 import type {ClientConfigTarget} from '../shared/clientConfig'
-import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,claudeResumeSelectionSchema,sessionContentSchema,sessionStatsSchema,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult,type SessionSource,type SessionContentPage} from '../shared/sessions'
+import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,claudeResumeSelectionSchema,sessionContentSchema,sessionStatsSchema,type SessionCopySourceSelection,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult,type SessionSource,type SessionContentPage} from '../shared/sessions'
 import {openSessionFile,rolloutFiles,firstSessionEvent,sessionActivity,sessionTokens,sessionContains,sessionDigest,cleanText,sessionIdentifier,safeSessionPath} from './sessionFiles'
 import {readSessionDisplay,readSessionRolloutIndex,displayTitle,displayProject} from './sessionDisplay'
 import {probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,pathContains,validateExternalHome} from './instancePaths'
 import {scanClaudeCodeSessionsAsync,verifyClaudeSessionLocation,readClaudeSessionContent,previewClaudeSessionResume,type ClaudeSessionLocation,type ClaudeSessionRecord,type ClaudeSessionResumePreview} from './claudeCodeSessions'
 import {isClaudeDesktopProfile} from '../shared/instances'
-import {readCodexSessionContent} from './codexSessionContent'
+import {readCodexSessionContent,readCodexSessionContentForMerge,readCodexSessionLineageContent} from './codexSessionContent'
+import {readCodexSessionLineage} from './codexSessionLineage'
 
 interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;mtime:number;ctime:number;record:SessionRecord;duplicateOf?:string}
-export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
+export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord;sourceVersionId?:string;sourceConflict?:boolean}
 interface ClaudeSourceFile {target:SessionSource;profile:string;location:ClaudeSessionLocation;sessionId:string;record:ClaudeSessionRecord}
 export interface CatalogClaudeResumePreview extends ClaudeSessionResumePreview {instanceRevision:number;profileFingerprint:string}
 export interface SessionCatalogOptions {defaultCodexDirectory?:string|null;defaultClaudeDirectory?:string|null;disableSqliteDisplay?:boolean}
 const defaultClaudeSourceId='4135f4e6-6db5-4bd4-95f7-06f4c667341a'
 const defaultCodexSourceId='61f5fc85-e814-4f63-9f9f-b96d94fcf51a'
 interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;claudeFiles:Map<string,ClaudeSourceFile>;warnings:string[];sourceCounts:Record<string,number>;sources:SessionSource[]}
+function hasPaginatedHistory(record:SessionRecord):boolean{return record.historyMode==='paginated'||record.locations.some(location=>location.historyMode==='paginated'||location.versions?.some(version=>version.historyMode==='paginated'))}
 class SessionLimitError extends Error {}
 export const classifySession=(title:string,cwd:string):SessionKind=>{
   const name=title.toLowerCase(),path=cwd.toLowerCase()
@@ -161,10 +163,17 @@ export class SessionCatalog {
                 const cwd=cleanText(meta.payload?.cwd)||'未知工作目录',title=displayTitle(display,id),kind=classifySession(title,cwd)
                 const indexed=display.index.get(id)?.updatedAt,activity=await sessionActivity(file,stat.size,signal)
                 const updatedAt=indexed!==undefined&&(activity===undefined||Math.abs(indexed-activity)<=3600000)?indexed:activity??stat.mtimeMs
-                const historyMode=meta.payload?.history_mode==='paginated'?'paginated' as const:undefined
+                const historyMode=meta.payload?.history_mode==='paginated'||typeof meta.payload?.history_base?.thread_id==='string'&&!!meta.payload.history_base.thread_id?'paginated' as const:undefined
                 const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false,...historyMode?{historyMode}:{}}
-                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',capabilities:{open:true,transfer:!readOnly,archive:!readOnly,trash:!readOnly,visibilityRepair:!readOnly,tokens:true,contentSearch:true,content:true},...historyMode?{historyMode}:{}}
-                const matched=[title,id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase()))&&(!input.contentQuery||await sessionContains(file,stat.size,input.contentQuery,signal))
+                // Codex transcript viewing is supported for both ordinary and
+                // verified paginated rollouts. Codex resume has a separate
+                // CODEX_HOME index/ticket boundary and is not exposed here yet.
+                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',capabilities:{open:true,transfer:!readOnly,archive:!readOnly,trash:!readOnly,visibilityRepair:!readOnly,tokens:true,contentSearch:true,content:true},...historyMode?{historyMode}:{},...(historyMode?{syncBlockedReason:'Codex 分段会话依赖 history_base lineage 与 SQLite 数据库组，当前版本尚不支持跨实例同步'}:{})}
+                const matchesTitle=[title,id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase()))
+                // Never search a single paginated segment as though it were a
+                // complete transcript. Verified lineage search is performed
+                // after the source's active rollout has been resolved.
+                const matched=matchesTitle&&(!input.contentQuery||(historyMode==='paginated'?false:await sessionContains(file,stat.size,input.contentQuery,signal)))
                 sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,size:stat.size,mtime:stat.mtimeMs,ctime:stat.ctimeMs,record:structuredClone(record)}})
               }finally{await file.close()}
             }catch(error){signal.throwIfAborted();warn(`部分会话文件无法读取（${basename(path)}），请刷新或检查文件`)}
@@ -174,9 +183,9 @@ export class SessionCatalog {
           const finalRoot=await lstat(root);if(finalRoot.dev!==rootStat.dev||finalRoot.ino!==rootStat.ino)throw new Error('会话目录已被替换')
           const grouped=new Map<string,typeof sourceRows>()
           for(const row of sourceRows)grouped.set(row.record.id,[...(grouped.get(row.record.id)??[]),row])
-          const indexedRollouts=[...grouped.values()].some(rows=>rows.length>1)&&useSqlite?await readSessionRolloutIndex(root,signal,warn):new Map<string,string>()
+          const needsRolloutIndex=[...grouped.values()].some(rows=>rows.length>1||!!input.contentQuery&&rows.some(row=>row.record.historyMode==='paginated'))
+          const indexedRollouts=needsRolloutIndex&&useSqlite?await readSessionRolloutIndex(root,signal,warn):new Map<string,string>()
           for(const [id,rows] of grouped){
-            if(rows.some(row=>row.matched))matches.add(id)
             const ordered=rows.slice().sort((a,b)=>canonical(a.file).localeCompare(canonical(b.file)))
             let identical=rows.length<2
             if(!identical&&rows.every(row=>row.file.size===ordered[0].file.size)){
@@ -185,11 +194,33 @@ export class SessionCatalog {
                 for(const row of ordered.slice(1))if(await digest(row.file,signal)!==first){identical=false;break}
               }catch{signal.throwIfAborted();identical=false}
             }
-            // A native paginated thread has distinct continuation segments.
-            // Its active database path, matched against safely scanned files
-            // with the same metadata ID, identifies the current segment. Never
-            // guess from filenames, mtime, the longest file or inactive DBs.
-            const indexed=ordered.filter(row=>row.file.path===indexedRollouts.get(id)),primary=!identical&&indexed.length===1?indexed[0]:undefined
+            // Resolve the current rollout through the active SQLite index when
+            // available. Read-only/default homes cannot open SQLite, so a
+            // single physical candidate may be used as an explicit lineage
+            // entrypoint; ambiguous candidates remain fail-closed.
+            const indexed=ordered.filter(row=>row.file.path===indexedRollouts.get(id)),primary=indexed.length===1?indexed[0]:undefined
+            let contentMatched=false
+            if(input.contentQuery.trim()&&rows.some(row=>row.record.historyMode==='paginated')){
+              // Search every independently verified candidate lineage. A
+              // read-only/default home has no authority to consult SQLite to
+              // choose one rollout, but that must not hide the conversation
+              // when an older segment contains the requested text. Keep the
+              // location ambiguous so the user still chooses which version
+              // to inspect; search never resolves or merges candidates.
+              const candidates=primary?.record.historyMode==='paginated'?[primary]:identical?[ordered[0]]:ordered.filter(row=>row.record.historyMode==='paginated')
+              let unreadable=false
+              for(const candidate of candidates){
+                if(candidate.record.historyMode!=='paginated')continue
+                try{
+                  const handle=await openSessionFile(root,candidate.file.path)
+                  try{const page=await readCodexSessionLineage(root,candidate.file.path,id,{page:1,pageSize:1,query:input.contentQuery},signal,{file:handle.file,size:handle.stat.size});contentMatched ||= page.total>0}
+                  finally{await handle.file.close()}
+                }catch{signal.throwIfAborted();unreadable=true}
+              }
+              if(unreadable)warn('一个或多个 Codex 分段历史无法完整验证，正文搜索结果可能不完整；请打开会话并选择具体文件版本')
+            }
+            const titleMatched=rows.some(row=>[row.record.title,id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase())))
+            if(titleMatched&&(rows.some(row=>row.matched)||contentMatched))matches.add(id)
             const selected=primary?[primary]:identical?[ordered[0]]:ordered
             if(!primary&&!identical&&rows.length>1){
               const conflictLocation:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:false,ambiguous:true,versions:ordered.map(row=>({id:this.versionId(row.file),label:relative(root,row.file.path).split(sep).join('/'),archived:row.record.locations[0].archived,updatedAt:row.record.updatedAt,historyMode:row.record.historyMode}))}
@@ -254,7 +285,8 @@ export class SessionCatalog {
       const sorted=[...records.values()].map(record=>{
         if(record.clientType!=='codex')return record
         const writable=record.locations.some(location=>!this.readOnlyCodexSource(location.targetId)),conflicted=record.locations.some(location=>location.ambiguous)
-        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
+        const paginated=record.historyMode==='paginated'
+        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted, syncSource:writable&&!paginated,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
       }).filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)&&(!input.projectQuery||[record.cwd,record.projectName??''].some(value=>value.toLowerCase().includes(input.projectQuery.toLowerCase())))).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
       this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,claudeFiles,warnings:[...warnings].slice(0,100),sourceCounts,sources}
       return this.page({snapshotId:this.snapshot.id,page:1,pageSize:25})
@@ -322,7 +354,7 @@ export class SessionCatalog {
       else if(location.versions?.length){const version=location.versions.find(value=>value.id===input.versionId);if(!version)throw new Error('所选 Codex 会话存在多个同 ID 文件冲突，请选择具体版本');source=sources.find(value=>this.versionId(value)===version.id);if(!source)throw new Error('所选会话文件版本已变化，请刷新列表')}
       if(!source)throw new Error('所选 Codex 会话存在文件冲突，请先选择具体版本')
       const opened=await this.verified(source,input.sessionId,new AbortController().signal)
-      try{if(opened.stat.size!==source.size||opened.stat.mtimeMs!==source.mtime||opened.stat.ctimeMs!==source.ctime)throw new Error('会话文件已变化，请刷新列表');const content=await readCodexSessionContent(opened.file,opened.stat.size,{page:input.page,pageSize:input.pageSize,query:input.query});await this.unchanged(source,opened.stat);this.current(input.snapshotId);return {snapshotId:input.snapshotId,sessionId:row.id,sourceSessionId:row.id,title:source.record.title,cwd:source.record.cwd,sourceName:location.versions?.length?`${location.name} · ${relative(source.root,source.path).split(sep).join('/')}`:location.name,clientType:'codex',...content}}finally{await opened.file.close()}
+      try{if(opened.stat.size!==source.size||opened.stat.mtimeMs!==source.mtime||opened.stat.ctimeMs!==source.ctime)throw new Error('会话文件已变化，请刷新列表');const paginated=source.record.historyMode==='paginated',content=paginated?await readCodexSessionLineage(source.root,source.path,input.sessionId,{page:input.page,pageSize:input.pageSize,query:input.query},new AbortController().signal,{file:opened.file,size:opened.stat.size}):await readCodexSessionContent(opened.file,opened.stat.size,{page:input.page,pageSize:input.pageSize,query:input.query});await this.unchanged(source,opened.stat);this.current(input.snapshotId);return {snapshotId:input.snapshotId,sessionId:row.id,sourceSessionId:row.id,title:source.record.title,cwd:source.record.cwd,sourceName:location.versions?.length?location.name+' · '+relative(source.root,source.path).split(sep).join('/'):location.name,clientType:'codex',...content}}finally{await opened.file.close()}
     }
     if(claude.target.id!==input.targetId)throw new Error('所选会话不属于当前目录')
     const current=await this.claudeTargetIdentity(claude.target)
@@ -396,6 +428,42 @@ export class SessionCatalog {
     }
     this.current(input.snapshotId);return result
   }
+  /** Resolve each requested Codex file version from the immutable scan snapshot.
+   * Callers provide only logical IDs and target/version IDs, never filesystem paths. */
+  async selectedTransferSources(snapshotId:string,selections:SessionCopySourceSelection[],signal=new AbortController().signal):Promise<SessionTransferSource[]>{
+    const input=z.object({snapshotId:z.string().uuid(),selections:z.array(z.object({sessionId:z.string().min(1).max(256),targetId:z.string().uuid(),versionId:z.string().regex(/^[a-f0-9]{32}$/).optional()}).strict()).min(1).max(1000)}).strict().parse({snapshotId,selections}),snapshot=this.current(input.snapshotId),result:SessionTransferSource[]=[],seen=new Set<string>()
+    for(const selection of input.selections){
+      if(seen.has(selection.sessionId))throw new Error('同一目标不能重复选择同 ID 会话的多个来源，请只选择一个来源版本')
+      seen.add(selection.sessionId)
+      const record=snapshot.records.find(row=>row.id===selection.sessionId)
+      if(!record)throw new Error('所选会话不在当前筛选列表中，请重新选择')
+      if(record.clientType==='claude_code')throw new Error('Claude Code 会话当前仅支持只读查看，不能使用 Codex 会话复制或导出')
+      if(this.readOnlyCodexSource(selection.targetId))throw new Error('本机默认 Codex 会话来源仅支持只读查看，不能复制或导出')
+      const location=record.locations.find(value=>value.targetId===selection.targetId)
+      if(!location)throw new Error('所选会话不属于指定来源目录')
+      const all=snapshot.files.get(selection.sessionId)?.filter(source=>source.targetId===selection.targetId)??[]
+      let source:SourceFile|undefined
+      if(location.versions?.length){
+        if(!selection.versionId)throw new Error('此会话存在多个同 ID 文件，请选择具体版本')
+        const version=location.versions.find(value=>value.id===selection.versionId)
+        if(!version)throw new Error('所选会话版本不属于指定来源目录，请刷新列表')
+        source=all.find(value=>this.versionId(value)===version.id)
+        if(!source)throw new Error('所选会话文件版本已变化，请刷新列表')
+      }else{
+        if(selection.versionId)throw new Error('所选会话已不再包含指定冲突版本，请刷新列表')
+        const candidates=all.filter(value=>!value.duplicateOf)
+        if(candidates.length!==1)throw new Error(candidates.length?'所选来源目录仍存在同 ID 文件冲突，请刷新列表并指定版本':'会话不属于所选目录')
+        source=candidates[0]
+      }
+      if(source.record.historyMode==='paginated')throw new Error('会话使用分段历史，当前单会话复制不能保留完整记录。')
+      const opened=await this.verified(source,selection.sessionId,signal)
+      try{
+        if(opened.stat.size!==source.size||opened.stat.mtimeMs!==source.mtime||opened.stat.ctimeMs!==source.ctime)throw new Error('会话文件版本已变化，请刷新列表')
+        result.push({path:source.path,root:source.root,targetId:source.targetId,rootDevice:source.rootDevice,rootInode:source.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(source.record),sourceVersionId:this.versionId(source),sourceConflict:!!location.versions?.length})
+      }finally{await opened.file.close()}
+    }
+    this.current(input.snapshotId);return result
+  }
   async syncSources(snapshotId:string,signal:AbortSignal):Promise<SessionTransferSource[]>{
     const snapshot=this.current(snapshotId),result:SessionTransferSource[]=[]
     if(snapshot.claudeFiles.size)throw new Error('Claude Code 会话当前仅支持只读查看，不能使用 Codex 全目录同步')
@@ -407,23 +475,63 @@ export class SessionCatalog {
     }
     this.current(snapshotId);return result
   }
-  async directionalSyncSources(snapshotId:string,ids:string[],targetIds:string[],signal:AbortSignal,requireEachId:boolean):Promise<SessionTransferSource[]>{
+  async directionalSyncSources(snapshotId:string,ids:string[],targetIds:string[],signal:AbortSignal,requireEachId:boolean,selections:SessionCopySourceSelection[]=[],requireConflictChoices=true):Promise<SessionTransferSource[]>{
     const input=sessionStatsSchema.extend({sessionIds:z.array(z.string().uuid()).max(1000),targetIds:z.array(z.string().uuid()).min(1).max(100)}).parse({snapshotId,sessionIds:ids,targetIds}),snapshot=this.current(input.snapshotId),result:SessionTransferSource[]=[],found=new Set<string>()
     if(snapshot.warnings.length)throw new Error('部分会话目录读取不完整，未准备同步：'+snapshot.warnings[0])
+    const chosen=new Map<string,SessionCopySourceSelection>()
+    for(const selection of selections){const key=selection.sessionId+'|'+selection.targetId;if(chosen.has(key))throw new Error('同一会话来源重复选择');chosen.set(key,selection)}
+    if([...chosen.values()].some(selection=>!input.targetIds.includes(selection.targetId)||ids.length>0&&!input.sessionIds.includes(selection.sessionId)))throw new Error('会话文件选择不属于当前同步范围')
     const wanted=input.sessionIds.length?new Set(input.sessionIds):new Set(snapshot.records.filter(row=>row.clientType!=='claude_code').map(row=>row.id))
     for(const id of wanted){
       const record=snapshot.records.find(row=>row.id===id)
       if(!record){if(requireEachId)throw new Error('所选会话不在当前扫描结果中，请刷新后重新选择');continue}
       if(record.clientType==='claude_code')throw new Error('Claude Code 会话当前不支持同步到 Codex 实例')
       z.string().uuid().parse(id)
+      for(const targetId of input.targetIds){
+        const location=record.locations.find(value=>value.targetId===targetId)
+        if(!location)continue
+        if(hasPaginatedHistory(record))continue
+        const selected=chosen.get(id+'|'+targetId)
+        if(location.ambiguous&&requireConflictChoices&&!selected?.versionId)throw new Error('会话 '+record.title+' 在来源实例“'+location.name+'”存在多个同 ID 文件，请选择具体版本后再同步')
+        if(selected?.versionId&&!location.ambiguous)throw new Error('会话来源文件版本已变化，请刷新列表')
+      }
+      if(record.historyMode==='paginated'){found.add(id);continue}
       for(const source of snapshot.files.get(id)??[]){
         if(!input.targetIds.includes(source.targetId)||this.readOnlyCodexSource(source.targetId))continue
-        const opened=await this.verified(source,id,signal)
-        try{result.push({path:source.path,root:source.root,targetId:source.targetId,rootDevice:source.rootDevice,rootInode:source.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(source.record)});found.add(id)}finally{await opened.file.close()}
+        const selected=chosen.get(id+'|'+source.targetId)
+        if(source.duplicateOf&&!chosen.has(id+'|'+source.targetId))continue
+        if(requireConflictChoices&&record.locations.find(value=>value.targetId===source.targetId)?.ambiguous&&!chosen.has(id+'|'+source.targetId))throw new Error('会话 '+record.title+' 在来源实例存在多个同 ID 文件，请选择具体版本后再同步')
+        let resolved=source
+        const location=record.locations.find(value=>value.targetId===source.targetId)
+        if(location?.versions?.length&&selected?.versionId){
+          if(!selected?.versionId)throw new Error('会话 '+record.title+' 在来源实例“'+location.name+'”存在多个同 ID 文件，请选择具体版本后再同步')
+          const version=location.versions.find(value=>value.id===selected.versionId)
+          if(!version)throw new Error('所选会话版本不属于指定来源目录，请刷新列表')
+          const candidate=snapshot.files.get(id)?.find(value=>value.targetId===source.targetId&&this.versionId(value)===version.id)
+          if(!candidate)throw new Error('所选会话文件版本已变化，请刷新列表')
+          if(source.path!==candidate.path)continue
+          resolved=candidate
+        }
+        const opened=await this.verified(resolved,id,signal)
+        try{result.push({path:resolved.path,root:resolved.root,targetId:resolved.targetId,rootDevice:resolved.rootDevice,rootInode:resolved.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(resolved.record),sourceVersionId:this.versionId(resolved),sourceConflict:!!location?.versions?.length});found.add(id)}finally{await opened.file.close()}
       }
     }
     if(requireEachId){const missing=input.sessionIds.find(id=>!found.has(id));if(missing)throw new Error(`所选来源实例中找不到会话 ${missing}`)}
     this.current(input.snapshotId);return result
+  }
+  recordsForSync(snapshotId:string,ids:string[],targetIds:string[]):SessionRecord[]{
+    const snapshot=this.current(snapshotId),wanted=ids.length?new Set(ids):undefined
+    if(snapshot.warnings.length)throw new Error('部分会话目录读取不完整，未准备同步：'+snapshot.warnings[0])
+    return snapshot.records.filter(record=>record.clientType==='codex'&&(!wanted||wanted.has(record.id))&&record.locations.some(location=>targetIds.includes(location.targetId))).map(record=>structuredClone(record))
+  }
+  directionalSyncUnsupported(snapshotId:string,ids:string[],targetIds:string[]):Array<{id:string;title:string;sourceIds:string[];reason:string}>{
+    const snapshot=this.current(snapshotId),wanted=ids.length?new Set(ids):undefined,result:Array<{id:string;title:string;sourceIds:string[];reason:string}>=[]
+    for(const record of snapshot.records){
+      if(record.clientType!=='codex'||!hasPaginatedHistory(record)||wanted&&!wanted.has(record.id))continue
+      const sourceIds=record.locations.filter(location=>targetIds.includes(location.targetId)&&!this.readOnlyCodexSource(location.targetId)).map(location=>location.targetId)
+      if(sourceIds.length)result.push({id:record.id,title:record.title,sourceIds,reason:record.syncBlockedReason??'Codex 分段会话依赖 history_base lineage 与 SQLite 数据库组，当前版本尚不支持跨实例同步'})
+    }
+    return result
   }
   async tokenStats(raw:unknown):Promise<SessionTokenResult[]>{
     const input=sessionStatsSchema.parse(raw),snapshot=this.current(input.snapshotId)

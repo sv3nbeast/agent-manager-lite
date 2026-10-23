@@ -89,7 +89,9 @@ export class SessionTransfers {
   }
   async preview(raw:unknown):Promise<SessionCopyPreview>{
     const input=sessionCopyPreviewSchema.parse(raw);this.discard();const generation=this.generation,controller=new AbortController();this.previewController=controller
-    const sources=await this.catalog.transferSources(input.snapshotId,input.sessionIds,controller.signal)
+    const sources=input.sourceSelections
+      ?await this.catalog.selectedTransferSources(input.snapshotId,input.sourceSelections,controller.signal)
+      :await this.catalog.transferSources(input.snapshotId,input.sessionIds!,controller.signal)
     return this.buildPreview(input,sources,controller,generation)
   }
   // Internal only: ZIP entries are already verified/extracted into a private
@@ -111,7 +113,7 @@ export class SessionTransfers {
     controller.signal.throwIfAborted()
     const config=this.config(target),program=sessionProgram(application),existing=await this.existingIds(target.directory,controller.signal)
     await assertUnpagedSessionSources(sources.filter(source=>!existing.has(source.record.id)),controller.signal)
-    const view:SessionCopyPreview={ticket:randomUUID(),targetId:target.id,targetName:target.name,directory:target.directory,applicationName:application.name,provider:config.provider,items:sources.map(source=>({id:source.record.id,title:source.record.title,sourceName:source.record.locations[0].name,sourceDirectory:source.root,bytes:source.size,status:existing.has(source.record.id)?'existing':'ready'})),totalBytes:sources.filter(source=>!existing.has(source.record.id)).reduce((sum,source)=>sum+source.size,0)}
+    const view:SessionCopyPreview={ticket:randomUUID(),targetId:target.id,targetName:target.name,directory:target.directory,applicationName:application.name,provider:config.provider,items:sources.map(source=>({id:source.record.id,title:source.record.title,sourceName:source.record.locations.find(location=>location.targetId===source.targetId)?.name??source.targetId,sourceDirectory:source.root,sourcePath:relative(source.root,source.path).split(sep).join('/'),...(source.sourceVersionId?{sourceVersionId:source.sourceVersionId}:{}),...(source.sourceConflict?{sourceConflict:true}:{}),bytes:source.size,status:existing.has(source.record.id)?'existing':'ready'})),totalBytes:sources.filter(source=>!existing.has(source.record.id)).reduce((sum,source)=>sum+source.size,0)}
     if(view.totalBytes>100*1024**3)throw new Error('所选会话超过 100 GiB，请分批复制')
     if(generation!==this.generation)throw new Error('会话复制预览已更新，请重新选择')
     this.pending={view,target,rootIdentity:existsSync(target.directory)?fileIdentity(lstatSync(target.directory)):undefined,configHash:config.hash,profileHash:this.profileHash(target.id),sources,lockedIds:ids,indexes,existing,program,expires:this.now()+300000}

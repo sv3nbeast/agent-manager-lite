@@ -62,6 +62,8 @@ jobs:
         run: npm run test:desktop:claude-sessions
       - name: Verify default Codex session discovery remains read-only
         run: npm run test:desktop:default-codex-sessions
+      - name: Verify Codex transcript browsing and paginated history boundaries
+        run: npm run test:desktop:codex-session-content
       - name: Save isolated Claude UI failure diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

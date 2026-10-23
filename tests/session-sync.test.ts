@@ -149,11 +149,68 @@ test('directional selected sync merges source instances into one target and neve
   const backup=f.sync.view().sync!.backups[0];assert.ok(readdirSync(f.sync.backupLocation(backup.id)).some(name=>name.startsWith('old-')&&readFileSync(join(f.sync.backupLocation(backup.id),name)).equals(targetOriginal)))
 })
 
+test('directional selected sync previews paginated sessions as skipped while importing ordinary JSONL sessions',async t=>{
+  const f=fixture(t),ordinaryId=randomUUID(),paginatedId=randomUUID(),ordinary=rollout(f.a,ordinaryId,when,'ordinary JSONL body'),paginated=rollout(f.a,paginatedId,when,'paginated JSONL body'),before=[readFileSync(ordinary),readFileSync(paginated)]
+  const lines=readFileSync(paginated,'utf8').trimEnd().split('\n'),meta=JSON.parse(lines[0]);meta.payload.history_mode='paginated';meta.payload.history_base={thread_id:randomUUID(),end_ordinal_exclusive:2,end_byte_offset:0};lines[0]=JSON.stringify(meta);writeFileSync(paginated,lines.join('\n')+'\n')
+  const scan=await f.catalog.scan({runId:randomUUID(),targetId:f.targetA.id,clientType:'codex'});assert.deepEqual(scan.items.map(item=>[item.id,item.historyMode,item.locations[0]?.ambiguous]),[[ordinaryId,undefined,false],[paginatedId,'paginated',false]].sort((a,b)=>String(a[0]).localeCompare(String(b[0]))))
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'selected',sessionIds:[ordinaryId,paginatedId],applicationId:'fixture'})
+  assert.equal(preview.canStart,true);assert.ok(preview.ticket);assert.equal(preview.sessionCount,1);assert.equal(preview.sourceFiles,1);assert.deepEqual(preview.directional?.sessions.map(item=>item.id),[ordinaryId])
+  assert.deepEqual(preview.unsupportedSessions?.map(item=>item.id),[paginatedId]);assert.match(preview.unsupportedSessions?.[0].reason??'',/分段历史.*SQLite/)
+  assert.equal(preview.unsupportedSessions?.[0].sourceIds[0],f.targetA.id);assert.equal(preview.targets[0].added,1)
+  f.sync.start({ticket:preview.ticket!,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'completed',JSON.stringify(f.sync.view()))
+  const imported=readFileSync((await files(f.targetC.directory))[0],'utf8');assert.match(imported,/ordinary JSONL body/);assert.doesNotMatch(imported,/paginated JSONL body/)
+  assert.deepEqual(readFileSync(ordinary),before[0]);assert.deepEqual(readFileSync(paginated).includes(Buffer.from('paginated JSONL body')),true)
+})
+
+test('directional selected sync returns a non-startable skip-only preview for paginated sessions',async t=>{
+  const f=fixture(t),id=randomUUID(),paginated=rollout(f.a,id,when,'paginated only body'),before=readFileSync(paginated),lines=readFileSync(paginated,'utf8').trimEnd().split('\n'),meta=JSON.parse(lines[0]);meta.payload.history_mode='paginated';meta.payload.history_base={thread_id:randomUUID(),end_ordinal_exclusive:2,end_byte_offset:0};lines[0]=JSON.stringify(meta);writeFileSync(paginated,lines.join('\n')+'\n')
+  const actualBefore=readFileSync(paginated),preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'selected',sessionIds:[id],applicationId:'fixture'})
+  assert.equal(preview.canStart,false);assert.equal(preview.ticket,undefined);assert.equal(preview.sessionCount,0);assert.equal(preview.sourceFiles,0);assert.deepEqual(preview.directional?.sessions,[])
+  assert.deepEqual(preview.unsupportedSessions?.map(item=>item.id),[id]);assert.match(preview.unsupportedSessions?.[0].reason??'',/分段历史.*SQLite/)
+  assert.equal(f.sync.view().sync?.status,'ready');assert.throws(()=>f.sync.start({ticket:randomUUID(),clientsClosed:true}),/预览已过期/)
+  assert.deepEqual(await files(f.targetC.directory),[]);assert.deepEqual(readFileSync(paginated),actualBefore);assert.notDeepEqual(before,actualBefore)
+})
+
+test('directional selected sync requires and honors an explicit same-ID source file version',async t=>{
+  const f=fixture(t),id=randomUUID(),older=rollout(f.a,id,when,'旧版本内容'),newer=rollout(f.a,id,'2026-10-01T09:00:00Z','选中的版本内容',true)
+  const page=await f.catalog.scan({runId:randomUUID(),targetId:f.targetA.id,clientType:'codex'}),record=page.items.find(row=>row.id===id)!
+  const location=record.locations.find(value=>value.targetId===f.targetA.id)!
+  assert.equal(location.ambiguous,true);assert.equal(location.versions?.length,2)
+  const chosen=location.versions!.find(version=>version.label.endsWith(newer.split('/').at(-1)!))!
+  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'selected',sessionIds:[id],applicationId:'fixture'}),/选择具体版本/)
+  const beforeSource=[readFileSync(older),readFileSync(newer)]
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'selected',sessionIds:[id],sourceSelections:[{sessionId:id,targetId:f.targetA.id,versionId:chosen.id}],applicationId:'fixture'})
+  assert.equal(preview.sourceFiles,1);assert.equal(preview.directional?.sessions[0].sourceFiles,1)
+  f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'completed',JSON.stringify(f.sync.view()))
+  assert.deepEqual(readFileSync(older),beforeSource[0]);assert.deepEqual(readFileSync(newer),beforeSource[1])
+  const imported=readFileSync((await files(f.targetC.directory))[0],'utf8');assert.match(imported,/选中的版本内容/);assert.doesNotMatch(imported,/旧版本内容/)
+})
+
+test('all-scope conflict scan is read-only and all-scope sync requires every source conflict version',async t=>{
+  const f=fixture(t),id=randomUUID(),older=rollout(f.a,id,when,'旧版本内容'),newer=rollout(f.a,id,'2026-10-01T09:00:00Z','选定的版本内容',true),sourceBefore=[readFileSync(older),readFileSync(newer)]
+  f.busy(true);const conflicts=await f.sync.conflicts({requestId:randomUUID(),sourceIds:[f.targetA.id],targetId:f.targetC.id});f.busy(false)
+  assert.equal(conflicts.length,1);assert.equal(conflicts[0].id,id);assert.equal(conflicts[0].locations[0].versions.length,2)
+  const selected=conflicts[0].locations[0].versions.find(version=>version.label.endsWith(newer.split('/').at(-1)!))!
+  assert.deepEqual(readFileSync(older),sourceBefore[0]);assert.deepEqual(readFileSync(newer),sourceBefore[1])
+  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/选择具体版本/)
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],sourceSelections:[{sessionId:id,targetId:f.targetA.id,versionId:selected.id}],applicationId:'fixture'})
+  assert.equal(preview.sessionCount,1);assert.equal(preview.sourceFiles,1)
+  f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'completed',JSON.stringify(f.sync.view()))
+  const imported=readFileSync((await files(f.targetC.directory))[0],'utf8');assert.match(imported,/选定的版本内容/);assert.doesNotMatch(imported,/旧版本内容/)
+  assert.deepEqual(readFileSync(older),sourceBefore[0]);assert.deepEqual(readFileSync(newer),sourceBefore[1])
+})
+
 test('directional all scope reads only selected source instances and rejects an empty source set',async t=>{
   const f=fixture(t),aId=randomUUID(),bId=randomUUID();rollout(f.a,aId);rollout(f.b,bId);rollout(f.targetC.directory,randomUUID())
   const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});assert.equal(preview.sessionCount,1);assert.deepEqual(preview.directional?.sessions.map(row=>row.id),[aId])
   f.sync.discard();rmSync(join(f.a,'sessions'),{recursive:true,force:true})
   await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/没有可同步的 Codex 会话/)
+})
+
+test('directional all sync still blocks unselected ambiguous branches instead of silently choosing one',async t=>{
+  const f=fixture(t),id=randomUUID();rollout(f.a,id,when,'first');rollout(f.a,id,'2026-10-01T09:00:00Z','second',true)
+  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/选择具体版本/)
+  assert.deepEqual(await files(f.targetC.directory),[])
 })
 
 test('directional preparation leaves source and target SQLite WAL/SHM sidecars byte-for-byte unchanged',async t=>{
@@ -165,7 +222,7 @@ test('directional sync rejects changed sources and paginated histories before ta
   const f=fixture(t),id=randomUUID(),path=rollout(f.a,id),beforeTarget=await files(f.targetC.directory)
   const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});appendFileSync(path,'\n');f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'failed');assert.deepEqual(await files(f.targetC.directory),beforeTarget)
   writeFileSync(path,readFileSync(path,'utf8').replace('"extra":"keep"','"history_mode":"paginated","history_base":{"thread_id":"'+randomUUID()+'"},"extra":"keep"'))
-  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/分段历史.*复制实例/)
+  const skipped=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});assert.equal(skipped.canStart,false);assert.deepEqual(skipped.unsupportedSessions?.map(item=>item.id),[id]);assert.match(skipped.unsupportedSessions?.[0].reason??'',/分段历史.*SQLite/)
   assert.deepEqual(await files(f.targetC.directory),beforeTarget)
 })
 
