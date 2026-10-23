@@ -2,13 +2,13 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { SessionContentBlock, SessionContentPage, SessionRecord } from '../../../shared/sessions'
 
-const props = defineProps<{ snapshotId: string; record: SessionRecord; targetId: string; initialQuery?: string; canResume?: boolean; canForkDefault?: boolean; resumeReason?: string }>()
+const props = defineProps<{ snapshotId: string; record: SessionRecord; targetId: string; versionId?: string; initialQuery?: string; canResume?: boolean; canForkDefault?: boolean; resumeReason?: string }>()
 const emit = defineEmits<{ close: []; resume: [record: SessionRecord]; forkDefault: [record: SessionRecord] }>()
 const result = ref<SessionContentPage>(), query = ref(props.initialQuery ?? ''), appliedQuery = ref(''), loading = ref(false), error = ref('')
 const body = ref<HTMLElement>()
 let generation = 0, alive = true
-const roles = { user: '你', assistant: 'Claude', system: '系统' }
-const clientName = computed(() => props.record.launchMode === 'desktop' ? 'Claude Desktop · Code 本地记录' : 'Claude Code CLI')
+const roles = computed(() => ({ user: '你', assistant: props.record.clientType==='codex'?'Codex':'Claude', system: '系统' }))
+const clientName = computed(() => props.record.clientType==='codex'?'Codex':props.record.launchMode === 'desktop' ? 'Claude Desktop · Code 本地记录' : 'Claude Code CLI')
 const date = (value?: number) => value ? new Date(value).toLocaleString() : ''
 const pageCount = computed(() => result.value ? Math.max(1, Math.ceil(result.value.total / result.value.pageSize)) : 0)
 const pageLabel = computed(() => result.value ? `第 ${result.value.page} / ${pageCount.value} 页 · 本页 ${result.value.messages.length} 条消息` : '')
@@ -47,7 +47,7 @@ function markdownForCurrentPage(): string {
     '> 此文件仅包含当前显示页；切换页面后可分别导出其他页。',
   ]
   for (const entry of page.messages) {
-    const heading = `## ${roles[entry.role]}${entry.timestamp ? ` · ${plainMarkdown(date(entry.timestamp))}` : ''}${entry.model ? ` · ${plainMarkdown(entry.model.replace(/[\r\n]+/g, ' '))}` : ''}`
+    const heading = `## ${roles.value[entry.role]}${entry.timestamp ? ` · ${plainMarkdown(date(entry.timestamp))}` : ''}${entry.model ? ` · ${plainMarkdown(entry.model.replace(/[\r\n]+/g, ' '))}` : ''}`
     lines.push('', heading, '')
     for (const block of entry.blocks) {
       if (block.type === 'text') lines.push(block.text.split('\n').map(plainMarkdown).join('\n'), '')
@@ -96,7 +96,7 @@ function highlight(text: string): { text: string; match: boolean }[] {
   return parts
 }
 async function load(page = 1): Promise<void> {
-  const current = ++generation, selection = { snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId, page, pageSize: 40, query: query.value.trim() }
+  const current = ++generation, selection = { snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId, ...(props.versionId ? { versionId: props.versionId } : {}), page, pageSize: 40, query: query.value.trim() }
   loading.value = true; error.value = ''; actionFeedback.value = undefined; result.value = undefined
   try {
     const next = await window.manager.sessionContent(selection)
@@ -106,7 +106,7 @@ async function load(page = 1): Promise<void> {
   } catch (cause) { if (alive && current === generation) error.value = String(cause) }
   finally { if (alive && current === generation) loading.value = false }
 }
-watch(() => [props.snapshotId, props.record.id, props.targetId], () => { query.value = props.initialQuery ?? ''; void load() })
+watch(() => [props.snapshotId, props.record.id, props.targetId, props.versionId], () => { query.value = props.initialQuery ?? ''; void load() })
 onMounted(() => { void load() })
 onUnmounted(() => { alive = false; generation++ })
 </script>
@@ -115,7 +115,7 @@ onUnmounted(() => { alive = false; generation++ })
   <a-modal open :width="960" title="会话内容" :footer="null" class="session-content-modal" @cancel="emit('close')">
     <div class="session-reader">
       <header class="session-reader-heading">
-        <div><h2>{{record.title}}</h2><div class="session-reader-source"><a-tag>{{clientName}}</a-tag><span>{{result?.sourceName ?? record.locations.find(location => location.targetId === targetId)?.name}}</span></div></div>
+        <div><h2>{{result?.title ?? record.title}}</h2><div class="session-reader-source"><a-tag>{{clientName}}</a-tag><span>{{result?.sourceName ?? record.locations.find(location => location.targetId === targetId)?.name}}</span></div></div>
         <a-space><a-button v-if="canResume" type="primary" :disabled="loading" @click="emit('resume', record)">恢复此会话</a-button><a-button v-if="canForkDefault" type="primary" :disabled="loading" @click="emit('forkDefault', record)">在 Terminal 中分叉</a-button></a-space>
       </header>
       <p class="muted session-reader-project">项目：{{result?.cwd ?? record.cwd}}</p>

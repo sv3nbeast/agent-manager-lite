@@ -515,7 +515,7 @@ async function main(): Promise<void> {
       case 'cancelSessionTokens': sessions.cancelTokens(z.string().uuid().parse(input));return
       case 'openSession': {
         const parsed=sessionSelectionSchema.extend({action:z.enum(['location','file'])}).strict().parse(input)
-        const {action,...selection}=parsed,path=await sessions.location(selection)
+        const {action,...selection}=parsed,path=await sessions.location(selection,action)
         if(action==='location')shell.showItemInFolder(path)
         else if(await shell.openPath(path))throw new Error('无法打开会话文件，请检查默认应用')
         return

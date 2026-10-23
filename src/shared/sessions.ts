@@ -8,7 +8,7 @@ export const sessionScanSchema=z.object({runId:z.string().uuid(),targetId:z.stri
 export type SessionScanInput=z.infer<typeof sessionScanSchema>
 export const sessionPageSchema=z.object({snapshotId:z.string().uuid(),page:z.number().int().min(1).max(100000),pageSize:z.number().int().min(1).max(100).default(25)}).strict()
 export type SessionPageInput=z.infer<typeof sessionPageSchema>
-export const sessionSelectionSchema=z.object({snapshotId:z.string().uuid(),sessionId,targetId:z.string().uuid()}).strict()
+export const sessionSelectionSchema=z.object({snapshotId:z.string().uuid(),sessionId,targetId:z.string().uuid(),versionId:z.string().regex(/^[a-f0-9]{32}$/).optional()}).strict()
 /** A resume directory is an explicit choice tied to the scanned transcript source. */
 export const claudeResumeSelectionSchema=sessionSelectionSchema.extend({sourceId:z.string().min(1).max(256),cwd:z.string().min(1).max(4096)}).strict()
 export type ClaudeResumeSelection=z.infer<typeof claudeResumeSelectionSchema>
@@ -19,11 +19,12 @@ export const sessionContentSchema=sessionSelectionSchema.extend({page:z.number()
 export type SessionContentInput=z.infer<typeof sessionContentSchema>
 export interface SessionContentBlock {type:'text'|'thinking'|'tool_use'|'tool_result'|'notice';text:string;name?:string;truncated?:boolean}
 export interface SessionContentMessage {index:number;role:'user'|'assistant'|'system';timestamp?:number;model?:string;blocks:SessionContentBlock[];truncated?:boolean}
-export interface SessionContentPage {snapshotId:string;sessionId:string;sourceSessionId:string;title:string;cwd:string;sourceName:string;clientType:'claude_code';page:number;pageSize:number;total:number;messages:SessionContentMessage[];warnings:string[]}
+export interface SessionContentPage {snapshotId:string;sessionId:string;sourceSessionId:string;title:string;cwd:string;sourceName:string;clientType:'codex'|'claude_code';page:number;pageSize:number;total:number;messages:SessionContentMessage[];warnings:string[]}
 // Token reports may span several UI pages. Keep a bounded batch so a report
 // remains cancellable and cannot turn into an unbounded directory scan.
 export const sessionStatsSchema=z.object({snapshotId:z.string().uuid(),sessionIds:z.array(sessionId).min(1).max(1000)}).strict()
-export interface SessionLocation {targetId:string;name:string;directory:string;running:boolean;archived:boolean;ambiguous:boolean;historicalCopies?:number;historyMode?:'paginated'}
+export interface SessionFileVersion {id:string;label:string;archived:boolean;updatedAt?:number;historyMode?:'paginated'}
+export interface SessionLocation {targetId:string;name:string;directory:string;running:boolean;archived:boolean;ambiguous:boolean;historicalCopies?:number;historyMode?:'paginated';versions?:SessionFileVersion[]}
 export interface SessionTokens {input:number;output:number;total:number}
 export interface SessionCapabilities {open:boolean;transfer:boolean;archive:boolean;trash:boolean;visibilityRepair:boolean;tokens:boolean;contentSearch:boolean;content?:boolean;resume?:boolean}
 export interface SessionSource extends ClientConfigTarget {clientType:'codex'|'claude_code';readOnly?:boolean;launchMode?:'cli'|'desktop'}

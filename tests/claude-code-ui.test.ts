@@ -515,6 +515,35 @@ test('copying a Claude session ID calls the direct API without opening a locatio
   assert.equal(f.state.choosing, undefined, 'copy must not briefly open the directory picker')
 })
 
+test('Codex session conflict UI selects a physical rollout before content and file actions', async t => {
+  const targetId = randomUUID(), id = randomUUID(), versionId = 'b'.repeat(32)
+  const location = { targetId, name: 'Codex copy', directory: '/fixture/codex', running: false, archived: false, ambiguous: true, versions: [
+    { id: versionId, label: 'sessions/2026/rollout-one.jsonl', archived: false, updatedAt: 1 },
+    { id: 'c'.repeat(32), label: 'archived_sessions/2026/rollout-two.jsonl', archived: true, updatedAt: 2 },
+  ] }
+  const row = { id, clientType: 'codex', title: 'A conflicted session', cwd: '/fixture/project', kind: 'conversation', locations: [location], capabilities: { content: true } }
+  const page = { snapshotId: randomUUID(), scannedAt: 1, total: 1, page: 1, pageSize: 25, items: [row], warnings: [], sources: [{ id: targetId, name: 'Codex copy', directory: location.directory, role: 'instance', clientType: 'codex' }] }
+  const opens: any[] = []
+  const f = await component(t, 'SessionsView', {}, {
+    listClientConfigs: async () => [], scanSessions: async () => page, cancelSessionScan: async () => {}, cancelSessionTokens: async () => {},
+    openSession: async (input: any) => { opens.push(input) },
+  }, data())
+  await f.state.reload()
+  f.state.open(row, 'content')
+  assert.equal(f.state.choosing.action, 'content')
+  f.state.selectedVersion = versionId
+  await f.state.confirmOpen(); await nextTick()
+  assert.equal(f.state.reader.versionId, versionId)
+  assert.equal(f.state.reader.targetId, targetId)
+  f.state.reader = undefined; f.state.open(row, 'file')
+  f.state.selectedVersion = versionId
+  await f.state.confirmOpen(); await nextTick()
+  assert.deepEqual(opens.at(-1), { snapshotId: page.snapshotId, sessionId: id, targetId, action: 'file', versionId })
+  f.state.open(row, 'location'); await f.state.confirmOpen(); await nextTick()
+  assert.deepEqual(opens.at(-1), { snapshotId: page.snapshotId, sessionId: id, targetId, action: 'location', versionId: undefined })
+  f.state.selectRows([id]);assert.deepEqual(f.state.selectedIds,[],'conflict rows must not enter bulk mutation selections')
+})
+
 test('Claude session source capabilities remain visible while refreshing and after a failed refresh', async t => {
   const page = { snapshotId: 'fixture-snapshot', scannedAt: 1, total: 0, page: 1, pageSize: 25, items: [], warnings: [], sources: [
     { id: 'claude-source', name: 'Claude fixture', directory: '/fixture/claude', role: 'instance', clientType: 'claude_code', readOnly: true },

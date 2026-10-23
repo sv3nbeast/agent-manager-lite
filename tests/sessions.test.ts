@@ -109,6 +109,27 @@ test('active state index resolves native paginated segments while retaining ever
   assert.deepEqual(hashes(a.home),before)
 })
 
+test('ambiguous Codex rollout versions are listed and can only be opened or previewed after explicit version choice',async t=>{
+  const f=fixture(t),a=f.source('conflicting-rollouts'),id=randomUUID(),first=rollout(a.home,id,[{type:'event_msg',timestamp:when,payload:{type:'user_message',message:'first version body'}}]),second=rollout(a.home,id,[{type:'event_msg',timestamp:'2026-10-01T09:00:00Z',payload:{type:'user_message',message:'second version body'}}],'archived_sessions','second')
+  const secondLines=readFileSync(second,'utf8').trimEnd().split('\n'),secondMeta=JSON.parse(secondLines[0]);secondMeta.payload.cwd='/fixture/archived-version-project';secondLines[0]=JSON.stringify(secondMeta);writeFileSync(second,secondLines.join('\n')+'\n')
+  const page=await f.scan({targetId:a.target.id}),record=page.items.find(row=>row.id===id)!,location=record.locations[0]
+  assert.equal(location.ambiguous,true);assert.deepEqual(location.versions?.map(value=>value.label).sort(),[relative(a.home,first).split('\\').join('/'),relative(a.home,second).split('\\').join('/')].sort())
+  assert.ok(location.versions?.every(value=>/^[a-f0-9]{32}$/.test(value.id)))
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id},'location'),a.home,'opening location remains available without choosing a rollout')
+  await assert.rejects(f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),/选择具体版本/)
+  await assert.rejects(f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),/选择具体版本/)
+  const selected=location.versions!.find(value=>value.label===relative(a.home,first).split('\\').join('/'))!,contents=await f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id,versionId:selected.id})
+  assert.equal(contents.clientType,'codex');assert.equal(contents.total,1);assert.match(contents.messages[0].blocks[0].text,/first version body/);assert.equal(contents.sourceName,location.name+' · '+selected.label)
+  assert.equal(contents.title,record.title);assert.equal(contents.cwd,'/fixture/project/src')
+  const archivedVersion=location.versions!.find(value=>value.label===relative(a.home,second).split('\\').join('/'))!,archivedContent=await f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id,versionId:archivedVersion.id})
+  assert.equal(archivedContent.cwd,'/fixture/archived-version-project');assert.equal(archivedContent.sourceName,location.name+' · '+archivedVersion.label)
+  assert.deepEqual(await f.catalog.tokenStats({snapshotId:page.snapshotId,sessionIds:[id]}),[{id,error:'此会话存在同 ID 文件冲突，请先逐个核对版本'}])
+  assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id,versionId:selected.id}),first)
+  const replacement=join(a.home,'sessions','2026','10','01','rollout-replaced.jsonl');writeFileSync(replacement,readFileSync(first))
+  rmSync(first)
+  await assert.rejects(f.catalog.content({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id,versionId:selected.id}),/已被替换|已变化|版本已变化/)
+})
+
 test('only the active profile sqlite_home resolves segments; inactive/root index paths have no authority',async t=>{
   const f=fixture(t),a=f.source('profiles'),id=randomUUID(),first=paginatedRollout(a.home,id,100,'first'),current=paginatedRollout(a.home,id,200,'current')
   mkdirSync(join(a.home,'sqlite'));mkdirSync(join(a.home,'inactive'))
@@ -373,6 +394,26 @@ test('a registered copy remains manageable when its conversation ID also exists 
   assert.ok(row.locations.some(location=>location.targetId===page.sources?.find(source=>source.directory===native)?.id))
   assert.equal(nativeFile.startsWith(native),true)
   assert.deepEqual(treeState(native),nativeBefore);assert.deepEqual(treeState(managed.home),managedBefore)
+})
+
+test('Codex same-ID conflicts across a default read-only home and managed instance stay explicitly unselectable for mutation',async t=>{
+  const f=fixture(t),native=join(f.root,'newer-native-home'),managed=f.source('older-managed-copy'),id=randomUUID()
+  mkdirSync(native);rollout(native,id,[{type:'event_msg',timestamp:'2026-10-02T08:00:00Z',payload:{type:'user_message',message:'newer native version'}}])
+  rollout(managed.home,id,[{type:'event_msg',timestamp:'2026-10-01T08:00:00Z',payload:{type:'user_message',message:'managed version'}}])
+  const catalog=new SessionCatalog(f.store,undefined,{defaultCodexDirectory:native,defaultClaudeDirectory:null});t.after(()=>catalog.stop())
+  const page=await catalog.scan({runId:randomUUID(),clientType:'codex'}),row=page.items.find(value=>value.id===id)!
+  assert.equal(row.locations.length,2);assert.equal(row.locations.find(location=>location.targetId===managed.target.id)?.ambiguous,false)
+  assert.equal(row.capabilities?.transfer,true,'a separate non-conflicted managed source remains selectable when the default home is newer')
+  assert.doesNotThrow(()=>catalog.selectedRecords(page.snapshotId,[id]))
+  assert.equal((await catalog.transferSources(page.snapshotId,[id]))[0].targetId,managed.target.id)
+  const conflict=rollout(native,id,[{type:'event_msg',timestamp:'2026-10-03T08:00:00Z',payload:{type:'user_message',message:'conflicting native branch'}}],'archived_sessions','conflict')
+  const conflictPage=await catalog.scan({runId:randomUUID(),clientType:'codex'}),conflictRow=conflictPage.items.find(value=>value.id===id)!
+  assert.equal(conflictRow.locations.find(location=>location.targetId===managed.target.id)?.ambiguous,false)
+  assert.equal(conflictRow.locations.find(location=>location.targetId===page.sources?.find(source=>source.directory===native)?.id)?.ambiguous,true)
+  assert.equal(conflictRow.capabilities?.transfer,false,'a conflicted source prevents fallback to another copy until explicitly reviewed')
+  assert.throws(()=>catalog.selectedRecords(conflictPage.snapshotId,[id]),/同 ID 文件冲突/)
+  await assert.rejects(catalog.transferSources(conflictPage.snapshotId,[id]),/冲突/)
+  assert.ok(conflict)
 })
 
 test('source counts describe whole scanned directories and distinguish empty defaults from unreadable sources',async t=>{

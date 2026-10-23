@@ -1,5 +1,5 @@
 import {createHash,randomUUID} from 'node:crypto'
-import {lstat} from 'node:fs/promises'
+import {lstat,type FileHandle} from 'node:fs/promises'
 import {lstatSync,realpathSync,statSync,type Stats} from 'node:fs'
 import {homedir} from 'node:os'
 import {basename,dirname,isAbsolute,join,relative,resolve,sep} from 'node:path'
@@ -14,8 +14,9 @@ import {probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,pathContains,validateExternalHome} from './instancePaths'
 import {scanClaudeCodeSessionsAsync,verifyClaudeSessionLocation,readClaudeSessionContent,previewClaudeSessionResume,type ClaudeSessionLocation,type ClaudeSessionRecord,type ClaudeSessionResumePreview} from './claudeCodeSessions'
 import {isClaudeDesktopProfile} from '../shared/instances'
+import {readCodexSessionContent} from './codexSessionContent'
 
-interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;record:SessionRecord;duplicateOf?:string}
+interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;mtime:number;ctime:number;record:SessionRecord;duplicateOf?:string}
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
 interface ClaudeSourceFile {target:SessionSource;profile:string;location:ClaudeSessionLocation;sessionId:string;record:ClaudeSessionRecord}
 export interface CatalogClaudeResumePreview extends ClaudeSessionResumePreview {instanceRevision:number;profileFingerprint:string}
@@ -162,9 +163,9 @@ export class SessionCatalog {
                 const updatedAt=indexed!==undefined&&(activity===undefined||Math.abs(indexed-activity)<=3600000)?indexed:activity??stat.mtimeMs
                 const historyMode=meta.payload?.history_mode==='paginated'?'paginated' as const:undefined
                 const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false,...historyMode?{historyMode}:{}}
-                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',...historyMode?{historyMode}:{}}
+                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',capabilities:{open:true,transfer:!readOnly,archive:!readOnly,trash:!readOnly,visibilityRepair:!readOnly,tokens:true,contentSearch:true,content:true},...historyMode?{historyMode}:{}}
                 const matched=[title,id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase()))&&(!input.contentQuery||await sessionContains(file,stat.size,input.contentQuery,signal))
-                sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,size:stat.size,record:structuredClone(record)}})
+                sourceRows.push({record,matched,file:{path,root,targetId:target.id,device:stat.dev,inode:stat.ino,rootDevice:rootStat.dev,rootInode:rootStat.ino,size:stat.size,mtime:stat.mtimeMs,ctime:stat.ctimeMs,record:structuredClone(record)}})
               }finally{await file.close()}
             }catch(error){signal.throwIfAborted();warn(`部分会话文件无法读取（${basename(path)}），请刷新或检查文件`)}
           }
@@ -190,6 +191,17 @@ export class SessionCatalog {
             // guess from filenames, mtime, the longest file or inactive DBs.
             const indexed=ordered.filter(row=>row.file.path===indexedRollouts.get(id)),primary=!identical&&indexed.length===1?indexed[0]:undefined
             const selected=primary?[primary]:identical?[ordered[0]]:ordered
+            if(!primary&&!identical&&rows.length>1){
+              const conflictLocation:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:false,ambiguous:true,versions:ordered.map(row=>({id:this.versionId(row.file),label:relative(root,row.file.path).split(sep).join('/'),archived:row.record.locations[0].archived,updatedAt:row.record.updatedAt,historyMode:row.record.historyMode}))}
+              // Keep every conflicting physical file in the snapshot. The UI
+              // can only send a version ID; the main process resolves it back
+              // to one of these scanned, identity-checked files.
+              files.set(id,[...files.get(id)??[],...ordered.map(row=>row.file)])
+              const existing=records.get(id)
+              if(existing){const location=existing.locations.find(value=>value.targetId===target.id);if(location)Object.assign(location,conflictLocation);else existing.locations.push(conflictLocation)}
+              else records.set(id,{...structuredClone(ordered[0].record),locations:[conflictLocation]})
+              continue
+            }
             const retained=primary?ordered.filter(row=>row!==primary):identical?ordered.slice(1):[]
             for(const row of retained)row.file.duplicateOf=selected[0].file.path
             if(primary)primary.record.locations[0].historicalCopies=retained.length
@@ -200,14 +212,10 @@ export class SessionCatalog {
               const existing=records.get(id)
               if(existing){
                 const location=existing.locations.find(value=>value.targetId===target.id)
-                if(location)location.ambiguous=true
+                if(location&&!location.versions?.length)location.ambiguous=true
                 else existing.locations.push(record.locations[0])
                 if((record.updatedAt??0)>(existing.updatedAt??0)){const locations=existing.locations;records.set(id,{...record,locations})}
               }else records.set(id,record)
-            }
-            if(!identical&&!primary&&rows.length>1){
-              const location=records.get(id)?.locations.find(value=>value.targetId===target.id)
-              if(location)location.ambiguous=true
             }
           }
           if(complete)sourceCounts[target.id]=grouped.size
@@ -243,13 +251,18 @@ export class SessionCatalog {
         }catch{signal.throwIfAborted();warn('实例目录已变化或无法安全读取，请刷新后重试')}
       }
       signal.throwIfAborted()
-      const sorted=[...records.values()].map(record=>record.locations.every(location=>this.readOnlyCodexSource(location.targetId))?{...record,capabilities:{open:true,transfer:false,archive:false,trash:false,visibilityRepair:false,tokens:true,contentSearch:true}}:record).filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)&&(!input.projectQuery||[record.cwd,record.projectName??''].some(value=>value.toLowerCase().includes(input.projectQuery.toLowerCase())))).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
+      const sorted=[...records.values()].map(record=>{
+        if(record.clientType!=='codex')return record
+        const writable=record.locations.some(location=>!this.readOnlyCodexSource(location.targetId)),conflicted=record.locations.some(location=>location.ambiguous)
+        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
+      }).filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)&&(!input.projectQuery||[record.cwd,record.projectName??''].some(value=>value.toLowerCase().includes(input.projectQuery.toLowerCase())))).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
       this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,claudeFiles,warnings:[...warnings].slice(0,100),sourceCounts,sources}
       return this.page({snapshotId:this.snapshot.id,page:1,pageSize:25})
     }catch(error){if(signal.aborted)throw new Error('会话读取已取消');throw error}
     finally{if(this.scanning===run)this.scanning=undefined}
   }
   private current(id:string):Snapshot{const snapshot=this.snapshot;if(!snapshot||snapshot.id!==id)throw new Error('会话列表已更新，请重新读取');return snapshot}
+  private versionId(source:SourceFile):string{return createHash('sha256').update(JSON.stringify([source.path,source.device,source.inode,source.size,source.mtime,source.ctime])).digest('hex').slice(0,32)}
   page(raw:unknown):SessionPage{
     const input=sessionPageSchema.parse(raw),snapshot=this.current(input.snapshotId),page=Math.min(input.page,Math.max(1,Math.ceil(snapshot.records.length/input.pageSize)))
     return {snapshotId:snapshot.id,scannedAt:snapshot.scannedAt,total:snapshot.records.length,page,pageSize:input.pageSize,items:structuredClone(snapshot.records.slice((page-1)*input.pageSize,page*input.pageSize)),warnings:[...snapshot.warnings],sourceCounts:{...snapshot.sourceCounts},sources:structuredClone(snapshot.sources)}
@@ -265,7 +278,8 @@ export class SessionCatalog {
     signal.throwIfAborted()
     const target=this.codexIdentityTarget(source.targetId);if(target.directory!==source.root)throw new Error('会话来源目录已改变')
     const root=await lstat(source.root);if(root.dev!==source.rootDevice||root.ino!==source.rootInode)throw new Error('会话来源目录已被替换')
-    const opened=await openSessionFile(source.root,source.path)
+    let opened:{file:FileHandle;stat:Stats}
+    try{opened=await openSessionFile(source.root,source.path)}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')throw new Error('会话文件已变化或被移除，请刷新列表');throw error}
     try{
       if(opened.stat.dev!==source.device||opened.stat.ino!==source.inode)throw new Error('会话文件已被替换，请刷新列表')
       const meta=await firstSessionEvent(opened.file,opened.stat.size,signal)
@@ -273,7 +287,7 @@ export class SessionCatalog {
       await this.unchanged(source,opened.stat);signal.throwIfAborted();return opened
     }catch(error){await opened.file.close();throw error}
   }
-  async location(raw:unknown):Promise<string>{
+  async location(raw:unknown,action:'location'|'file'='file'):Promise<string>{
     const input=sessionSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),claude=snapshot.claudeFiles.get(input.sessionId)
     if(claude){
       if(claude.target.id!==input.targetId||!snapshot.records.some(record=>record.id===input.sessionId))throw new Error('会话不属于所选目录')
@@ -281,13 +295,36 @@ export class SessionCatalog {
       if(current.profile!==claude.profile)throw new Error('Claude Code 会话来源实例已变化，请刷新列表')
       const path=verifyClaudeSessionLocation(claude.location);this.current(input.snapshotId);return path
     }
-    const sources=snapshot.files.get(input.sessionId)?.filter(value=>value.targetId===input.targetId&&!value.duplicateOf)??[]
-    if(sources.length!==1)throw new Error(sources.length?'所选目录存在多个同 ID 会话，无法确定文件':'会话不属于所选目录')
+    const allSources=snapshot.files.get(input.sessionId)?.filter(value=>value.targetId===input.targetId)??[]
+    const sources=allSources.filter(value=>!value.duplicateOf)
+    const location=snapshot.records.find(record=>record.id===input.sessionId)?.locations.find(value=>value.targetId===input.targetId)
+    if(!location)throw new Error('会话不属于所选目录')
+    if(action==='location'&&location.versions?.length){
+      const rootSource=allSources[0]
+      if(!rootSource)throw new Error('会话来源已变化，请刷新列表')
+      const target=this.codexIdentityTarget(input.targetId)
+      if(target.directory!==rootSource.root)throw new Error('会话来源目录已改变')
+      const root=await lstat(rootSource.root)
+      if(root.dev!==rootSource.rootDevice||root.ino!==rootSource.rootInode)throw new Error('会话来源目录已被替换')
+      this.current(input.snapshotId);return rootSource.root
+    }
+    if(location.versions?.length){const version=location.versions.find(value=>value.id===input.versionId);if(!version)throw new Error('此会话存在多个同 ID 文件，请选择具体版本');const chosen=allSources.find(source=>this.versionId(source)===version.id);if(!chosen)throw new Error('会话文件版本已变化，请刷新列表');const opened=await this.verified(chosen,input.sessionId,new AbortController().signal);try{if(opened.stat.size!==chosen.size||opened.stat.mtimeMs!==chosen.mtime||opened.stat.ctimeMs!==chosen.ctime)throw new Error('会话文件版本已变化，请刷新列表')}finally{await opened.file.close()};this.current(input.snapshotId);return chosen.path}
+    if(sources.length!==1)throw new Error(sources.length?'所选目录存在多个同 ID 会话文件，请刷新后选择版本':'会话不属于所选目录')
     const opened=await this.verified(sources[0],input.sessionId,new AbortController().signal);await opened.file.close();this.current(input.snapshotId);return sources[0].path
   }
   async content(raw:unknown):Promise<SessionContentPage>{
     const input=sessionContentSchema.parse(raw),snapshot=this.current(input.snapshotId),claude=snapshot.claudeFiles.get(input.sessionId),row=snapshot.records.find(record=>record.id===input.sessionId)
-    if(!claude||!row||claude.target.id!==input.targetId)throw new Error('所选会话不支持此正文阅读器，或不属于当前目录')
+    if(!row||!row.locations.some(location=>location.targetId===input.targetId))throw new Error('所选会话不属于当前目录')
+    if(!claude){
+      const location=row.locations.find(value=>value.targetId===input.targetId)!,sources=snapshot.files.get(input.sessionId)?.filter(value=>value.targetId===input.targetId&&!value.duplicateOf)??[]
+      let source:SourceFile|undefined
+      if(sources.length===1)source=sources[0]
+      else if(location.versions?.length){const version=location.versions.find(value=>value.id===input.versionId);if(!version)throw new Error('所选 Codex 会话存在多个同 ID 文件冲突，请选择具体版本');source=sources.find(value=>this.versionId(value)===version.id);if(!source)throw new Error('所选会话文件版本已变化，请刷新列表')}
+      if(!source)throw new Error('所选 Codex 会话存在文件冲突，请先选择具体版本')
+      const opened=await this.verified(source,input.sessionId,new AbortController().signal)
+      try{if(opened.stat.size!==source.size||opened.stat.mtimeMs!==source.mtime||opened.stat.ctimeMs!==source.ctime)throw new Error('会话文件已变化，请刷新列表');const content=await readCodexSessionContent(opened.file,opened.stat.size,{page:input.page,pageSize:input.pageSize,query:input.query});await this.unchanged(source,opened.stat);this.current(input.snapshotId);return {snapshotId:input.snapshotId,sessionId:row.id,sourceSessionId:row.id,title:source.record.title,cwd:source.record.cwd,sourceName:location.versions?.length?`${location.name} · ${relative(source.root,source.path).split(sep).join('/')}`:location.name,clientType:'codex',...content}}finally{await opened.file.close()}
+    }
+    if(claude.target.id!==input.targetId)throw new Error('所选会话不属于当前目录')
     const current=await this.claudeTargetIdentity(claude.target)
     if(current.profile!==claude.profile)throw new Error('Claude Code 会话来源实例已变化，请刷新列表')
     const content=readClaudeSessionContent(claude.location,{page:input.page,pageSize:input.pageSize,query:input.query})
@@ -343,7 +380,7 @@ export class SessionCatalog {
   }
   selectedRecords(snapshotId:string,ids:string[]):SessionRecord[]{
     const input=sessionStatsSchema.parse({snapshotId,sessionIds:ids}),snapshot=this.current(input.snapshotId)
-    return [...new Set(input.sessionIds)].map(id=>{const row=snapshot.records.find(row=>row.id===id);if(!row)throw new Error('所选会话不在当前列表中，请重新选择');if(row.clientType==='claude_code')throw new Error('Claude Code 会话当前仅支持只读查看，不能使用 Codex 会话修改操作');if(row.locations.every(location=>this.readOnlyCodexSource(location.targetId)))throw new Error('本机默认 Codex 会话来源仅支持只读查看，不能使用批量修改操作');z.string().uuid().parse(id);return structuredClone(row)})
+    return [...new Set(input.sessionIds)].map(id=>{const row=snapshot.records.find(row=>row.id===id);if(!row)throw new Error('所选会话不在当前列表中，请重新选择');if(row.clientType==='claude_code')throw new Error('Claude Code 会话当前仅支持只读查看，不能使用 Codex 会话修改操作');if(row.locations.every(location=>this.readOnlyCodexSource(location.targetId)))throw new Error('本机默认 Codex 会话来源仅支持只读查看，不能使用批量修改操作');if(row.locations.some(location=>location.ambiguous))throw new Error('所选会话存在同 ID 文件冲突，请先逐个核对版本');z.string().uuid().parse(id);return structuredClone(row)})
   }
   async transferSources(snapshotId:string,ids:string[],signal=new AbortController().signal):Promise<SessionTransferSource[]>{
     const input=sessionStatsSchema.extend({sessionIds:z.array(z.string().min(1).max(256)).min(1).max(1000)}).parse({snapshotId,sessionIds:ids}),snapshot=this.current(input.snapshotId),result:SessionTransferSource[]=[]
@@ -399,6 +436,7 @@ export class SessionCatalog {
         if(snapshot.records.find(record=>record.id===id)?.capabilities?.tokens===false){results.push({id,error:'Claude Code 会话用量尚未接入'});continue}
         let found:SessionTokenResult|undefined,failed=false
         const record=snapshot.records.find(record=>record.id===id)!
+        if(record.locations.some(location=>location.ambiguous)){results.push({id,error:'此会话存在同 ID 文件冲突，请先逐个核对版本'});continue}
         for(const location of record.locations){
           if(location.ambiguous){failed=true;continue}
           const source=snapshot.files.get(id)!.find(value=>value.targetId===location.targetId&&!value.duplicateOf)!

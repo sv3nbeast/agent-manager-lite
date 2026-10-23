@@ -56,6 +56,16 @@ test('Claude reader binds whole-conversation search and pagination to the origin
   assert.equal(ui.state.appliedQuery, 'second page')
 })
 
+test('Codex reader binds the explicitly selected physical rollout version to transcript IPC', async t => {
+  const calls: unknown[] = [], versionId = 'a'.repeat(32)
+  const record = session('codex-fixture')
+  record.clientType = 'codex'; record.sourceSessionId = undefined
+  const ui = mount('SessionContentPanel', { sessionContent: async (value: any) => { calls.push(structuredClone(value)); return { ...content(value.sessionId, 'Codex response'), clientType: 'codex' } } }, { record, versionId })
+  t.after(ui.unmount); await settle()
+  assert.deepEqual(calls[0], { snapshotId: 'snapshot', sessionId: 'codex-fixture', targetId: session().locations[0].targetId, versionId, page: 1, pageSize: 40, query: '' })
+  assert.equal(ui.state.result.clientType, 'codex')
+})
+
 test('a delayed transcript cannot replace another source after navigating between conversations', async t => {
   const first = deferred<SessionContentPage>(), second = deferred<SessionContentPage>(), calls: string[] = []
   const ui = mount('SessionContentPanel', { sessionContent: (value: any) => { calls.push(value.sessionId); return calls.length === 1 ? first.promise : second.promise } })
