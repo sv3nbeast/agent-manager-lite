@@ -102,12 +102,24 @@ export async function rollbackSync(journal:SyncJournal):Promise<void>{
   for(const file of installed)unlinkSync(join(journal.root,file.relative))
   for(const old of moved)renameSync(join(syncStage(journal),old.stage),join(journal.root,old.relative))
 }
-export function cleanupSync(journal:SyncJournal):void{
+export async function cleanupSync(journal:SyncJournal):Promise<void>{
   if(!['done','committed','rolled_back'].includes(journal.phase))throw new Error('同步尚未提交或恢复，不能清理备份')
   verifySyncRoot(journal);if(!existsSync(syncStage(journal))&&journal.phase==='rolled_back')return
   verifyStage(journal)
   if(journal.phase==='rolled_back'){rmSync(syncStage(journal),{recursive:true});return}
-  for(const file of journal.outputs){const path=join(syncStage(journal),file.stage),stat=currentFile(journal.root,path);if(stat){if(!stat.isFile()||stat.isSymbolicLink()||stat.dev!==file.device||stat.ino!==file.inode)throw new Error('同步暂存文件已变化');unlinkSync(path)}}
+  const checked=new Map<string,Stats|undefined>()
+  for(const file of journal.outputs){
+    const staged=join(syncStage(journal),file.stage),destination=join(journal.root,file.relative),stageStat=await inspectFile(journal.root,staged,file)
+    // Keep the staged copy until the committed destination is proven to be
+    // the same complete inode. Recovery can then retain the only merged copy
+    // if another process removes or replaces the destination.
+    if(!stageStat)continue
+    const destinationStat=await inspectFile(journal.root,destination,file)
+    if(!destinationStat||destinationStat.dev!==stageStat.dev||destinationStat.ino!==stageStat.ino)throw new Error('同步目标会话已被移除或替换，已保留暂存副本')
+    checked.set(staged,stageStat);checked.set(destination,destinationStat)
+  }
+  unchanged(journal.root,checked)
+  for(const file of journal.outputs){const path=join(syncStage(journal),file.stage);if(currentFile(journal.root,path))unlinkSync(path)}
   // Preserve overwritten originals and readable metadata backups for the user.
   for(const item of journal.metadata)if(item.before!==null&&!existsSync(join(syncStage(journal),item.name+'.before')))atomic(join(syncStage(journal),item.name+'.before'),item.before)
 }

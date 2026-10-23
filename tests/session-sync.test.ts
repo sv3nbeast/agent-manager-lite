@@ -14,14 +14,14 @@ import {rolloutFiles} from '../src/main/sessionFiles'
 const when='2026-10-01T08:00:00Z'
 function rollout(home:string,id:string,time=when,body='test',duplicate=false){const folder=join(home,'sessions','2026','10','01');mkdirSync(folder,{recursive:true});const path=join(folder,`rollout-2026-10-01T08-00-${duplicate?'01':'00'}-${id}.jsonl`);writeFileSync(path,JSON.stringify({type:'session_meta',timestamp:when,payload:{id,cwd:'/fixture/中文项目',model_provider:'openai',extra:'keep'}})+'\n'+JSON.stringify({type:'event_msg',timestamp:time,payload:{type:'user_message',message:body}})+'\n');return path}
 function fixture(t:{after(fn:()=>void|Promise<void>):void},rebuild:ConstructorParameters<typeof SessionSync>[4]=async()=>{}){
-  const root=realpathSync(mkdtempSync(join(process.platform==='darwin'?'/tmp':tmpdir(),'cml-sync-job-'))),store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null}),a=join(root,'a'),b=join(root,'b');mkdirSync(a);mkdirSync(b)
-  const targets=[configs.register(a),configs.register(b)],program=join(root,'codex');writeFileSync(program,Buffer.from('cffaedfe00000000','hex'),{mode:0o700});const apps=[{id:'fixture',name:'Fixture CLI',kind:'cli' as const,path:program}]
+  const root=realpathSync(mkdtempSync(join(process.platform==='darwin'?'/tmp':tmpdir(),'cml-'))),store=new Store(join(root,'data'),{encrypt:value=>Buffer.from(value),decrypt:value=>value.toString()}),configs=new ClientConfigs(store),catalog=new SessionCatalog(store,undefined,{defaultCodexDirectory:null,defaultClaudeDirectory:null})
+  const targetIds=[randomUUID(),randomUUID(),randomUUID()],externalHomes=targetIds.map((_,index)=>{const directory=join(root,`h${index}`);mkdirSync(directory);const stat=lstatSync(directory);return {directory,device:stat.dev,inode:stat.ino}});store.transaction(state=>{state.instances=targetIds.map((id,index)=>({id,name:`Fixture ${index}`,revision:0,createdAt:Date.now(),applicationId:'fixture',accountId:'',model:'fixture-model',defaultTier:'inherit',extraArgs:[],connectionMode:'native',externalHome:externalHomes[index]} as any))});const instanceTargets=targetIds.map(id=>configs.targets().find(target=>target.id===id)!);const [targetA,targetB,targetC]=instanceTargets;const a=targetA.directory,b=targetB.directory,targets=[targetA,targetB],program=join(root,'codex');writeFileSync(program,Buffer.from('cffaedfe00000000','hex'),{mode:0o700});const apps=[{id:'fixture',name:'Fixture CLI',kind:'cli' as const,path:program}]
   let sync:SessionSync,externalBusy=false,now=Date.now()
   const transfers=new SessionTransfers(store,catalog,()=>apps,id=>sync?.busy(id)??false,async()=>{}),create=(indexer=rebuild)=>new SessionSync(store,transfers,()=>apps,()=>externalBusy,indexer,()=>now);sync=create()
-  const preview=()=>sync.preview({targetIds:targets.map(item=>item.id),applicationId:'fixture'})
+  const preview=()=>sync.preview({targetIds:[targetA.id,targetB.id],applicationId:'fixture'})
   const start=async()=>{const view=await preview();sync.start({ticket:view.ticket,clientsClosed:true});await sync.settled();assert.equal(sync.view().sync?.status,'completed',JSON.stringify(sync.view()));return view}
   t.after(async()=>{await sync.stop();await transfers.stop();catalog.stop();rmSync(root,{recursive:true,force:true})})
-  return {root,store,configs,catalog,a,b,targets,program,apps,transfers,sync,create,preview,start,advance:()=>{now+=300001},busy:(value:boolean)=>{externalBusy=value}}
+  return {root,store,configs,catalog,a,b,targets,targetA,targetB,targetC,program,apps,transfers,sync,create,preview,start,advance:()=>{now+=300001},busy:(value:boolean)=>{externalBusy=value}}
 }
 async function files(home:string){const result:string[]=[];for await(const path of rolloutFiles(home,new AbortController().signal))result.push(path);return result}
 
@@ -87,7 +87,7 @@ test('running clients, nested homes, duplicate directory selections and live dae
   const f=fixture(t);rollout(f.a,randomUUID());f.busy(true);await assert.rejects(f.preview(),/正在使用/);f.busy(false)
   await assert.rejects(f.sync.preview({targetIds:[f.targets[0].id,f.targets[0].id],applicationId:'fixture'}),/至少两个/)
   const sub=join(f.a,'nested');mkdirSync(sub);const target=f.configs.register(sub);await assert.rejects(f.sync.preview({targetIds:[f.targets[0].id,target.id],applicationId:'fixture'}),/相互包含/)
-  const control=join(f.a,'app-server-control');mkdirSync(control);const server=createServer(socket=>socket.end());await new Promise<void>(resolve=>server.listen(join(control,'app-server-control.sock'),resolve));t.after(()=>new Promise<void>(resolve=>server.close(()=>resolve())));await assert.rejects(f.preview(),/后台进程/)
+  const control=join(f.a,'app-server-control');mkdirSync(control);const socketPath=join(control,'app-server-control.sock'),server=createServer(socket=>socket.end());await new Promise<void>(resolve=>server.listen(socketPath,resolve));t.after(()=>new Promise<void>(resolve=>server.close(()=>resolve())));await assert.rejects(f.preview(),/后台进程/)
 })
 
 test('cancel before commit changes no homes, cancel after first commit retains it and skips later targets',async t=>{
@@ -99,9 +99,18 @@ test('cancel before commit changes no homes, cancel after first commit retains i
 
 test('indexing failure survives restart and recovery only retries indexing without copying again',async t=>{
   const f=fixture(t,async()=>{throw new Error('Codex fixture index failed')});rollout(f.a,randomUUID());await f.start();assert.equal(f.sync.view().recoveries.length,2)
-  const before=await files(f.b),inode=lstatSync(before[0]).ino,restarted=f.create(async()=>{});await restarted.recover();assert.equal(restarted.view().recoveries.length,2)
+  const before=await files(f.b),inode=lstatSync(before[0]).ino,backups=f.sync.view().sync!.backups,restarted=f.create(async()=>{});for(const backup of backups)assert.ok(readdirSync(f.sync.backupLocation(backup.id)).some(name=>name.startsWith('new-')),'merged output remains staged after indexing fails');await restarted.recover();assert.equal(restarted.view().recoveries.length,2)
+  for(const backup of backups)assert.ok(readdirSync(f.sync.backupLocation(backup.id)).some(name=>name.startsWith('new-')),'startup recovery must preserve committed merged output')
   for(const recovery of restarted.view().recoveries)await restarted.retry({id:recovery.id,applicationId:'fixture',clientsClosed:true})
-  assert.deepEqual(restarted.view().recoveries,[]);assert.equal(restarted.view().sync?.targets.length,1);assert.equal(restarted.view().sync?.completedTargets.length,1);assert.equal(lstatSync(before[0]).ino,inode);assert.deepEqual(await files(f.b),before);await restarted.stop()
+  assert.deepEqual(restarted.view().recoveries,[]);assert.equal(restarted.view().sync?.targets.length,1);assert.equal(restarted.view().sync?.completedTargets.length,1);assert.equal(lstatSync(before[0]).ino,inode);assert.deepEqual(await files(f.b),before);for(const backup of backups)assert.equal(readdirSync(f.sync.backupLocation(backup.id)).some(name=>name.startsWith('new-')),false,'successful retry cleans staged output');await restarted.stop()
+})
+
+test('committed retry refuses missing or replaced destinations and retains staged merged output',async t=>{
+  for(const mutation of ['missing','replaced'] as const){
+    const f=fixture(t,async()=>{throw new Error('Codex fixture index failed')}),id=randomUUID();rollout(f.a,id);await f.start();const backup=f.sync.view().sync!.backups.find(item=>item.targetId===f.targets[0].id)!;const recovery=f.sync.view().recoveries.find(item=>item.id===backup.id)!,stage=f.sync.backupLocation(backup.id),staged=readdirSync(stage).find(name=>name.startsWith('new-'))!,target=f.configs.identityTarget(backup.targetId),destination=(await files(target.directory))[0];assert.ok(destination)
+    rmSync(destination);if(mutation==='replaced')writeFileSync(destination,'user replacement\n')
+    const restarted=f.create(async()=>{});await restarted.recover();await assert.rejects(restarted.retry({id:recovery.id,applicationId:'fixture',clientsClosed:true}),/已提交的目标会话缺失|同步文件已被其他进程修改/);assert.equal(readFileSync(join(stage,staged),'utf8').includes('test'),true,'merged copy remains available for manual recovery');if(mutation==='replaced')assert.equal(readFileSync(destination,'utf8'),'user replacement\n');assert.equal(restarted.view().recoveries.some(item=>item.id===backup.id),true);await restarted.stop()
+  }
 })
 
 test('corrupt journals block related writes and expose manager recovery folder without touching homes',async t=>{
@@ -110,10 +119,10 @@ test('corrupt journals block related writes and expose manager recovery folder w
 })
 
 test('sync blocks selected copy and client config writes while official indexing runs',async t=>{
-  let release!:()=>void,entered!:()=>void;const atIndex=new Promise<void>(resolve=>{entered=resolve}),f=fixture(t,async()=>{entered();await new Promise<void>(resolve=>{release=resolve})}),id=randomUUID();rollout(f.a,id)
+  let release!:()=>void,entered!:()=>void;const atIndex=new Promise<void>(resolve=>{entered=resolve}),f=fixture(t,async()=>{entered();await new Promise<void>(resolve=>{release=resolve})}),id=randomUUID();rollout(f.a,id);const page=await f.catalog.scan({runId:randomUUID(),targetId:f.targetA.id}),copy=await f.transfers.preview({snapshotId:page.snapshotId,sessionIds:[id],targetId:f.targetB.id,applicationId:'fixture'})
   const config=new ClientConfigs(f.store,Date.now,id=>f.sync.busy(id)),view=config.view(f.targets[0].id),edit=config.preview({id:f.targets[0].id,revision:view.revision,changes:{service_tier:'fast'}})
   const preview=await f.preview();f.sync.start({ticket:preview.ticket,clientsClosed:true});await atIndex
-  try{assert.throws(()=>config.apply(edit.ticket),/正在|停止|使用/);const scan=await f.catalog.scan({runId:randomUUID(),targetId:f.targets[0].id});await assert.rejects(f.transfers.preview({snapshotId:scan.snapshotId,sessionIds:[id],targetId:f.targets[1].id,applicationId:'fixture'}),/正在使用/)}
+  try{assert.throws(()=>config.apply(edit.ticket),/正在|停止|使用/);assert.throws(()=>f.transfers.start({ticket:copy.ticket,clientsClosed:true}),/正在使用/)}
   finally{const stop=f.sync.cancel(f.sync.view().sync!.id);release();await stop}
 })
 
@@ -122,4 +131,47 @@ test('sync preserves explicit index title/timestamp aliases while relocating onl
   writeFileSync(join(f.a,'session_index.jsonl'),JSON.stringify(row)+'\n');await f.start()
   const copied=JSON.parse(readFileSync(join(f.b,'session_index.jsonl'),'utf8'))
   assert.equal(copied.threadName,row.threadName);assert.equal(copied.thread_name,undefined);assert.equal(copied.updatedAt,when);assert.equal(copied.updated_at,undefined);assert.equal(copied.customLocation,row.customLocation);assert.deepEqual(copied.unknown,row.unknown);assert.ok(copied.path.startsWith(f.b))
+})
+
+test('directional selected sync merges source instances into one target and never writes source homes',async t=>{
+  const f=fixture(t),id=randomUUID(),other=randomUUID(),aPath=rollout(f.a,id,when,'来自 A'),bPath=rollout(f.b,id,'2026-10-01T09:00:00Z','来自 B'),targetPath=rollout(f.targetC.directory,id,when,'目标旧分支'),unselected=rollout(f.a,other,when,'不应导入')
+  const sidecars=[f.a,f.b,f.targetC.directory].flatMap(home=>['state_1.sqlite','state_1.sqlite-wal','state_1.sqlite-shm'].map(name=>join(home,name)));for(const [index,path] of sidecars.entries())writeFileSync(path,Buffer.from(`sidecar-${index}`));const sidecarContents=sidecars.map(path=>readFileSync(path))
+  const sourcesAndUnselected=[aPath,bPath,unselected].map(path=>[path,readFileSync(path)])
+  const targetOriginal=readFileSync(targetPath)
+  writeFileSync(join(f.targetC.directory,'config.toml'),'model_provider="target-provider"')
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id,f.targetB.id],targetId:f.targetC.id,scope:'selected',sessionIds:[id],applicationId:'fixture'})
+  assert.equal(preview.sessionCount,1);assert.equal(preview.targets.length,1);assert.equal(preview.targets[0].updated,1);assert.deepEqual(new Set(preview.directional?.sessions[0].sourceIds),new Set([f.targetA.id,f.targetB.id]));assert.equal(preview.directional?.sessions[0].targetFiles,1)
+  f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'completed',JSON.stringify(f.sync.view()));assert.deepEqual(f.sync.view().sync?.completedTargets,[f.targetC.id]);assert.deepEqual(f.sync.view().sync?.backups.map(item=>item.targetId),[f.targetC.id])
+  for(const [path,bytes] of sourcesAndUnselected)assert.deepEqual(readFileSync(path),bytes,'source or unrelated file was changed: '+path)
+  for(const [index,path] of sidecars.entries())assert.deepEqual(readFileSync(path),sidecarContents[index],'Codex SQLite sidecar was changed: '+path)
+  assert.equal((await files(f.targetC.directory)).filter(path=>path.includes(id)).length,1);assert.equal((await files(f.targetC.directory)).some(path=>path.includes(other)),false)
+  const merged=readFileSync((await files(f.targetC.directory)).find(path=>path.includes(id))!,'utf8').trim().split('\n').map(line=>JSON.parse(line));assert.equal(merged[0].payload.model_provider,'target-provider');assert.deepEqual(merged.slice(1).map(row=>row.payload.message).sort(),['来自 A','来自 B','目标旧分支'].sort())
+  const backup=f.sync.view().sync!.backups[0];assert.ok(readdirSync(f.sync.backupLocation(backup.id)).some(name=>name.startsWith('old-')&&readFileSync(join(f.sync.backupLocation(backup.id),name)).equals(targetOriginal)))
+})
+
+test('directional all scope reads only selected source instances and rejects an empty source set',async t=>{
+  const f=fixture(t),aId=randomUUID(),bId=randomUUID();rollout(f.a,aId);rollout(f.b,bId);rollout(f.targetC.directory,randomUUID())
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});assert.equal(preview.sessionCount,1);assert.deepEqual(preview.directional?.sessions.map(row=>row.id),[aId])
+  f.sync.discard();rmSync(join(f.a,'sessions'),{recursive:true,force:true})
+  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/没有可同步的 Codex 会话/)
+})
+
+test('directional preparation leaves source and target SQLite WAL/SHM sidecars byte-for-byte unchanged',async t=>{
+  const f=fixture(t),id=randomUUID();rollout(f.a,id);const sidecars=[f.a,f.targetC.directory].flatMap(home=>['state_1.sqlite','state_1.sqlite-wal','state_1.sqlite-shm'].map(name=>join(home,name)));for(const [index,path] of sidecars.entries())writeFileSync(path,Buffer.from(`sidecar-${index}`));const before=sidecars.map(path=>readFileSync(path))
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'completed');for(const [index,path] of sidecars.entries())assert.deepEqual(readFileSync(path),before[index])
+})
+
+test('directional sync rejects changed sources and paginated histories before target writes',async t=>{
+  const f=fixture(t),id=randomUUID(),path=rollout(f.a,id),beforeTarget=await files(f.targetC.directory)
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});appendFileSync(path,'\n');f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'failed');assert.deepEqual(await files(f.targetC.directory),beforeTarget)
+  writeFileSync(path,readFileSync(path,'utf8').replace('"extra":"keep"','"history_mode":"paginated","history_base":{"thread_id":"'+randomUUID()+'"},"extra":"keep"'))
+  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/分段历史.*复制实例/)
+  assert.deepEqual(await files(f.targetC.directory),beforeTarget)
+})
+
+test('directional sync locks source and target while indexing and rejects duplicate sources',async t=>{
+  let release!:()=>void,entered!:()=>void;const atIndex=new Promise<void>(resolve=>{entered=resolve}),f=fixture(t,async()=>{entered();await new Promise<void>(resolve=>{release=resolve})}),id=randomUUID();rollout(f.a,id)
+  const preview=await f.sync.preview({sourceIds:[f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'});f.sync.start({ticket:preview.ticket,clientsClosed:true});await atIndex
+  try{const page=await f.catalog.scan({runId:randomUUID(),targetId:f.targetA.id});await assert.rejects(f.transfers.preview({snapshotId:page.snapshotId,sessionIds:[id],targetId:f.targetB.id,applicationId:'fixture'}),/正在使用/);await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id,f.targetA.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/来源实例不能重复/)}
+  finally{const stopping=f.sync.cancel(f.sync.view().sync!.id);release();await stopping}
 })

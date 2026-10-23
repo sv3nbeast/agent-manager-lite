@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {mkdtempSync,realpathSync,mkdirSync,writeFileSync,readFileSync,rmSync,lstatSync,renameSync,linkSync,existsSync,symlinkSync,appendFileSync,readdirSync} from 'node:fs'
+import {mkdtempSync,realpathSync,mkdirSync,writeFileSync,readFileSync,rmSync,lstatSync,renameSync,linkSync,unlinkSync,existsSync,symlinkSync,appendFileSync,readdirSync} from 'node:fs'
 import {join,relative} from 'node:path'
 import {tmpdir} from 'node:os'
 import {randomUUID,createHash} from 'node:crypto'
@@ -83,16 +83,25 @@ function prepared(f:ReturnType<typeof fixture>):SyncJournal{
   journal.metadata=[{name:'session_index.jsonl',before:null,after:'new index\n',beforeHash:textHash(null),afterHash:textHash('new index\n')}];journal.phase='prepared';return journal
 }
 
-test('publication keeps exact original backup; committed cleanup keeps backups and removes extra new-file links',async t=>{
+test('publication keeps exact original backup; committed cleanup verifies destination then removes extra new-file links',async t=>{
   const f=fixture(t),journal=prepared(f);await publishSync(journal,signal());assert.equal(readFileSync(join(f.home,journal.outputs[0].relative),'utf8'),'merged\n');assert.equal(readFileSync(join(syncStage(journal),'old-0.jsonl'),'utf8'),'original\n')
-  assert.throws(()=>cleanupSync(journal),/不能清理/);journal.phase='committed';cleanupSync(journal);cleanupSync(journal);assert.equal(lstatSync(join(f.home,journal.outputs[0].relative)).nlink,1);assert.equal(existsSync(join(syncStage(journal),'old-0.jsonl')),true);await assert.rejects(rollbackSync(journal),/不能撤回/)
+  await assert.rejects(cleanupSync(journal),/不能清理/);journal.phase='committed';await cleanupSync(journal);await cleanupSync(journal);assert.equal(lstatSync(join(f.home,journal.outputs[0].relative)).nlink,1);assert.equal(existsSync(join(syncStage(journal),'old-0.jsonl')),true);await assert.rejects(rollbackSync(journal),/不能撤回/)
+})
+
+test('committed cleanup keeps the staged merged copy when the destination is missing or replaced',async t=>{
+  for(const mutation of ['missing','replaced'] as const){
+    const f=fixture(t),journal=prepared(f),destination=join(f.home,journal.outputs[0].relative),staged=join(syncStage(journal),journal.outputs[0].stage)
+    await publishSync(journal,signal());journal.phase='committed'
+    if(mutation==='missing')unlinkSync(destination);else{unlinkSync(destination);writeFileSync(destination,'other app content\n')}
+    await assert.rejects(cleanupSync(journal),/备份已保留|被移除或替换/);assert.equal(readFileSync(staged,'utf8'),'merged\n');if(mutation==='missing')assert.equal(existsSync(destination),false);else assert.equal(readFileSync(destination,'utf8'),'other app content\n')
+  }
 })
 
 test('partial and full precommit publication roll back repeatedly without losing originals',async t=>{
   const f=fixture(t),journal=prepared(f),backup=join(syncStage(journal),'old-0.jsonl'),destination=join(f.home,journal.originals[0].relative)
   renameSync(destination,backup);await rollbackSync(journal);await rollbackSync(journal);assert.equal(readFileSync(destination,'utf8'),'original\n')
   await publishSync(journal,signal());await rollbackSync(journal);await rollbackSync(journal);assert.equal(readFileSync(destination,'utf8'),'original\n');assert.equal(existsSync(join(f.home,'session_index.jsonl')),false)
-  journal.phase='rolled_back';cleanupSync(journal);cleanupSync(journal);assert.equal(existsSync(syncStage(journal)),false)
+  journal.phase='rolled_back';await cleanupSync(journal);await cleanupSync(journal);assert.equal(existsSync(syncStage(journal)),false)
 })
 
 test('recovery refuses changed user content and changed parent directories and keeps backups',async t=>{
@@ -124,7 +133,7 @@ test('persisted journals recover after actual SIGKILL at prepared, renamed and p
     const closed=new Promise<void>(resolve=>child.once('close',()=>resolve()))
     await new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');reject(new Error('fixture timeout '+stderr))},5000);child.once('error',error=>{clearTimeout(timer);reject(error)});child.stdout.once('data',data=>{clearTimeout(timer);assert.match(String(data),/fixture-ready/);resolve()});child.once('close',()=>{clearTimeout(timer);reject(new Error('fixture exited '+stderr))})})
     child.kill('SIGKILL');await closed
-    const recovered=syncJournalSchema.parse(JSON.parse(readFileSync(path,'utf8')));await rollbackSync(recovered);recovered.phase='rolled_back';cleanupSync(recovered)
+    const recovered=syncJournalSchema.parse(JSON.parse(readFileSync(path,'utf8')));await rollbackSync(recovered);recovered.phase='rolled_back';await cleanupSync(recovered)
     assert.equal(readFileSync(join(f.home,recovered.originals[0].relative),'utf8'),'original\n');assert.equal(existsSync(join(f.home,'session_index.jsonl')),false);assert.equal(existsSync(syncStage(recovered)),false)
   }
 })

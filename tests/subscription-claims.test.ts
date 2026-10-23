@@ -11,7 +11,7 @@ import { serializeAccounts } from '../src/main/accountFiles'
 import { exportBackupState, validateBackup } from '../src/main/dataBackupState'
 
 const workspace = 'workspace-one'
-const expiry = '2026-10-22T14:07:21+00:00'
+const expiry = new Date(Math.ceil((Date.now() + 24 * 60 * 60_000) / 1000) * 1000).toISOString()
 const expiryMs = Date.parse(expiry)
 function jwt(auth: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): string {
   return `fixture.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86400,

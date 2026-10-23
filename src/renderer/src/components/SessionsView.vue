@@ -117,7 +117,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
       <p v-if="hasClaude" class="muted session-codex-tools-note">以下批量管理与用量功能适用于 Codex，会话选择框仅选择 Codex 记录。</p>
       <SessionTransferPanel :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
       <SessionArchivePanel :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
-      <SessionSyncPanel :targets="targets" :reading="busy" @completed="reload" />
+      <SessionSyncPanel :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
       <SessionTrashPanel :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
     </template>
     <div class="toolbar"><span>{{result?.total??0}} 个会话</span><span class="muted">{{result?'读取于 '+date(result.scannedAt):busy?'正在读取目录…':'尚未读取'}}</span><span class="toolbar-spacer" /><a-button v-if="readingTokens" @click="cancelTokens">取消用量读取</a-button><a-button v-else-if="!claudeOnly" :disabled="busy||!tokenIds.length" @click="readTokens">{{selectedIds.length?'读取所选用量':'读取本页用量'}}</a-button></div>
@@ -132,7 +132,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
       </a-table>
     </a-spin>
     <a-pagination v-if="result&&result.total>25" :current="result.page" :total="result.total" :page-size="25" :show-size-changer="false" :disabled="busy" class="pagination" @change="page" />
-    <p v-if="!claudeOnly" class="muted session-note">扫描已登记目录和本机默认 ~/.codex；默认目录仅用于浏览、搜索、打开和读取用量，不会作为配置、复制、同步、删除或修复目标。Codex 长对话可能分段保存；客户端索引能确认当前文件时显示“分段记录”，保留其他分段。只有多个不同版本且无法确认当前文件时，才显示“多个版本待核对”。复制与 ZIP 导入保留目标已有会话；分页历史请从实例页面复制完整会话。Token 来自当前会话文件的累计记录；未记录时显示未知。全目录同步保留原文件备份；可用“修复可见性”检查历史会话不显示的问题。</p>
+    <p v-if="!claudeOnly" class="muted session-note">扫描已登记目录和本机默认 ~/.codex；默认目录仅用于浏览、搜索、打开和读取用量，不会作为配置、复制、同步、删除或修复目标。Codex 长对话可能分段保存；客户端索引能确认当前文件时显示“分段记录”，保留其他分段。只有多个不同版本且无法确认当前文件时，才显示“多个版本待核对”。从其他实例同步会话是单向导入：来源只读、仅目标实例写入，目标原文件会备份。分页历史仍需从实例页面复制完整会话。Token 来自当前会话文件的累计记录；未记录时显示未知。可用“修复可见性”检查历史会话不显示的问题。</p>
     <a-modal :open="!!choosing" title="选择会话所在目录" ok-text="继续" cancel-text="取消" :ok-button-props="{disabled:!selectedTarget||choosing?.record.clientType!=='claude_code'&&choosing?.record.locations.find(value=>value.targetId===selectedTarget)?.ambiguous}" @ok="confirmOpen" @cancel="choosing=undefined">
       <p>{{choosing?.record.title}}</p><a-radio-group v-model:value="selectedTarget" class="session-location-picker"><a-radio v-for="location in choosing?.record.locations??[]" :key="location.targetId" :value="location.targetId" :disabled="location.ambiguous">{{location.name}}<div class="muted session-meta">{{location.directory}}</div><small v-if="location.ambiguous||location.historyMode==='paginated'">{{locationExplanation(location)}}</small></a-radio></a-radio-group>
     </a-modal>

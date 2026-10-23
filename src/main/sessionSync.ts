@@ -13,23 +13,24 @@ import {fileIdentity,textHash,verifySource,copySessionRollout} from './sessionTr
 import {hashSource} from './sessionZip'
 import {mergeSessionCopies,type MergedSession} from './sessionMerge'
 import {syncMetadata} from './sessionSyncMetadata'
-import {createSyncJournal,encodeSyncJournal,syncJournalSchema,syncStage,verifySyncRoot,publishSync,rollbackSync,cleanupSync,type SyncJournal} from './sessionSyncFiles'
+import {createSyncJournal,encodeSyncJournal,syncJournalSchema,syncStage,verifySyncRoot,verifySyncFile,publishSync,rollbackSync,cleanupSync,type SyncJournal} from './sessionSyncFiles'
 import {sessionProgram,verifySessionProgram,rebuildSessionMetadata,type SessionProgram} from './officialSessions'
-import {syncPreviewSchema,syncStartSchema,type SyncPreview,type SyncView,type SyncRecovery,type SyncTargetPreview} from '../shared/sessionSync'
+import {legacySyncPreviewSchema,directionalSyncPreviewSchema,syncStartSchema,type SyncPreview,type SyncView,type SyncRecovery,type SyncTargetPreview,type DirectionalSyncPreviewInput} from '../shared/sessionSync'
 import type {ClientConfigTarget} from '../shared/clientConfig'
 import type {InstanceApplication} from '../shared/instances'
 import {assertUnpagedSessionSources} from './sessionPaging'
 
 type PlannedFile={merged:MergedSession;projected:SessionTransferSource;relative:string;sha256:string;originals:SessionTransferSource[];changed:boolean}
 type Plan={target:ClientConfigTarget;view:SyncTargetPreview;rootIdentity?:{device:number;inode:number};configHash:string;profileHash:string;inventory:string;indexBefore:string|null;globalBefore:string|null;files:PlannedFile[];metadata:SyncJournal['metadata']}
-type Pending={view:SyncPreview;root:string;plans:Plan[];sources:SessionTransferSource[];program:SessionProgram;applicationId:string;expires:number}
+type SourceGuard={target:ClientConfigTarget;rootIdentity?:{device:number;inode:number};profileHash:string;configHash:string;inventory:string;indexBefore:string|null;globalBefore:string|null}
+type Pending={view:SyncPreview;root:string;plans:Plan[];guards:SourceGuard[];sources:SessionTransferSource[];program:SessionProgram;applicationId:string;expires:number}
 type Job={view:SyncView;ids:Set<string>;controller:AbortController;task?:Promise<unknown>}
 function officialLocation(source:SessionTransferSource):boolean{
   const path=relative(source.root,source.path).split(sep).join('/'),match=path.match(/^(archived_sessions|sessions\/(\d{4})\/(\d{2})\/(\d{2}))\/rollout-(\d{4})-(\d{2})-(\d{2})T\d{2}-\d{2}-\d{2}-([a-fA-F0-9-]+)(?:_([a-fA-F0-9-]+))?\.jsonl$/)
   return !!match&&match[8].toLowerCase()===source.record.id.toLowerCase()&&(!match[9]||z.string().uuid().safeParse(match[9]).success)&&(match[1]==='archived_sessions'||match.slice(2,5).join('-')===match.slice(5,8).join('-'))
 }
 const overlap=(a:string,b:string)=>a===b||a.startsWith(b+sep)||b.startsWith(a+sep)
-const safeError=(error:unknown)=>error instanceof Error&&/^(同步|会话|来源|目标|所选|请选择|相关|部分|Codex|已有|单个|合并)/.test(error.message)?error.message:'会话同步失败，请检查目录变化、权限和可用磁盘空间'
+const safeError=(error:unknown)=>error instanceof Error&&/^(同步|会话|来源|目标|所选|请选择|相关|部分|Codex|已有|单个|合并|已提交)/.test(error.message)?error.message:'会话同步失败，请检查目录变化、权限和可用磁盘空间'
 export class SessionSync {
   private readonly configs:ClientConfigs
   private readonly root:string
@@ -65,8 +66,19 @@ export class SessionSync {
     if(readBounded(join(target.directory,'session_index.jsonl'),16*1024**2)!==plan.indexBefore||readBounded(join(target.directory,'.codex-global-state.json'),16*1024**2)!==plan.globalBefore)throw new Error('同步目标索引在预览后发生变化')
     return target
   }
+  private async guardSources(guards:SourceGuard[],signal:AbortSignal):Promise<void>{
+    for(const guard of guards){
+      signal.throwIfAborted();const target=this.configs.identityTarget(guard.target.id);await this.transfers.closed(target,signal)
+      if(target.directory!==guard.target.directory||this.profileHash(target.id)!==guard.profileHash)throw new Error('同步来源配置或实例在预览后发生变化')
+      if(this.transfers.config(target).hash!==guard.configHash||readBounded(join(target.directory,'session_index.jsonl'),16*1024**2)!==guard.indexBefore||readBounded(join(target.directory,'.codex-global-state.json'),16*1024**2)!==guard.globalBefore)throw new Error('同步来源配置或会话索引在预览后发生变化，请重新预览')
+      if(guard.rootIdentity){const stat=lstatSync(target.directory);if(stat.dev!==guard.rootIdentity.device||stat.ino!==guard.rootIdentity.inode)throw new Error('同步来源目录在预览后发生变化')}
+      else if(existsSync(target.directory))throw new Error('同步来源目录已被其他进程创建')
+      if(await this.inventory(target.directory,signal)!==guard.inventory)throw new Error('同步来源会话在预览后发生变化，请刷新后重试')
+    }
+  }
   async preview(raw:unknown):Promise<SyncPreview>{
-    const input=syncPreviewSchema.parse(raw),ids=[...new Set(input.targetIds)];if(ids.length<2)throw new Error('请选择至少两个不同的 Codex 目录')
+    if(raw&&typeof raw==='object'&&'sourceIds'in raw)return this.previewDirectional(directionalSyncPreviewSchema.parse(raw))
+    const input=legacySyncPreviewSchema.parse(raw),ids=[...new Set(input.targetIds)];if(ids.length<2)throw new Error('请选择至少两个不同的 Codex 目录')
     this.available();this.free(ids);this.clear();const job=this.begin(ids,'preparing'),signal=job.controller.signal
     return this.execute(job,async()=>{
       const targets=ids.map(id=>this.configs.identityTarget(id)),application=this.applications().find(app=>app.id===input.applicationId);if(!application)throw new Error('请选择已登记的 Codex 程序')
@@ -103,16 +115,64 @@ export class SessionSync {
         for(const plan of plans){this.validate(plan);if(await this.inventory(plan.target.directory,signal)!==plan.inventory)throw new Error('同步准备期间会话文件发生变化')}
         verifySessionProgram(program);signal.throwIfAborted()
         const view:SyncPreview={ticket:randomUUID(),sessionCount:merged.length,sourceFiles:sources.length,totalBytes:bytes,targets:plans.map(plan=>plan.view)}
-        this.pending={view,root,plans,sources,program,applicationId:input.applicationId,expires:this.now()+300000};Object.assign(job.view,{status:'ready',targets:view.targets})
+        this.pending={view,root,plans,guards:[],sources,program,applicationId:input.applicationId,expires:this.now()+300000};Object.assign(job.view,{status:'ready',targets:view.targets})
         this.timer=setTimeout(()=>{if(!this.job?.task)this.clear()},300000);this.timer.unref();return structuredClone(view)
       }catch(error){directory(root);rmSync(root,{recursive:true});throw error}
+    })
+  }
+  private async previewDirectional(input:DirectionalSyncPreviewInput):Promise<SyncPreview>{
+    const sourceIds=[...new Set(input.sourceIds)];if(sourceIds.length!==input.sourceIds.length)throw new Error('来源实例不能重复')
+    if(sourceIds.includes(input.targetId))throw new Error('目标实例不能同时作为来源')
+    const target=this.configs.identityTarget(input.targetId),sourceTargets=sourceIds.map(id=>this.configs.identityTarget(id))
+    if(target.role!=='instance'||sourceTargets.some(source=>source.role!=='instance'))throw new Error('来源和目标必须是已登记的 Codex 实例目录')
+    if([...sourceTargets,target].some(value=>value.role==='default'&&value.managed))throw new Error('默认 Codex 配置目录不能作为会话同步来源或目标')
+    const directories=[...sourceTargets.map(source=>source.directory),target.directory];for(let i=0;i<directories.length;i++)for(const other of directories.slice(i+1))if(overlap(directories[i],other))throw new Error('同步来源和目标目录不能相互包含或别名重叠')
+    this.available();this.free([target.id,...sourceTargets.map(source=>source.id)]);this.clear();const job=this.begin([target.id,...sourceTargets.map(source=>source.id)],'preparing'),signal=job.controller.signal
+    return this.execute(job,async()=>{
+      const application=this.applications().find(app=>app.id===input.applicationId);if(!application)throw new Error('请选择已登记的 Codex 程序')
+      const program=sessionProgram(application),config=this.transfers.config(target),targetExisting=existsSync(target.directory),targetRootIdentity=targetExisting?fileIdentity(lstatSync(target.directory)):undefined,targetInventory=await this.inventory(target.directory,signal),targetIndexBefore=readBounded(join(target.directory,'session_index.jsonl'),16*1024**2),targetGlobalBefore=readBounded(join(target.directory,'.codex-global-state.json'),16*1024**2)
+      if(targetExisting)await this.transfers.closed(target,signal)
+      const guards:SourceGuard[]=[],sourceCopies:SessionTransferSource[]=[];let activeCatalog:SessionCatalog|undefined;const stop=()=>activeCatalog?.stop();signal.addEventListener('abort',stop,{once:true})
+      try{
+        for(const source of sourceTargets){
+          signal.throwIfAborted();await this.transfers.closed(source,signal);const profileHash=this.profileHash(source.id),inventory=await this.inventory(source.directory,signal),identity=existsSync(source.directory)?fileIdentity(lstatSync(source.directory)):undefined,guard:SourceGuard={target:source,rootIdentity:identity,profileHash,configHash:this.transfers.config(source).hash,inventory,indexBefore:readBounded(join(source.directory,'session_index.jsonl'),16*1024**2),globalBefore:readBounded(join(source.directory,'.codex-global-state.json'),16*1024**2)}
+          const catalog=activeCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true});try{const page=await catalog.scan({runId:randomUUID(),targetId:source.id,clientType:'codex'});if(page.warnings.length)throw new Error('部分会话来源未读取完整：'+page.warnings[0]);sourceCopies.push(...await catalog.directionalSyncSources(page.snapshotId,input.scope==='selected'?input.sessionIds:[],[source.id],signal,false))}finally{catalog.stop();activeCatalog=undefined}
+          guards.push(guard)
+          if(await this.inventory(source.directory,signal)!==inventory)throw new Error('同步扫描期间来源会话文件发生变化')
+        }
+        if(input.scope==='selected'){const found=new Set(sourceCopies.map(source=>source.record.id)),missing=input.sessionIds.find(id=>!found.has(id));if(missing)throw new Error(`所选会话未在所选来源中找到：${missing}`)}
+        const ids=[...new Set(sourceCopies.map(source=>source.record.id))]
+        if(!ids.length)throw new Error('所选来源目录中没有可同步的 Codex 会话')
+        const targetCatalog=activeCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true});let targetCopies:SessionTransferSource[]=[];try{const targetPage=await targetCatalog.scan({runId:randomUUID(),targetId:target.id,clientType:'codex'});if(targetPage.warnings.length)throw new Error('部分目标会话未读取完整：'+targetPage.warnings[0]);targetCopies=await targetCatalog.directionalSyncSources(targetPage.snapshotId,ids,[target.id],signal,false)}finally{targetCatalog.stop();activeCatalog=undefined}
+        const sources=[...sourceCopies,...targetCopies],bytes=sources.reduce((sum,source)=>sum+source.size,0)
+        if(sources.length>10000||bytes>100*1024**3)throw new Error('同步范围超过暂存限制（1 万份副本或 100 GiB），请选择更少会话')
+        await assertUnpagedSessionSources(sources,signal);Object.assign(job.view,{sourceFiles:sources.length,totalBytes:bytes})
+        directory(this.scratch,true);const root=join(this.scratch,randomUUID());mkdirSync(root,{mode:0o700})
+        try{
+          const indexes=await this.transfers.sourceIndexes(sources,signal),merged=await mergeSessionCopies(root,sources,indexes,signal,(files,done)=>{job.view.processedFiles=files;job.view.bytes=done})
+          const sourceHashes=new Map<string,string>();for(const source of sources)sourceHashes.set(source.path,await hashSource(source,signal,()=>{}))
+          const targetPlan:Plan={target,view:{id:target.id,name:target.name,directory:target.directory,added:0,updated:0,unchanged:0,duplicates:0,repairsWorkspace:false,repairsIndex:false},rootIdentity:targetRootIdentity,configHash:config.hash,profileHash:this.profileHash(target.id),inventory:targetInventory,indexBefore:targetIndexBefore,globalBefore:targetGlobalBefore,files:[],metadata:[]}
+          const projectedRoot=join(root,target.id);mkdirSync(projectedRoot,{mode:0o700});mkdirSync(join(projectedRoot,'sessions'),{mode:0o700})
+          for(const item of merged){
+            const originals=item.originals.filter(source=>source.targetId===target.id),destination=join(projectedRoot,'sessions','rollout-'+item.source.record.id+'.jsonl'),copied=await copySessionRollout(item.source,destination,config.provider,signal,()=>{}),stat=lstatSync(destination),rootStat=lstatSync(projectedRoot),archived=item.source.record.locations[0].archived,existing=originals.find(source=>source.record.locations[0].archived===archived&&officialLocation(source)),rel=existing?relative(target.directory,existing.path).split(sep).join('/'):sessionDestination(item.source,target.directory,targetPlan.files),projected:SessionTransferSource={...item.source,path:destination,root:projectedRoot,targetId:target.id,rootDevice:rootStat.dev,rootInode:rootStat.ino,...fileIdentity(stat),size:stat.size,mtime:stat.mtimeMs,ctime:stat.ctimeMs}
+            const changed=originals.length!==1||!existing||sourceHashes.get(originals[0]?.path??'')!==copied.sha256||Math.trunc(originals[0]?.mtime??-1)!==Math.trunc(stat.mtimeMs)
+            targetPlan.files.push({merged:item,projected,relative:rel,sha256:copied.sha256,originals,changed});targetPlan.view[!originals.length?'added':changed?'updated':'unchanged']++;targetPlan.view.duplicates+=Math.max(0,originals.length-1)
+          }
+          const metadata=syncMetadata(target.directory,targetPlan.files,targetPlan.indexBefore,targetPlan.globalBefore);targetPlan.metadata=metadata.metadata;targetPlan.view.repairsWorkspace=metadata.repairsWorkspace;targetPlan.view.repairsIndex=metadata.metadata.some(item=>item.name==='session_index.jsonl')
+          if(Buffer.byteLength(JSON.stringify(targetPlan.metadata))>38*1024**2)throw new Error('同步恢复索引超过 38 MiB，请整理索引')
+          this.validate(targetPlan);if(await this.inventory(target.directory,signal)!==targetPlan.inventory)throw new Error('同步准备期间目标会话文件发生变化')
+          await this.guardSources(guards,signal);verifySessionProgram(program);signal.throwIfAborted()
+          const view:SyncPreview={ticket:randomUUID(),sessionCount:merged.length,sourceFiles:sourceCopies.length,totalBytes:sourceCopies.reduce((sum,source)=>sum+source.size,0),targets:[targetPlan.view],directional:{sourceIds,targetId:target.id,scope:input.scope,sources:sourceTargets.map(source=>({id:source.id,name:source.name,directory:source.directory})),sessions:merged.map(item=>({id:item.source.record.id,title:item.source.record.title,sourceIds:[...new Set(item.originals.filter(source=>source.targetId!==target.id).map(source=>source.targetId))],sourceFiles:item.originals.filter(source=>source.targetId!==target.id).length,targetFiles:item.originals.filter(source=>source.targetId===target.id).length,action:targetPlan.files.find(file=>file.merged.source.record.id===item.source.record.id)?.changed?(item.originals.some(source=>source.targetId===target.id)?'merge':'add'):'unchanged'}))}}
+          this.pending={view,root,plans:[targetPlan],guards,sources,program,applicationId:input.applicationId,expires:this.now()+300000};Object.assign(job.view,{status:'ready',targets:view.targets});this.timer=setTimeout(()=>{if(!this.job?.task)this.clear()},300000);this.timer.unref();return structuredClone(view)
+        }catch(error){directory(root);rmSync(root,{recursive:true});throw error}
+      }finally{signal.removeEventListener('abort',stop);activeCatalog?.stop()}
     })
   }
   start(raw:unknown):void{
     const input=syncStartSchema.parse(raw),pending=this.pending;this.available()
     if(!pending||pending.view.ticket!==input.ticket||pending.expires<this.now())throw new Error('同步预览已过期，请重新预览')
-    this.free(pending.plans.map(plan=>plan.target.id));clearTimeout(this.timer);this.pending=undefined
-    const job=this.begin(pending.plans.map(plan=>plan.target.id),'running');Object.assign(job.view,{targets:pending.view.targets,sourceFiles:pending.sources.length,totalBytes:pending.plans.reduce((sum,plan)=>sum+plan.files.filter(file=>file.changed).reduce((sum,file)=>sum+file.projected.size,0),0)})
+    this.free([...pending.plans.map(plan=>plan.target.id),...pending.guards.map(guard=>guard.target.id)]);clearTimeout(this.timer);this.pending=undefined
+    const job=this.begin([...pending.plans.map(plan=>plan.target.id),...pending.guards.map(guard=>guard.target.id)],'running');Object.assign(job.view,{targets:pending.view.targets,sourceFiles:pending.sources.length,totalBytes:pending.plans.reduce((sum,plan)=>sum+plan.files.filter(file=>file.changed).reduce((sum,file)=>sum+file.projected.size,0),0)})
     void this.execute(job,()=>this.run(job,pending)).catch(()=>{})
   }
   private save(journal:SyncJournal):void{const raw=encodeSyncJournal(journal);directory(this.root,true);directory(join(this.root,journal.id),true);atomic(join(this.root,journal.id,'journal.json'),raw)}
@@ -124,15 +184,17 @@ export class SessionSync {
     try{
       const application=this.applications().find(app=>app.id===pending.applicationId);if(!application||sessionProgram(application).path!==pending.program.path)throw new Error('Codex 程序登记已变化');verifySessionProgram(pending.program)
       for(const plan of pending.plans){await this.transfers.closed(this.validate(plan),signal);if(await this.inventory(plan.target.directory,signal)!==plan.inventory)throw new Error('同步预览后会话文件发生变化')}
+      await this.guardSources(pending.guards,signal)
       for(const source of pending.sources)await verifySource(source)
       for(const plan of pending.plans){
         signal.throwIfAborted();current=undefined;job.view.currentTarget=plan.target.id
         await this.transfers.closed(this.validate(plan),signal);if(await this.inventory(plan.target.directory,signal)!==plan.inventory)throw new Error('同步目标文件在提交前发生变化')
+        await this.guardSources(pending.guards,signal)
         const changed=plan.files.filter(file=>file.changed)
         if(!changed.length&&!plan.metadata.length){job.view.completedTargets.push(plan.target.id);continue}
         const target=this.configs.prepareIdentityTarget(plan.target.id)
         current=createSyncJournal(randomUUID(),target.id,target.name,target.directory,plan.configHash,pending.program)
-        try{this.save(current)}catch(error){current.phase='rolled_back';cleanupSync(current);current=undefined;throw error}
+        try{this.save(current)}catch(error){current.phase='rolled_back';await cleanupSync(current);current=undefined;throw error}
         for(const file of changed)for(const original of file.originals){await verifySource(original);current.originals.push({relative:relative(current.root,original.path).split(sep).join('/'),stage:'old-'+current.originals.length+'.jsonl',...fileIdentity(lstatSync(original.path)),size:original.size,sha256:await hashSource(original,signal,()=>{})})}
         this.save(current)
         const provider=this.transfers.config(target).provider
@@ -143,19 +205,20 @@ export class SessionSync {
           current.outputs.push({relative:file.relative,stage,...copied});this.save(current);job.view.processedFiles++
         }
         await this.transfers.closed(target,signal);this.target(current)
+        await this.guardSources(pending.guards,signal)
         if(await this.inventory(target.directory,signal)!==(plan.rootIdentity?plan.inventory:textHash('')))throw new Error('同步目标会话在准备期间发生变化')
         verifySessionProgram(pending.program);signal.throwIfAborted()
         current={...current,metadata:plan.metadata,sessionIds:plan.files.map(file=>file.merged.source.record.id),phase:'prepared'};this.save(current)
         await publishSync(current,signal);const committed:SyncJournal={...current,phase:'committed'};this.save(committed);current=committed
-        job.view.completedTargets.push(target.id);job.view.backups.push({targetId:target.id,id:current.id});cleanupSync(current)
-        try{await this.rebuild(pending.program,target.directory,current.sessionIds,signal);current.phase='done';this.save(current)}
-        catch(error){current.phase='committed';this.needsRecovery(current,'会话已同步，需重试 Codex 索引更新：'+safeError(error))}
+        job.view.completedTargets.push(target.id);job.view.backups.push({targetId:target.id,id:current.id})
+        try{await this.rebuild(pending.program,target.directory,current.sessionIds,signal);await cleanupSync(current);current.phase='done';this.save(current)}
+        catch(error){this.needsRecovery(current,'会话已同步，需重试 Codex 索引更新或清理备份：'+safeError(error))}
       }
       signal.throwIfAborted();job.view.status='completed'
     }catch(error){
       if(current){
         if(['committed','done'].includes(current.phase))this.needsRecovery(current,'会话已同步，清理或索引更新未完成，请重试恢复')
-        else try{await rollbackSync(current);current.phase='rolled_back';this.save(current);cleanupSync(current)}catch(cause){this.needsRecovery(current,safeError(cause))}
+        else try{await rollbackSync(current);current.phase='rolled_back';this.save(current);await cleanupSync(current)}catch(cause){this.needsRecovery(current,safeError(cause))}
       }
       throw error
     }finally{job.view.currentTarget=undefined;directory(pending.root);rmSync(pending.root,{recursive:true})}
@@ -172,9 +235,9 @@ export class SessionSync {
         journal=this.load(entry.name);if(journal.phase==='done')continue
         const target=this.target(journal);if(this.inUse(target.id)||this.transfers.busy(target.id))throw new Error('同步目录正在使用，请停止客户端后恢复')
         await this.transfers.closed(target,new AbortController().signal)
-        if(journal.phase==='rolled_back'){cleanupSync(journal);continue}
-        if(journal.phase==='committed'){cleanupSync(journal);this.needsRecovery(journal,'会话已同步，需继续 Codex 索引更新');continue}
-        await rollbackSync(journal);journal.phase='rolled_back';this.save(journal);cleanupSync(journal)
+        if(journal.phase==='rolled_back'){await cleanupSync(journal);continue}
+        if(journal.phase==='committed'){this.needsRecovery(journal,'会话已同步，需继续 Codex 索引更新；合并副本已保留供恢复');continue}
+        await rollbackSync(journal);journal.phase='rolled_back';this.save(journal);await cleanupSync(journal)
       }catch(error){this.recovery.set(entry.name,{id:entry.name,targetId:journal?.targetId??'',targetName:journal?.targetName??'未识别的目录',message:safeError(error)})}
     }
   }
@@ -186,9 +249,13 @@ export class SessionSync {
     job.view.targets=[{id:target.id,name:target.name,directory:target.directory,added:0,updated:0,unchanged:journal.sessionIds.length,duplicates:0,repairsWorkspace:false,repairsIndex:false}];job.view.currentTarget=target.id;job.view.backups=[{targetId:target.id,id:journal.id}]
     await this.execute(job,async()=>{try{
       await this.transfers.closed(target,job.controller.signal);this.target(journal)
-      if(journal.phase==='committed'){this.transfers.config(target);cleanupSync(journal);await this.rebuild(program,target.directory,journal.sessionIds,job.controller.signal);journal.program=program;journal.phase='done'}
+      if(journal.phase==='committed'){
+        this.transfers.config(target)
+        for(const output of journal.outputs)if(!await verifySyncFile(journal.root,join(journal.root,output.relative),output,job.controller.signal))throw new Error('已提交的目标会话缺失，合并副本仍保留在备份目录；请先恢复目标文件')
+        await this.rebuild(program,target.directory,journal.sessionIds,job.controller.signal);await cleanupSync(journal);journal.program=program;journal.phase='done'
+      }
       else if(journal.phase!=='done'&&journal.phase!=='rolled_back'){await rollbackSync(journal);journal.phase='rolled_back'}
-      this.save(journal);cleanupSync(journal);this.recovery.delete(journal.id);job.view.status='completed';job.view.completedTargets.push(target.id)
+      this.save(journal);await cleanupSync(journal);this.recovery.delete(journal.id);job.view.status='completed';job.view.completedTargets.push(target.id)
     }catch(error){this.needsRecovery(journal,safeError(error));throw error}finally{job.view.currentTarget=undefined}})
   }
   backupLocation(id:string):string{z.string().uuid().parse(id);if(this.recovery.get(id)?.targetId===''){directory(this.root);const folder=join(this.root,id);directory(folder);return folder};const journal=this.load(id);this.target(journal);const folder=existsSync(syncStage(journal))?syncStage(journal):join(this.root,id);directory(folder);return folder}

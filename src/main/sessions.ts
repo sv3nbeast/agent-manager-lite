@@ -19,7 +19,7 @@ interface SourceFile {path:string;root:string;targetId:string;device:number;inod
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord}
 interface ClaudeSourceFile {target:SessionSource;profile:string;location:ClaudeSessionLocation;sessionId:string;record:ClaudeSessionRecord}
 export interface CatalogClaudeResumePreview extends ClaudeSessionResumePreview {instanceRevision:number;profileFingerprint:string}
-export interface SessionCatalogOptions {defaultCodexDirectory?:string|null;defaultClaudeDirectory?:string|null}
+export interface SessionCatalogOptions {defaultCodexDirectory?:string|null;defaultClaudeDirectory?:string|null;disableSqliteDisplay?:boolean}
 const defaultClaudeSourceId='4135f4e6-6db5-4bd4-95f7-06f4c667341a'
 const defaultCodexSourceId='61f5fc85-e814-4f63-9f9f-b96d94fcf51a'
 interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;claudeFiles:Map<string,ClaudeSourceFile>;warnings:string[];sourceCounts:Record<string,number>;sources:SessionSource[]}
@@ -38,10 +38,12 @@ export class SessionCatalog {
   private readonly root:string
   private readonly defaultCodexDirectory:string|null
   private readonly defaultClaudeDirectory:string|null
+  private readonly disableSqliteDisplay:boolean
   constructor(private readonly store:Store,private readonly running:(id:string)=>boolean=()=>false,options:SessionCatalogOptions={}){
     this.configs=new ClientConfigs(store);this.root=realpathSync(store.directory)
     this.defaultCodexDirectory=options.defaultCodexDirectory===undefined?join(homedir(),'.codex'):options.defaultCodexDirectory
     this.defaultClaudeDirectory=options.defaultClaudeDirectory===undefined?join(homedir(),'.claude'):options.defaultClaudeDirectory
+    this.disableSqliteDisplay=options.disableSqliteDisplay===true
     if(this.defaultCodexDirectory!==null&&(!isAbsolute(this.defaultCodexDirectory)||resolve(this.defaultCodexDirectory)!==this.defaultCodexDirectory))throw new Error('默认 Codex 会话目录必须是规范绝对路径')
     if(this.defaultClaudeDirectory!==null&&(!isAbsolute(this.defaultClaudeDirectory)||resolve(this.defaultClaudeDirectory)!==this.defaultClaudeDirectory))throw new Error('默认 Claude 会话目录必须是规范绝对路径')
   }
@@ -145,7 +147,7 @@ export class SessionCatalog {
         try{
           const target=this.codexIdentityTarget(selected.id),root=target.directory
           try{await lstat(root)}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'&&target.managed){sourceCounts[target.id]=0;continue}throw error}
-          const rootStat=await lstat(root),daemon=await probeClientDaemon(root,signal),targetRunning=this.running(target.id)||daemon==='running',readOnly=this.readOnlyCodexSource(target.id),display=await readSessionDisplay(root,signal,warn,{sqlite:!readOnly}),sourceRows:{record:SessionRecord;file:SourceFile;matched:boolean}[]=[]
+          const rootStat=await lstat(root),daemon=await probeClientDaemon(root,signal),targetRunning=this.running(target.id)||daemon==='running',readOnly=this.readOnlyCodexSource(target.id),useSqlite=!readOnly&&!this.disableSqliteDisplay,display=await readSessionDisplay(root,signal,warn,{sqlite:useSqlite}),sourceRows:{record:SessionRecord;file:SourceFile;matched:boolean}[]=[]
           for await(const path of rolloutFiles(root,signal)){
             signal.throwIfAborted();if(++fileCount>100000)throw new SessionLimitError('会话文件超过 10 万条，请选择单个目录')
             try{
@@ -171,7 +173,7 @@ export class SessionCatalog {
           const finalRoot=await lstat(root);if(finalRoot.dev!==rootStat.dev||finalRoot.ino!==rootStat.ino)throw new Error('会话目录已被替换')
           const grouped=new Map<string,typeof sourceRows>()
           for(const row of sourceRows)grouped.set(row.record.id,[...(grouped.get(row.record.id)??[]),row])
-          const indexedRollouts=[...grouped.values()].some(rows=>rows.length>1)?await readSessionRolloutIndex(root,signal,warn,{sqlite:!readOnly}):new Map<string,string>()
+          const indexedRollouts=[...grouped.values()].some(rows=>rows.length>1)&&useSqlite?await readSessionRolloutIndex(root,signal,warn):new Map<string,string>()
           for(const [id,rows] of grouped){
             if(rows.some(row=>row.matched))matches.add(id)
             const ordered=rows.slice().sort((a,b)=>canonical(a.file).localeCompare(canonical(b.file)))
@@ -349,6 +351,7 @@ export class SessionCatalog {
       const record=snapshot.records.find(row=>row.id===id)
       if(!record)throw new Error('所选会话不在当前筛选列表中，请重新选择')
       if(record.clientType==='claude_code')throw new Error('Claude Code 会话当前仅支持只读查看，不能使用 Codex 会话复制或导出')
+      if(record.locations.some(location=>location.ambiguous))throw new Error('所选会话在至少一个目录中存在同 ID 文件冲突，不能自动改从其他目录复制；请使用指定来源的同步或先核对冲突')
       const sources=(snapshot.files.get(id)??[]).filter(source=>!this.readOnlyCodexSource(source.targetId)&&!source.duplicateOf&&!record.locations.find(location=>location.targetId===source.targetId)?.ambiguous).sort((a,b)=>(b.record.updatedAt??0)-(a.record.updatedAt??0))
       if(!sources.length){if((snapshot.files.get(id)??[]).every(source=>this.readOnlyCodexSource(source.targetId)))throw new Error('本机默认 Codex 会话来源仅支持只读查看，不能复制或导出');throw new Error('所选会话存在同 ID 文件冲突，请先核对')}
       const source=sources[0],opened=await this.verified(source,id,signal)
@@ -366,6 +369,24 @@ export class SessionCatalog {
       try{result.push({path:source.path,root:source.root,targetId:source.targetId,rootDevice:source.rootDevice,rootInode:source.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(source.record)})}finally{await opened.file.close()}
     }
     this.current(snapshotId);return result
+  }
+  async directionalSyncSources(snapshotId:string,ids:string[],targetIds:string[],signal:AbortSignal,requireEachId:boolean):Promise<SessionTransferSource[]>{
+    const input=sessionStatsSchema.extend({sessionIds:z.array(z.string().uuid()).max(1000),targetIds:z.array(z.string().uuid()).min(1).max(100)}).parse({snapshotId,sessionIds:ids,targetIds}),snapshot=this.current(input.snapshotId),result:SessionTransferSource[]=[],found=new Set<string>()
+    if(snapshot.warnings.length)throw new Error('部分会话目录读取不完整，未准备同步：'+snapshot.warnings[0])
+    const wanted=input.sessionIds.length?new Set(input.sessionIds):new Set(snapshot.records.filter(row=>row.clientType!=='claude_code').map(row=>row.id))
+    for(const id of wanted){
+      const record=snapshot.records.find(row=>row.id===id)
+      if(!record){if(requireEachId)throw new Error('所选会话不在当前扫描结果中，请刷新后重新选择');continue}
+      if(record.clientType==='claude_code')throw new Error('Claude Code 会话当前不支持同步到 Codex 实例')
+      z.string().uuid().parse(id)
+      for(const source of snapshot.files.get(id)??[]){
+        if(!input.targetIds.includes(source.targetId)||this.readOnlyCodexSource(source.targetId))continue
+        const opened=await this.verified(source,id,signal)
+        try{result.push({path:source.path,root:source.root,targetId:source.targetId,rootDevice:source.rootDevice,rootInode:source.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(source.record)});found.add(id)}finally{await opened.file.close()}
+      }
+    }
+    if(requireEachId){const missing=input.sessionIds.find(id=>!found.has(id));if(missing)throw new Error(`所选来源实例中找不到会话 ${missing}`)}
+    this.current(input.snapshotId);return result
   }
   async tokenStats(raw:unknown):Promise<SessionTokenResult[]>{
     const input=sessionStatsSchema.parse(raw),snapshot=this.current(input.snapshotId)
