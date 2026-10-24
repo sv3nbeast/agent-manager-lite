@@ -547,7 +547,7 @@ test('Codex session conflict UI selects a physical rollout before content and fi
 test('Codex and Claude session rows expose the same transcript viewer entry point', async t => {
   const codexId=randomUUID(),claudeId='claude:'+randomUUID(),codexTarget=randomUUID(),claudeTarget=randomUUID(),snapshotId=randomUUID()
   const page={snapshotId,scannedAt:1,total:2,page:1,pageSize:25,items:[
-    {id:codexId,clientType:'codex',title:'Codex fixture',cwd:'/fixture/codex',kind:'conversation',locations:[{targetId:codexTarget,name:'Codex fixture',directory:'/fixture/codex',running:false,archived:false,ambiguous:false}],capabilities:{content:true}},
+    {id:codexId,clientType:'codex',historyMode:'paginated',title:'Codex fixture',cwd:'/fixture/codex',kind:'conversation',locations:[{targetId:codexTarget,name:'Codex fixture',directory:'/fixture/codex',running:false,archived:false,ambiguous:false,historyMode:'paginated'}],capabilities:{content:true,syncSource:true}},
     {id:claudeId,clientType:'claude_code',title:'Claude fixture',cwd:'/fixture/claude',kind:'conversation',locations:[{targetId:claudeTarget,name:'Claude fixture',directory:'/fixture/claude',running:false,archived:false,ambiguous:false}],capabilities:{content:true}},
   ],warnings:[],sources:[
     {id:codexTarget,name:'Codex fixture',directory:'/fixture/codex',role:'instance',clientType:'codex'},
@@ -557,6 +557,9 @@ test('Codex and Claude session rows expose the same transcript viewer entry poin
   await f.state.reload()
   assert.equal(f.state.knownRecords[codexId].capabilities.content,true)
   assert.equal(f.state.knownRecords[claudeId].capabilities.content,true)
+  f.state.selectRows([codexId]);assert.deepEqual(f.state.syncSelectedIds,[codexId],'paginated Codex rows remain selectable for single-session migration')
+  assert.deepEqual(f.state.codexSelectedIds,[],'the shared selection must not expose paginated history to JSONL-only copy, archive, trash or visibility repair')
+  assert.equal(f.state.canCopyFromSource(f.state.knownRecords[codexId]),false,'paginated history uses the complete SQLite-aware migration path, not JSONL-only copy')
   f.state.open(f.state.knownRecords[codexId],'content');assert.equal(f.state.reader.record.id,codexId);assert.equal(f.state.reader.targetId,codexTarget)
   f.state.reader=undefined;f.state.open(f.state.knownRecords[claudeId],'content');assert.equal(f.state.reader.record.id,claudeId);assert.equal(f.state.reader.targetId,claudeTarget)
 })

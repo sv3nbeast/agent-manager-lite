@@ -1,13 +1,13 @@
 import {createHash,randomUUID} from 'node:crypto'
 import {lstat,type FileHandle} from 'node:fs/promises'
-import {lstatSync,realpathSync,statSync,type Stats} from 'node:fs'
+import {existsSync,lstatSync,realpathSync,statSync,type Stats} from 'node:fs'
 import {homedir} from 'node:os'
 import {basename,dirname,isAbsolute,join,relative,resolve,sep} from 'node:path'
 import {z} from 'zod'
 import {Store} from './store'
 import {ClientConfigs} from './clientConfig'
 import type {ClientConfigTarget} from '../shared/clientConfig'
-import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,claudeResumeSelectionSchema,sessionContentSchema,sessionStatsSchema,type SessionCopySourceSelection,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult,type SessionSource,type SessionContentPage} from '../shared/sessions'
+import {sessionScanSchema,sessionPageSchema,sessionSelectionSchema,claudeResumeSelectionSchema,codexResumeSelectionSchema,sessionContentSchema,sessionStatsSchema,type SessionCopySourceSelection,type SessionKind,type SessionLocation,type SessionRecord,type SessionPage,type SessionTokenResult,type SessionSource,type SessionContentPage,type CodexResumeTicketSource} from '../shared/sessions'
 import {openSessionFile,rolloutFiles,firstSessionEvent,sessionActivity,sessionTokens,sessionContains,sessionDigest,cleanText,sessionIdentifier,safeSessionPath} from './sessionFiles'
 import {readSessionDisplay,readSessionRolloutIndex,displayTitle,displayProject} from './sessionDisplay'
 import {probeClientDaemon} from './clientDaemon'
@@ -26,6 +26,7 @@ export interface SessionCatalogOptions {defaultCodexDirectory?:string|null;defau
 const defaultClaudeSourceId='4135f4e6-6db5-4bd4-95f7-06f4c667341a'
 const defaultCodexSourceId='61f5fc85-e814-4f63-9f9f-b96d94fcf51a'
 interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;claudeFiles:Map<string,ClaudeSourceFile>;warnings:string[];sourceCounts:Record<string,number>;sources:SessionSource[]}
+const fingerprint=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 function hasPaginatedHistory(record:SessionRecord):boolean{return record.historyMode==='paginated'||record.locations.some(location=>location.historyMode==='paginated'||location.versions?.some(version=>version.historyMode==='paginated'))}
 class SessionLimitError extends Error {}
 export const classifySession=(title:string,cwd:string):SessionKind=>{
@@ -176,10 +177,10 @@ export class SessionCatalog {
                 const updatedAt=indexed!==undefined&&(activity===undefined||Math.abs(indexed-activity)<=3600000)?indexed:activity??stat.mtimeMs
                 const historyMode=meta.payload?.history_mode==='paginated'||typeof meta.payload?.history_base?.thread_id==='string'&&!!meta.payload.history_base.thread_id?'paginated' as const:undefined
                 const location:SessionLocation={targetId:target.id,name:target.name,directory:root,running:targetRunning,archived:relative(root,path).startsWith('archived_sessions'+sep),ambiguous:false,...historyMode?{historyMode}:{}}
-                // Codex transcript viewing is supported for both ordinary and
-                // verified paginated rollouts. Codex resume has a separate
-                // CODEX_HOME index/ticket boundary and is not exposed here yet.
-                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',capabilities:{open:true,transfer:!readOnly,archive:!readOnly,trash:!readOnly,visibilityRepair:!readOnly,tokens:true,contentSearch:true,content:true},...historyMode?{historyMode}:{},...(historyMode?{syncBlockedReason:'Codex 分段会话依赖 history_base lineage 与 SQLite 数据库组，当前版本尚不支持跨实例同步'}:{})}
+                // Codex resume is offered only after the active SQLite index
+                // identifies the exact physical rollout; read-only sources and
+                // paginated histories stay viewable but cannot launch by ID.
+                const record:SessionRecord={id,title,cwd,projectName:displayProject(display,cwd),updatedAt,kind,locations:[location],clientType:'codex',capabilities:{open:true,transfer:!readOnly,archive:!readOnly,trash:!readOnly,visibilityRepair:!readOnly,tokens:true,contentSearch:true,content:true,resume:false},...historyMode?{historyMode}:{},...(historyMode?{syncBlockedReason:'Codex 分段会话目前仅支持单条迁移；全量或多选同步会跳过，需要明确选择 SQLite 当前活动 rollout。'}:{})}
                 const matchesTitle=[title,id].some(value=>value.toLowerCase().includes(input.titleQuery.toLowerCase()))
                 // Never search a single paginated segment as though it were a
                 // complete transcript. Verified lineage search is performed
@@ -194,7 +195,9 @@ export class SessionCatalog {
           const finalRoot=await lstat(root);if(finalRoot.dev!==rootStat.dev||finalRoot.ino!==rootStat.ino)throw new Error('会话目录已被替换')
           const grouped=new Map<string,typeof sourceRows>()
           for(const row of sourceRows)grouped.set(row.record.id,[...(grouped.get(row.record.id)??[]),row])
-          const needsRolloutIndex=[...grouped.values()].some(rows=>rows.length>1||!!input.contentQuery&&rows.some(row=>row.record.historyMode==='paginated'))
+          const selectedProfile=selected.role==='instance'?this.store.read().instances?.find(profile=>profile.id===selected.id&&profile.clientType!=='claude_code'&&!profile.externalHome):undefined
+          const selectedApplication=selectedProfile&&this.store.read().instanceApplications?.find(application=>application.id===selectedProfile.applicationId)
+          const needsRolloutIndex=selectedApplication?.kind==='cli'||[...grouped.values()].some(rows=>rows.length>1||!!input.contentQuery&&rows.some(row=>row.record.historyMode==='paginated'))
           const indexedRollouts=needsRolloutIndex&&useSqlite?await readSessionRolloutIndex(root,signal,warn):new Map<string,string>()
           for(const [id,rows] of grouped){
             const ordered=rows.slice().sort((a,b)=>canonical(a.file).localeCompare(canonical(b.file)))
@@ -250,6 +253,11 @@ export class SessionCatalog {
             // Keep every physical file for full-directory sync/trash.  Actions
             // that need one source filter duplicateOf and use the canonical row.
             for(const {record,file} of selected){
+              const profile=target.role==='instance'?this.store.read().instances?.find(value=>value.id===target.id&&value.clientType!=='claude_code'):undefined
+              const application=profile&&this.store.read().instanceApplications?.find(value=>value.id===profile.applicationId)
+              let cwdAvailable=false;try{const cwdStat=lstatSync(record.cwd);cwdAvailable=cwdStat.isDirectory()&&!cwdStat.isSymbolicLink()&&realpathSync(record.cwd)===record.cwd}catch{}
+            const isCurrentCli=!!primary&&primary.file.path===file.path&&!!profile&&!profile.externalHome&&application?.kind==='cli'&&!readOnly&&!targetRunning&&isAbsolute(record.cwd)&&cwdAvailable&&!record.locations[0].archived
+              if(isCurrentCli){record.capabilities={...(record.capabilities??{open:true,transfer:true,archive:true,trash:true,visibilityRepair:true,tokens:true,contentSearch:true,content:true}),resume:true};record.resumeMode='managed';record.launchMode='cli'}
               files.set(id,[...files.get(id)??[],file,...retained.map(row=>row.file)])
               const existing=records.get(id)
               if(existing){
@@ -298,7 +306,9 @@ export class SessionCatalog {
         const writable=record.locations.some(location=>!this.readOnlyCodexSource(location.targetId)),conflicted=record.locations.some(location=>location.ambiguous)
         const paginated=record.historyMode==='paginated'
         const externalSync=record.locations.some(location=>this.externalCodexSource(location.targetId))
-        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted,syncSource:(writable||externalSync)&&!paginated,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
+        // Paginated sessions can be selected for the dedicated single-session
+        // transfer path. Bulk/full sync still reports them as unsupported.
+        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted,syncSource:writable||externalSync,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
       }).filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)&&(!input.projectQuery||[record.cwd,record.projectName??''].some(value=>value.toLowerCase().includes(input.projectQuery.toLowerCase())))).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
       this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,claudeFiles,warnings:[...warnings].slice(0,100),sourceCounts,sources}
       return this.page({snapshotId:this.snapshot.id,page:1,pageSize:25})
@@ -374,6 +384,33 @@ export class SessionCatalog {
     const content=readClaudeSessionContent(claude.location,{page:input.page,pageSize:input.pageSize,query:input.query})
     this.current(input.snapshotId)
     return {snapshotId:input.snapshotId,sessionId:row.id,sourceSessionId:claude.sessionId,title:row.title,cwd:row.cwd,sourceName:claude.target.name,clientType:'claude_code',...content}
+  }
+  async codexResumeSource(raw:unknown):Promise<CodexResumeTicketSource>{
+    const input=codexResumeSelectionSchema.parse(raw),snapshot=this.current(input.snapshotId),row=snapshot.records.find(value=>value.id===input.sessionId),sources=snapshot.files.get(input.sessionId)??[]
+    if(!row||row.clientType!=='codex'||row.resumeMode!=='managed'||row.capabilities?.resume!==true||row.launchMode!=='cli')throw new Error(row?.resumeBlockedReason??'此 Codex 会话当前不能安全恢复')
+    if(row.locations.length!==1||row.locations[0].targetId!==input.targetId||row.locations[0].ambiguous)throw new Error('Codex 会话存在多个来源或同 ID 文件冲突，请先选择并核对来源')
+    const profile=this.store.read().instances?.find(value=>value.id===input.targetId&&value.clientType!=='claude_code')
+    const application=profile&&this.store.read().instanceApplications?.find(value=>value.id===profile.applicationId)
+    if(!profile||profile.externalHome||application?.kind!=='cli'||profile.revision<0)throw new Error('仅支持已登记的受管 Codex CLI 实例恢复')
+    if(this.running(profile.id))throw new Error('Codex 实例正在运行，请先停止后重试')
+    const target=this.codexIdentityTarget(profile.id),source=sources.find(value=>value.targetId===profile.id&&!value.duplicateOf)
+    if(target.directory!==source?.root||!source||source.record.locations[0].archived)throw new Error('此会话不是受管 Codex CLI 当前可恢复的 rollout')
+    const indexed=await readSessionRolloutIndex(source.root,new AbortController().signal,()=>{})
+    if(indexed.get(input.sessionId)!==source.path)throw new Error('无法确认此 rollout 是当前会话，请刷新列表后重试')
+    if(!isAbsolute(row.cwd)||!existsSync(row.cwd))throw new Error('会话原项目目录不可用，请恢复目录后重试')
+    const cwdCanonicalPath=realpathSync(row.cwd),cwdStat=statSync(row.cwd)
+    if(!cwdStat.isDirectory()||lstatSync(row.cwd).isSymbolicLink())throw new Error('会话项目目录不是稳定的普通目录')
+    const opened=await this.verified(source,input.sessionId,new AbortController().signal)
+    let lineage:CodexResumeTicketSource['lineage']
+    try{
+      if(opened.stat.size!==source.size||opened.stat.mtimeMs!==source.mtime||opened.stat.ctimeMs!==source.ctime)throw new Error('会话文件已变化，请刷新列表')
+      if(source.record.historyMode==='paginated'){
+        await readCodexSessionLineage(source.root,source.path,input.sessionId,{page:1,pageSize:1},new AbortController().signal,{file:opened.file,size:opened.stat.size},files=>{lineage=files})
+        if(!lineage?.length||lineage[0].path!==source.path)throw new Error('无法验证 Codex 分段会话的完整历史，拒绝恢复')
+      }
+    }finally{await opened.file.close()}
+    this.current(input.snapshotId)
+    return {snapshotId:input.snapshotId,targetId:profile.id,sessionId:input.sessionId,path:source.path,root:source.root,rootDevice:source.rootDevice,rootInode:source.rootInode,device:source.device,inode:source.inode,size:source.size,mtime:source.mtime,ctime:source.ctime,cwd:row.cwd,cwdCanonicalPath,cwdDevice:cwdStat.dev,cwdInode:cwdStat.ino,instanceRevision:profile.revision,profileFingerprint:fingerprint(profile),...(lineage?{lineage}:{})}
   }
   /** Resume plans are bound to the original instance/profile and snapshot.
    * Launch tickets must call this again immediately before committing launch. */
@@ -541,7 +578,7 @@ export class SessionCatalog {
     for(const record of snapshot.records){
       if(record.clientType!=='codex'||!hasPaginatedHistory(record)||wanted&&!wanted.has(record.id))continue
       const sourceIds=record.locations.filter(location=>targetIds.includes(location.targetId)&&location.targetId!==defaultCodexSourceId).map(location=>location.targetId)
-      if(sourceIds.length)result.push({id:record.id,title:record.title,sourceIds,reason:record.syncBlockedReason??'Codex 分段会话依赖 history_base lineage 与 SQLite 数据库组，当前版本尚不支持跨实例同步'})
+      if(sourceIds.length)result.push({id:record.id,title:record.title,sourceIds,reason:record.syncBlockedReason??'Codex 分段会话目前仅支持单条迁移；全量或多选同步会跳过，需要明确选择 SQLite 当前活动 rollout。'})
     }
     return result
   }

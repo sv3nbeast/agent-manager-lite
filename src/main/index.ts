@@ -56,7 +56,7 @@ import {SessionArchives} from './sessionArchives'
 import {SessionSync} from './sessionSync'
 import {SessionTrash} from './sessionTrash'
 import {SessionVisibilityRepair} from './sessionVisibility'
-import {sessionSelectionSchema,claudeResumeSelectionSchema,sessionCopyIdSchema} from '../shared/sessions'
+import {sessionSelectionSchema,claudeResumeSelectionSchema,codexResumeSelectionSchema,sessionCopyIdSchema} from '../shared/sessions'
 import {AccountNetwork} from './accountNetwork'
 import {AccountProxies} from './accountProxy'
 import {UpstreamProxies} from './upstreamProxy'
@@ -519,6 +519,8 @@ async function main(): Promise<void> {
       case 'sessionContent': return sessions.content(input)
       case 'previewClaudeSessionResume': return instances.previewClaudeSessionResume(await sessions.claudeResume(claudeResumeSelectionSchema.parse(input)))
       case 'discardClaudeSessionResume': instances.discardClaudeSessionResume(z.string().uuid().parse(input));return
+      case 'previewCodexSessionResume': return instances.previewCodexSessionResume(await sessions.codexResumeSource(codexResumeSelectionSchema.parse(input)))
+      case 'discardCodexSessionResume': instances.discardCodexSessionResume(z.string().uuid().parse(input));return
       case 'previewDefaultClaudeSessionResume': return defaultClaudeSessionResume.preview(claudeResumeSelectionSchema.parse(input))
       case 'startDefaultClaudeSessionResume': return defaultClaudeSessionResume.start(z.string().uuid().parse(input))
       case 'discardDefaultClaudeSessionResume': return defaultClaudeSessionResume.discard(z.string().uuid().parse(input))

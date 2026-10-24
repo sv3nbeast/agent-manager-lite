@@ -22,6 +22,8 @@ import type {InstanceApplication} from '../shared/instances'
 import {assertUnpagedSessionSources} from './sessionPaging'
 import {CodexSessionSources} from './codexSessionSources'
 import {probeClientDaemon} from './clientDaemon'
+import {inspectCodexPaginatedSession,inspectCodexPaginatedTransferTarget,transferCodexPaginatedSession,recoverCodexPaginatedTransfers} from './codexPaginatedSessionTransfer'
+import {instanceHomePath} from './instancePaths'
 
 type PlannedFile={merged:MergedSession;projected:SessionTransferSource;relative:string;sha256:string;originals:SessionTransferSource[];changed:boolean}
 type Plan={target:ClientConfigTarget;view:SyncTargetPreview;rootIdentity?:{device:number;inode:number};configHash:string;profileHash:string;inventory:string;indexBefore:string|null;globalBefore:string|null;files:PlannedFile[];metadata:SyncJournal['metadata']}
@@ -29,7 +31,8 @@ type SourceGuard=
   |{kind:'instance';target:ClientConfigTarget;rootIdentity?:{device:number;inode:number};profileHash:string;configHash:string;inventory:string;indexBefore:string|null;globalBefore:string|null}
   |{kind:'external';id:string;name:string;directory:string;device:number;inode:number;inventory:string}
 type DirectionalSource=ClientConfigTarget&{role:'instance'|'external';device?:number;inode?:number}
-type Pending={view:SyncPreview;root:string;plans:Plan[];guards:SourceGuard[];sources:SessionTransferSource[];program:SessionProgram;applicationId:string;expires:number}
+type PaginatedPending={sourceId:string;sourceRole:'instance'|'external';sourceName:string;sourceInventory:string;targetId:string;sourceHome:string;targetHome:string;sessionId:string;title:string;expectedRolloutPath:string;expectedRecordFingerprint:string;expectedSourceFingerprint:string;expectedTargetFingerprint:string;rollouts:number;bytes:number;sourceProfileHash:string;targetProfileHash:string;sourceConfigHash:string;targetConfigHash:string;sourceRootIdentity:{device:number;inode:number};targetRootIdentity:{device:number;inode:number}}
+type Pending={view:SyncPreview;root:string;plans:Plan[];guards:SourceGuard[];sources:SessionTransferSource[];program:SessionProgram;applicationId:string;expires:number;paginated?:PaginatedPending}
 type Job={view:SyncView;ids:Set<string>;controller:AbortController;task?:Promise<unknown>}
 function officialLocation(source:SessionTransferSource):boolean{
   const path=relative(source.root,source.path).split(sep).join('/'),match=path.match(/^(archived_sessions|sessions\/(\d{4})\/(\d{2})\/(\d{2}))\/rollout-(\d{4})-(\d{2})-(\d{2})T\d{2}-\d{2}-\d{2}-([a-fA-F0-9-]+)(?:_([a-fA-F0-9-]+))?\.jsonl$/)
@@ -47,14 +50,16 @@ export class SessionSync {
   private job?:Job
   private timer?:NodeJS.Timeout
   private readonly recovery=new Map<string,SyncRecovery>()
+  private readonly paginatedBackups=new Map<string,string>()
+  private readonly paginatedRecovery=new Map<string,{targetId:string;targetHome:string;targetName:string;directory:string}>()
   private readonly conflictScans=new Map<string,AbortController>()
   constructor(private readonly store:Store,private readonly transfers:SessionTransfers,private readonly applications:()=>InstanceApplication[],private readonly inUse:(id:string)=>boolean=()=>false,private readonly rebuild:typeof rebuildSessionMetadata=rebuildSessionMetadata,private readonly now:()=>number=Date.now){
     this.configs=new ClientConfigs(store);this.codexSessionSources=new CodexSessionSources(store);const root=realpathSync(store.directory);this.root=join(root,'session-sync');this.scratch=join(root,'session-sync-previews')
     if(existsSync(this.scratch)){directory(this.scratch);for(const entry of readdirSync(this.scratch,{withFileTypes:true}))if(entry.isDirectory()&&z.string().uuid().safeParse(entry.name).success)rmSync(join(this.scratch,entry.name),{recursive:true})}
   }
-  view():{sync?:SyncView;recoveries:SyncRecovery[]}{return {sync:this.job?structuredClone(this.job.view):undefined,recoveries:[...this.recovery.values()].map(value=>({...value}))}}
-  busy(id:string):boolean{return !!this.job?.task&&this.job.ids.has(id)||[...this.recovery.values()].some(item=>!item.targetId||item.targetId===id)}
-  private free(ids:Iterable<string>):void{for(const id of ids)if(this.inUse(id)||this.transfers.busy(id)||[...this.recovery.values()].some(item=>!item.targetId||item.targetId===id))throw new Error('相关目录正在使用或等待恢复，请先关闭客户端并处理恢复记录')}
+  view():{sync?:SyncView;recoveries:SyncRecovery[]}{return {sync:this.job?structuredClone(this.job.view):undefined,recoveries:[...this.recovery.values()].map(value=>({...value,...this.paginatedRecovery.has(value.id)?{kind:'codex_paginated' as const}:{} }))}}
+  busy(id:string):boolean{return !!this.job?.task&&this.job.ids.has(id)||[...this.recovery.values()].some(item=>!item.targetId||item.targetId===id)||[...this.paginatedRecovery.values()].some(item=>item.targetId===id)}
+  private free(ids:Iterable<string>):void{for(const id of ids)if(this.inUse(id)||this.transfers.busy(id)||[...this.recovery.values()].some(item=>!item.targetId||item.targetId===id)||[...this.paginatedRecovery.values()].some(item=>item.targetId===id))throw new Error('相关目录正在使用或等待恢复，请先关闭客户端并处理恢复记录')}
   private profileHash(id:string):string{return textHash(JSON.stringify(this.store.read().instances?.find(item=>item.id===id)??null))}
   private directionalSource(id:string):DirectionalSource{
     if((this.store.read().codexSessionSources??[]).some(source=>source.id===id)){const source=this.codexSessionSources.resolve(id);return {id:source.id,name:source.name,directory:source.directory,managed:false,role:'external',device:source.device,inode:source.inode}}
@@ -64,6 +69,18 @@ export class SessionSync {
     return {...target,role:'instance'}
   }
   private sourceVersionId(source:SessionTransferSource):string{return createHash('sha256').update(JSON.stringify([source.path,source.device,source.inode,source.size,source.mtime,source.ctime])).digest('hex').slice(0,32)}
+  private async paginatedFileVersions(root:string,id:string,signal:AbortSignal):Promise<Array<{path:string;versionId:string}>>{
+    const rootStat=lstatSync(root),found:Array<{path:string;versionId:string}>=[]
+    for await(const path of rolloutFiles(root,signal)){
+      signal.throwIfAborted();const stat=await safeSessionPath(root,path);if(!stat.isFile()||stat.nlink!==1)continue
+      const opened=await openSessionFile(root,path)
+      try{const meta=await firstSessionEvent(opened.file,opened.stat.size,signal),foundId=meta?.type==='session_meta'?sessionIdentifier(meta.payload?.id??meta.payload?.session_id??meta.id??meta.session_id):undefined;if(foundId!==id)continue
+        const row:SessionTransferSource={path,root,targetId:'',rootDevice:rootStat.dev,rootInode:rootStat.ino,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:{id,title:'',cwd:'',kind:'conversation',locations:[]}}
+        found.push({path,versionId:this.sourceVersionId(row)})
+      }finally{await opened.file.close()}
+    }
+    return found
+  }
   private async externalCopies(source:DirectionalSource,records:SessionRecord[],selections:NonNullable<DirectionalSyncPreviewInput['sourceSelections']>,signal:AbortSignal):Promise<SessionTransferSource[]>{
     const rootStat=lstatSync(source.directory),wanted=new Set(records.map(record=>record.id)),found=new Map<string,SessionTransferSource[]>()
     for await(const path of rolloutFiles(source.directory,signal)){
@@ -87,7 +104,7 @@ export class SessionSync {
     return result
   }
   private available():void{if(this.job?.task)throw new Error('已有会话同步正在执行')}
-  private clear():void{clearTimeout(this.timer);if(this.pending){directory(this.scratch);directory(this.pending.root);rmSync(this.pending.root,{recursive:true});this.pending=undefined};if(this.job?.view.status==='ready')this.job.view.status='cancelled'}
+  private clear():void{clearTimeout(this.timer);if(this.pending){if(this.pending.root){directory(this.scratch);directory(this.pending.root);rmSync(this.pending.root,{recursive:true})};this.pending=undefined};if(this.job?.view.status==='ready')this.job.view.status='cancelled'}
   async discard():Promise<void>{if(this.job?.task&&this.job.view.status==='preparing')await this.cancel(this.job.view.id);if(!this.job?.task)this.clear()}
   private begin(ids:string[],status:SyncView['status']):Job{this.available();const job:Job={ids:new Set(ids),controller:new AbortController(),view:{id:randomUUID(),status,targets:[],completedTargets:[],sourceFiles:0,processedFiles:0,bytes:0,totalBytes:0,backups:[]}};this.job=job;return job}
   private async execute<T>(job:Job,action:()=>Promise<T>):Promise<T>{const task=action();job.task=task;try{return await task}catch(error){job.view.status=job.controller.signal.aborted?'cancelled':'failed';job.view.error=job.controller.signal.aborted?'同步已取消':safeError(error);throw new Error(job.view.error)}finally{job.task=undefined}}
@@ -216,6 +233,46 @@ export class SessionSync {
       }catch(error){directory(root);rmSync(root,{recursive:true});throw error}
     })
   }
+  private async previewPaginated(input:DirectionalSyncPreviewInput,source:DirectionalSource,target:ClientConfigTarget,record:SessionRecord,snapshotId:string,application:InstanceApplication,job:Job,signal:AbortSignal):Promise<SyncPreview>{
+    const profile=(id:string)=>this.store.read().instances?.find(item=>item.id===id&&item.clientType!=='claude_code')
+    const sourceProfile=profile(source.id),targetProfile=profile(target.id)
+    const externalSource=source.role==='external'?this.codexSessionSources.resolve(source.id):undefined
+    let blocked=''
+    if(source.role!=='instance'&&source.role!=='external'||target.role!=='instance'||!target.managed||!targetProfile||targetProfile.externalHome||source.role==='instance'&&(!source.managed||!sourceProfile||sourceProfile.externalHome)||source.role==='external'&&(!externalSource||externalSource.directory!==source.directory||externalSource.device!==source.device||externalSource.inode!==source.inode))blocked='Codex 分段会话仅支持受管实例或已登记的只读外部来源迁移到受管目标；默认目录和外部目标暂不支持。'
+    let sourceState:Awaited<ReturnType<typeof inspectCodexPaginatedSession>>|undefined,targetState:Awaited<ReturnType<typeof inspectCodexPaginatedTransferTarget>>|undefined
+    if(!blocked){
+      await this.transfers.closed(source,signal);await this.transfers.closed(target,signal)
+      const location=record.locations.find(item=>item.targetId===source.id)
+      const selection=input.sourceSelections?.find(item=>item.sessionId===record.id&&item.targetId===source.id)
+      if(input.sourceSelections?.some(item=>item.sessionId!==record.id||item.targetId!==source.id))blocked='分页会话同步一次只能指定一个来源版本。'
+      if(location?.ambiguous&&!selection?.versionId)blocked='此分页会话有多个同 ID 文件，请选择当前活动版本后再继续。'
+      const versions=await this.paginatedFileVersions(source.directory,record.id,signal)
+      sourceState=await inspectCodexPaginatedSession({sourceHome:source.directory,sessionId:record.id},{signal})
+      if(!sourceState.canTransfer)blocked||=sourceState.reason??'来源分页会话不满足安全迁移条件。'
+      const selected=selection?.versionId?versions.find(item=>item.versionId===selection.versionId):undefined
+      if(selection?.versionId&&!selected)blocked||='所选来源版本已变化，请刷新会话列表后重试。'
+      if(selected&&selected.path!==sourceState.currentRolloutPath)blocked||='所选 JSONL 文件不是 SQLite 中记录的当前活动 rollout；为避免错配，不能迁移此版本。'
+      if(!selection&&versions.length&&sourceState&&!versions.some(item=>item.path===sourceState!.currentRolloutPath))blocked||='当前 SQLite 活动 rollout 不在已扫描来源版本中，请刷新后重试。'
+      if(!selection&&location?.ambiguous)blocked||='必须明确选择 SQLite 当前活动 rollout 对应的文件版本。'
+      if(sourceState?.canTransfer){
+        targetState=await inspectCodexPaginatedTransferTarget({sourceHome:source.directory,targetHome:target.directory,sessionId:record.id},{signal})
+        if(!targetState.canReceive)blocked||=targetState.reason??'目标实例不能接收此分页会话。'
+        for(const item of sourceState.rollouts){const destination=join(target.directory,relative(source.directory,item.path));if(existsSync(destination))blocked||='目标实例已存在 lineage 文件 '+relative(target.directory,destination)+'，拒绝覆盖。'}
+        const targetCatalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true})
+        try{const targetPage=await targetCatalog.scan({runId:randomUUID(),targetId:target.id,clientType:'codex'});if(targetPage.warnings.length)blocked||='目标实例会话扫描未完整，无法安全排除同 ID 文件冲突。';else if(targetCatalog.recordsForSync(targetPage.snapshotId,[record.id],[target.id]).some(item=>item.id===record.id))blocked||='目标实例已存在相同会话 ID 的 rollout 文件，拒绝覆盖或形成双重会话。'}finally{targetCatalog.stop()}
+      }
+    }
+    const sourceIdentity=lstatSync(source.directory),targetIdentity=lstatSync(target.directory),sourceInventory=await this.inventory(source.directory,signal)
+    const sources=[{id:source.id,name:source.name,directory:source.directory}],unsupportedSessions=blocked?[{id:record.id,title:record.title,sourceIds:[source.id,target.id],reason:blocked}]:[]
+    const view:SyncPreview={canStart:!blocked,sessionCount:blocked?0:1,sourceFiles:blocked?0:sourceState!.rollouts.length,totalBytes:blocked?0:sourceState!.rollouts.reduce((sum,item)=>sum+item.bytes,0),targets:[{id:target.id,name:target.name,directory:target.directory,added:blocked?0:1,updated:0,unchanged:0,duplicates:0,repairsWorkspace:false,repairsIndex:false}],unsupportedSessions,directional:{sourceIds:[source.id],targetId:target.id,scope:'selected',sources,sessions:blocked?[]:[{id:record.id,title:record.title,sourceIds:[source.id],sourceFiles:sourceState!.rollouts.length,targetFiles:0,action:'add'}]},...(blocked?{}:{paginatedTransfer:{kind:'codex_paginated' as const,sourceId:source.id,targetId:target.id,rollouts:sourceState!.rollouts.length,bytes:sourceState!.rollouts.reduce((sum,item)=>sum+item.bytes,0)}})}
+    job.view.status='ready';Object.assign(job.view,{targets:view.targets,sourceFiles:view.sourceFiles,totalBytes:view.totalBytes})
+    if(view.canStart&&sourceState&&targetState){
+      const ticket=randomUUID();view.ticket=ticket
+      this.pending={view,root:'',plans:[],guards:[],sources:[],program:sessionProgram(application),applicationId:input.applicationId,expires:this.now()+300000,paginated:{sourceId:source.id,sourceRole:source.role as 'instance'|'external',sourceName:source.name,sourceInventory,targetId:target.id,sourceHome:source.directory,targetHome:target.directory,sessionId:record.id,title:record.title,expectedRolloutPath:sourceState.currentRolloutPath,expectedRecordFingerprint:sourceState.recordFingerprint,expectedSourceFingerprint:sourceState.sourceFingerprint,expectedTargetFingerprint:targetState.targetFingerprint,rollouts:sourceState.rollouts.length,bytes:sourceState.rollouts.reduce((sum,item)=>sum+item.bytes,0),sourceProfileHash:this.profileHash(source.id),targetProfileHash:this.profileHash(target.id),sourceConfigHash:textHash(readBounded(join(source.directory,'config.toml'),1024*1024)),targetConfigHash:this.transfers.config(target).hash,sourceRootIdentity:{device:sourceIdentity.dev,inode:sourceIdentity.ino},targetRootIdentity:{device:targetIdentity.dev,inode:targetIdentity.ino}}}
+      this.timer=setTimeout(()=>{if(!this.job?.task)this.clear()},300000);this.timer.unref()
+    }
+    return structuredClone(view)
+  }
   private async previewDirectional(input:DirectionalSyncPreviewInput):Promise<SyncPreview>{
     const sourceIds=[...new Set(input.sourceIds)];if(sourceIds.length!==input.sourceIds.length)throw new Error('同步来源不能重复')
     if(sourceIds.includes(input.targetId))throw new Error('目标实例不能同时作为来源')
@@ -227,6 +284,14 @@ export class SessionSync {
     this.available();this.free([target.id,...sourceTargets.map(source=>source.id)]);this.clear();const job=this.begin([target.id,...sourceTargets.map(source=>source.id)],'preparing'),signal=job.controller.signal
     return this.execute(job,async()=>{
       const application=this.applications().find(app=>app.id===input.applicationId);if(!application)throw new Error('请选择已登记的 Codex 程序')
+      if(input.scope==='selected'&&sourceTargets.length===1&&input.sessionIds.length===1){
+        const single=sourceTargets[0],catalog=new SessionCatalog(this.store,undefined,{disableSqliteDisplay:true}),cancel=()=>catalog.stop();signal.addEventListener('abort',cancel,{once:true})
+        try{
+          const page=await catalog.scan({runId:randomUUID(),targetId:single.id,clientType:'codex'});if(page.warnings.length)throw new Error('部分会话来源未读取完整：'+page.warnings[0])
+          const record=catalog.recordsForSync(page.snapshotId,input.sessionIds,[single.id]).find(row=>row.id===input.sessionIds[0])
+          if(record&&paginatedSession(record))return await this.previewPaginated(input,single,target,record,page.snapshotId,application,job,signal)
+        }finally{signal.removeEventListener('abort',cancel);catalog.stop()}
+      }
       const program=sessionProgram(application),config=this.transfers.config(target),targetExisting=existsSync(target.directory),targetRootIdentity=targetExisting?fileIdentity(lstatSync(target.directory)):undefined,targetInventory=await this.inventory(target.directory,signal),targetIndexBefore=readBounded(join(target.directory,'session_index.jsonl'),16*1024**2),targetGlobalBefore=readBounded(join(target.directory,'.codex-global-state.json'),16*1024**2)
       if(targetExisting)await this.transfers.closed(target,signal)
       const guards:SourceGuard[]=[],sourceCopies:SessionTransferSource[]=[],sourceScopeIds=new Set<string>(),paginatedById=new Map<string,{title:string;sourceIds:string[]}>(),validatedUnsupportedChoices=new Set<string>();let activeCatalog:SessionCatalog|undefined;const stop=()=>activeCatalog?.stop();signal.addEventListener('abort',stop,{once:true})
@@ -298,10 +363,25 @@ export class SessionSync {
   start(raw:unknown):void{
     const input=syncStartSchema.parse(raw),pending=this.pending;this.available()
     if(!pending||pending.view.ticket!==input.ticket||pending.expires<this.now())throw new Error('同步预览已过期，请重新预览')
-    const lockedIds=[...new Set([...pending.plans.map(plan=>plan.target.id),...pending.guards.map(guard=>guard.kind==='external'?guard.id:guard.target.id)])]
+    const lockedIds=[...new Set([...pending.plans.map(plan=>plan.target.id),...pending.guards.map(guard=>guard.kind==='external'?guard.id:guard.target.id),...(pending.paginated?[pending.paginated.sourceId,pending.paginated.targetId]:[])])]
     this.free(lockedIds);clearTimeout(this.timer);this.pending=undefined
-    const job=this.begin(lockedIds,'running');Object.assign(job.view,{targets:pending.view.targets,sourceFiles:pending.sources.length,totalBytes:pending.plans.reduce((sum,plan)=>sum+plan.files.filter(file=>file.changed).reduce((sum,file)=>sum+file.projected.size,0),0)})
-    void this.execute(job,()=>this.run(job,pending)).catch(()=>{})
+    const job=this.begin(lockedIds,'running');Object.assign(job.view,{targets:pending.view.targets,sourceFiles:pending.paginated?.rollouts??pending.sources.length,totalBytes:pending.paginated?.bytes??pending.plans.reduce((sum,plan)=>sum+plan.files.filter(file=>file.changed).reduce((sum,file)=>sum+file.projected.size,0),0),transferKind:pending.paginated?'codex_paginated':'jsonl'})
+    void this.execute(job,()=>pending.paginated?this.runPaginated(job,pending.paginated):this.run(job,pending)).catch(()=>{})
+  }
+  private async runPaginated(job:Job,pending:PaginatedPending):Promise<void>{
+    const signal=job.controller.signal
+    try{
+      const source=pending.sourceRole==='external'?this.directionalSource(pending.sourceId):this.configs.identityTarget(pending.sourceId),target=this.configs.identityTarget(pending.targetId),sourceProfile=this.store.read().instances?.find(item=>item.id===pending.sourceId),targetProfile=this.store.read().instances?.find(item=>item.id===pending.targetId)
+      if(source.role!==pending.sourceRole||source.role!=='instance'&&source.role!=='external'||target.role!=='instance'||!target.managed||!targetProfile||targetProfile.externalHome||source.role==='instance'&&(!source.managed||!sourceProfile||sourceProfile.externalHome))throw new Error('分页会话同步只允许受管实例或已登记只读来源迁移到受管实例')
+      const sourceRoot=lstatSync(source.directory),targetRoot=lstatSync(target.directory)
+      if(source.directory!==pending.sourceHome||target.directory!==pending.targetHome||sourceRoot.dev!==pending.sourceRootIdentity.device||sourceRoot.ino!==pending.sourceRootIdentity.inode||targetRoot.dev!==pending.targetRootIdentity.device||targetRoot.ino!==pending.targetRootIdentity.inode)throw new Error('预览后实例目录身份发生变化，请重新预览')
+      if(source.role==='external'){const registered=this.codexSessionSources.resolve(source.id);if(registered.name!==pending.sourceName||registered.directory!==pending.sourceHome||registered.device!==pending.sourceRootIdentity.device||registered.inode!==pending.sourceRootIdentity.inode)throw new Error('只读来源登记或目录身份已变化，请重新预览')}
+      else if(this.profileHash(source.id)!==pending.sourceProfileHash)throw new Error('预览后来源实例发生变化，请重新预览')
+      if(this.profileHash(target.id)!==pending.targetProfileHash||textHash(readBounded(join(source.directory,'config.toml'),1024*1024))!==pending.sourceConfigHash||this.transfers.config(target).hash!==pending.targetConfigHash)throw new Error('预览后实例或 sqlite_home 配置发生变化，请重新预览')
+      await this.transfers.closed(source,signal);await this.transfers.closed(target,signal);if(await this.inventory(source.directory,signal)!==pending.sourceInventory)throw new Error('分页会话只读来源文件在预览后发生变化，请重新预览');signal.throwIfAborted();job.view.currentTarget=target.id
+      const result=await transferCodexPaginatedSession({sourceHome:source.directory,targetHome:target.directory,sessionId:pending.sessionId,expectedRolloutPath:pending.expectedRolloutPath,expectedRecordFingerprint:pending.expectedRecordFingerprint,expectedSourceFingerprint:pending.expectedSourceFingerprint,expectedTargetFingerprint:pending.expectedTargetFingerprint},{signal})
+      const backupId=result.backupDirectory.split(sep).at(-1)??randomUUID();this.paginatedBackups.set(backupId,result.backupDirectory);job.view.completedTargets.push(target.id);job.view.backups.push({targetId:target.id,id:backupId});job.view.processedFiles=result.rollouts;job.view.bytes=result.bytes;job.view.status='completed'
+    }finally{job.view.currentTarget=undefined}
   }
   private save(journal:SyncJournal):void{const raw=encodeSyncJournal(journal);directory(this.root,true);directory(join(this.root,journal.id),true);atomic(join(this.root,journal.id,'journal.json'),raw)}
   private load(id:string):SyncJournal{z.string().uuid().parse(id);directory(this.root);directory(join(this.root,id));const journal=syncJournalSchema.parse(JSON.parse(readBounded(join(this.root,id,'journal.json'),40*1024**2)??''));if(journal.id!==id)throw new Error('同步恢复记录身份不一致');return journal}
@@ -355,6 +435,17 @@ export class SessionSync {
   async cancel(id:string):Promise<void>{z.string().uuid().parse(id);if(this.job?.view.id!==id)throw new Error('同步任务已变化');this.job.controller.abort();await this.settled();if(this.pending)this.clear()}
   async stop():Promise<void>{for(const controller of this.conflictScans.values())controller.abort();this.job?.controller.abort();await this.settled();this.clear()}
   async recover():Promise<void>{
+    for(const profile of this.store.read().instances??[]){
+      if(profile.clientType==='claude_code'||profile.externalHome)continue
+      const target=this.configs.identityTarget(profile.id),home=instanceHomePath(realpathSync(this.store.directory),profile)
+      if(target.directory!==home||!existsSync(home))continue
+      for(const item of await recoverCodexPaginatedTransfers(home)){
+        if(item.status==='blocked'){
+          const value:SyncRecovery={id:item.id,targetId:profile.id,targetName:profile.name,message:'Codex 分段会话迁移需要恢复：'+item.message+'（备份目录：'+item.directory+'）',kind:'codex_paginated'}
+          this.recovery.set(item.id,value);this.paginatedRecovery.set(item.id,{targetId:profile.id,targetHome:home,targetName:profile.name,directory:item.directory})
+        }else this.paginatedBackups.set(item.id,item.directory)
+      }
+    }
     if(!existsSync(this.root))return;directory(this.root)
     for(const entry of readdirSync(this.root,{withFileTypes:true})){
       if(!entry.isDirectory()||!z.string().uuid().safeParse(entry.name).success)continue
@@ -371,6 +462,22 @@ export class SessionSync {
   }
   async retry(raw:unknown):Promise<void>{
     const input=z.object({id:z.string().uuid(),applicationId:z.string().min(1).max(100),clientsClosed:z.literal(true)}).strict().parse(raw);this.available()
+    const paginated=this.paginatedRecovery.get(input.id)
+    if(paginated||this.paginatedBackups.has(input.id)){
+      if(!paginated)throw new Error('此 Codex 分段会话迁移已完成；备份保留供审计或手动恢复。')
+      const target=this.configs.identityTarget(paginated.targetId)
+      if(target.directory!==paginated.targetHome||target.role!=='instance'||!target.managed)throw new Error('Codex 分段迁移恢复目标目录已变化')
+      await this.transfers.closed(target,new AbortController().signal)
+      const records=await recoverCodexPaginatedTransfers(target.directory)
+      const result=records.find(item=>item.id===input.id)
+      if(!result)throw new Error('找不到 Codex 分段迁移恢复日志，请检查备份目录')
+      if(result.status==='blocked'){
+        const value:SyncRecovery={id:result.id,targetId:target.id,targetName:target.name,message:'Codex 分段会话迁移仍需处理：'+result.message+'（备份目录：'+result.directory+'）',kind:'codex_paginated'}
+        this.recovery.set(result.id,value);this.paginatedRecovery.set(result.id,{...paginated,directory:result.directory});throw new Error(value.message)
+      }
+      this.recovery.delete(result.id);this.paginatedRecovery.delete(result.id);this.paginatedBackups.set(result.id,result.directory)
+      return
+    }
     const journal=this.load(input.id),target=this.target(journal);if(this.inUse(target.id)||this.transfers.busy(target.id))throw new Error('同步目录正在使用，请停止客户端后恢复')
     const application=this.applications().find(app=>app.id===input.applicationId);if(!application)throw new Error('请选择 Codex 程序')
     const program=sessionProgram(application),job=this.begin([target.id],'running')
@@ -386,5 +493,5 @@ export class SessionSync {
       this.save(journal);await cleanupSync(journal);this.recovery.delete(journal.id);job.view.status='completed';job.view.completedTargets.push(target.id)
     }catch(error){this.needsRecovery(journal,safeError(error));throw error}finally{job.view.currentTarget=undefined}})
   }
-  backupLocation(id:string):string{z.string().uuid().parse(id);if(this.recovery.get(id)?.targetId===''){directory(this.root);const folder=join(this.root,id);directory(folder);return folder};const journal=this.load(id);this.target(journal);const folder=existsSync(syncStage(journal))?syncStage(journal):join(this.root,id);directory(folder);return folder}
+  backupLocation(id:string):string{z.string().uuid().parse(id);const paginated=this.paginatedRecovery.get(id);if(paginated){directory(paginated.directory);return paginated.directory};const known=this.paginatedBackups.get(id);if(known){directory(known);return known};if(this.recovery.get(id)?.targetId===''){directory(this.root);const folder=join(this.root,id);directory(folder);return folder};const journal=this.load(id);this.target(journal);const folder=existsSync(syncStage(journal))?syncStage(journal):join(this.root,id);directory(folder);return folder}
 }

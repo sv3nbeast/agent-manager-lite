@@ -146,6 +146,7 @@ test('active state index resolves native paginated segments while retaining ever
   const before=hashes(a.home),page=await f.scan(),record=page.items[0]
   assert.deepEqual(page.warnings,[]);assert.equal(page.total,1);assert.equal(record.historyMode,'paginated')
   assert.equal(record.locations[0].historyMode,'paginated');assert.equal(record.locations[0].ambiguous,false);assert.equal(record.locations[0].historicalCopies,7)
+  assert.equal(record.capabilities?.syncSource,true,'paginated sessions must remain selectable for the dedicated single-session migration path')
   assert.equal(await f.catalog.location({snapshotId:page.snapshotId,sessionId:id,targetId:a.target.id}),current)
   assert.equal((await f.catalog.transferSources(page.snapshotId,[id]))[0].path,current)
   assert.equal((await f.catalog.transferSources(page.snapshotId,[id]))[0].record.historyMode,'paginated')
@@ -411,6 +412,15 @@ test('registered external Codex sources scan and filter transcripts, show shared
   await assert.rejects(f.catalog.content({...selection,page:2,pageSize:10}),/已停用/)
   await assert.rejects(f.catalog.location(selection),/已停用/)
   assert.deepEqual(treeState(home),before,'registration, filtered scan, transcript viewing and source disable must not alter external files or timestamps')
+})
+
+test('registered read-only paginated Codex source remains selectable for single-session migration',async t=>{
+  const f=fixture(t),home=join(f.root,'external-paginated-codex-home'),id=randomUUID(),path=rollout(home,id,[{type:'event_msg',ordinal:1,timestamp:when,payload:{type:'user_message',message:'external paginated text'}}])
+  const lines=readFileSync(path,'utf8').trimEnd().split('\n'),meta=JSON.parse(lines[0]);meta.ordinal=0;meta.payload.history_mode='paginated';lines[0]=JSON.stringify(meta);writeFileSync(path,lines.join('\n')+'\n')
+  const registered=new CodexSessionSources(f.store).register(home,'External paginated Codex'),page=await f.scan({targetId:registered.id})
+  assert.equal(page.total,1);assert.equal(page.items[0].historyMode,'paginated')
+  assert.equal(page.items[0].capabilities?.content,true);assert.equal(page.items[0].capabilities?.syncSource,true)
+  assert.equal(page.items[0].capabilities?.transfer,false);assert.equal(page.items[0].capabilities?.archive,false);assert.equal(page.items[0].capabilities?.trash,false)
 })
 
 test('read-only default Codex paginated rollouts show verified full lineage after explicit version selection without opening SQLite',async t=>{

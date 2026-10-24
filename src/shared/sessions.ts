@@ -14,6 +14,8 @@ export const claudeResumeSelectionSchema=sessionSelectionSchema.extend({sourceId
 export type ClaudeResumeSelection=z.infer<typeof claudeResumeSelectionSchema>
 export const codexResumeSelectionSchema=sessionSelectionSchema
 export type CodexResumeSelection=z.infer<typeof codexResumeSelectionSchema>
+export interface CodexResumeLineageSegment {path:string;rolloutId:string;device:number;inode:number;size:number;mtime:number;ctime:number}
+export interface CodexResumeTicketSource {snapshotId:string;targetId:string;sessionId:string;path:string;root:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;cwd:string;cwdCanonicalPath:string;cwdDevice:number;cwdInode:number;instanceRevision:number;profileFingerprint:string;lineage?:CodexResumeLineageSegment[]}
 export type SessionSelection=z.infer<typeof sessionSelectionSchema>
 export const sessionCopyIdSchema=z.object({snapshotId:z.string().uuid(),sessionId,targetId:z.string().uuid()}).strict()
 export type SessionCopyIdInput=z.infer<typeof sessionCopyIdSchema>

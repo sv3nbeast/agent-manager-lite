@@ -7,6 +7,7 @@ import {firstSessionEvent,jsonLine,openSessionFile,rolloutFiles,safeSessionPath,
 interface HistoryBase {rolloutId:string;endOrdinalExclusive:number;endByteOffset:number}
 interface RolloutNode {path:string;rolloutId:string;threadId:string;file:FileHandle;size:number;device:number;inode:number;mtime:number;ctime:number;initialOrdinal:number;historyBase?:HistoryBase}
 interface CandidateRevision {path:string;digest:string;device:number;inode:number;size:number;mtime:number;ctime:number}
+export interface CodexSessionLineageFile {path:string;rolloutId:string;device:number;inode:number;size:number;mtime:number;ctime:number}
 const maxLineageSegments=100
 const maxPaginatedLineBytes=64*1024**2
 const canonicalName=/^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$/i
@@ -73,6 +74,7 @@ function safeSessionPathSync(root:string,path:string){
 export async function readCodexSessionLineage(
   root:string,currentPath:string,sessionId:string,raw:{page?:number;pageSize?:number;query?:string},signal:AbortSignal,
   current?:{file:FileHandle;size:number},
+  onResolved?:(files:CodexSessionLineageFile[])=>void,
 ):Promise<CodexSessionContentPage>{
   const rootStat=lstatSync(root)
   if(rootStat.isSymbolicLink()||!rootStat.isDirectory()||require('node:fs').realpathSync(root)!==root)throw new Error('Codex 实例目录已变化')
@@ -129,6 +131,7 @@ export async function readCodexSessionLineage(
     })
     const result=await readCodexSessionLineageContent(segments,raw,sourceSignal)
     for(const node of nodes)unchanged(root,node)
+    onResolved?.(nodes.map(node=>({path:node.path,rolloutId:node.rolloutId,device:node.device,inode:node.inode,size:node.size,mtime:node.mtime,ctime:node.ctime})))
     return result
   }finally{for(const file of owned)await file.close()}
 }
