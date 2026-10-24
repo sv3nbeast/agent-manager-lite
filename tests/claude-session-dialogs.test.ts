@@ -66,6 +66,19 @@ test('Codex reader binds the explicitly selected physical rollout version to tra
   assert.equal(ui.state.result.clientType, 'codex')
 })
 
+test('Codex reader keeps pagination on the selected rollout and explains incomplete history_base without showing partial content', async t => {
+  const calls: any[] = [], versionId = 'd'.repeat(32), record = session('codex-paginated')
+  record.clientType = 'codex'; record.sourceSessionId = undefined; record.historyMode = 'paginated'
+  const ui = mount('SessionContentPanel', { sessionContent: async (value: any) => { calls.push(structuredClone(value)); if (value.page === 2) throw new Error('Error: Codex history_base 未找到 ordinal 与字节边界都匹配的祖先 rollout'); return { ...content(value.sessionId, 'verified page one'), clientType: 'codex' } } }, { record, versionId })
+  t.after(ui.unmount); await settle()
+  await ui.state.load(2); await settle()
+  assert.equal(calls[1].versionId, versionId)
+  assert.equal(calls[1].page, 2)
+  assert.match(ui.state.error, /history_base 未找到/)
+  assert.match(ui.state.error, /没有显示局部内容；请刷新列表并检查来源目录中的 rollout 文件/)
+  assert.equal(ui.state.result, undefined, 'a failed page must never leave an earlier or partial transcript looking current')
+})
+
 test('a delayed transcript cannot replace another source after navigating between conversations', async t => {
   const first = deferred<SessionContentPage>(), second = deferred<SessionContentPage>(), calls: string[] = []
   const ui = mount('SessionContentPanel', { sessionContent: (value: any) => { calls.push(value.sessionId); return calls.length === 1 ? first.promise : second.promise } })

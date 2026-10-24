@@ -95,6 +95,13 @@ function highlight(text: string): { text: string; match: boolean }[] {
   if (offset < text.length) parts.push({ text: text.slice(offset), match: false })
   return parts
 }
+function readErrorMessage(cause: unknown): string {
+  const raw = typeof cause === 'string' ? cause : cause && typeof cause === 'object' && 'message' in cause && typeof cause.message === 'string' ? cause.message : ''
+  const message = raw.replace(/^Error:\s*/, '').trim() || '会话内容读取失败，请刷新会话列表后重试'
+  if (/history_base/.test(message)) return `${message}。Codex 分段历史未能完整验证，因此没有显示局部内容；请刷新列表并检查来源目录中的 rollout 文件。`
+  if (/会话文件.*变化|rollout.*变化/.test(message)) return `${message}。请刷新会话列表后重试。`
+  return message
+}
 async function load(page = 1): Promise<void> {
   const current = ++generation, selection = { snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId, ...(props.versionId ? { versionId: props.versionId } : {}), page, pageSize: 40, query: query.value.trim() }
   loading.value = true; error.value = ''; actionFeedback.value = undefined; result.value = undefined
@@ -103,7 +110,7 @@ async function load(page = 1): Promise<void> {
     if (!alive || current !== generation) return
     result.value = next; appliedQuery.value = selection.query
     body.value?.scrollTo({ top: 0 })
-  } catch (cause) { if (alive && current === generation) error.value = String(cause) }
+  } catch (cause) { if (alive && current === generation) error.value = readErrorMessage(cause) }
   finally { if (alive && current === generation) loading.value = false }
 }
 watch(() => [props.snapshotId, props.record.id, props.targetId, props.versionId], () => { query.value = props.initialQuery ?? ''; void load() })

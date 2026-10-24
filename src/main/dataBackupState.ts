@@ -53,7 +53,7 @@ const portable=z.object({localDataArchives:z.array(z.object({id,fingerprint:z.st
   proxyCatalogs:z.array(z.object({id,revision:integer,name:text,kind:z.enum(['manual','subscription','strategy']),strategyMembers:z.array(z.object({sourceId:id,itemId:text,name:text,sourceName:text}).strict()).max(64).optional(),catalog:z.object({nodes:z.array(catalogNode).max(4096),groups:z.array(catalogGroup).max(4096)}).strict(),updatedAt:date,default:z.object({itemId:text,selections:z.record(text)}).strict().optional(),defaultInvalidated:z.boolean().optional(),url:text.optional(),autoUpdate:z.boolean().optional(),lastAttemptAt:date.optional(),error:text.optional(),usage:z.object({upload:date,download:date,total:date,expireAt:date.optional(),at:date}).strict().optional()}).strict()).max(32).optional()
 }).strict()
 
-export type PortableState=Omit<State,'configTargets'|'clientAuthorities'|'clientSwitches'>
+export type PortableState=Omit<State,'configTargets'|'codexSessionSources'|'clientAuthorities'|'clientSwitches'>
 export interface DataBackupBundle {schema:'codex-manager-lite.data-backup';version:1;exportedAt:number;state:PortableState;localKeyUsage:Record<string,number>;sourceConnections:number;sourceDirectories:number}
 const bundle=z.object({schema:z.literal('codex-manager-lite.data-backup'),version:z.literal(1),exportedAt:date,state:portable,localKeyUsage:z.record(id,integer),sourceConnections:integer,sourceDirectories:integer}).strict()
 
@@ -113,7 +113,7 @@ export function validateBackup(value:unknown):DataBackupBundle{
 }
 export function backupCounts(s:PortableState):BackupCounts{return {accounts:s.accounts.length,groups:s.groups.length,providers:s.providers?.length??0,localKeys:s.localAccess?.keys.length??0,instances:s.instances?.length??0,recycledAccounts:s.accountRecycle?.length??0}}
 export function exportBackupState(state:State,usage:Record<string,number>,now=Date.now()):DataBackupBundle{
-  const {configTargets,clientAuthorities,clientSwitches,...portable}=state
+  const {configTargets,codexSessionSources:_codexSessionSources,clientAuthorities,clientSwitches,...portable}=state
   return validateBackup({schema:'codex-manager-lite.data-backup',version:1,exportedAt:now,state:portable,localKeyUsage:usage,sourceConnections:(clientAuthorities?.length??0)+(clientSwitches?.length??0),sourceDirectories:configTargets?.length??0})
 }
 export function effectiveKeyUsage(state:State,raw:Record<string,number>):Record<string,number>{

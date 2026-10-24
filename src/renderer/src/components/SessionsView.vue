@@ -27,7 +27,8 @@ const selectedIds=ref<string[]>([])
 const sourceCounts=ref<Record<string,number>>({})
 const catalogSources=ref<SessionSource[]>()
 const sources=computed(()=>catalogSources.value??targets.value.map(target=>({...target,clientType:'codex' as const})))
-const sourceOptions=computed(()=>sources.value.filter(target=>(clientType.value==='all'||target.clientType===clientType.value)&&(target.id===targetId.value||target.role!=='default'||sourceCounts.value[target.id]!==0)).map(target=>({value:target.id,label:target.name,...sourceCounts.value[target.id]===undefined?{}:{count:sourceCounts.value[target.id]},directory:target.directory,description:target.description})))
+const sourceManagementOpen=ref(false),sourceManagement=ref<SessionSource[]>([])
+const sourceOptions=computed(()=>sources.value.filter(target=>(clientType.value==='all'||target.clientType===clientType.value)&&(target.id===targetId.value||target.role!=='default'||sourceCounts.value[target.id]!==0)&&(target.role!=='source'||target.enabled!==false&&target.available!==false)).map(target=>({value:target.id,label:target.name,...sourceCounts.value[target.id]===undefined?{}:{count:sourceCounts.value[target.id]},directory:target.directory,description:target.description})))
 const sourceDescription=computed(()=>sources.value.find(target=>target.id===targetId.value)?.description)
 const claudeOnly=computed(()=>clientType.value==='claude_code'||sources.value.find(target=>target.id===targetId.value)?.clientType==='claude_code')
 const hasClaude=computed(()=>claudeOnly.value||result.value?.items.some(record=>record.clientType==='claude_code'))
@@ -60,7 +61,10 @@ async function page(number:number){
   try{const next=await window.manager.sessionPage({snapshotId:result.value.snapshotId,page:number,pageSize:25});if(alive&&current===generation){result.value=next;catalogSources.value=next.sources;remember(next.items)}}
   catch(cause){if(alive&&current===generation)error.value=String(cause)}finally{if(current===generation)busy.value=false}
 }
-async function chooseDirectory(){clientType.value='all';try{const target=await window.manager.chooseClientConfig();if(target){targets.value=await window.manager.listClientConfigs();targetId.value=target.id;await reload()}}catch(cause){error.value=String(cause)}}
+async function chooseDirectory(){clientType.value='all';try{const target=await window.manager.chooseCodexSessionSource();if(target){targetId.value=target.id;await reload()}}catch(cause){error.value=String(cause)}}
+async function manageSources(){sourceManagementOpen.value=true;try{sourceManagement.value=await window.manager.listCodexSessionSources()}catch(cause){error.value=String(cause)}}
+async function setSourceEnabled(id:string,enabled:boolean){try{sourceManagement.value=await window.manager.setCodexSessionSourceEnabled({id,enabled});if(targetId.value===id&&!enabled){targetId.value=undefined;result.value=undefined;catalogSources.value=undefined}await reload()}catch(cause){error.value=String(cause)}}
+async function removeSource(id:string){try{sourceManagement.value=await window.manager.removeCodexSessionSource(id);if(targetId.value===id)targetId.value=undefined;await reload()}catch(cause){error.value=String(cause)}}
 async function readTokens(){
   const snapshot=result.value;if(!snapshot?.items.length)return
   const ids=[...new Set(tokenIds.value)];if(!ids.length)return
@@ -87,7 +91,7 @@ function copyFromSource(record:SessionRecord){
   if(!locations.length){error.value='此会话没有可复制的受管 Codex 来源';return}
   choosing.value={record,action:'copy'};selectedTarget.value=locations.length===1?locations[0].targetId:undefined;selectedVersion.value=undefined
 }
-const copyLocations=(record:SessionRecord)=>record.locations.filter(location=>sources.value.some(source=>source.id===location.targetId&&source.clientType==='codex'&&source.role!=='default'))
+const copyLocations=(record:SessionRecord)=>record.locations.filter(location=>sources.value.some(source=>source.id===location.targetId&&source.clientType==='codex'&&source.role!=='default'&&source.role!=='source'))
 const canCopyFromSource=(record:SessionRecord)=>record.clientType!=='claude_code'&&copyLocations(record).length>0
 watch(selectedTarget,(_value,previous)=>{if(previous!==undefined)selectedVersion.value=undefined})
 async function copyId(record:SessionRecord){
@@ -121,7 +125,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
 
 <template>
   <section class="sessions-panel">
-    <div class="page-heading"><div><h1>会话</h1><p>按客户端、项目和来源查找会话，查看 Codex 与 Claude 对话并继续受支持的 CLI 会话。</p></div><a-space><a-button v-if="!claudeOnly" :disabled="busy" @click="chooseDirectory">选择会话目录</a-button><a-button v-if="!claudeOnly" :disabled="busy" @click="visibilityRepairOpen=true">修复可见性</a-button><a-button v-if="busy&&runId" @click="cancel">取消读取</a-button><a-button v-else type="primary" :loading="busy" @click="reload">刷新会话</a-button></a-space></div>
+    <div class="page-heading"><div><h1>会话</h1><p>按客户端、项目和来源查找会话，查看 Codex 与 Claude 对话并继续受支持的 CLI 会话。</p></div><a-space><a-button v-if="!claudeOnly" :disabled="busy" @click="chooseDirectory">添加只读会话来源</a-button><a-button v-if="!claudeOnly" :disabled="busy" @click="manageSources">管理来源</a-button><a-button v-if="!claudeOnly" :disabled="busy" @click="visibilityRepairOpen=true">修复可见性</a-button><a-button v-if="busy&&runId" @click="cancel">取消读取</a-button><a-button v-else type="primary" :loading="busy" @click="reload">刷新会话</a-button></a-space></div>
     <a-alert v-if="error" type="error" :message="error" class="error-banner" />
     <a-alert v-if="resumedInstance" :type="resumedInstance.error?'error':resumedInstance.status==='running'?'success':'info'" :message="resumedStatus" class="error-banner session-resume-status"><template #description><span>{{resumedInstance.name}}<template v-if="resumedInstance.error"> · {{resumedInstance.error}}</template></span><a-button type="link" @click="emit('showInstances')">查看实例</a-button></template></a-alert>
     <a-alert v-if="defaultResumeNotice" type="success" :message="defaultResumeNotice" class="error-banner" />
@@ -141,7 +145,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
       <p v-if="hasClaude" class="muted session-codex-tools-note">以下批量管理与用量功能适用于 Codex，会话选择框仅选择 Codex 记录。</p>
       <SessionTransferPanel ref="transferPanel" :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
       <SessionArchivePanel :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
-      <SessionSyncPanel :targets="targets" :snapshot-id="result?.snapshotId" :selected-ids="syncSelectedIds" :selected-sessions="syncSelectedSessions" :reading="busy" @completed="reload" />
+      <SessionSyncPanel :targets="targets" :sources="sources" :snapshot-id="result?.snapshotId" :selected-ids="syncSelectedIds" :selected-sessions="syncSelectedSessions" :reading="busy" @completed="reload" />
       <SessionTrashPanel :snapshot-id="result?.snapshotId" :selected-ids="codexSelectedIds" :reading="busy" @completed="reload" />
     </template>
     <div class="toolbar"><span>{{result?.total??0}} 个会话</span><span class="muted">{{result?'读取于 '+date(result.scannedAt):busy?'正在读取目录…':'尚未读取'}}</span><span class="toolbar-spacer" /><a-button v-if="readingTokens" @click="cancelTokens">取消用量读取</a-button><a-button v-else-if="!claudeOnly" :disabled="busy||!tokenIds.length" @click="readTokens">{{selectedIds.length?'读取所选用量':'读取本页用量'}}</a-button></div>
@@ -162,6 +166,7 @@ const reportScope=computed(()=>selectedIds.value.length?`已选 ${selectedIds.va
       <a-radio-group v-model:value="selectedTarget" class="session-location-picker"><a-radio v-for="location in (choosing?.action==='copy'?copyLocations(choosing.record):choosing?.record.locations??[])" :key="location.targetId" :value="location.targetId">{{location.name}}<div class="muted session-meta">{{location.directory}}</div><small v-if="location.ambiguous||location.historyMode==='paginated'">{{locationExplanation(location,choosing?.record)}}</small></a-radio></a-radio-group>
       <a-radio-group v-if="['content','file','copy'].includes(choosing?.action??'')&&choosing?.record.locations.find(value=>value.targetId===selectedTarget)?.versions?.length" v-model:value="selectedVersion" class="session-location-picker session-version-picker"><a-radio v-for="version in choosing?.record.locations.find(value=>value.targetId===selectedTarget)?.versions??[]" :key="version.id" :value="version.id">{{version.label}}<div class="muted session-meta">{{version.archived?'归档副本':'活动目录'}} · {{date(version.updatedAt)}}</div></a-radio></a-radio-group>
     </a-modal>
+    <a-modal :open="sourceManagementOpen" title="只读会话来源" :footer="null" @cancel="sourceManagementOpen=false"><p class="muted">这些目录只用于发现、查看和作为单向导入来源。不会加入 Codex 配置管理；停用或移除登记都不会删除目录内容。</p><a-empty v-if="!sourceManagement.length" description="尚未登记外部来源"/><a-list v-else :data-source="sourceManagement" item-layout="horizontal"><template #renderItem="{item}"><a-list-item><a-list-item-meta :title="item.name" :description="item.directory"/><template #actions><a-tag v-if="!item.available" color="red">不可用</a-tag><a-switch :checked="item.enabled!==false" :disabled="!item.available" checked-children="启用" un-checked-children="停用" @change="(value:boolean)=>setSourceEnabled(item.id,!!value)"/><a-button type="link" danger @click="removeSource(item.id)">移除登记</a-button></template><a-alert v-if="item.issue" type="warning" :message="item.issue"/></a-list-item></template></a-list></a-modal>
     <SessionContentPanel v-if="reader&&result" :snapshot-id="result.snapshotId" :record="reader.record" :target-id="reader.targetId" :version-id="reader.versionId" :initial-query="content" :can-resume="canResume(reader.record)" :can-fork-default="canDefaultFork(reader.record)" :resume-reason="resumeReason(reader.record)" @close="reader=undefined" @resume="resume" @fork-default="forkDefault" />
     <SessionResumePanel v-if="resuming&&result" :snapshot-id="result.snapshotId" :record="resuming.record" :target-id="resuming.targetId" @close="resuming=undefined" @started="resumeStarted" />
     <DefaultClaudeResumePanel v-if="defaultResuming&&result" :snapshot-id="result.snapshotId" :record="defaultResuming.record" :target-id="defaultResuming.targetId" @close="defaultResuming=undefined" @started="defaultResumeStarted" />

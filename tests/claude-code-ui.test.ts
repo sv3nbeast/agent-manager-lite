@@ -561,6 +561,20 @@ test('Codex and Claude session rows expose the same transcript viewer entry poin
   f.state.reader=undefined;f.state.open(f.state.knownRecords[claudeId],'content');assert.equal(f.state.reader.record.id,claudeId);assert.equal(f.state.reader.targetId,claudeTarget)
 })
 
+test('registered Codex source selector omits disabled and unavailable source registrations', async t => {
+  const managedId=randomUUID(),enabledId=randomUUID(),disabledId=randomUUID(),unavailableId=randomUUID()
+  const page={snapshotId:randomUUID(),scannedAt:1,total:0,page:1,pageSize:25,items:[],warnings:[],sources:[
+    {id:managedId,name:'Managed',directory:'/fixture/managed',role:'instance',clientType:'codex'},
+    {id:enabledId,name:'External ready',directory:'/fixture/external',role:'source',clientType:'codex',enabled:true,available:true,readOnly:true},
+    {id:disabledId,name:'External disabled',directory:'/fixture/disabled',role:'source',clientType:'codex',enabled:false,available:true,readOnly:true},
+    {id:unavailableId,name:'External replaced',directory:'/fixture/replaced',role:'source',clientType:'codex',enabled:true,available:false,readOnly:true},
+  ]}
+  const f=await component(t,'SessionsView',{}, {listClientConfigs:async()=>[],scanSessions:async()=>page,cancelSessionScan:async()=>{},cancelSessionTokens:async()=>{}},data())
+  await f.state.reload()
+  assert.deepEqual(f.state.sourceOptions.map((source:any)=>source.value).sort(),[enabledId,managedId].sort())
+  assert.equal(f.state.sourceOptions.some((source:any)=>source.value===disabledId||source.value===unavailableId),false)
+})
+
 test('Claude session source capabilities remain visible while refreshing and after a failed refresh', async t => {
   const page = { snapshotId: 'fixture-snapshot', scannedAt: 1, total: 0, page: 1, pageSize: 25, items: [], warnings: [], sources: [
     { id: 'claude-source', name: 'Claude fixture', directory: '/fixture/claude', role: 'instance', clientType: 'claude_code', readOnly: true },

@@ -5,12 +5,13 @@ import type {ClientConfigTarget} from '../../../shared/clientConfig'
 import type {InstanceApplication} from '../../../shared/instances'
 import type {SyncPreview,SyncView,SyncRecovery,SyncConflictSession} from '../../../shared/sessionSync'
 import type {SessionRecord} from '../../../shared/sessions'
-const props=defineProps<{targets:ClientConfigTarget[];snapshotId?:string;selectedIds:string[];selectedSessions:SessionRecord[];reading:boolean}>(),emit=defineEmits<{completed:[]}>()
+import type {SessionSource} from '../../../shared/sessions'
+const props=defineProps<{targets:ClientConfigTarget[];sources:SessionSource[];snapshotId?:string;selectedIds:string[];selectedSessions:SessionRecord[];reading:boolean}>(),emit=defineEmits<{completed:[]}>()
 const sync=ref<SyncView>(),recoveries=ref<SyncRecovery[]>([]),applications=ref<InstanceApplication[]>([]),open=ref(false),sourceIds=ref<string[]>([]),targetId=ref<string>(),scope=ref<'all'|'selected'>('all'),applicationId=ref<string>(),preview=ref<SyncPreview>(),retryId=ref<string>(),clientsClosed=ref(false),loading=ref(false),error=ref('')
 const sourceId=computed({get:()=>sourceIds.value[0],set:(value:string|undefined)=>{sourceIds.value=value?[value]:[]}})
 const sourceVersionSelections=ref<Record<string,string>>({})
 useFormFeedback(()=>error.value,{active:()=>open.value})
-const sourceOptions=computed(()=>props.targets.filter(source=>source.role==='instance'&&source.id!==targetId.value).map(source=>({value:source.id,label:source.name+' · '+source.directory})))
+const sourceOptions=computed(()=>props.sources.filter(source=>(source.role==='instance'||source.role==='source'&&source.enabled!==false&&source.available!==false)&&source.id!==targetId.value).map(source=>({value:source.id,label:source.name+(source.role==='source'?' · 只读':'')+' · '+source.directory})))
 const targetOptions=computed(()=>props.targets.filter(target=>target.role==='instance').map(target=>({value:target.id,label:target.name+' · '+target.directory})))
 const eligibleSelected=computed(()=>[...new Set(props.selectedIds)].slice(0,1000))
 const selectedSessionsWithSourceConflicts=computed(()=>props.selectedSessions.filter(record=>record.locations.some(location=>sourceIds.value.includes(location.targetId)&&location.ambiguous)))
@@ -20,7 +21,7 @@ const unresolvedConflicts=computed(()=>relevantConflicts.value.some(record=>reco
 const running=computed(()=>!!sync.value&&['preparing','running'].includes(sync.value.status)),labels={preparing:'正在准备导入',ready:'导入预览已就绪',running:'正在导入',completed:'会话导入已完成',cancelled:'导入已取消',failed:'导入未完成'}
 const progress=computed(()=>sync.value?.totalBytes?Math.min(100,Math.floor(sync.value.bytes/sync.value.totalBytes*100)):0)
 const bytes=(value:number)=>value<1024**2?(value/1024).toFixed(1)+' KiB':value<1024**3?(value/1024**2).toFixed(1)+' MiB':(value/1024**3).toFixed(2)+' GiB'
-const sourceNames=computed(()=>sourceIds.value.map(id=>props.targets.find(source=>source.id===id)?.name??id))
+const sourceNames=computed(()=>sourceIds.value.map(id=>props.sources.find(source=>source.id===id)?.name??id))
 const targetName=computed(()=>targetOptions.value.find(target=>target.value===targetId.value)?.label??targetId.value??'')
 let alive=true,generation=0,polling=false,timer:ReturnType<typeof setInterval>|undefined,observed=false
 let activeConflictRequest:string|undefined
@@ -57,7 +58,7 @@ onUnmounted(()=>{alive=false;generation++;cancelConflictRequest();clearInterval(
 </script>
 <template>
   <div class="session-sync">
-    <div class="sync-toolbar"><a-button :disabled="reading||running||loading||targetOptions.length===0||sourceOptions.length===0" @click="begin()">导入其他实例的 Codex 会话</a-button><span class="muted">指定来源和目标；来源只读，只更新所选目标实例。</span></div>
+    <div class="sync-toolbar"><a-button :disabled="reading||running||loading||targetOptions.length===0||sourceOptions.length===0" @click="begin()">同步其他来源的 Codex 会话</a-button><span class="muted">可从已登记实例或外部只读来源单向导入；目标必须是管理器实例。</span></div>
     <a-alert v-if="error&&!open" type="error" :message="error" class="error-banner" />
     <a-card v-if="sync&&sync.status!=='ready'" size="small" class="sync-progress">
       <div class="sync-toolbar"><strong>{{labels[sync.status]}}</strong><span class="toolbar-spacer" /><a-button v-if="running" @click="cancel">取消导入</a-button></div>
@@ -73,7 +74,7 @@ onUnmounted(()=>{alive=false;generation++;cancelConflictRequest();clearInterval(
         <a-alert v-if="error" type="error" :message="error" class="error-banner" />
         <p v-if="!retryId" class="muted sync-explanation">这是单向导入：仅从所选来源读取，只有目标实例会写入。目标中已有的同 ID 会话会与来源内容合并，替换前保存目标原文件备份。来源与目标 Codex 客户端需先关闭。同步前会检查所选范围内的同 ID 文件冲突，并要求逐条指定来源版本；分段历史会被安全检查拦截并说明原因。</p>
         <a-form layout="vertical">
-          <a-form-item v-if="!retryId" label="来源实例（可多选）"><a-checkbox-group v-model:value="sourceIds" class="sync-source-options" aria-label="会话同步来源实例" :disabled="loading" @change="invalidate"><a-checkbox v-for="source in sourceOptions" :key="source.value" :value="source.value" class="sync-source-option"><span>{{source.label.split(' · ')[0]}}</span><small class="muted sync-path">{{source.label.slice(source.label.indexOf(' · ')+3)}}</small></a-checkbox></a-checkbox-group></a-form-item>
+          <a-form-item v-if="!retryId" label="来源目录（可多选）"><a-checkbox-group v-model:value="sourceIds" class="sync-source-options" aria-label="会话同步来源目录" :disabled="loading" @change="invalidate"><a-checkbox v-for="source in sourceOptions" :key="source.value" :value="source.value" class="sync-source-option"><span>{{source.label.split(' · ')[0]}}</span><small class="muted sync-path">{{source.label.slice(source.label.indexOf(' · ')+3)}}</small></a-checkbox></a-checkbox-group></a-form-item>
           <a-form-item v-if="!retryId" label="目标实例"><a-select v-model:value="targetId" aria-label="会话同步目标实例" :options="targetOptions" placeholder="选择接收会话的 Codex 实例" :disabled="loading" @change="invalidate" /></a-form-item>
           <a-form-item v-if="!retryId" label="同步范围"><a-radio-group v-model:value="scope" @change="invalidate"><a-radio value="all">所选来源实例中的全部会话</a-radio><a-radio value="selected">会话列表中当前勾选的会话（{{eligibleSelected.length}}）</a-radio></a-radio-group><div v-if="scope==='selected'&&!eligibleSelected.length" class="muted">先关闭此窗口，在会话列表中勾选 Codex 会话，再重新打开。</div></a-form-item>
           <a-alert v-if="scope==='all'&&conflictLoading" type="info" message="正在检查所选来源中的同 ID 会话文件冲突…" />

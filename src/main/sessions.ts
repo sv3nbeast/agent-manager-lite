@@ -16,12 +16,13 @@ import {scanClaudeCodeSessionsAsync,verifyClaudeSessionLocation,readClaudeSessio
 import {isClaudeDesktopProfile} from '../shared/instances'
 import {readCodexSessionContent,readCodexSessionContentForMerge,readCodexSessionLineageContent} from './codexSessionContent'
 import {readCodexSessionLineage} from './codexSessionLineage'
+import {CodexSessionSources} from './codexSessionSources'
 
 interface SourceFile {path:string;root:string;targetId:string;device:number;inode:number;rootDevice:number;rootInode:number;size:number;mtime:number;ctime:number;record:SessionRecord;duplicateOf?:string}
 export interface SessionTransferSource {path:string;root:string;targetId:string;rootDevice:number;rootInode:number;device:number;inode:number;size:number;mtime:number;ctime:number;record:SessionRecord;sourceVersionId?:string;sourceConflict?:boolean}
 interface ClaudeSourceFile {target:SessionSource;profile:string;location:ClaudeSessionLocation;sessionId:string;record:ClaudeSessionRecord}
 export interface CatalogClaudeResumePreview extends ClaudeSessionResumePreview {instanceRevision:number;profileFingerprint:string}
-export interface SessionCatalogOptions {defaultCodexDirectory?:string|null;defaultClaudeDirectory?:string|null;disableSqliteDisplay?:boolean}
+export interface SessionCatalogOptions {defaultCodexDirectory?:string|null;defaultClaudeDirectory?:string|null;disableSqliteDisplay?:boolean;codexSessionSources?:CodexSessionSources}
 const defaultClaudeSourceId='4135f4e6-6db5-4bd4-95f7-06f4c667341a'
 const defaultCodexSourceId='61f5fc85-e814-4f63-9f9f-b96d94fcf51a'
 interface Snapshot {id:string;scannedAt:number;records:SessionRecord[];files:Map<string,SourceFile[]>;claudeFiles:Map<string,ClaudeSourceFile>;warnings:string[];sourceCounts:Record<string,number>;sources:SessionSource[]}
@@ -42,11 +43,13 @@ export class SessionCatalog {
   private readonly defaultCodexDirectory:string|null
   private readonly defaultClaudeDirectory:string|null
   private readonly disableSqliteDisplay:boolean
+  private readonly externalCodexSources:CodexSessionSources
   constructor(private readonly store:Store,private readonly running:(id:string)=>boolean=()=>false,options:SessionCatalogOptions={}){
     this.configs=new ClientConfigs(store);this.root=realpathSync(store.directory)
     this.defaultCodexDirectory=options.defaultCodexDirectory===undefined?join(homedir(),'.codex'):options.defaultCodexDirectory
     this.defaultClaudeDirectory=options.defaultClaudeDirectory===undefined?join(homedir(),'.claude'):options.defaultClaudeDirectory
     this.disableSqliteDisplay=options.disableSqliteDisplay===true
+    this.externalCodexSources=options.codexSessionSources??new CodexSessionSources(store)
     if(this.defaultCodexDirectory!==null&&(!isAbsolute(this.defaultCodexDirectory)||resolve(this.defaultCodexDirectory)!==this.defaultCodexDirectory))throw new Error('默认 Codex 会话目录必须是规范绝对路径')
     if(this.defaultClaudeDirectory!==null&&(!isAbsolute(this.defaultClaudeDirectory)||resolve(this.defaultClaudeDirectory)!==this.defaultClaudeDirectory))throw new Error('默认 Claude 会话目录必须是规范绝对路径')
   }
@@ -62,16 +65,23 @@ export class SessionCatalog {
     }catch{return}
   }
   private codexIdentityTarget(id:string):ClientConfigTarget {
-    if(id!==defaultCodexSourceId)return this.configs.identityTarget(id)
+    if(id!==defaultCodexSourceId){
+      if((this.store.read().codexSessionSources??[]).some(source=>source.id===id)){const source=this.externalCodexSources.resolve(id);return {id:source.id,name:source.name,directory:source.directory,managed:false,role:'external'}}
+      return this.configs.identityTarget(id)
+    }
     const target=this.defaultCodexTarget()
     if(!target)throw new Error('本机默认 Codex 会话目录已变化或不可安全读取，请刷新列表')
-    return target
+    return {id:target.id,name:target.name,directory:target.directory,managed:false,role:'default'}
   }
-  private readOnlyCodexSource(id:string):boolean{return id===defaultCodexSourceId}
+  private externalCodexSource(id:string):boolean{return (this.store.read().codexSessionSources??[]).some(source=>source.id===id&&source.enabled)}
+  private readOnlyCodexSource(id:string):boolean{
+    if(id===defaultCodexSourceId||this.externalCodexSource(id))return true
+    try{return this.defaultCodexDirectory!==null&&this.codexIdentityTarget(id).directory===this.defaultCodexDirectory}catch{return false}
+  }
   /** Path guard for file outputs that must stay outside discover-only homes. */
   isReadOnlySourcePath(path:string):boolean {
     const candidate=resolve(path)
-    return [this.defaultCodexDirectory,this.defaultClaudeDirectory].some(directory=>!!directory&&(candidate===directory||pathContains(directory,candidate)))
+    return [this.defaultCodexDirectory,this.defaultClaudeDirectory,...(this.store.read().codexSessionSources??[]).map(source=>source.directory)].some(directory=>!!directory&&(candidate===directory||pathContains(directory,candidate)))
   }
   private defaultClaudeTarget():SessionSource|undefined {
     const directory=this.defaultClaudeDirectory
@@ -115,9 +125,10 @@ export class SessionCatalog {
   cancelTokens(id:string):void{z.string().uuid().parse(id);if(this.snapshot?.id===id)this.statsController?.abort()}
   stop():void{this.scanning?.controller.abort();this.statsController?.abort()}
   async scan(raw:unknown):Promise<SessionPage>{
-    const input=sessionScanSchema.parse(raw),defaultCodex=this.defaultCodexTarget(),sources:SessionSource[]=[...this.configs.targets().map(target=>({...target,clientType:'codex' as const})),...(defaultCodex?[defaultCodex]:[]),...this.claudeTargets()]
+    const input=sessionScanSchema.parse(raw),defaultCodex=this.defaultCodexTarget(),externalSources:SessionSource[]=this.externalCodexSources.list().map(source=>({...source,managed:false,role:'source' as const,clientType:'codex' as const,readOnly:true,description:source.available?source.enabled?'已登记的外部 Codex 会话目录；只读浏览，可作为单向导入来源。':'已停用的只读会话来源。':source.issue??'来源不可用。'})),sources:SessionSource[]=[...this.configs.targets().map(target=>({...target,clientType:'codex' as const})),...(defaultCodex?[defaultCodex]:[]),...externalSources,...this.claudeTargets()]
     if(input.targetId&&!sources.some(target=>target.id===input.targetId))throw new Error('会话来源目录不存在')
-    const selectedSources=sources.filter(target=>(!input.targetId||input.targetId===target.id)&&(input.clientType==='all'||input.clientType===target.clientType)),targets=selectedSources.filter(target=>target.clientType==='codex')
+    const selectedSources=sources.filter(target=>(!input.targetId||input.targetId===target.id)&&(input.clientType==='all'||input.clientType===target.clientType)),targets=selectedSources.filter(target=>target.clientType==='codex'&&(target.role!=='source'||target.enabled!==false&&target.available!==false))
+    if(input.targetId){const chosen=sources.find(target=>target.id===input.targetId);if(chosen?.role==='source'&&(chosen.enabled===false||chosen.available===false))throw new Error(chosen.issue??'此只读会话来源已停用或不可用，请在来源管理中检查')}
     this.stop();this.snapshot=undefined
     const controller=new AbortController(),signal=controller.signal,run={id:input.runId,controller};this.scanning=run
     const warnings=new Set<string>(),files=new Map<string,SourceFile[]>(),claudeFiles=new Map<string,ClaudeSourceFile>(),records=new Map<string,SessionRecord>(),matches=new Set<string>(),digests=new Map<string,Promise<string>>()
@@ -150,7 +161,7 @@ export class SessionCatalog {
         try{
           const target=this.codexIdentityTarget(selected.id),root=target.directory
           try{await lstat(root)}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'&&target.managed){sourceCounts[target.id]=0;continue}throw error}
-          const rootStat=await lstat(root),daemon=await probeClientDaemon(root,signal),targetRunning=this.running(target.id)||daemon==='running',readOnly=this.readOnlyCodexSource(target.id),useSqlite=!readOnly&&!this.disableSqliteDisplay,display=await readSessionDisplay(root,signal,warn,{sqlite:useSqlite}),sourceRows:{record:SessionRecord;file:SourceFile;matched:boolean}[]=[]
+          const rootStat=await lstat(root),daemon=selected.role==='source'?'not_detected':await probeClientDaemon(root,signal),targetRunning=selected.role==='source'?false:this.running(target.id)||daemon==='running',readOnly=this.readOnlyCodexSource(target.id),useSqlite=!readOnly&&!this.disableSqliteDisplay,display=await readSessionDisplay(root,signal,warn,{sqlite:useSqlite}),sourceRows:{record:SessionRecord;file:SourceFile;matched:boolean}[]=[]
           for await(const path of rolloutFiles(root,signal)){
             signal.throwIfAborted();if(++fileCount>100000)throw new SessionLimitError('会话文件超过 10 万条，请选择单个目录')
             try{
@@ -286,7 +297,8 @@ export class SessionCatalog {
         if(record.clientType!=='codex')return record
         const writable=record.locations.some(location=>!this.readOnlyCodexSource(location.targetId)),conflicted=record.locations.some(location=>location.ambiguous)
         const paginated=record.historyMode==='paginated'
-        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted, syncSource:writable&&!paginated,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
+        const externalSync=record.locations.some(location=>this.externalCodexSource(location.targetId))
+        return {...record,capabilities:{...record.capabilities,open:true,transfer:writable&&!conflicted,syncSource:(writable||externalSync)&&!paginated,archive:writable&&!conflicted,trash:writable&&!conflicted,visibilityRepair:writable&&!conflicted,tokens:true,contentSearch:true,content:true}}
       }).filter(record=>matches.has(record.id)&&(input.kind==='all'||record.kind===input.kind)&&(!input.projectQuery||[record.cwd,record.projectName??''].some(value=>value.toLowerCase().includes(input.projectQuery.toLowerCase())))).sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)||a.cwd.localeCompare(b.cwd)||a.id.localeCompare(b.id))
       this.snapshot={id:randomUUID(),scannedAt:Date.now(),records:sorted,files,claudeFiles,warnings:[...warnings].slice(0,100),sourceCounts,sources}
       return this.page({snapshotId:this.snapshot.id,page:1,pageSize:25})
@@ -469,7 +481,7 @@ export class SessionCatalog {
     if(snapshot.claudeFiles.size)throw new Error('Claude Code 会话当前仅支持只读查看，不能使用 Codex 全目录同步')
     if(snapshot.warnings.length)throw new Error('部分会话目录读取不完整，未准备同步：'+snapshot.warnings[0])
     for(const [id,sources] of snapshot.files)for(const source of sources){
-      if(source.targetId===defaultCodexSourceId)continue
+      if(source.targetId===defaultCodexSourceId||this.externalCodexSource(source.targetId))continue
       const opened=await this.verified(source,id,signal)
       try{result.push({path:source.path,root:source.root,targetId:source.targetId,rootDevice:source.rootDevice,rootInode:source.rootInode,device:opened.stat.dev,inode:opened.stat.ino,size:opened.stat.size,mtime:opened.stat.mtimeMs,ctime:opened.stat.ctimeMs,record:structuredClone(source.record)})}finally{await opened.file.close()}
     }
@@ -497,7 +509,7 @@ export class SessionCatalog {
       }
       if(record.historyMode==='paginated'){found.add(id);continue}
       for(const source of snapshot.files.get(id)??[]){
-        if(!input.targetIds.includes(source.targetId)||this.readOnlyCodexSource(source.targetId))continue
+        if(!input.targetIds.includes(source.targetId)||source.targetId===defaultCodexSourceId)continue
         const selected=chosen.get(id+'|'+source.targetId)
         if(source.duplicateOf&&!chosen.has(id+'|'+source.targetId))continue
         if(requireConflictChoices&&record.locations.find(value=>value.targetId===source.targetId)?.ambiguous&&!chosen.has(id+'|'+source.targetId))throw new Error('会话 '+record.title+' 在来源实例存在多个同 ID 文件，请选择具体版本后再同步')
@@ -528,7 +540,7 @@ export class SessionCatalog {
     const snapshot=this.current(snapshotId),wanted=ids.length?new Set(ids):undefined,result:Array<{id:string;title:string;sourceIds:string[];reason:string}>=[]
     for(const record of snapshot.records){
       if(record.clientType!=='codex'||!hasPaginatedHistory(record)||wanted&&!wanted.has(record.id))continue
-      const sourceIds=record.locations.filter(location=>targetIds.includes(location.targetId)&&!this.readOnlyCodexSource(location.targetId)).map(location=>location.targetId)
+      const sourceIds=record.locations.filter(location=>targetIds.includes(location.targetId)&&location.targetId!==defaultCodexSourceId).map(location=>location.targetId)
       if(sourceIds.length)result.push({id:record.id,title:record.title,sourceIds,reason:record.syncBlockedReason??'Codex 分段会话依赖 history_base lineage 与 SQLite 数据库组，当前版本尚不支持跨实例同步'})
     }
     return result

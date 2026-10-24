@@ -248,6 +248,10 @@ export interface ManagerAPI {
   scanSessions(input:SessionScanInput):Promise<SessionPage>
   sessionPage(input:SessionPageInput):Promise<SessionPage>
   sessionContent(input:SessionContentInput):Promise<SessionContentPage>
+  listCodexSessionSources():Promise<import('./sessions').SessionSource[]>
+  chooseCodexSessionSource():Promise<import('./sessions').SessionSource|undefined>
+  setCodexSessionSourceEnabled(input:{id:string;enabled:boolean}):Promise<import('./sessions').SessionSource[]>
+  removeCodexSessionSource(id:string):Promise<import('./sessions').SessionSource[]>
   previewClaudeSessionResume(input:import('./sessions').ClaudeResumeSelection):Promise<InstanceLaunchPreview & {sessionId:string}>
   discardClaudeSessionResume(ticket:string):Promise<void>
   previewDefaultClaudeSessionResume(input:import('./sessions').ClaudeResumeSelection):Promise<import('./sessions').DefaultClaudeSessionResumePreview>

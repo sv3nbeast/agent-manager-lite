@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {mkdtempSync,realpathSync,mkdirSync,writeFileSync,readFileSync,rmSync,lstatSync,existsSync,readdirSync,appendFileSync,renameSync} from 'node:fs'
-import {join} from 'node:path'
+import {join,relative} from 'node:path'
 import {tmpdir} from 'node:os'
 import {randomUUID} from 'node:crypto'
 import {createServer} from 'node:net'
@@ -10,6 +10,7 @@ import {ClientConfigs} from '../src/main/clientConfig'
 import {SessionCatalog} from '../src/main/sessions'
 import {SessionTransfers} from '../src/main/sessionTransfers'
 import {SessionSync} from '../src/main/sessionSync'
+import {CodexSessionSources} from '../src/main/codexSessionSources'
 import {rolloutFiles} from '../src/main/sessionFiles'
 const when='2026-10-01T08:00:00Z'
 function rollout(home:string,id:string,time=when,body='test',duplicate=false){const folder=join(home,'sessions','2026','10','01');mkdirSync(folder,{recursive:true});const path=join(folder,`rollout-2026-10-01T08-00-${duplicate?'01':'00'}-${id}.jsonl`);writeFileSync(path,JSON.stringify({type:'session_meta',timestamp:when,payload:{id,cwd:'/fixture/中文项目',model_provider:'openai',extra:'keep'}})+'\n'+JSON.stringify({type:'event_msg',timestamp:time,payload:{type:'user_message',message:body}})+'\n');return path}
@@ -24,6 +25,7 @@ function fixture(t:{after(fn:()=>void|Promise<void>):void},rebuild:ConstructorPa
   return {root,store,configs,catalog,a,b,targets,targetA,targetB,targetC,program,apps,transfers,sync,create,preview,start,advance:()=>{now+=300001},busy:(value:boolean)=>{externalBusy=value}}
 }
 async function files(home:string){const result:string[]=[];for await(const path of rolloutFiles(home,new AbortController().signal))result.push(path);return result}
+function treeBytes(root:string):Map<string,Buffer>{const result=new Map<string,Buffer>();const visit=(directory:string)=>{for(const entry of readdirSync(directory,{withFileTypes:true})){const path=join(directory,entry.name);if(entry.isDirectory())visit(path);else result.set(relative(root,path),readFileSync(path))}};visit(root);return result}
 
 test('sync refuses paginated segments before staging or modifying any selected home',async t=>{
   const f=fixture(t),id=randomUUID(),first=rollout(f.a,id,when,'first'),latest=rollout(f.a,id,'2026-10-01T09:00:00Z','latest',true),other=rollout(f.b,randomUUID())
@@ -147,6 +149,43 @@ test('directional selected sync merges source instances into one target and neve
   assert.equal((await files(f.targetC.directory)).filter(path=>path.includes(id)).length,1);assert.equal((await files(f.targetC.directory)).some(path=>path.includes(other)),false)
   const merged=readFileSync((await files(f.targetC.directory)).find(path=>path.includes(id))!,'utf8').trim().split('\n').map(line=>JSON.parse(line));assert.equal(merged[0].payload.model_provider,'target-provider');assert.deepEqual(merged.slice(1).map(row=>row.payload.message).sort(),['来自 A','来自 B','目标旧分支'].sort())
   const backup=f.sync.view().sync!.backups[0];assert.ok(readdirSync(f.sync.backupLocation(backup.id)).some(name=>name.startsWith('old-')&&readFileSync(join(f.sync.backupLocation(backup.id),name)).equals(targetOriginal)))
+})
+
+test('registered readonly Codex sources import ordinary JSONL into an instance without changing any source bytes',async t=>{
+  const f=fixture(t),directory=join(f.root,'other-codex-home');mkdirSync(directory);const id=randomUUID(),rolloutPath=rollout(directory,id,when,'external readonly conversation')
+  writeFileSync(join(directory,'config.toml'),'model_provider = "external"\n');writeFileSync(join(directory,'session_index.jsonl'),JSON.stringify({id,thread_name:'外部标题',updated_at:when})+'\n');for(const name of ['state_1.sqlite','state_1.sqlite-wal','state_1.sqlite-shm'])writeFileSync(join(directory,name),Buffer.from('must remain byte-for-byte unchanged:'+name))
+  const registry=new CodexSessionSources(f.store),registered=registry.register(directory,'External Codex'),sourceBefore=treeBytes(directory)
+  const preview=await f.sync.preview({sourceIds:[registered.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'})
+  assert.equal(preview.sessionCount,1);assert.equal(preview.directional?.sourceIds[0],registered.id);assert.equal(preview.directional?.sources[0].id,registered.id);assert.equal(preview.targets[0].id,f.targetC.id)
+  f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'completed',JSON.stringify(f.sync.view()))
+  assert.deepEqual(treeBytes(directory),sourceBefore);assert.equal((await files(f.targetC.directory)).length,1);assert.match(readFileSync((await files(f.targetC.directory))[0],'utf8'),/external readonly conversation/)
+})
+
+test('unregistered source IDs and registered readonly sources as targets are rejected',async t=>{
+  const f=fixture(t),directory=join(f.root,'other-codex-home');mkdirSync(directory);rollout(directory,randomUUID());const registered=new CodexSessionSources(f.store).register(directory)
+  await assert.rejects(f.sync.preview({sourceIds:[randomUUID()],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/已登记实例或已登记的只读 Codex 来源/)
+  await assert.rejects(f.sync.preview({sourceIds:[f.targetA.id],targetId:registered.id,scope:'all',sessionIds:[],applicationId:'fixture'}),/只读会话来源不能作为同步目标/)
+})
+
+test('conflict scans accept registered readonly sources and reject them as targets without writes',async t=>{
+  const f=fixture(t),directory=join(f.root,'other-codex-home'),id=randomUUID();mkdirSync(directory);const first=rollout(directory,id,when,'first branch'),second=rollout(directory,id,'2026-10-01T09:00:00Z','second branch',true),before=treeBytes(directory),registered=new CodexSessionSources(f.store).register(directory)
+  const conflicts=await f.sync.conflicts({requestId:randomUUID(),sourceIds:[registered.id],targetId:f.targetC.id})
+  assert.equal(conflicts.length,1);assert.equal(conflicts[0].id,id);assert.equal(conflicts[0].locations[0].targetId,registered.id);assert.equal(conflicts[0].locations[0].versions.length,2);assert.deepEqual(treeBytes(directory),before)
+  await assert.rejects(f.sync.conflicts({requestId:randomUUID(),sourceIds:[f.targetA.id],targetId:registered.id}),/只读会话来源不能作为同步目标/)
+  assert.deepEqual(readFileSync(first),before.get(relative(directory,first)));assert.deepEqual(readFileSync(second),before.get(relative(directory,second)))
+})
+
+test('disabling, removing, replacing, or changing inventory of a registered readonly source after preview blocks commit',async t=>{
+  for(const mutation of ['disable','remove','replace','inventory'] as const){
+    const f=fixture(t),directory=join(f.root,'other-codex-home'),id=randomUUID();mkdirSync(directory);const sourcePath=rollout(directory,id,when,'must not be imported'),registry=new CodexSessionSources(f.store),registered=registry.register(directory),before=treeBytes(directory),preview=await f.sync.preview({sourceIds:[registered.id],targetId:f.targetC.id,scope:'all',sessionIds:[],applicationId:'fixture'})
+    if(mutation==='disable')registry.disable(registered.id)
+    if(mutation==='remove')registry.remove(registered.id)
+    if(mutation==='replace'){renameSync(directory,directory+'-old');mkdirSync(directory);rollout(directory,id,when,'replacement must not be imported')}
+    if(mutation==='inventory')appendFileSync(sourcePath,Buffer.from('external inventory changed\n'))
+    const expectedTree=treeBytes(directory)
+    f.sync.start({ticket:preview.ticket,clientsClosed:true});await f.sync.settled();assert.equal(f.sync.view().sync?.status,'failed',mutation+': '+JSON.stringify(f.sync.view()));assert.deepEqual(await files(f.targetC.directory),[])
+    assert.deepEqual(treeBytes(directory),expectedTree)
+  }
 })
 
 test('directional selected sync previews paginated sessions as skipped while importing ordinary JSONL sessions',async t=>{

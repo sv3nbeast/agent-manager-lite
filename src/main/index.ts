@@ -49,6 +49,7 @@ import { Instances } from './instances'
 import {ExternalInstanceSources} from './externalInstanceSources'
 import { LocalAccess } from './localAccess'
 import {SessionCatalog} from './sessions'
+import {CodexSessionSources} from './codexSessionSources'
 import {ClaudeDefaultSessionResume} from './claudeDefaultSessionResume'
 import {SessionTransfers} from './sessionTransfers'
 import {SessionArchives} from './sessionArchives'
@@ -166,7 +167,8 @@ async function main(): Promise<void> {
   },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages(),undefined,new NativeProxy(binary,proxyTunnels))
   const externalInstanceSources=new ExternalInstanceSources({managerRoot:realpathSync(store.directory),managedDirectories:()=>instances.views().map(instance=>instance.directory),...(isolatedTest?{home:join(realpathSync(store.directory),'external-source-home')}:{})})
   const localAccess=new LocalAccess(store,gateway,async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},ids=>effectiveKeyUsage(store.read(),history.keyTokenUsage(ids)))
-  const sessions=new SessionCatalog(store,id=>instances.inUse(id),isolatedTest?{defaultCodexDirectory:process.env.CML_TEST_DEFAULT_CODEX_DIRECTORY??null,defaultClaudeDirectory:process.env.CML_TEST_DEFAULT_CLAUDE_DIRECTORY??null}:{})
+  const codexSessionSources=new CodexSessionSources(store)
+  const sessions=new SessionCatalog(store,id=>instances.inUse(id),{...(isolatedTest?{defaultCodexDirectory:process.env.CML_TEST_DEFAULT_CODEX_DIRECTORY??null,defaultClaudeDirectory:process.env.CML_TEST_DEFAULT_CLAUDE_DIRECTORY??null}:{}),codexSessionSources})
   const defaultClaudeSessionResume=new ClaudeDefaultSessionResume(sessions)
   sessionTransfers=new SessionTransfers(store,sessions,()=>instances.applications(),id=>instances.inUse(id,false)||!!clientSwitches?.usesTarget(id)||!!sessionArchives?.busy(id)||!!sessionSync?.busy(id)||!!sessionTrash?.busy(id))
   sessionArchives=new SessionArchives(store,sessions,sessionTransfers,Date.now,id=>(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false))
@@ -451,6 +453,14 @@ async function main(): Promise<void> {
       case 'wakeupRunNow': await wakeups.runNow(z.string().uuid().parse(input)); return snapshot()
       case 'wakeupCancel': wakeups.cancel(z.string().uuid().parse(input)); return snapshot()
       case 'scanSessions': return sessions.scan(input)
+      case 'listCodexSessionSources': z.undefined().parse(input);return codexSessionSources.list()
+      case 'chooseCodexSessionSource': {
+        const selection=await dialog.showOpenDialog(window,{title:'选择其他 Codex 实例的 CODEX_HOME（只读会话来源）',properties:['openDirectory']})
+        if(selection.canceled||!selection.filePaths[0])return
+        return codexSessionSources.register(selection.filePaths[0])
+      }
+      case 'setCodexSessionSourceEnabled': {const value=z.object({id:z.string().uuid(),enabled:z.boolean()}).strict().parse(input);if(value.enabled)codexSessionSources.enable(value.id);else codexSessionSources.disable(value.id);return codexSessionSources.list()}
+      case 'removeCodexSessionSource': {codexSessionSources.remove(z.string().uuid().parse(input));return codexSessionSources.list()}
       case 'chooseLegacySessionTrash': {
         const selection=await dialog.showOpenDialog(window,{title:'选择 Cockpit 会话废纸篓、日期批次或条目目录',properties:['openDirectory']})
         return selection.canceled?undefined:sessionTrash.selectLegacy(selection.filePaths[0])

@@ -8,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {Store} from '../src/main/store'
 import {ClientConfigs} from '../src/main/clientConfig'
 import {SessionCatalog,classifySession} from '../src/main/sessions'
+import {CodexSessionSources} from '../src/main/codexSessionSources'
 import {openSessionFile,reverseSessionLines,sessionContains,sessionTokens,sessionDigest} from '../src/main/sessionFiles'
 import {instanceInputSchema} from '../src/shared/instances'
 
@@ -383,6 +384,33 @@ test('the native default Codex home is a discoverable read-only session source a
   assert.deepEqual(await catalog.syncSources(page.snapshotId,new AbortController().signal),[],'full sync only receives registered sources')
   assert.deepEqual(hashes(home),before,'discovery, content search, opening and token parsing must not modify the native home')
   assert.ok(registered.target.id!==source.id)
+})
+
+test('registered external Codex sources scan and filter transcripts, show shared content read-only, reject disabled snapshots, and preserve source files and timestamps',async t=>{
+  const f=fixture(t),home=join(f.root,'external-codex-home'),id=randomUUID(),sourceFile=rollout(home,id,[
+    {type:'event_msg',timestamp:when,payload:{type:'user_message',message:'EXTERNAL_CODEX_NEEDLE: keep this conversation available'}},
+    {type:'event_msg',timestamp:when,payload:{type:'agent_message',message:'This is the read-only external source response.'}},
+  ])
+  const indexPath=join(home,'session_index.jsonl')
+  writeFileSync(indexPath,JSON.stringify({id,thread_name:'External source searchable title',updated_at:when})+'\n')
+  const sources=new CodexSessionSources(f.store),registered=sources.register(home,'Other Codex instance')
+  const before=treeState(home)
+  const page=await f.scan({targetId:registered.id,titleQuery:'searchable title',contentQuery:'external_codex_needle'})
+  assert.equal(page.total,1);assert.equal(page.items[0].id,id);assert.equal(page.items[0].title,'External source searchable title')
+  assert.equal(page.sourceCounts?.[registered.id],1)
+  const source=page.sources?.find(value=>value.id===registered.id)!
+  assert.equal(source.readOnly,true);assert.equal(source.enabled,true);assert.equal(source.role,'source')
+  assert.equal(page.items[0].capabilities?.syncSource,true,'a registered read-only source can supply a one-way import into a managed instance')
+  assert.equal(page.items[0].capabilities?.transfer,false);assert.equal(page.items[0].capabilities?.archive,false);assert.equal(page.items[0].capabilities?.trash,false);assert.equal(page.items[0].capabilities?.visibilityRepair,false)
+  const selection={snapshotId:page.snapshotId,sessionId:id,targetId:registered.id}
+  assert.equal(await f.catalog.location(selection),sourceFile)
+  const content=await f.catalog.content({...selection,page:1,pageSize:10})
+  assert.equal(content.clientType,'codex');assert.equal(content.sourceName,'Other Codex instance');assert.equal(content.cwd,'/fixture/project/src')
+  assert.ok(content.messages.some(message=>message.blocks.some(block=>block.text.includes('EXTERNAL_CODEX_NEEDLE'))))
+  sources.disable(registered.id)
+  await assert.rejects(f.catalog.content({...selection,page:2,pageSize:10}),/已停用/)
+  await assert.rejects(f.catalog.location(selection),/已停用/)
+  assert.deepEqual(treeState(home),before,'registration, filtered scan, transcript viewing and source disable must not alter external files or timestamps')
 })
 
 test('read-only default Codex paginated rollouts show verified full lineage after explicit version selection without opening SQLite',async t=>{
