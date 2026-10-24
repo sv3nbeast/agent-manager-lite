@@ -2,8 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { SessionContentBlock, SessionContentPage, SessionRecord } from '../../../shared/sessions'
 
-const props = defineProps<{ snapshotId: string; record: SessionRecord; targetId: string; versionId?: string; initialQuery?: string; canResume?: boolean; canForkDefault?: boolean; resumeReason?: string }>()
-const emit = defineEmits<{ close: []; resume: [record: SessionRecord]; forkDefault: [record: SessionRecord] }>()
+const props = defineProps<{ snapshotId: string; record: SessionRecord; targetId: string; versionId?: string; initialQuery?: string; canResume?: boolean; canForkDefault?: boolean; canResumeCodex?: boolean; resumeReason?: string }>()
+const emit = defineEmits<{ close: []; resume: [record: SessionRecord]; forkDefault: [record: SessionRecord]; resumeCodex:[record:SessionRecord] }>()
 const result = ref<SessionContentPage>(), query = ref(props.initialQuery ?? ''), appliedQuery = ref(''), loading = ref(false), error = ref('')
 const body = ref<HTMLElement>()
 let generation = 0, alive = true
@@ -123,7 +123,7 @@ onUnmounted(() => { alive = false; generation++ })
     <div class="session-reader">
       <header class="session-reader-heading">
         <div><h2>{{result?.title ?? record.title}}</h2><div class="session-reader-source"><a-tag>{{clientName}}</a-tag><span>{{result?.sourceName ?? record.locations.find(location => location.targetId === targetId)?.name}}</span></div></div>
-        <a-space><a-button v-if="canResume" type="primary" :disabled="loading" @click="emit('resume', record)">恢复此会话</a-button><a-button v-if="canForkDefault" type="primary" :disabled="loading" @click="emit('forkDefault', record)">在 Terminal 中分叉</a-button></a-space>
+        <a-space><a-button v-if="canResume" type="primary" :disabled="loading" @click="emit('resume', record)">恢复此会话</a-button><a-button v-if="canForkDefault" type="primary" :disabled="loading" @click="emit('forkDefault', record)">在 Terminal 中分叉</a-button><a-button v-if="canResumeCodex" type="primary" :disabled="loading" @click="emit('resumeCodex',record)">恢复此会话</a-button></a-space>
       </header>
       <p class="muted session-reader-project">项目：{{result?.cwd ?? record.cwd}}</p>
       <p class="muted session-reader-id">会话 ID：{{record.sourceSessionId ?? record.id}}</p>

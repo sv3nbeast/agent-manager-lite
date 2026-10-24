@@ -24,6 +24,8 @@ import {claudeDesktopRuntimeContext,claudeDesktopLaunchPreview,prepareClaudeDesk
 import {initializeClaudeCodeOnboarding} from './claudeCodeOnboarding'
 import {readClaudeCodeInstanceHistory,claudeSessionResumeArgs} from './claudeCodeSessions'
 import type {CatalogClaudeResumePreview} from './sessions'
+import type {CodexResumeTicketSource} from '../shared/sessions'
+import {readCodexSessionLineage} from './codexSessionLineage'
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
 import {scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
 import {copySavedInstanceHome,normalizeSessionDatabaseCopy} from './instanceCopySnapshot'
@@ -38,6 +40,7 @@ import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCo
 import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopServiceTier'
 import {readInstanceHistory} from './instanceHistory'
 import {repairSessionProjection} from './sessionProjectionRepair'
+import {readSessionRolloutIndex} from './sessionDisplay'
 import {readInstanceIdentityStatus} from './instanceIdentityStatus'
 import type {prepareCodexSharedSkills} from './codexSkills'
 
@@ -48,7 +51,8 @@ const defaultSpeedMenuServices:InstanceSpeedMenuServices={inspectFeatures:inspec
 type ClaudeResumeLaunch=CatalogClaudeResumePreview & {cwdDevice:number;cwdInode:number}
 const claudeWorkingDirectorySchema=z.object({path:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)),canonicalPath:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)).optional(),device:z.number().int().nonnegative(),inode:z.number().int().nonnegative()}).strict()
 type ClaudeWorkingDirectory=z.infer<typeof claudeWorkingDirectorySchema>
-type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string;claudeSubscriptionFingerprint?:string;claudeResume?:ClaudeResumeLaunch;claudeWorkingDirectory?:ClaudeWorkingDirectory}
+type CodexResumeLaunch=CodexResumeTicketSource & {cwdDevice:number;cwdInode:number}
+type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string;claudeSubscriptionFingerprint?:string;claudeResume?:ClaudeResumeLaunch;claudeWorkingDirectory?:ClaudeWorkingDirectory;codexResume?:CodexResumeLaunch}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const resolveCompatibleApplication=(application:InstanceApplication)=>{try {resolveAgentClientType(application.clientType);return true}catch{return false}}
 const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native','client_login']).optional(),launchMode:z.enum(['desktop','cli']).optional(),nativeTier:z.string().optional(),nativeProxy:z.boolean().optional(),claudeExecutable:z.string().min(1).max(4096).optional(),claudeApplication:z.string().min(1).max(4096).optional(),claudeSubscriptionFingerprint:z.string().regex(/^[a-f0-9]{64}$/).optional(),claudeWorkingDirectory:claudeWorkingDirectorySchema.optional()}).strict()
@@ -56,7 +60,7 @@ const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),non
 export class Instances {
   private readonly root:string
   private readonly active=new Map<string,Running>()
-  private readonly previews=new Map<string,{preview:InstanceLaunchPreview;fingerprint:string;expiresAt:number;claudeResume?:ClaudeResumeLaunch}>()
+  private readonly previews=new Map<string,{preview:InstanceLaunchPreview;fingerprint:string;expiresAt:number;claudeResume?:ClaudeResumeLaunch;codexResume?:CodexResumeLaunch}>()
   private readonly recoveryErrors=new Map<string,string>()
   private readonly notices=new Map<string,string>()
   private refreshing?:Promise<void>
@@ -487,6 +491,44 @@ export class Instances {
     z.string().uuid().parse(ticket)
     for(const [id,value] of this.previews)if(value.claudeResume&&value.preview.ticket===ticket)this.previews.delete(id)
   }
+  previewCodexSessionResume(source:CodexResumeTicketSource):InstanceLaunchPreview & CodexResumeTicketSource & {sessionId:string} {
+    const profile=this.profile(source.targetId),application=this.store.read().instanceApplications?.find(value=>value.id===profile.applicationId)
+    if(profile.clientType==='claude_code'||profile.externalHome||application?.kind!=='cli'||profile.revision!==source.instanceRevision||digest(profile)!==source.profileFingerprint)throw new Error('仅支持当前受管 Codex CLI 实例，请刷新后重试')
+    if(this.inUse(profile.id))throw new Error('Codex 实例正在运行，请先停止后重试')
+    if(source.cwd!==source.cwdCanonicalPath||!isAbsolute(source.cwd)||/[\0-\x1f\x7f]/.test(source.cwd))throw new Error('会话项目目录路径无效')
+    const cwdStat=lstatSync(source.cwd)
+    if(!cwdStat.isDirectory()||cwdStat.isSymbolicLink()||cwdStat.dev!==source.cwdDevice||cwdStat.ino!==source.cwdInode||realpathSync(source.cwd)!==source.cwdCanonicalPath)throw new Error('会话项目目录已变化，请刷新后重试')
+    const context=this.context(profile,randomUUID())
+    if(context.plan.mode!=='cli'||context.plan.clientType!=='codex')throw new Error('此会话来源不是 Codex CLI 实例')
+    const state=this.store.read(),account=state.accounts.find(value=>value.id===profile.accountId)!
+    const ticket=randomUUID(),resume={...source},args=['resume',source.sessionId,...profile.extraArgs],preview:InstanceLaunchPreview & CodexResumeTicketSource & {sessionId:string}={
+      clientType:'codex',ticket,instanceId:profile.id,name:profile.name,application:context.plan.application,executable:context.plan.executable,directory:context.plan.directory,desktopDirectory:context.plan.desktopDirectory,workingDirectory:source.cwd,args,accountName:account.name,model:profile.model,tierSource:'instance',connectionMode:profile.connectionMode??'local_api',launchMode:'cli',identityStatus:'local_api',...resume
+    }
+    this.previews.set(profile.id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000,codexResume:resume});return structuredClone(preview)
+  }
+  discardCodexSessionResume(ticket:string):void {z.string().uuid().parse(ticket);for(const [id,value] of this.previews)if(value.codexResume&&value.preview.ticket===ticket)this.previews.delete(id)}
+  private validateCodexResume(profile:InstanceProfile,resume:CodexResumeLaunch,allowActive=false):void {
+    if(profile.clientType==='claude_code'||profile.externalHome||profile.id!==resume.targetId||profile.revision!==resume.instanceRevision||digest(profile)!==resume.profileFingerprint||!allowActive&&this.inUse(profile.id))throw new Error('Codex 实例已变化或正在运行，请刷新后重新预览')
+    const application=this.store.read().instanceApplications?.find(value=>value.id===profile.applicationId)
+    if(application?.kind!=='cli'||profile.applicationId===undefined)throw new Error('Codex 会话恢复仅支持已登记的 CLI 实例')
+    const folder=this.folder(profile.id),home=instanceHomePath(this.root,profile),root=lstatSync(home)
+    if(home!==resume.root||root.dev!==resume.rootDevice||root.ino!==resume.rootInode)throw new Error('Codex 会话来源目录已变化，请刷新')
+    const cwd=lstatSync(resume.cwd)
+    if(!cwd.isDirectory()||cwd.isSymbolicLink()||cwd.dev!==resume.cwdDevice||cwd.ino!==resume.cwdInode||realpathSync(resume.cwd)!==resume.cwdCanonicalPath)throw new Error('会话项目目录已变化，请刷新后重试')
+    const pathStat=lstatSync(resume.path)
+    if(!pathStat.isFile()||pathStat.isSymbolicLink()||pathStat.nlink!==1||pathStat.dev!==resume.device||pathStat.ino!==resume.inode||pathStat.size!==resume.size||pathStat.mtimeMs!==resume.mtime||pathStat.ctimeMs!==resume.ctime)throw new Error('会话 rollout 已变化，请刷新列表后重试')
+    const target=this.profile(profile.id);if(instanceHomePath(this.root,target)!==resume.root||folder!==join(this.root,'instances',profile.id))throw new Error('Codex 会话实例目录已变化')
+  }
+  private async validateCodexCurrentRollout(profile:InstanceProfile,resume:CodexResumeLaunch):Promise<void> {
+    this.validateCodexResume(profile,resume,true)
+    const indexed=await readSessionRolloutIndex(resume.root,new AbortController().signal,()=>{})
+    if(indexed.get(resume.sessionId)!==resume.path)throw new Error('Codex 当前会话 rollout 已变化，请刷新列表后重试')
+    if(resume.lineage){
+      let current:CodexResumeLaunch['lineage']
+      await readCodexSessionLineage(resume.root,resume.path,resume.sessionId,{page:1,pageSize:1},new AbortController().signal,undefined,files=>{current=files})
+      if(!current?.length||current[0].path!==resume.path||JSON.stringify(current)!==JSON.stringify(resume.lineage))throw new Error('Codex 分段会话历史在预览后发生变化，请刷新列表后重试')
+    }
+  }
   private validateClaudeResume(profile:InstanceProfile,resume:ClaudeResumeLaunch):void {
     if(profile.clientType!=='claude_code'||isClaudeDesktopProfile(profile)||profile.externalHome
       ||profile.id!==resume.instanceId||profile.revision!==resume.instanceRevision||digest(profile)!==resume.profileFingerprint
@@ -510,6 +552,18 @@ export class Instances {
     const entry=[...this.previews.entries()].find(([,value])=>value.preview.ticket===ticket)
     if(!entry || entry[1].expiresAt<Date.now())throw new Error('启动预览已过期，请重新预览')
     const [id,pending]=entry,profile=this.profile(id)
+    if(pending.codexResume){
+      this.validateCodexResume(profile,pending.codexResume)
+      const context=this.context(profile)
+      if(context.fingerprint!==pending.fingerprint)throw new Error('Codex 账号、配置或 CLI 程序已变化，请重新预览')
+      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController()}
+      run.plan.args=[...profile.extraArgs]
+      run.plan.managedArgs=['resume',pending.codexResume.sessionId]
+      run.plan.workingDirectory=pending.codexResume.cwd
+      run.codexResume=pending.codexResume
+      this.previews.delete(id);this.notices.delete(id);this.active.set(id,run)
+      run.task=this.launch(run,context.view.revision,pending.fingerprint).finally(()=>{run.task=undefined});return
+    }
     if(isClaudeDesktopProfile(profile)){
       if(this.inUse(id))throw new Error('实例已有启动或运行任务')
       this.previews.delete(id)
@@ -621,6 +675,7 @@ export class Instances {
   private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id,false,!run.claudeWorkingDirectory),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,claudeSubscriptionFingerprint:run.claudeSubscriptionFingerprint,claudeWorkingDirectory:run.claudeWorkingDirectory,connectionMode:run.profile.connectionMode??'local_api',launchMode:run.plan.mode??'desktop',nativeTier:run.nativeTier,nativeProxy:run.plan.networkRoute?.mode==='proxy'||undefined,...run.profile.clientType==='claude_code'?{claudeExecutable:run.plan.executable,...isClaudeDesktopProfile(run.profile)?{claudeApplication:run.plan.application}:{}}:{}}))}
   private async launch(run:Running,revision:string,fingerprint:string):Promise<void> {
     try {
+      if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
       if(isClaudeDesktopProfile(run.profile)){await this.launchClaudeDesktop(run,fingerprint);return}
       if(run.profile.clientType==='claude_code'){await this.launchClaude(run,fingerprint);return}
       if(run.profile.externalHome&&run.profile.connectionMode!=='native')assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))
@@ -693,6 +748,7 @@ export class Instances {
           if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例设置在等待凭据写入期间已变化，请重新预览')
         })
         run.controller.signal.throwIfAborted();run.status='starting'
+        if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
         run.child=await this.runtime.launch(run.plan,run.controller.signal)
         run.controller.signal.throwIfAborted()
         if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
@@ -719,6 +775,7 @@ export class Instances {
         await this.nativeAccounts.injectLocalApi(run.profile,run.plan.nonce,run.controller.signal)
       }
       run.status='starting'
+      if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
       run.child=await this.runtime.launch(run.plan,run.controller.signal)
       run.controller.signal.throwIfAborted()
       await gateway.updateCredentials(this.store.read().accounts.find(value=>value.id===run.profile.accountId)!)

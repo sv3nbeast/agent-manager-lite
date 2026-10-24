@@ -254,6 +254,8 @@ export interface ManagerAPI {
   removeCodexSessionSource(id:string):Promise<import('./sessions').SessionSource[]>
   previewClaudeSessionResume(input:import('./sessions').ClaudeResumeSelection):Promise<InstanceLaunchPreview & {sessionId:string}>
   discardClaudeSessionResume(ticket:string):Promise<void>
+  previewCodexSessionResume(input:import('./sessions').CodexResumeSelection):Promise<import('./sessions').CodexResumeTicketSource & {ticket:string;name:string;application:string;executable:string;directory:string;workingDirectory:string;args:string[];accountName:string;model:string;connectionMode:'native'|'local_api'}>
+  discardCodexSessionResume(ticket:string):Promise<void>
   previewDefaultClaudeSessionResume(input:import('./sessions').ClaudeResumeSelection):Promise<import('./sessions').DefaultClaudeSessionResumePreview>
   startDefaultClaudeSessionResume(ticket:string):Promise<{opened:true}>
   discardDefaultClaudeSessionResume(ticket:string):Promise<void>
