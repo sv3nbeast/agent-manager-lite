@@ -173,3 +173,6 @@ npm run test:claude-desktop:runtime -- --upstream-proxy-file /absolute/path/prox
 项目代码按 [CC-BY-NC-SA-4.0](LICENSE) 分发。独立第三方依赖继续适用各自许可证，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
 部分 Codex 管理逻辑适配自 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools)，技术栈和视觉参考 [Kiro Manager Lite](https://github.com/lucks-cloud/kiro-manager-lite)。本项目为独立工具，与 OpenAI、Anthropic 或上述项目无官方关联。
+## 存储清单
+
+「存储清单」只读盘点本管理器的受管实例和可识别的历史归档，按会话文件、SQLite 数据库、配置、技能、缓存及其他文件列出逻辑大小和文件数。扫描跳过符号链接、外部工作目录与未识别归档，并在文件数、目录深度或扫描耗时达到上限时停止。APFS 克隆可能共享底层数据块，因此分配空间是估算值，不等于可回收空间。旧归档缺少来源清单时不能通过此页面恢复或删除。
