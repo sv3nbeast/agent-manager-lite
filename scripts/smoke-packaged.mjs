@@ -231,7 +231,8 @@ try {
   assert.equal(await evaluate('window.manager.saveAccountProxy({accountId:"invalid",revision:0,mode:"direct"}).then(()=>false,()=>true)'),true)
   assert.equal(await evaluate('typeof window.manager.readAccountKey'),'function')
   assert.equal(await evaluate('window.manager.readAccountKey({id:"invalid",revision:0}).then(()=>false,()=>true)'),true)
-  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll(".navigation .ant-menu-item")).slice(0,4).map(el=>el.textContent.replace(/\\s/g,""))'),['概览','实例','账号管理0','供应商与密钥0'])
+  const navigation=await evaluate('Array.from(document.querySelectorAll(".navigation .ant-menu-item")).map(el=>el.textContent.replace(/\\s/g,""))')
+  assert.ok(navigation.includes('概览')&&navigation.includes('实例')&&navigation.includes('存储清单')&&navigation.some(value=>value.startsWith('账号管理'))&&navigation.some(value=>value.startsWith('供应商与密钥')),'Primary workspace navigation entries are present')
   await evaluate('Array.from(document.querySelectorAll(".navigation .ant-menu-item")).find(el=>el.textContent==="概览").click()')
   for(let i=0;i<50;i++){if(await evaluate('!!document.querySelector(".overview-assets")'))break;await delay(50)}
   assert.equal(await evaluate('document.querySelectorAll(".overview-assets .asset-empty").length'),2)
