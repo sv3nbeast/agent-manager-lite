@@ -20,6 +20,7 @@ import {builtInCatalog,parseNativeCatalog} from '../src/main/modelCatalog'
 import { MacDesktopRuntime, desktopEnvironment, macLaunchArgs, type DesktopRuntime, type DesktopPlan, type DesktopProcess } from '../src/main/instanceRuntime'
 import { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
 import { TokenAuthority } from '../src/main/tokens'
+import {scanInstanceStorage} from '../src/main/instanceStorage'
 
 class FixtureDesktop implements DesktopRuntime {
   readonly children=new Map<string,DesktopProcess>()
@@ -388,6 +389,47 @@ test('managed instances persist independently, expose config targets, reject sta
   const original=second.directory+'-original';renameSync(second.directory,original);symlinkSync(f.root,second.directory,'dir')
   assert.throws(()=>f.instances.preview({id:second.id,revision:second.revision}),/目录/)
   assert.equal(existsSync(join(f.root,'config.toml')),false)
+})
+
+test('storage inventory is read-only, classifies managed files and exposes legacy trash without following links',async t=>{
+  const f=fixture(t),account=f.account(),instance=f.add(account.id,'Storage fixture'),home=instance.directory
+  mkdirSync(join(home,'sessions','2026'),{recursive:true})
+  mkdirSync(join(home,'skills','sample'),{recursive:true})
+  mkdirSync(join(home,'cache'),{recursive:true})
+  mkdirSync(join(home,'workspace','project'),{recursive:true})
+  writeFileSync(join(home,'sessions','2026','rollout-fixture.jsonl'),'conversation bytes')
+  writeFileSync(join(home,'skills','sample','SKILL.md'),'skill bytes')
+  writeFileSync(join(home,'cache','cache.bin'),'cache bytes')
+  writeFileSync(join(home,'workspace','project','README.md'),'workspace bytes')
+  writeFileSync(join(home,'settings.json'),'{}')
+  const trash=join(f.store.directory,'instance-trash'),archivedId=randomUUID(),archivedName=archivedId+'-'+String(Date.now())
+  mkdirSync(join(trash,archivedName,'home','sessions'),{recursive:true})
+  writeFileSync(join(trash,archivedName,'home','sessions','old.jsonl'),'old archived bytes')
+  mkdirSync(join(trash,'unknown-future-archive','home'),{recursive:true})
+  writeFileSync(join(trash,'unknown-future-archive','home','do-not-scan.bin'),'unknown')
+  mkdirSync(join(f.root,'external-workspace'),{recursive:true});writeFileSync(join(f.root,'external-workspace','external.txt'),'outside')
+  symlinkSync(join(f.root,'external-workspace'),join(home,'linked-workspace'),'dir')
+  const before=readFileSync(join(f.store.directory,'state.vault'))
+  const inventory=await scanInstanceStorage(realpathSync(f.store.directory),f.store.read().instances??[],1234)
+  const managed=inventory.rows.find(row=>row.kind==='managed'&&row.id===instance.id)!
+  const legacy=inventory.rows.find(row=>row.kind==='legacy_trash'&&row.id===archivedId)!
+  assert.equal(inventory.capturedAt,1234)
+  assert.ok(managed.logicalBytes>0);assert.ok(managed.files>0)
+  assert.equal(managed.categories.find(row=>row.category==='sessions')?.files,1)
+  assert.equal(managed.categories.find(row=>row.category==='skills')?.files,1)
+  assert.equal(managed.categories.find(row=>row.category==='cache')?.files,1)
+  assert.equal(managed.categories.find(row=>row.category==='workspace')?.files,1)
+  assert.equal(legacy.warning?.includes('旧归档没有来源清单'),true)
+  assert.equal(inventory.rows.some(row=>row.name==='unknown-future-archive'),false)
+  assert.equal(inventory.rows.some(row=>row.directory.includes('external-workspace')),false)
+  assert.equal(inventory.rows.some(row=>row.directory.includes('linked-workspace')),false)
+  assert.deepEqual(readFileSync(join(f.store.directory,'state.vault')),before)
+  assert.equal(readFileSync(join(home,'sessions','2026','rollout-fixture.jsonl'),'utf8'),'conversation bytes')
+  const partial=await scanInstanceStorage(realpathSync(f.store.directory),f.store.read().instances??[],1234,{maxFiles:1})
+  assert.ok(partial.warnings.some(warning=>warning.includes('已停止')||warning.includes('安全扫描上限')))
+  assert.ok(partial.files<=1)
+  const depthLimited=await scanInstanceStorage(realpathSync(f.store.directory),f.store.read().instances??[],1234,{maxDepth:1})
+  assert.ok(depthLimited.warnings.some(warning=>warning.includes('安全扫描深度')))
 })
 
 test('two instances own different gateways and credentials; Fast/Standard reach real upstream and stopping one preserves the other',async t=>{

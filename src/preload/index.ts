@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { ManagerAPI } from '../shared/types'
 
 const api: ManagerAPI = {
+  scanInstanceStorage: () => ipcRenderer.invoke('manager:invoke','scanInstanceStorage'),
   exportDataBackup:input=>ipcRenderer.invoke('manager:invoke','exportDataBackup',input),
   previewDataBackup:input=>ipcRenderer.invoke('manager:invoke','previewDataBackup',input),
   restoreDataBackup:input=>ipcRenderer.invoke('manager:invoke','restoreDataBackup',input),

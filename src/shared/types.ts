@@ -152,6 +152,7 @@ export interface InstanceApplicationChoice { application?:InstanceApplication; s
 export interface ImportPreview { entries: { index: number; name: string; kind: Account['kind']; needsVerification?: boolean }[]; errors: string[]; skipped?: number }
 export interface StagedImport { ticket: string; preview: ImportPreview; fileName?: string }
 export interface ManagerAPI {
+  scanInstanceStorage():Promise<import('./instanceStorage').InstanceStorageInventory>
   listSshServers():Promise<SshServersView>
   saveSshServer(input:SshServerInput):Promise<AppSnapshot>
   deleteSshServer(id:string):Promise<AppSnapshot>

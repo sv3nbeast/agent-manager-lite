@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { theme, message, Modal } from 'ant-design-vue'
 import zhCN from 'ant-design-vue/es/locale/zh_CN'
-import { AppstoreOutlined, UserOutlined, DesktopOutlined, ApiOutlined, FileTextOutlined, SettingOutlined, PlusOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined, SearchOutlined, DeleteOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, UserOutlined, DesktopOutlined, ApiOutlined, FileTextOutlined, FolderOpenOutlined, SettingOutlined, PlusOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined, SearchOutlined, DeleteOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import { settingsSchema, type Account, type AppSnapshot, type Settings, type TierMode } from '../../shared/types'
 import { supportsAccountQuotaQuery } from '../../shared/providerUsage'
 import { useManager } from './store'
@@ -23,6 +23,7 @@ import GroupsDialog from './components/GroupsDialog.vue'
 import ClientConfigPanel from './components/ClientConfigPanel.vue'
 import ProviderLibraryView from './components/ProviderLibraryView.vue'
 import InstancesView from './components/InstancesView.vue'
+import InstanceStorageView from './components/InstanceStorageView.vue'
 import LocalAccessPanel from './components/LocalAccessPanel.vue'
 import SessionsView from './components/SessionsView.vue'
 import AccountRecyclePanel from './components/AccountRecyclePanel.vue'
@@ -130,7 +131,7 @@ watch(() => filtered.value.length, count => { offset.value = Math.min(offset.val
 watch(pageAccounts, value => { const ids = new Set(value.map(a => a.id)); selected.value = selected.value.filter(id => ids.has(id)) })
 watch(groups, value => { if (!['all', 'none'].includes(groupFilter.value) && !value.some(g => g.id === groupFilter.value)) groupFilter.value = 'all' })
 const tiers = [{ label: '跟随请求', value: 'follow' }, { label: 'Standard', value: 'standard' }, { label: 'Fast', value: 'fast' }]
-const names: Record<string, string> = { overview: '概览', accounts: '账号管理', connections:'API 连接', providers: '供应商与密钥', config: '客户端配置', instances:'实例',sessions:'会话管理',wakeup:'唤醒任务',gateway: '本地 API', history: '调用记录', settings: '设置' }
+const names: Record<string, string> = { overview: '概览', accounts: '账号管理', connections:'API 连接', providers: '供应商与密钥', config: '客户端配置', instances:'实例',storage:'存储清单',sessions:'会话管理',wakeup:'唤醒任务',gateway: '本地 API', history: '调用记录', settings: '设置' }
 let refreshTimer: ReturnType<typeof setInterval>
 onMounted(async () => { await manager.load(); refreshTimer = setInterval(() => { if (!manager.loading) void manager.refresh() }, 2000) })
 onUnmounted(() => clearInterval(refreshTimer))
@@ -280,6 +281,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
         <a-menu :selected-keys="[page === 'connections' ? 'providers' : page]" mode="inline" class="navigation" @click="page = String($event.key)">
           <a-menu-item key="overview"><span class="nav-item-content"><AppstoreOutlined />概览</span></a-menu-item>
           <a-menu-item key="instances"><span class="nav-item-content"><DesktopOutlined />实例</span></a-menu-item>
+          <a-menu-item key="storage"><span class="nav-item-content"><FolderOpenOutlined />存储清单</span></a-menu-item>
           <a-menu-item key="accounts"><span class="nav-item-content"><UserOutlined />账号管理 <span class="nav-count">{{ identityAccounts.length }}</span></span></a-menu-item>
           <a-menu-item key="providers"><span class="nav-item-content"><ApiOutlined />供应商与密钥 <span class="nav-count">{{ providerResourceCount }}</span></span></a-menu-item>
           <a-menu-item key="config"><span class="nav-item-content"><SettingOutlined />客户端配置</span></a-menu-item>
@@ -358,6 +360,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
             <ClientConfigPanel v-else-if="page === 'config'" />
             <ProviderLibraryView id="provider-library-panel" role="tabpanel" aria-labelledby="provider-library-tab" ref="providerLibrary" v-else-if="page === 'providers'" @manage-connections="viewConnections" />
             <InstancesView v-else-if="page === 'instances'" :login-result="loginResult" @add-account="openAccountLogin" />
+            <InstanceStorageView v-else-if="page === 'storage'" />
             <SessionsView v-else-if="page === 'sessions'" @show-instances="page='instances'" />
             <WakeupPanel v-else-if="page === 'wakeup'" :accounts="accounts" />
             <template v-else-if="page === 'settings'">
