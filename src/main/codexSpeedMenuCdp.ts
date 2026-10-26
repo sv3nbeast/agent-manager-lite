@@ -4,8 +4,11 @@ import {setTimeout as delay} from 'node:timers/promises'
 import {dirname,join} from 'node:path'
 import type {CodexSpeedMenuHook} from './codexSpeedMenu'
 
-type Replacement={begin:string;end:string;before:string;after:string}
-type Manifest={version:1;home:string;desktopDirectory:string;executable:string;nonce:string;url:string;sourceSha256:string;patchedSha256:string;enhancements:'speed'|'locale'|'speed-locale';replacements:Replacement[];replacementCount:number;replacementsSha256:string;patchedBody?:string;patchedBodySha256?:string}
+type Replacement={begin:string;end:string;before:string;after:string;offset?:number}
+type Resource={id:string;url:string;sourceSha256:string;patchedSha256:string;replacements:Replacement[];patchedBodyPath?:string;patchedBodySha256?:string}
+type Manifest={version:2;home:string;desktopDirectory:string;executable:string;nonce:string;enhancements:'speed'|'locale'|'speed-locale';resources:Resource[];resourceIdsByFeature:Record<string,string[]>}
+export function codexResourceFetchPatterns(resources:readonly Pick<Resource,'url'>[]):{urlPattern:string;requestStage:'Request'}[]{return resources.map(resource=>({urlPattern:resource.url+'*',requestStage:'Request'}))}
+export function codexResourceForRequest<T extends Pick<Resource,'url'>>(resources:readonly T[],url:unknown):T|undefined{return typeof url==='string'?resources.find(resource=>resource.url===url):undefined}
 type StatusKind='hook-loaded'|'patched'|'original'|'disabled'
 
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex')
@@ -22,14 +25,14 @@ const privateDirectory=(path:string):boolean=>{
   }catch{return false}
 }
 
-function status(path:string,scope:{home:string;desktopDirectory:string;executable:string;nonce:string;pid?:number},kind:StatusKind,reason?:string):void {
+function status(path:string,scope:{home:string;desktopDirectory:string;executable:string;nonce:string;pid?:number},kind:StatusKind,reason?:string,resourceId?:string):void {
   try{
     if(!privateDirectory(join(path,'..'))||!privateFile(path))return
     const fd=openSync(path,'a')
     try{
       const stat=lstatSync(path)
       if(!stat.isFile()||stat.size>128*1024||stat.mode&0o022)return
-      writeSync(fd,JSON.stringify({time:Date.now(),...(scope.pid===undefined?{}:{pid:scope.pid}),mainThread:true,threadId:0,nonce:scope.nonce,executable:scope.executable,directory:scope.home,kind,...(reason?{reason}:{})})+'\n')
+      writeSync(fd,JSON.stringify({time:Date.now(),...(scope.pid===undefined?{}:{pid:scope.pid}),mainThread:true,threadId:0,nonce:scope.nonce,executable:scope.executable,directory:scope.home,kind,...(reason?{reason}:{}),...(resourceId?{resourceId}:{})})+'\n')
     }finally{closeSync(fd)}
   }catch{/* A status failure must never stop the client. */}
 }
@@ -39,14 +42,15 @@ function readManifest(hook:CodexSpeedMenuHook):Manifest {
   const body=readFileSync(hook.manifest,'utf8')
   if(body.length>32768||hash(body)!==hook.manifestSha256)throw new Error('manifest')
   const value=JSON.parse(body) as Manifest
-  if(value.version!==1||!Array.isArray(value.replacements)||value.replacements.length!==value.replacementCount||hash(JSON.stringify(value.replacements))!==value.replacementsSha256)throw new Error('manifest')
-  if(hook.transport==='cdp'){
-    const expectedBody=join(dirname(hook.manifest),'patched.js')
-    if(value.patchedBody!==expectedBody||typeof value.patchedBodySha256!=='string'||!privateFile(expectedBody)||hash(readFileSync(expectedBody))!==value.patchedBodySha256)throw new Error('manifest body')
+  if(value.version!==2||!Array.isArray(value.resources)||value.resources.length<1||value.resources.length>4)throw new Error('manifest')
+  const ids=new Set<string>(),urls=new Set<string>()
+  for(const [index,resource] of value.resources.entries()){
+    if(!resource||typeof resource.id!=='string'||typeof resource.url!=='string'||ids.has(resource.id)||urls.has(resource.url)||!Array.isArray(resource.replacements)||resource.replacements.length<1)throw new Error('manifest resource')
+    ids.add(resource.id);urls.add(resource.url)
+    if(hook.transport==='cdp'){const expectedBody=join(dirname(hook.manifest),'patched-'+index+'.js');if(resource.patchedBodyPath!==expectedBody||typeof resource.patchedBodySha256!=='string'||!privateFile(expectedBody)||hash(readFileSync(expectedBody))!==resource.patchedBodySha256)throw new Error('manifest body')}
+    for(const replacement of resource.replacements)if(!replacement||typeof replacement.before!=='string'||typeof replacement.after!=='string'||replacement.offset===undefined&&(typeof replacement.begin!=='string'||typeof replacement.end!=='string'))throw new Error('manifest replacement')
   }
-  for(const replacement of value.replacements){
-    if(!replacement||typeof replacement.begin!=='string'||typeof replacement.end!=='string'||typeof replacement.before!=='string'||typeof replacement.after!=='string')throw new Error('manifest')
-  }
+  for(const resourceIds of Object.values(value.resourceIdsByFeature))if(!Array.isArray(resourceIds)||resourceIds.some(id=>!ids.has(id)))throw new Error('manifest feature scope')
   return value
 }
 
@@ -247,7 +251,7 @@ export class CodexSpeedMenuCdpSession {
     if(typeof targetInfo?.targetId==='string')this.attachedTargets.add(targetInfo.targetId)
     const page=targetInfo?.type==='page'||targetInfo?.type==='webview'
     if(page){
-        await this.call('Fetch.enable',{patterns:[{urlPattern:this.manifest.url+'*',requestStage:'Request'}]},sessionId)
+        await this.call('Fetch.enable',{patterns:codexResourceFetchPatterns(this.manifest.resources)},sessionId)
         // Register the startup listener before the single early reload.
         // A release failure must not prevent the audited renderer response from
         // loading; the speed hook remains useful even on older CDP targets.
@@ -285,24 +289,25 @@ export class CodexSpeedMenuCdpSession {
   }
 
   private async paused(sessionId:string|undefined,params:any):Promise<void>{
-    if(params.request?.url!==this.manifest.url){try{await this.call('Fetch.continueRequest',{requestId:params.requestId},sessionId)}catch{};return}
+    const resource=codexResourceForRequest(this.manifest.resources,params.request?.url)
+    if(!resource){try{await this.call('Fetch.continueRequest',{requestId:params.requestId},sessionId)}catch{};return}
     if(!Number.isInteger(params.responseStatusCode)){
       try{
-        const body=readFileSync(String(this.manifest.patchedBody))
-        if(hash(body)!==this.manifest.patchedBodySha256||hash(body)!==this.manifest.patchedSha256)throw new Error('patched body')
-        if(!await this.fulfill(sessionId,params,body,[],this.manifest.patchedSha256))throw new Error('fulfill')
-        this.patched=true;status(this.options.hook.statusLog,this.scope,'patched')
-      }catch{status(this.options.hook.statusLog,this.scope,'original','cdpResponse');try{await this.call('Fetch.continueRequest',{requestId:params.requestId},sessionId)}catch{}}
+        const body=readFileSync(String(resource.patchedBodyPath))
+        if(hash(body)!==resource.patchedBodySha256||hash(body)!==resource.patchedSha256)throw new Error('patched body')
+        if(!await this.fulfill(sessionId,params,body,[],resource.patchedSha256))throw new Error('fulfill')
+        this.patched=true;status(this.options.hook.statusLog,this.scope,'patched',resource.id)
+      }catch{status(this.options.hook.statusLog,this.scope,'original','cdpResponse',resource.id);try{await this.call('Fetch.continueRequest',{requestId:params.requestId},sessionId)}catch{}}
       return
     }
     try{
-      if(params.responseStatusCode!==200||headerValue(params.responseHeaders??[],'content-encoding')){await this.continue(sessionId,params.requestId);status(this.options.hook.statusLog,this.scope,'original','response');return}
-      const body=readFileSync(String(this.manifest.patchedBody))
-      if(hash(body)!==this.manifest.patchedBodySha256||hash(body)!==this.manifest.patchedSha256)throw new Error('patched body')
+      if(params.responseStatusCode!==200||headerValue(params.responseHeaders??[],'content-encoding')){await this.continue(sessionId,params.requestId);status(this.options.hook.statusLog,this.scope,'original','response',resource.id);return}
+      const body=readFileSync(String(resource.patchedBodyPath))
+      if(hash(body)!==resource.patchedBodySha256||hash(body)!==resource.patchedSha256)throw new Error('patched body')
       const source=body.toString('utf8')
-      if(!await this.fulfill(sessionId,params,body,params.responseHeaders??[],this.manifest.patchedSha256))throw new Error('fulfill')
-      this.patched=true;status(this.options.hook.statusLog,this.scope,'patched')
-    }catch{status(this.options.hook.statusLog,this.scope,'original','cdpResponse');await this.continue(sessionId,params.requestId)}
+      if(!await this.fulfill(sessionId,params,body,params.responseHeaders??[],resource.patchedSha256))throw new Error('fulfill')
+      this.patched=true;status(this.options.hook.statusLog,this.scope,'patched',resource.id)
+    }catch{status(this.options.hook.statusLog,this.scope,'original','cdpResponse',resource.id);await this.continue(sessionId,params.requestId)}
   }
 
   private async message(event:any):Promise<void>{
