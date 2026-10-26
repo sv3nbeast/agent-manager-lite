@@ -72,7 +72,7 @@ function safeSessionPathSync(root:string,path:string){
  * Every ancestor must resolve to one immutable canonical rollout inside the
  * selected managed home; both ordinal and byte-offset cutoffs are verified. */
 export async function readCodexSessionLineage(
-  root:string,currentPath:string,sessionId:string,raw:{page?:number;pageSize?:number;query?:string},signal:AbortSignal,
+  root:string,currentPath:string,sessionId:string,raw:{page?:number;pageSize?:number;query?:string;recent?:boolean;offset?:number},signal:AbortSignal,
   current?:{file:FileHandle;size:number},
   onResolved?:(files:CodexSessionLineageFile[])=>void,
 ):Promise<CodexSessionContentPage>{

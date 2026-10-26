@@ -64,6 +64,18 @@ test('Codex content pages messages and searches message/tool text without exposi
   })
 })
 
+test('Codex recent content returns the last page in original chronological order, including recent search matches', async () => {
+  const lines=[event('session_meta',{id:'fixture-session'}),...Array.from({length:13},(_,index)=>event('event_msg',{type:index%2?'agent_message':'user_message',message:`message-${index+1}`}))]
+  await withRollout(lines,async(file,size)=>{
+    const recent=await readCodexSessionContent(file,size,{page:1,pageSize:10,recent:true})
+    assert.equal(recent.total,13);assert.equal(recent.page,1);assert.equal(recent.startIndex,3);assert.deepEqual(recent.messages.map(message=>message.blocks[0].text),Array.from({length:10},(_,index)=>`message-${index+4}`))
+    const older=await readCodexSessionContent(file,size,{page:1,pageSize:10})
+    assert.equal(older.page,1);assert.deepEqual(older.messages.map(message=>message.blocks[0].text),Array.from({length:10},(_,index)=>`message-${index+1}`))
+    const found=await readCodexSessionContent(file,size,{page:1,pageSize:3,query:'message',recent:true})
+    assert.equal(found.total,13);assert.equal(found.page,1);assert.equal(found.startIndex,10);assert.deepEqual(found.messages.map(message=>message.blocks[0].text),['message-11','message-12','message-13'])
+  })
+})
+
 test('Codex transcript bounds long message/page text and returns truncation warnings', async () => {
   const large = '界'.repeat(80_000)
   const lines = [event('event_msg', { type: 'user_message', message: large }), event('event_msg', { type: 'agent_message', message: 'second' })]

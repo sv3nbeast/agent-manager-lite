@@ -685,17 +685,19 @@ export interface ClaudeSessionContentPage {
   page: number
   pageSize: number
   total: number
+  startIndex:number
   messages: SessionContentMessage[]
   warnings: string[]
 }
 
 /** The requested page is projected while validating the entire transcript.
  * No body is cached in a catalog snapshot, and stale reads return no content. */
-export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: { page?: number; pageSize?: number; query?: string } = {}): ClaudeSessionContentPage {
-  const input = sessionContentSchema.pick({ page: true, pageSize: true, query: true }).parse(raw)
-  const start = (input.page - 1) * input.pageSize, query = input.query.toLowerCase()
-  const result: ClaudeSessionContentPage = { page: input.page, pageSize: input.pageSize, total: 0, messages: [], warnings: [] }
+export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: { page?: number; pageSize?: number; query?: string; recent?:boolean; offset?:number } = {}): ClaudeSessionContentPage {
+  const input = sessionContentSchema.pick({ page: true, pageSize: true, query: true, recent:true, offset:true }).parse(raw)
+  const recent=input.recent&&input.page===1,start = (input.page - 1) * input.pageSize, query = input.query.toLowerCase()
+  const result: ClaudeSessionContentPage = { page: input.page, pageSize: input.pageSize, total: 0, startIndex:start, messages: [], warnings: [] }
   let index = 0, searchTruncated = false
+  const recentMessages:SessionContentMessage[]=[],requestedWindow:SessionContentMessage[]=[]
   const validate = (): void => { unchangedDirectory(location.source.config); unchangedDirectory(location.source.projects); unchangedDirectory(location.project) }
   const current = readTranscript(location.path, validate, { sessionId: location.contentSessionId, includeUnscopedFor: location.contentIncludesPrefix ? location.contentSessionId : undefined, onRecord(record) {
     // Unknown record types, indexes and title updates are not conversation text.
@@ -703,10 +705,10 @@ export function readClaudeSessionContent(location: ClaudeSessionLocation, raw: {
     const messageIndex = index++
     if (query && !contentMatches(record, query, () => { searchTruncated = true })) return
     const position = result.total++
-    if (position < start || position >= start + input.pageSize) return
-    const message = readableMessage(record, messageIndex, Math.min(maxContentMessageCharacters, Math.floor(maxContentPageCharacters / input.pageSize)))
-    if (message) result.messages.push(message)
+    if(recent){if(input.offset===undefined){const message=readableMessage(record,messageIndex,Math.min(maxContentMessageCharacters,Math.floor(maxContentPageCharacters/input.pageSize)));if(message){recentMessages.push(message);if(recentMessages.length>input.pageSize)recentMessages.shift()}}else if(position>=input.offset&&position<input.offset+input.pageSize){const message=readableMessage(record,messageIndex,Math.min(maxContentMessageCharacters,Math.floor(maxContentPageCharacters/input.pageSize)));if(message)requestedWindow.push(message)}}
+    else if (position >= start && position < start + input.pageSize){const message=readableMessage(record,messageIndex,Math.min(maxContentMessageCharacters,Math.floor(maxContentPageCharacters/input.pageSize)));if(message)result.messages.push(message)}
   } })
+  if(recent){const startIndex=input.offset===undefined?Math.max(0,result.total-input.pageSize):Math.min(input.offset,result.total);result.startIndex=startIndex;result.page=1;result.messages=input.offset!==undefined?requestedWindow:recentMessages}
   if (sourceId(location.source, location.project, location.path, current.stat, current.sha256, location.contentSessionId ?? undefined) !== location.sourceId) throw new Error('Claude Code 会话来源已变化，请刷新列表')
   if (current.metadata.incomplete) result.warnings.push('会话末尾仍在写入，仅显示已完整保存的消息；请稍后刷新')
   if (searchTruncated) result.warnings.push('部分工具参数超出读取上限，搜索未包含其省略部分；可打开源文件查看')
@@ -793,7 +795,7 @@ export function claudeSessionIdentity(path: string): { path: string; device: num
 
 /** Claude has no Codex archive/index projection; summarize its own projects. */
 export function readClaudeCodeInstanceHistory(configDirectory: string, options: ClaudeSessionScanOptions = {}): InstanceHistorySummary {
-  const summary: InstanceHistorySummary = { sessions: 0, archived: 0, projects: [], unassigned: 0, issues: [] }
+  const summary: InstanceHistorySummary = { sessions: 0, archived: 0, projects: [], folders: [], unassigned: 0, issues: [] }
   try {
     const scan = scanClaudeCodeSessions(configDirectory, options), projects = new Map<string, InstanceHistorySummary['projects'][number]>()
     summary.issues = [...scan.warnings]

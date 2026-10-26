@@ -92,12 +92,15 @@ export interface InstanceHistorySummary {
   sessions:number
   archived:number
   projects:{path:string;name:string;exists:boolean;sessions:number}[]
+  /** Main-process derived, path-scoped choices used to select sessions for a copy. */
+  folders?:{key:string;path:string;name:string;exists:boolean;sessions:number;unassigned?:boolean}[]
   unassigned:number
   issues:string[]
 }
 export const instanceRevisionSchema=z.object({id:z.string().uuid(),revision:z.number().int().nonnegative()}).strict()
 export const saveInstanceSchema=z.object({id:z.string().uuid().optional(),revision:z.number().int().nonnegative().optional(),details:instanceInputSchema}).strict()
-export const copyInstanceSchema=instanceRevisionSchema.extend({copyMode:instanceCopyModeSchema,details:instanceInputSchema}).strict()
+const folderSelection=z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(50000).refine(values=>new Set(values).size===values.length,'会话文件夹选择不能重复')
+export const copyInstanceSchema=instanceRevisionSchema.extend({copyMode:instanceCopyModeSchema,selectedFolderKeys:folderSelection.optional(),details:instanceInputSchema}).strict()
 export type InstanceCopyInput=z.infer<typeof copyInstanceSchema>
 export interface InstanceCopySource {ticket:string;name:string;directory:string;history?:InstanceHistorySummary}
 export interface ExternalInstanceSource {
@@ -105,7 +108,7 @@ export interface ExternalInstanceSource {
   launchMode:'desktop'|'cli';runtimeState:'running'|'not_detected'|'unknown'
 }
 export interface ExternalInstanceDiscovery {sources:ExternalInstanceSource[];issues:string[]}
-export const copyExternalInstanceSchema=z.object({ticket:z.string().uuid(),sourceClosed:z.boolean().optional(),copyMode:instanceCopyModeSchema,details:instanceInputSchema}).strict()
+export const copyExternalInstanceSchema=z.object({ticket:z.string().uuid(),sourceClosed:z.boolean().optional(),copyMode:instanceCopyModeSchema,selectedFolderKeys:folderSelection.optional(),details:instanceInputSchema}).strict()
 export type ExternalInstanceCopyInput=z.infer<typeof copyExternalInstanceSchema>
 export const attachInstanceSchema=copyExternalInstanceSchema.omit({copyMode:true}).extend({sourceClosed:z.literal(true)})
 export type AttachInstanceInput=z.infer<typeof attachInstanceSchema>

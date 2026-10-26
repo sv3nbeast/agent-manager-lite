@@ -10,8 +10,9 @@ let generation = 0, alive = true
 const roles = computed(() => ({ user: '你', assistant: props.record.clientType==='codex'?'Codex':'Claude', system: '系统' }))
 const clientName = computed(() => props.record.clientType==='codex'?'Codex':props.record.launchMode === 'desktop' ? 'Claude Desktop · Code 本地记录' : 'Claude Code CLI')
 const date = (value?: number) => value ? new Date(value).toLocaleString() : ''
-const pageCount = computed(() => result.value ? Math.max(1, Math.ceil(result.value.total / result.value.pageSize)) : 0)
-const pageLabel = computed(() => result.value ? `第 ${result.value.page} / ${pageCount.value} 页 · 本页 ${result.value.messages.length} 条消息` : '')
+const pageLabel = computed(() => !result.value?'':result.value.messages.length?`第 ${result.value.startIndex+1}–${result.value.startIndex+result.value.messages.length} 条 / 共 ${result.value.total} 条记录`:`没有匹配记录（共 ${result.value.total} 条）`)
+const canLoadOlder = computed(()=>!!result.value&&result.value.startIndex>0)
+const canLoadNewer = computed(()=>!!result.value&&result.value.startIndex+result.value.messages.length<result.value.total)
 function blockTitle(block: SessionContentBlock): string {
   if (block.type === 'thinking') return '思考过程'
   if (block.type === 'tool_use') return '工具调用' + (block.name ? ' · ' + block.name : '')
@@ -42,9 +43,9 @@ function markdownForCurrentPage(): string {
     `- 来源：${plainMarkdown(page.sourceName.replace(/[\r\n]+/g, ' '))}`,
     `- 项目：${codeSpan(page.cwd)}`,
     `- 会话 ID：${codeSpan(page.sourceSessionId)}`,
-    `- 当前页：${page.page} / ${pageCount.value}（本页 ${page.messages.length} 条；共 ${page.total} 条${appliedQuery.value ? '匹配消息' : '消息'}）`,
+    `- 当前范围：${page.messages.length?`第 ${page.startIndex+1}–${page.startIndex+page.messages.length} 条`:'没有匹配记录'}（共 ${page.total} 条${appliedQuery.value ? '匹配记录' : '记录'}）`,
     '',
-    '> 此文件仅包含当前显示页；切换页面后可分别导出其他页。',
+    '> 此文件仅包含当前显示窗口；切换窗口后可分别导出其他记录。',
   ]
   for (const entry of page.messages) {
     const heading = `## ${roles.value[entry.role]}${entry.timestamp ? ` · ${plainMarkdown(date(entry.timestamp))}` : ''}${entry.model ? ` · ${plainMarkdown(entry.model.replace(/[\r\n]+/g, ' '))}` : ''}`
@@ -67,7 +68,7 @@ async function copyCurrentPage(): Promise<void> {
   if (!markdown) return
   try {
     await navigator.clipboard.writeText(markdown)
-    actionFeedback.value = { type: 'success', text: `已复制${pageLabel.value}（当前页，不含其他页）` }
+    actionFeedback.value = { type: 'success', text: `已复制${pageLabel.value}（当前窗口，不含其他记录）` }
   } catch { actionFeedback.value = { type: 'error', text: '复制失败；请检查系统剪贴板权限后重试' } }
 }
 function saveCurrentPage(): void {
@@ -76,10 +77,10 @@ function saveCurrentPage(): void {
   const title = page.title.replace(/[\x00-\x1f<>:"/\\|?*]/g, '-').trim().slice(0, 80) || 'Claude 会话'
   const blobUrl = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown;charset=utf-8' }))
   const anchor = document.createElement('a')
-  anchor.href = blobUrl; anchor.download = `${title}-第${page.page}页.md`
+  anchor.href = blobUrl; anchor.download = `${title}-第${page.startIndex+1}-${page.startIndex+page.messages.length}条.md`
   document.body.appendChild(anchor); anchor.click(); anchor.remove()
   setTimeout(() => URL.revokeObjectURL(blobUrl), 0)
-  actionFeedback.value = { type: 'success', text: `已下载${pageLabel.value}的 Markdown（当前页，不含其他页）` }
+  actionFeedback.value = { type: 'success', text: `已下载${pageLabel.value}的 Markdown（当前窗口，不含其他记录）` }
 }
 function highlight(text: string): { text: string; match: boolean }[] {
   const needle = appliedQuery.value.toLocaleLowerCase()
@@ -102,8 +103,8 @@ function readErrorMessage(cause: unknown): string {
   if (/会话文件.*变化|rollout.*变化/.test(message)) return `${message}。请刷新会话列表后重试。`
   return message
 }
-async function load(page = 1): Promise<void> {
-  const current = ++generation, selection = { snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId, ...(props.versionId ? { versionId: props.versionId } : {}), page, pageSize: 40, query: query.value.trim() }
+async function load(page = 1, recent = false, offset?:number, windowSize=10): Promise<void> {
+  const current = ++generation, selection = { snapshotId: props.snapshotId, sessionId: props.record.id, targetId: props.targetId, ...(props.versionId ? { versionId: props.versionId } : {}), page, pageSize: windowSize, query: query.value.trim(), recent, ...(offset===undefined?{}:{offset}) }
   loading.value = true; error.value = ''; actionFeedback.value = undefined; result.value = undefined
   try {
     const next = await window.manager.sessionContent(selection)
@@ -113,8 +114,10 @@ async function load(page = 1): Promise<void> {
   } catch (cause) { if (alive && current === generation) error.value = readErrorMessage(cause) }
   finally { if (alive && current === generation) loading.value = false }
 }
-watch(() => [props.snapshotId, props.record.id, props.targetId, props.versionId], () => { query.value = props.initialQuery ?? ''; void load() })
-onMounted(() => { void load() })
+function loadOlder():void{const current=result.value;if(!current||current.startIndex<=0)return;const count=Math.min(10,current.startIndex);void load(1,true,current.startIndex-count,count)}
+function loadNewer():void{const current=result.value;if(!current||current.startIndex+current.messages.length>=current.total)return;void load(1,true,current.startIndex+current.messages.length,10)}
+watch(() => [props.snapshotId, props.record.id, props.targetId, props.versionId], () => { query.value = props.initialQuery ?? ''; void load(1,true) })
+onMounted(() => { void load(1,true) })
 onUnmounted(() => { alive = false; generation++ })
 </script>
 
@@ -126,18 +129,18 @@ onUnmounted(() => { alive = false; generation++ })
         <a-space><a-button v-if="canResume" type="primary" :disabled="loading" @click="emit('resume', record)">恢复此会话</a-button><a-button v-if="canForkDefault" type="primary" :disabled="loading" @click="emit('forkDefault', record)">在 Terminal 中分叉</a-button><a-button v-if="canResumeCodex" type="primary" :disabled="loading" @click="emit('resumeCodex',record)">恢复此会话</a-button></a-space>
       </header>
       <p class="muted session-reader-project">项目：{{result?.cwd ?? record.cwd}}</p>
-      <p class="muted session-reader-id">会话 ID：{{record.sourceSessionId ?? record.id}}</p>
+      <p class="muted session-reader-id">会话 ID：{{record.sourceSessionId ?? record.id}} · 默认显示最近 10 条记录</p>
       <p v-if="resumeReason" class="muted session-reader-boundary">{{resumeReason}}</p>
-      <a-form class="session-reader-search" layout="inline" :model="{query}" @finish="load(1)">
+      <a-form class="session-reader-search" layout="inline" :model="{query}" @finish="load(1,true)">
         <a-form-item><a-input v-model:value="query" aria-label="当前会话内容搜索" placeholder="查找这段会话中的文本" :maxlength="200" allow-clear :disabled="loading" /></a-form-item>
         <a-button html-type="submit" :loading="loading">查找</a-button>
         <span v-if="result" role="status" class="muted">{{appliedQuery ? '匹配' : '共'}} {{result.total}} 条消息</span>
       </a-form>
       <div v-if="result" class="session-reader-export">
-        <span class="muted">{{pageLabel}}；复制和下载只包含当前页</span>
+        <span class="muted">{{pageLabel}}；当前窗口按时间正序，复制和下载只包含当前窗口</span>
         <a-space>
-          <a-button size="small" :disabled="loading||!result.messages.length" @click="copyCurrentPage">复制本页 Markdown</a-button>
-          <a-button size="small" :disabled="loading||!result.messages.length" @click="saveCurrentPage">下载本页 Markdown</a-button>
+          <a-button size="small" :disabled="loading||!result.messages.length" @click="copyCurrentPage">复制当前窗口 Markdown</a-button>
+          <a-button size="small" :disabled="loading||!result.messages.length" @click="saveCurrentPage">下载当前窗口 Markdown</a-button>
         </a-space>
       </div>
       <a-alert v-if="actionFeedback" :type="actionFeedback.type" :message="actionFeedback.text" class="session-reader-feedback" />
@@ -160,8 +163,8 @@ onUnmounted(() => { alive = false; generation++ })
         </a-spin>
       </div>
       <footer class="session-reader-footer">
-        <span class="muted">对话与工具记录以文本显示；附件不会自动加载。复制或下载仅包含当前页。</span>
-        <a-pagination v-if="result && result.total > result.pageSize" :current="result.page" :total="result.total" :page-size="result.pageSize" :show-size-changer="false" :disabled="loading" size="small" @change="load" />
+        <span class="muted">对话与工具记录以文本显示；附件不会自动加载。复制或下载仅包含当前窗口。</span>
+        <a-space v-if="result && result.total > result.pageSize"><a-button size="small" :disabled="loading||!canLoadOlder" @click="loadOlder">更早 10 条</a-button><a-button size="small" :disabled="loading||!canLoadNewer" @click="loadNewer">更新 10 条</a-button></a-space>
       </footer>
     </div>
   </a-modal>

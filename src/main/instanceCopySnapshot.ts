@@ -247,6 +247,91 @@ export async function copySavedInstanceHome(manifest:CopyManifest,target:string,
   return {...copied,root:manifest.root,skipped:manifest.skipped,omittedSessions}
 }
 
+const knownThreadTables=new Set(['thread_dynamic_tools','thread_attachments','guardian_review_feedback','thread_read_receipts'])
+const historyTables=['thread_history_projection_state','thread_turns','thread_items','thread_realtime_items'] as const
+const quoted=(name:string)=>'"'+name.replaceAll('"','""')+'"'
+function userTables(db:sqlite.DatabaseSync):string[]{return (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as {name:string}[]).map(row=>row.name)}
+function columns(db:sqlite.DatabaseSync,table:string):string[]{return (db.prepare('PRAGMA table_xinfo('+quoted(table)+')').all() as {name:string;hidden?:number}[]).filter(row=>!row.hidden).map(row=>row.name)}
+function filterStateDatabase(path:string,selected:ReadonlySet<string>):void{
+  const db=new sqlite.DatabaseSync(path,{allowExtension:false});let transaction=false
+  try{
+    db.exec('PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000')
+    const names=userTables(db);if(!names.includes('threads'))throw new Error('会话索引缺少 threads 表，无法按文件夹裁剪')
+    const triggers=(db.prepare("SELECT name FROM sqlite_master WHERE type='trigger'").all() as {name:string}[]);if(triggers.length)throw new Error('会话索引包含未知触发器，无法安全裁剪')
+    if(!columns(db,'threads').includes('id')||!columns(db,'threads').includes('rollout_path'))throw new Error('会话索引结构未知，无法按文件夹裁剪')
+    const threadIds=db.prepare('SELECT id FROM threads').all() as {id:unknown}[]
+    if(threadIds.some(row=>typeof row.id!=='string'))throw new Error('会话索引包含无效 ID，无法按文件夹裁剪')
+    const allIds=new Set((db.prepare('SELECT id FROM threads').all() as {id:unknown}[]).flatMap(row=>typeof row.id==='string'?[row.id]:[])),removed=[...allIds].filter(id=>!selected.has(id))
+    const known=new Set(['threads',...knownThreadTables,'thread_spawn_edges','projects','thread_sections','project_roots'])
+    for(const name of names.filter(value=>!known.has(value))){
+      const cols=columns(db,name),fks=db.prepare('PRAGMA foreign_key_list('+quoted(name)+')').all() as {table:string;from:string;to:string|null}[]
+      if(fks.some(fk=>known.has(fk.table)))throw new Error('未知数据库表关联会话或项目数据，无法安全裁剪：'+name)
+      const refsThread=fks.some(fk=>fk.table==='threads'&&(!fk.to||fk.to==='id'))
+      const threadColumn=cols.find(value=>/thread/i.test(value))
+      if(refsThread&&!threadColumn)throw new Error('未知数据库表引用 threads，无法安全裁剪：'+name)
+      if(threadColumn){for(const id of removed)if(db.prepare('SELECT 1 FROM '+quoted(name)+' WHERE '+quoted(threadColumn)+'=? LIMIT 1').get(id))throw new Error('未知数据库表包含会话关联，无法安全裁剪：'+name)}
+      else for(const column of cols.filter(value=>/(^|_)id$/i.test(value)))for(const id of removed)if(db.prepare('SELECT 1 FROM '+quoted(name)+' WHERE '+quoted(column)+'=? LIMIT 1').get(id))throw new Error('未知数据库表可能包含会话关联，无法安全裁剪：'+name)
+    }
+    db.exec('BEGIN IMMEDIATE');transaction=true
+    for(const name of knownThreadTables)if(names.includes(name)){if(!columns(db,name).includes('thread_id'))throw new Error('会话关联表结构未知：'+name);for(const id of removed)db.prepare('DELETE FROM '+quoted(name)+' WHERE thread_id=?').run(id)}
+    if(names.includes('thread_spawn_edges')){const cols=columns(db,'thread_spawn_edges');if(!cols.includes('parent_thread_id')||!cols.includes('child_thread_id'))throw new Error('子会话关联表结构未知，无法安全裁剪');for(const id of removed)db.prepare('DELETE FROM thread_spawn_edges WHERE parent_thread_id=? OR child_thread_id=?').run(id,id)}
+    for(const id of removed)db.prepare('DELETE FROM threads WHERE id=?').run(id)
+    db.exec('COMMIT');transaction=false
+    if(db.prepare('PRAGMA foreign_key_check').all().length)throw new Error('会话索引裁剪后的外键检查失败')
+  }catch(error){if(transaction)try{db.exec('ROLLBACK')}catch{};throw error}finally{db.close()}
+}
+function filterHistoryDatabase(path:string,selected:ReadonlySet<string>):void{
+  const db=new sqlite.DatabaseSync(path,{allowExtension:false});let transaction=false
+  try{
+    db.exec('PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000')
+    const names=userTables(db);if(!names.length)return
+    if(names.length!==historyTables.length||historyTables.some(name=>!names.includes(name))){
+      // Legacy / future projection schemas can remain untouched when every
+      // row already belongs to a selected thread. If any unknown table has a
+      // missing or excluded thread identity, fail closed instead of carrying
+      // hidden conversation data across a partial folder selection.
+      for(const name of names){
+        const threadColumn=columns(db,name).find(column=>column==='thread_id')
+        if(!threadColumn){if(db.prepare('SELECT 1 FROM '+quoted(name)+' LIMIT 1').get())throw new Error('Codex 历史投影包含未知表，无法安全裁剪');continue}
+        const ids=db.prepare('SELECT DISTINCT '+quoted(threadColumn)+' AS thread_id FROM '+quoted(name)).all() as {thread_id:unknown}[]
+        if(ids.some(row=>typeof row.thread_id!=='string'||!selected.has(row.thread_id)))throw new Error('Codex 历史投影包含未选会话或未知表，无法安全裁剪')
+      }
+      return
+    }
+    for(const name of historyTables)if(!columns(db,name).includes('thread_id'))throw new Error('Codex 历史投影结构未知，无法安全裁剪')
+    const triggers=(db.prepare("SELECT name FROM sqlite_master WHERE type='trigger'").all() as {name:string}[]);if(triggers.length)throw new Error('Codex 历史投影包含未知触发器，无法安全裁剪')
+    const definitions=db.prepare("SELECT name,sql FROM sqlite_master WHERE type='table'").all() as {name:string;sql:string|null}[]
+    if(definitions.some(row=>historyTables.includes(row.name as typeof historyTables[number])&&!/thread_id/i.test(row.sql??'')))throw new Error('Codex 历史投影关联结构未知，无法安全裁剪')
+    db.exec('BEGIN IMMEDIATE');transaction=true
+    for(const name of historyTables){const ids=(db.prepare('SELECT DISTINCT thread_id FROM '+quoted(name)).all() as {thread_id:unknown}[]).flatMap(row=>typeof row.thread_id==='string'&&!selected.has(row.thread_id)?[row.thread_id]:[]);for(const id of ids)db.prepare('DELETE FROM '+quoted(name)+' WHERE thread_id=?').run(id)}
+    db.exec('COMMIT');transaction=false
+    if(db.prepare('PRAGMA foreign_key_check').all().length)throw new Error('Codex 历史投影裁剪后的外键检查失败')
+  }catch(error){if(transaction)try{db.exec('ROLLBACK')}catch{};throw error}finally{db.close()}
+}
+/** Prune unselected conversation bodies and indexes in the private staging copy. */
+export async function filterSessionSnapshot(home:string,selected:ReadonlySet<string>,signal:AbortSignal):Promise<void>{
+  signal.throwIfAborted()
+  const files:string[]=[],selectedSessionCwds=new Map<string,string|undefined>()
+  const walk=async(folder:string)=>{for(const entry of await readdir(folder,{withFileTypes:true})){signal.throwIfAborted();const path=join(folder,entry.name);if(entry.isSymbolicLink())throw new Error('会话快照包含链接，无法按文件夹过滤');if(entry.isDirectory())await walk(path);else if(entry.isFile()&&/\.jsonl$/i.test(entry.name))files.push(path)}}
+  for(const folder of ['sessions','archived_sessions'])try{await walk(join(home,folder))}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error}
+  for(const path of files){signal.throwIfAborted();const file=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);let currentId:string|undefined
+    let cwd:string|undefined
+    try{const stat=await file.stat();if(!stat.isFile()||stat.nlink!==1)throw new Error('会话 JSONL 不是独立普通文件');const header=Buffer.alloc(32*1024);let offset=0
+      while(offset<header.length){const read=await file.read(header,offset,header.length-offset,offset);if(!read.bytesRead)break;offset+=read.bytesRead;const newline=header.indexOf(10,0);if(newline>=0){let record:unknown;try{record=JSON.parse(header.subarray(0,newline).toString('utf8'))}catch{throw new Error('会话 JSONL 首行格式未知，无法按 ID 过滤')}const value=record&&typeof record==='object'?record as {type?:unknown;payload?:{id?:unknown;session_id?:unknown;cwd?:unknown}}:undefined;if(value?.type!=='session_meta')throw new Error('会话 JSONL 首行不是会话元数据，无法按文件夹过滤');const id=value.payload?.id??value.payload?.session_id;if(typeof id!=='string'||!id)throw new Error('会话 JSONL 缺少 ID，无法按文件夹过滤');currentId=id;cwd=typeof value.payload?.cwd==='string'?value.payload.cwd:undefined;break}}
+      if(!currentId)throw new Error('会话 JSONL 元数据超过 32 KiB 或缺失，无法按文件夹过滤');const after=await file.stat();if(stat.dev!==after.dev||stat.ino!==after.ino||stat.size!==after.size||stat.mtimeMs!==after.mtimeMs||stat.ctimeMs!==after.ctimeMs)throw new Error('会话 JSONL 在筛选期间发生变化')
+    }finally{await file.close()}
+    if(selected.has(currentId)){
+      if(selectedSessionCwds.has(currentId)&&selectedSessionCwds.get(currentId)!==cwd)throw new Error('同一会话 ID 的多个文件版本属于不同工作目录，无法按文件夹安全复制；请先在会话管理中核对冲突')
+      selectedSessionCwds.set(currentId,cwd)
+    }else await rm(path,{force:true})
+  }
+  for(const name of ['session_index.jsonl','history.jsonl','transcription-history.jsonl']){const path=join(home,name),raw=readBounded(path,64*1024*1024);if(raw===null)continue;const kept:string[]=[];for(const line of raw.split(/\r?\n/)){if(!line)continue;let row:Record<string,unknown>;try{row=JSON.parse(line)}catch{throw new Error('会话索引 JSONL 格式未知，无法按 ID 过滤')}const id=row.id??row.session_id;if(typeof id!=='string')throw new Error('会话索引 JSONL 缺少会话 ID，无法安全过滤');if(selected.has(id))kept.push(line)}atomic(path,kept.join('\n')+(kept.length?'\n':''))}
+  for(const entry of (await readdir(home,{withFileTypes:true})).filter(item=>item.isFile()&&/^state_\d+\.sqlite$/i.test(item.name)))filterStateDatabase(join(home,entry.name),selected)
+  for(const entry of (await readdir(home,{withFileTypes:true})).filter(item=>item.isFile()&&/^thread_history_\d+\.sqlite$/i.test(item.name)))filterHistoryDatabase(join(home,entry.name),selected)
+  const statePath=join(home,copiedProjectStateFile),state=readBounded(statePath,copiedProjectStateLimit)
+  if(state!==null)atomic(statePath,JSON.stringify(projectCopiedProjectState(state,{threadIds:selected}),null,2)+'\n')
+}
+
 /**
  * Codex resolves its default SQLite home relative to CODEX_HOME.  A source
  * profile may have used an internal `sqlite_home` (or an older `sqlite/`

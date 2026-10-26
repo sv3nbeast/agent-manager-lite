@@ -20,7 +20,7 @@ const preview = (ticket: string): InstanceLaunchPreview & { sessionId: string } 
 })
 const content = (sessionId: string, text: string): SessionContentPage => ({
   snapshotId: 'snapshot', sessionId, sourceSessionId: 'fixture-native-id', title: 'A conversation', cwd: '/fixture/project', sourceName: 'Source CLI', clientType: 'claude_code',
-  page: 1, pageSize: 40, total: 1, messages: [{ index: 0, role: 'user', blocks: [{ type: 'text', text }] }], warnings: [],
+  page: 1, pageSize: 10, total: 1, startIndex:0, messages: [{ index: 0, role: 'user', blocks: [{ type: 'text', text }] }], warnings: [],
 })
 const deferred = <T>() => { let resolve!: (value: T) => void, reject!: (cause: unknown) => void; const promise = new Promise<T>((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
 const settle = async () => { await vue.nextTick(); await new Promise(resolve => setImmediate(resolve)); await vue.nextTick() }
@@ -47,13 +47,26 @@ test('Claude reader binds whole-conversation search and pagination to the origin
   const calls: unknown[] = []
   const ui = mount('SessionContentPanel', { sessionContent: async (value: any) => { calls.push(structuredClone(value)); return { ...content(value.sessionId, '<img src="https://fixture.invalid">'), page: value.page } } }, { initialQuery: '  literal [text]  ' })
   t.after(ui.unmount); await settle()
-  assert.deepEqual(calls[0], { snapshotId: 'snapshot', sessionId: 'claude:fixture', targetId: session().locations[0].targetId, page: 1, pageSize: 40, query: 'literal [text]' })
+  assert.deepEqual(calls[0], { snapshotId: 'snapshot', sessionId: 'claude:fixture', targetId: session().locations[0].targetId, page: 1, pageSize: 10, query: 'literal [text]', recent:true })
   assert.equal(ui.state.result.messages[0].blocks[0].text, '<img src="https://fixture.invalid">')
   ui.state.query = 'second page'; await ui.state.load(2)
   assert.equal((calls[1] as any).page, 2)
   assert.equal((calls[1] as any).query, 'second page')
   assert.equal(ui.state.result.page, 2)
   assert.equal(ui.state.appliedQuery, 'second page')
+  assert.equal((calls[1] as any).recent,false,'ordinary page requests use the normal chronology')
+})
+
+test('reader moves through adjacent record windows without gaps for 41 records',async t=>{
+  const calls:any[]=[]
+  const ui=mount('SessionContentPanel',{sessionContent:async(value:any)=>{calls.push(structuredClone(value));const total=41,startIndex=value.offset??31,count=Math.min(value.pageSize,total-startIndex);return {...content(value.sessionId,'fixture'),page:Math.floor(startIndex/value.pageSize)+1,pageSize:value.pageSize,total,startIndex,messages:Array.from({length:count},(_,index)=>({index:startIndex+index,role:'user',blocks:[{type:'text',text:'record-'+(startIndex+index+1)}]})),warnings:[]}}})
+  t.after(ui.unmount);await settle()
+  assert.equal(calls[0].recent,true);assert.equal(calls[0].pageSize,10);assert.equal(ui.state.result.startIndex,31);assert.equal(ui.state.result.messages[0].blocks[0].text,'record-32');assert.equal(ui.state.result.messages.at(-1).blocks[0].text,'record-41')
+  ui.state.loadOlder();await settle()
+  assert.equal(calls[1].offset,21);assert.equal(calls[1].pageSize,10);assert.equal(calls[1].recent,true);assert.equal(ui.state.result.startIndex,21);assert.equal(ui.state.result.messages[0].blocks[0].text,'record-22');assert.equal(ui.state.result.messages.at(-1).blocks[0].text,'record-31')
+  ui.state.loadNewer();await settle()
+  assert.equal(calls[2].offset,31);assert.equal(calls[2].pageSize,10);assert.equal(ui.state.result.startIndex,31);assert.equal(ui.state.result.messages[0].blocks[0].text,'record-32')
+  assert.equal(ui.state.canLoadOlder,true);assert.equal(ui.state.canLoadNewer,false)
 })
 
 test('Codex reader binds the explicitly selected physical rollout version to transcript IPC', async t => {
@@ -62,7 +75,7 @@ test('Codex reader binds the explicitly selected physical rollout version to tra
   record.clientType = 'codex'; record.sourceSessionId = undefined
   const ui = mount('SessionContentPanel', { sessionContent: async (value: any) => { calls.push(structuredClone(value)); return { ...content(value.sessionId, 'Codex response'), clientType: 'codex' } } }, { record, versionId })
   t.after(ui.unmount); await settle()
-  assert.deepEqual(calls[0], { snapshotId: 'snapshot', sessionId: 'codex-fixture', targetId: session().locations[0].targetId, versionId, page: 1, pageSize: 40, query: '' })
+  assert.deepEqual(calls[0], { snapshotId: 'snapshot', sessionId: 'codex-fixture', targetId: session().locations[0].targetId, versionId, page: 1, pageSize: 10, query: '', recent:true })
   assert.equal(ui.state.result.clientType, 'codex')
 })
 

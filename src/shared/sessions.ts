@@ -19,11 +19,11 @@ export interface CodexResumeTicketSource {snapshotId:string;targetId:string;sess
 export type SessionSelection=z.infer<typeof sessionSelectionSchema>
 export const sessionCopyIdSchema=z.object({snapshotId:z.string().uuid(),sessionId,targetId:z.string().uuid()}).strict()
 export type SessionCopyIdInput=z.infer<typeof sessionCopyIdSchema>
-export const sessionContentSchema=sessionSelectionSchema.extend({page:z.number().int().min(1).max(100000).default(1),pageSize:z.number().int().min(1).max(100).default(40),query:z.string().trim().max(200).default('')}).strict()
+export const sessionContentSchema=sessionSelectionSchema.extend({page:z.number().int().min(1).max(100000).default(1),pageSize:z.number().int().min(1).max(100).default(40),query:z.string().trim().max(200).default(''),recent:z.boolean().default(false),offset:z.number().int().min(0).max(1000000000).optional()}).strict()
 export type SessionContentInput=z.infer<typeof sessionContentSchema>
 export interface SessionContentBlock {type:'text'|'thinking'|'tool_use'|'tool_result'|'notice';text:string;name?:string;truncated?:boolean}
 export interface SessionContentMessage {index:number;role:'user'|'assistant'|'system';timestamp?:number;model?:string;blocks:SessionContentBlock[];truncated?:boolean}
-export interface SessionContentPage {snapshotId:string;sessionId:string;sourceSessionId:string;title:string;cwd:string;sourceName:string;clientType:'codex'|'claude_code';page:number;pageSize:number;total:number;messages:SessionContentMessage[];warnings:string[]}
+export interface SessionContentPage {snapshotId:string;sessionId:string;sourceSessionId:string;title:string;cwd:string;sourceName:string;clientType:'codex'|'claude_code';page:number;pageSize:number;total:number;startIndex:number;messages:SessionContentMessage[];warnings:string[]}
 // Token reports may span several UI pages. Keep a bounded batch so a report
 // remains cancellable and cannot turn into an unbounded directory scan.
 export const sessionStatsSchema=z.object({snapshotId:z.string().uuid(),sessionIds:z.array(sessionId).min(1).max(1000)}).strict()

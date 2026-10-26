@@ -9,7 +9,7 @@ import type { SessionContentPage, SessionRecord } from '../src/shared/sessions'
 
 const targetId = '00000000-0000-4000-8000-000000000001'
 const record: SessionRecord = { id: 'claude:fixture', sourceSessionId: 'fixture-native-id', title: 'Title * with ticks', cwd: '/fixture/project', clientType: 'claude_code', launchMode: 'cli', kind: 'conversation', locations: [{ targetId, name: 'Fixture', directory: '/fixture', running: false, archived: false, ambiguous: false }] }
-const page = (messages: SessionContentPage['messages']): SessionContentPage => ({ snapshotId: 'snapshot', sessionId: record.id, sourceSessionId: record.sourceSessionId!, title: record.title, cwd: record.cwd, sourceName: 'Fixture', clientType: 'claude_code', page: 2, pageSize: 40, total: 41, messages, warnings: [] })
+const page = (messages: SessionContentPage['messages']): SessionContentPage => ({ snapshotId: 'snapshot', sessionId: record.id, sourceSessionId: record.sourceSessionId!, title: record.title, cwd: record.cwd, sourceName: 'Fixture', clientType: 'claude_code', page: 2, pageSize: 40, total: 41,startIndex:40, messages, warnings: [] })
 
 function mount(content: SessionContentPage) {
   const writes: string[] = [], downloads: { href: string; download: string }[] = [], blobs = new Map<string, Blob>()
@@ -37,27 +37,27 @@ test('copy and Markdown download are scoped to the current page', async t => {
   ]))
   t.after(ui.unmount); await vue.nextTick(); await new Promise(resolve => setImmediate(resolve)); await vue.nextTick()
   const markdown = ui.state.markdownForCurrentPage() as string
-  assert.ok(markdown.includes('当前页：2 / 2（本页 2 条；共 41 条消息）'))
-  assert.ok(markdown.includes('此文件仅包含当前显示页'))
+  assert.ok(markdown.includes('当前范围：第 41–42 条（共 41 条记录）'))
+  assert.ok(markdown.includes('此文件仅包含当前显示窗口'))
   assert.ok(markdown.includes('Literal &lt;img src=\"https://fixture\\.invalid\"&gt; &amp; \\*\\*plain\\*\\*'))
   assert.ok(markdown.includes('工具调用 · Read'))
   assert.ok(markdown.includes('line one\nline two'))
   assert.equal(markdown.includes('Synthetic message 0'), false)
   await ui.state.copyCurrentPage()
   assert.deepEqual(ui.writes, [markdown])
-  assert.ok(ui.state.actionFeedback.text.includes('当前页，不含其他页'))
+  assert.ok(ui.state.actionFeedback.text.includes('当前窗口，不含其他记录'))
   ui.state.saveCurrentPage()
   assert.equal(ui.downloads.length, 1)
-  assert.equal(ui.downloads[0].download, 'Title - with ticks-第2页.md')
+  assert.equal(ui.downloads[0].download, 'Title - with ticks-第41-42条.md')
   assert.equal(await ui.blobs.get(ui.downloads[0].href)!.text(), markdown)
-  assert.ok(ui.state.actionFeedback.text.includes('当前页，不含其他页'))
+  assert.ok(ui.state.actionFeedback.text.includes('当前窗口，不含其他记录'))
 })
 
 test('a zero-result page remains explicitly scoped and can be saved', async t => {
-  const ui = mount({ ...page([]), page: 1, total: 0 })
+  const ui = mount({ ...page([]), page: 1, total: 0, startIndex:0 })
   t.after(ui.unmount); await vue.nextTick(); await new Promise(resolve => setImmediate(resolve)); await vue.nextTick()
-  assert.ok(ui.state.markdownForCurrentPage().includes('本页 0 条；共 0 条消息'))
+  assert.ok(ui.state.markdownForCurrentPage().includes('没有匹配记录（共 0 条记录）'))
   ui.state.saveCurrentPage()
   assert.equal(ui.downloads.length, 1)
-  assert.ok(ui.downloads[0].download.endsWith('第1页.md'))
+  assert.ok(ui.downloads[0].download.endsWith('第1-0条.md'))
 })

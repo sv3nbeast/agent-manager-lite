@@ -12,6 +12,7 @@ export interface CodexSessionContentPage {
   page: number
   pageSize: number
   total: number
+  startIndex:number
   messages: SessionContentMessage[]
   warnings: string[]
 }
@@ -168,20 +169,23 @@ function messageFromEvent(event: JsonObject, index: number, charLimit: number): 
 export async function readCodexSessionContent(
   file: FileHandle,
   size: number,
-  raw: { page?: number; pageSize?: number; query?: string } = {},
+  raw: { page?: number; pageSize?: number; query?: string; recent?: boolean; offset?:number } = {},
   signal: AbortSignal = emptySignal,
 ): Promise<CodexSessionContentPage> {
   if (!Number.isSafeInteger(size) || size < 0) throw new Error('Codex 会话文件大小无效')
-  const page = raw.page ?? 1, pageSize = raw.pageSize ?? 40, queryValue = raw.query ?? ''
+  const page = raw.page ?? 1, pageSize = raw.pageSize ?? 40, queryValue = raw.query ?? '', recent = raw.recent === true && page === 1, requestedOffset=raw.offset
   if (!Number.isInteger(page) || page < 1 || page > 100_000) throw new Error('会话内容页码无效')
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new Error('会话内容每页数量无效')
   if (typeof queryValue !== 'string' || queryValue.trim().length > 200) throw new Error('会话内容搜索词无效')
   const input = { page, pageSize, query: queryValue.trim() }
-  const result: CodexSessionContentPage = { page: input.page, pageSize: input.pageSize, total: 0, messages: [], warnings: [] }
+  const result: CodexSessionContentPage = { page: input.page, pageSize: input.pageSize, total: 0, startIndex:0, messages: [], warnings: [] }
   const start = (input.page - 1) * input.pageSize
   const query = input.query.toLocaleLowerCase()
   const perMessageLimit = Math.min(maxMessageCharacters, Math.floor(maxPageCharacters / input.pageSize))
   let messageIndex = 0, invalidLines = 0, searchWasTruncated = false
+  const recentMessages:SessionContentMessage[]=[]
+  let requestedWindow:SessionContentMessage[]=[]
+  if(requestedOffset!==undefined&&(!Number.isSafeInteger(requestedOffset)||requestedOffset<0||requestedOffset>1_000_000_000))throw new Error('会话内容偏移量无效')
 
   for await (const line of sessionLines(file, size, signal)) {
     signal.throwIfAborted()
@@ -196,8 +200,11 @@ export async function readCodexSessionContent(
       continue
     }
     const position = result.total++
-    if (position >= start && position < start + input.pageSize) result.messages.push(parsed.message)
+    if(recent){recentMessages.push(parsed.message);if(recentMessages.length>input.pageSize)recentMessages.shift();if(requestedOffset!==undefined&&position>=requestedOffset&&position<requestedOffset+input.pageSize)requestedWindow.push(parsed.message)}
+    else if (position >= start && position < start + input.pageSize) result.messages.push(parsed.message)
   }
+  if(recent){const startIndex=requestedOffset===undefined?Math.max(0,result.total-input.pageSize):Math.min(requestedOffset,result.total);result.startIndex=startIndex;result.page=1;result.messages=requestedOffset!==undefined?requestedWindow:recentMessages}
+  else result.startIndex=start
   signal.throwIfAborted()
   if (invalidLines) result.warnings.push(invalidLines + ' 行记录格式无效，已跳过')
   if (searchWasTruncated) result.warnings.push('部分超长消息已截断，搜索不包含被省略的内容；可打开源文件查看')
@@ -221,17 +228,20 @@ export interface CodexRolloutSegmentSource {
  * offset before any messages are returned. */
 export async function readCodexSessionLineageContent(
   segments:CodexRolloutSegmentSource[],
-  raw:{page?:number;pageSize?:number;query?:string}={},
+  raw:{page?:number;pageSize?:number;query?:string;recent?:boolean;offset?:number}={},
   signal:AbortSignal=emptySignal,
 ):Promise<CodexSessionContentPage>{
-  const pageNumber=raw.page??1,pageSize=raw.pageSize??40,queryValue=raw.query??''
+  const pageNumber=raw.page??1,pageSize=raw.pageSize??40,queryValue=raw.query??'',recent=raw.recent===true&&pageNumber===1,requestedOffset=raw.offset
   if(!Number.isInteger(pageNumber)||pageNumber<1||pageNumber>100_000)throw new Error('会话内容页码无效')
   if(!Number.isInteger(pageSize)||pageSize<1||pageSize>100)throw new Error('会话内容每页数量无效')
   if(typeof queryValue!=='string'||queryValue.trim().length>200)throw new Error('会话内容搜索词无效')
   if(!segments.length||segments.length>100)throw new Error('Codex 分段历史数量无效')
-  const input={page:pageNumber,pageSize,query:queryValue.trim()},result:CodexSessionContentPage={page:pageNumber,pageSize,total:0,messages:[],warnings:[]}
+  const input={page:pageNumber,pageSize,query:queryValue.trim()},result:CodexSessionContentPage={page:pageNumber,pageSize,total:0,startIndex:0,messages:[],warnings:[]}
   const start=(input.page-1)*input.pageSize,query=input.query.toLocaleLowerCase(),perMessageLimit=Math.min(maxMessageCharacters,Math.floor(maxPageCharacters/input.pageSize))
   let messageIndex=0,invalidLines=0,searchWasTruncated=false,totalBytes=0
+  const recentMessages:SessionContentMessage[]=[]
+  let requestedWindow:SessionContentMessage[]=[]
+  if(requestedOffset!==undefined&&(!Number.isSafeInteger(requestedOffset)||requestedOffset<0||requestedOffset>1_000_000_000))throw new Error('会话内容偏移量无效')
   for(const segment of segments){
     signal.throwIfAborted()
     if(!Number.isSafeInteger(segment.size)||segment.size<0||!Number.isSafeInteger(segment.startOrdinal)||segment.startOrdinal<0||segment.endOrdinalExclusive!==undefined&&(!Number.isSafeInteger(segment.endOrdinalExclusive)||segment.endOrdinalExclusive<segment.startOrdinal))throw new Error('Codex rollout 分段范围无效')
@@ -252,7 +262,7 @@ export async function readCodexSessionLineageContent(
         if(segment.endOrdinalExclusive!==undefined&&boundaryOffset===undefined&&ordinal>=segment.endOrdinalExclusive)boundaryOffset=lineStart
         if(ordinal>=segment.startOrdinal&&(segment.endOrdinalExclusive===undefined||ordinal<segment.endOrdinalExclusive)){
           const parsed=messageFromEvent(event,messageIndex,perMessageLimit)
-          if(parsed){messageIndex++;if(query&&!parsed.searchText.toLocaleLowerCase().includes(query)){if(parsed.truncated)searchWasTruncated=true}else{const position=result.total++;if(position>=start&&position<start+input.pageSize)result.messages.push(parsed.message)}}
+          if(parsed){messageIndex++;if(query&&!parsed.searchText.toLocaleLowerCase().includes(query)){if(parsed.truncated)searchWasTruncated=true}else{const position=result.total++;if(recent){recentMessages.push(parsed.message);if(recentMessages.length>input.pageSize)recentMessages.shift();if(requestedOffset!==undefined&&position>=requestedOffset&&position<requestedOffset+input.pageSize)requestedWindow.push(parsed.message)}else if(position>=start&&position<start+input.pageSize)result.messages.push(parsed.message)}}
         }
       }else if(line.length){invalidLines++;firstRecord=false}
       offset=nextOffset
@@ -266,6 +276,8 @@ export async function readCodexSessionLineageContent(
       }else if(boundaryOffset!==segment.expectedEndByteOffset)throw new Error('Codex history_base 字节边界与来源 rollout 不一致')
     }
   }
+  if(recent){const startIndex=requestedOffset===undefined?Math.max(0,result.total-input.pageSize):Math.min(requestedOffset,result.total);result.startIndex=startIndex;result.page=1;result.messages=requestedOffset!==undefined?requestedWindow:recentMessages}
+  else result.startIndex=start
   signal.throwIfAborted()
   if(invalidLines)result.warnings.push(invalidLines+' 行记录格式无效，已跳过')
   if(searchWasTruncated)result.warnings.push('部分超长消息已截断，搜索不包含被省略的内容。')

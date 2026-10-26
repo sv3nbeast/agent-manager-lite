@@ -451,6 +451,19 @@ test('Claude content pages bound long tool outputs while searching beyond the vi
   } finally { f.dispose() }
 })
 
+test('Claude recent reader returns the last ten native records and accepts contiguous offsets',()=>{
+  const f=fixture()
+  try{
+    writeFileSync(f.path,Array.from({length:41},(_,index)=>JSON.stringify({...f.event,type:index%2?'assistant':'user',timestamp:new Date(Date.UTC(2026,9,12,1,index)).toISOString(),message:{content:'record-'+(index+1)}})).join('\n'))
+    const location=f.scan().records[0].locations[0],recent=readClaudeSessionContent(location,{page:1,pageSize:10,recent:true})
+    assert.equal(recent.total,41);assert.equal(recent.startIndex,31);assert.deepEqual(recent.messages.map(message=>message.blocks[0].text),Array.from({length:10},(_,index)=>'record-'+(index+32)))
+    const previous=readClaudeSessionContent(location,{page:1,pageSize:10,recent:true,offset:21})
+    assert.equal(previous.startIndex,21);assert.deepEqual(previous.messages.map(message=>message.blocks[0].text),Array.from({length:10},(_,index)=>'record-'+(index+22)))
+    const next=readClaudeSessionContent(location,{page:1,pageSize:10,recent:true,offset:31})
+    assert.equal(next.startIndex,31);assert.deepEqual(next.messages.map(message=>message.blocks[0].text),recent.messages.map(message=>message.blocks[0].text))
+  }finally{f.dispose()}
+})
+
 test('Claude reader rejects changed snapshots, linked sources and concurrent writes without returning partial text', t => {
   for (const kind of ['append', 'symlink', 'concurrent'] as const) {
     const f = fixture()

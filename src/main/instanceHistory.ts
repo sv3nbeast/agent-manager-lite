@@ -2,6 +2,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {constants,closeSync,fstatSync,lstatSync,openSync,opendirSync,readSync,realpathSync,statSync} from 'node:fs'
 import {basename,isAbsolute,join,relative,resolve,sep} from 'node:path'
 import {pathToFileURL} from 'node:url'
+import {createHash} from 'node:crypto'
 import {TomlDocument} from './tomlPatch'
 import type {InstanceHistorySummary} from '../shared/instances'
 
@@ -206,7 +207,7 @@ function headerThreads(root:string,issue:(message:string)=>void):Thread[] {
 /** Read only metadata for user-facing main threads. sessions includes archived;
  * archived is its subset. Never read conversation bodies or expose SQL errors. */
 export function readInstanceHistory(home:string):InstanceHistorySummary {
-  const summary:InstanceHistorySummary={sessions:0,archived:0,projects:[],unassigned:0,issues:[]}
+  const summary:InstanceHistorySummary={sessions:0,archived:0,projects:[],folders:[],unassigned:0,issues:[]}
   const issues=new Set<string>(),issue=(message:string)=>issues.add(message),root=resolve(home)
   try{const info=lstatSync(root);if(!info.isDirectory()||info.isSymbolicLink()||realpathSync(root)!==root)throw new Error('unsafe')}
   catch{summary.issues=['实例目录无法安全读取'];return summary}
@@ -227,6 +228,9 @@ export function readInstanceHistory(home:string):InstanceHistorySummary {
     projects.forEach((project,index)=>{for(const root of project.roots)if(contains(root,path)&&root.length>length){selected=index;length=root.length}})
     return selected
   }
+  const folderIds=new Map<string,number>(),folderNames=new Map<string,string>(),unassignedCount={value:0}
+  const foldersByProject=projects.map(project=>project.roots.map(value=>resolve(value)))
+  for(const [index,project] of projects.entries())for(const path of foldersByProject[index]){if(!folderIds.has(path))folderIds.set(path,0);folderNames.set(path,project.name)}
   summary.projects=projects.map(project=>({path:project.roots[0]??'',name:project.name,exists:project.roots.some(existsDirectory),sessions:0}))
   for(const thread of threads){
     summary.sessions++;if(thread.archived)summary.archived++
@@ -244,7 +248,39 @@ export function readInstanceHistory(home:string):InstanceHistorySummary {
       }else project=rootMatch(text(hints[thread.id])||thread.cwd)
     }
     if(project===undefined)summary.unassigned++;else summary.projects[project].sessions++
+    const cwd=text(hints[thread.id])||thread.cwd,folderAssignment=object(assignments[thread.id])
+    let assignedProject:number|undefined
+    if(!projectless.has(thread.id)){
+      if(folderAssignment?.projectKind==='local')assignedProject=byId.get(text(folderAssignment.projectId))
+      else if(thread.projectId)assignedProject=byId.get(thread.projectId)??serverToLocal.get(thread.projectId)
+    }
+    const candidateProjects=projects.map((_,index)=>index)
+    const matchingRoots=cwd?candidateProjects.flatMap(index=>foldersByProject[index].filter(candidate=>contains(candidate,cwd)).map(path=>({path,index,assigned:index===assignedProject}))).sort((a,b)=>b.path.length-a.path.length||(Number(b.assigned)-Number(a.assigned))):[]
+    // A project assignment is useful only to constrain matching when several
+    // projects contain overlapping roots. The final bucket is still a real
+    // canonical folder, chosen by the longest matching path prefix.
+    if(!matchingRoots.length)unassignedCount.value++;else{const key=matchingRoots[0].path;folderIds.set(key,(folderIds.get(key)??0)+1)}
   }
+  summary.folders=[...folderIds].filter(([,count])=>count>0).sort(([a],[b])=>a.localeCompare(b)).map(([path,sessions])=>({key:createHash('sha256').update(JSON.stringify([root,path])).digest('hex'),path,name:folderNames.get(path)||basename(path)||path,exists:existsDirectory(path),sessions}))
+  if(unassignedCount.value)summary.folders.push({key:createHash('sha256').update(JSON.stringify([root,'unassigned'])).digest('hex'),path:'',name:'未分组 / 无法确定文件夹',exists:false,sessions:unassignedCount.value,unassigned:true})
   summary.issues=[...issues]
   return summary
+}
+
+/** Resolve renderer folder keys to session IDs from a fresh, trusted scan. */
+export function selectedInstanceSessionIds(home:string,keys:readonly string[]):Set<string>{
+  const root=resolve(home),summary=readInstanceHistory(home),available=new Map((summary.folders??[]).map(folder=>[folder.key,folder])),projects=globalProjects(readState(root,()=>{}),()=>{}),database=readDatabase(root,()=>{}),threads=database?.threads??headerThreads(root,()=>{}),state=readState(root,()=>{})
+  const assignment=object(state['thread-project-assignments'])??{},projectless=new Set(strings(state['projectless-thread-ids'])),hints=object(state['thread-workspace-root-hints'])??{},rootKeys=new Map((summary.folders??[]).map(folder=>[folder.path,folder.key]))
+  const projectRoots=projects.map(project=>project.roots.map(value=>resolve(value))),byId=new Map(projects.map((project,index)=>[project.id,index]))
+  const hostMaps=object(state['app-server-project-id-by-legacy-project-id-by-host']),host=object(hostMaps?.['local:'+root])??{},serverToLocal=new Map<string,number>()
+  const legacyToServer=object(hostMaps?.['local:'+root])??{}
+  projects.forEach((project,index)=>{const server=legacyToServer[project.id];if(typeof server==='string')serverToLocal.set(server,index)})
+  const idsByKey=new Map<string,Set<string>>(),unassignedKey=createHash('sha256').update(JSON.stringify([root,'unassigned'])).digest('hex')
+  for(const thread of threads){const cwd=text(hints[thread.id])||thread.cwd;let assigned:number|undefined;const row=object(assignment[thread.id]);if(!projectless.has(thread.id)){if(row?.projectKind==='local')assigned=byId.get(text(row.projectId));else if(thread.projectId)assigned=byId.get(thread.projectId)??serverToLocal.get(thread.projectId)}
+    const matches=cwd?projectRoots.flatMap((roots,index)=>roots.filter(path=>contains(path,cwd)).map(path=>({path,index,assigned:index===assigned}))).sort((a,b)=>b.path.length-a.path.length||(Number(b.assigned)-Number(a.assigned))):[],key=matches.length?rootKeys.get(matches[0].path):unassignedKey
+    if(key){let ids=idsByKey.get(key);if(!ids){ids=new Set();idsByKey.set(key,ids)}ids.add(thread.id)}
+  }
+  const selected=new Set<string>()
+  for(const key of keys){if(!available.has(key))throw new Error('所选会话文件夹已变化，请刷新来源后重新选择');for(const id of idsByKey.get(key)??[])selected.add(id)}
+  return selected
 }

@@ -50,6 +50,14 @@ test('Codex viewer follows history_base lineage and includes inherited prefix an
   assert.deepEqual(f.snapshot(),before,'reading all lineage segments leaves source files unchanged')
 })
 
+test('Codex recent lineage returns the final page without reversing chronology',async t=>{
+  const f=fixture(t)
+  const recent=await readCodexSessionLineage(f.root,f.current,f.threadId,{page:1,pageSize:3,query:'',recent:true},new AbortController().signal)
+  assert.equal(recent.total,6);assert.equal(recent.page,1);assert.equal(recent.startIndex,3);assert.deepEqual(recent.messages.map(message=>message.blocks[0]?.text),['current rollout answer','{"query":"boundary search needle"}','boundary search result'])
+  const older=await readCodexSessionLineage(f.root,f.current,f.threadId,{page:1,pageSize:3,query:''},new AbortController().signal)
+  assert.equal(older.page,1);assert.deepEqual(older.messages.map(message=>message.blocks[0]?.text),['ancestor question','ancestor answer','current rollout question'])
+})
+
 test('Codex viewer refuses missing history_base rollouts instead of showing a partial transcript',async t=>{
   const f=fixture(t);rmSync(f.parent)
   await assert.rejects(readCodexSessionLineage(f.root,f.current,f.threadId,{page:1,pageSize:20,query:''},new AbortController().signal),/未找到 ordinal 与字节边界都匹配的祖先 rollout/)

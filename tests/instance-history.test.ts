@@ -61,7 +61,28 @@ test('missing databases use bounded metadata headers and exclude derived threads
 
 test('empty profiles return zero instead of estimating sessions from project lists',t=>{
   const f=fixture(t);state(f.home,{'local-projects':{p:{id:'p',name:'空项目',rootPaths:[f.project]}}})
-  assert.deepEqual(readInstanceHistory(f.home),{sessions:0,archived:0,projects:[{path:f.project,name:'空项目',exists:true,sessions:0}],unassigned:0,issues:[]})
+  const result=readInstanceHistory(f.home)
+  assert.deepEqual(result,{sessions:0,archived:0,projects:[{path:f.project,name:'空项目',exists:true,sessions:0}],folders:[],unassigned:0,issues:[]})
+  assert.deepEqual(result.folders,[])
+})
+
+test('copy folder choices split a multi-root project by the actual working directory and isolate unassigned threads',t=>{
+  const f=fixture(t),second=join(f.root,'第二个项目');mkdirSync(second)
+  state(f.home,{'local-projects':{multi:{id:'multi',name:'合并显示的项目',rootPaths:[f.project,second]}},'thread-project-assignments':{assigned:{projectKind:'local',projectId:'multi'}},'projectless-thread-ids':['projectless']})
+  const d=database(f.home)
+  d.thread('assigned',second,{projectId:'multi'})
+  d.thread('first',join(f.project,'nested','file'))
+  d.thread('projectless',f.project,{projectId:'multi'})
+  d.thread('outside',f.root)
+  d.db.close()
+  const result=readInstanceHistory(f.home)
+  assert.equal(result.projects[0].sessions,2,'the explicit projectless marker remains authoritative')
+  const folderByPath=new Map(result.folders?.map(folder=>[folder.path,folder]))
+  assert.equal(folderByPath.get(f.project)?.sessions,2)
+  assert.equal(folderByPath.get(second)?.sessions,1)
+  assert.equal(folderByPath.get('')?.sessions,1)
+  assert.equal(folderByPath.get('')?.unassigned,true)
+  assert.equal((result.folders??[]).reduce((sum,folder)=>sum+folder.sessions,0),4,'each conversation belongs to one selectable folder')
 })
 
 test('symlinked metadata, database and profile directories do not expose outside contents',t=>{

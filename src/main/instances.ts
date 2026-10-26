@@ -28,7 +28,7 @@ import type {CodexResumeTicketSource} from '../shared/sessions'
 import {readCodexSessionLineage} from './codexSessionLineage'
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
 import {scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
-import {copySavedInstanceHome,normalizeSessionDatabaseCopy} from './instanceCopySnapshot'
+import {copySavedInstanceHome,normalizeSessionDatabaseCopy,filterSessionSnapshot} from './instanceCopySnapshot'
 import {scanSessionHome} from './instanceSessionCopy'
 import {assertClientDaemonStopped,probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,validateExternalHome,pathContains} from './instancePaths'
@@ -38,7 +38,7 @@ import {instanceProviderName} from './instanceProviderName'
 import {initializeDesktopLocale,previewDesktopLocale,systemDesktopLanguages} from './desktopLocale'
 import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuInspection} from './codexSpeedMenu'
 import {initializeDesktopServiceTier,previewDesktopServiceTier} from './desktopServiceTier'
-import {readInstanceHistory} from './instanceHistory'
+import {readInstanceHistory,selectedInstanceSessionIds} from './instanceHistory'
 import {repairSessionProjection} from './sessionProjectionRepair'
 import {readSessionRolloutIndex} from './sessionDisplay'
 import {readInstanceIdentityStatus} from './instanceIdentityStatus'
@@ -216,7 +216,7 @@ export class Instances {
     this.beginCopy({id:source.id,name:source.name,directory:sourceHome},input.details,input.copyMode,()=>{
       if(this.profile(source.id).revision!==input.revision)throw new Error('来源实例已变化，请重新复制')
       if(source.externalHome)validateExternalHome(this.root,source.externalHome)
-    })
+    },input.selectedFolderKeys)
   }
   // Native choosers or validated discovery capabilities call this; the renderer receives a short-lived
   // capability, never an IPC accepting an arbitrary filesystem path.
@@ -245,7 +245,7 @@ export class Instances {
     const input=copyExternalInstanceSchema.parse(raw),source=this.externalCopySource
     if(!source||source.purpose!=='copy'||source.view.ticket!==input.ticket||source.expires<this.now())throw new Error('复制来源选择已过期，请重新选择目录')
     this.verifyExternalSource(source)
-    this.beginCopy({id:source.view.ticket,name:source.view.name,directory:source.view.directory,external:true},input.details,input.copyMode,()=>this.verifyExternalSource(source))
+    this.beginCopy({id:source.view.ticket,name:source.view.name,directory:source.view.directory,external:true},input.details,input.copyMode,()=>this.verifyExternalSource(source),input.selectedFolderKeys)
     this.externalCopySource=undefined
   }
   async attachExisting(raw:unknown):Promise<void> {
@@ -270,7 +270,7 @@ export class Instances {
       this.externalCopySource=undefined
     }finally{this.attaching.delete(controller)}
   }
-  private beginCopy(source:{id:string;name:string;directory:string;external?:boolean},details:InstanceInput,copyMode:InstanceCopyMode,verify:()=>void):void {
+  private beginCopy(source:{id:string;name:string;directory:string;external?:boolean},details:InstanceInput,copyMode:InstanceCopyMode,verify:()=>void,folderKeys?:string[]):void {
     if(details.clientType==='claude_code')throw new Error('Claude 会话复制尚未通过事务验收，请创建空白实例')
     if(this.copying())throw new Error('已有实例正在复制，请完成或取消后重试')
     if(this.store.read().instances?.some(item=>item.name.toLowerCase()===details.name.toLowerCase()))throw new Error('实例名称已存在')
@@ -279,6 +279,16 @@ export class Instances {
     const account=this.store.read().accounts.find(value=>value.id===details.accountId)!
     const copiedSessionProvider=getInstanceClientAdapter(details.clientType).copiedSessionProvider(details,account)
     const id=randomUUID(),controller=new AbortController(),sourceHome=source.directory
+    const history=copyMode==='sessions'?readInstanceHistory(sourceHome):undefined
+    const available=new Map((history?.folders??[]).map(folder=>[folder.key,folder]))
+    const chosenKeys=folderKeys??[...available.keys()]
+    if(copyMode==='sessions'&&chosenKeys.some(key=>!available.has(key)))throw new Error('所选会话文件夹已变化，请刷新来源后重新选择')
+    const selectedSessionIds=copyMode==='sessions'?selectedInstanceSessionIds(sourceHome,chosenKeys):undefined
+    const verifySelection=()=>{
+      if(!selectedSessionIds)return
+      const fresh=selectedInstanceSessionIds(sourceHome,chosenKeys)
+      if(fresh.size!==selectedSessionIds.size||[...selectedSessionIds].some(id=>!fresh.has(id)))throw new Error('来源文件夹或会话清单在复制期间发生变化，请刷新后重试')
+    }
     const view:InstanceCopyView={id,sourceId:source.id,sourceName:source.name,sourceDirectory:sourceHome,external:source.external,name:details.name,copyMode,status:'scanning',files:0,bytes:0,totalFiles:0,totalBytes:0,skipped:0}
     const job={view,controller,accountId:details.accountId,task:undefined as Promise<void>|undefined};this.copy=job
     job.task=(async()=>{
@@ -297,6 +307,8 @@ export class Instances {
         const stagingHome=join(staging,'home')
         const saved=await copySavedInstanceHome(manifest,stagingHome,controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
         if(copyMode==='sessions')await normalizeSessionDatabaseCopy(stagingHome,controller.signal)
+        if(copyMode==='sessions'&&selectedSessionIds)await filterSessionSnapshot(stagingHome,selectedSessionIds,controller.signal)
+        verifySelection()
         // Re-scan after normalizing an internal sqlite_home.  The relocation
         // step must see the canonical target paths and still retain the source
         // root for validating any rollout/database references.
@@ -307,6 +319,7 @@ export class Instances {
         await relocateCopiedProfile(normalized,stagingHome,join(target,'home'),controller.signal,copiedSessionProvider)
         controller.signal.throwIfAborted()
         verify()
+        verifySelection()
         await mkdir(join(staging,'desktop'),{mode:0o700});await mkdir(join(staging,'workspace'),{mode:0o700})
         // Publish only a complete independent directory. A durable marker lets
         // recovery distinguish a staged/published copy after abrupt exit.

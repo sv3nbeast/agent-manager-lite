@@ -7,14 +7,16 @@ const totalLabel=computed(()=>inventory.value?bytes(inventory.value.logicalBytes
 const bytes=(value:number)=>{if(value<1024)return String(value)+' B';if(value<1024**2)return (value/1024).toFixed(1)+' KiB';if(value<1024**3)return (value/1024**2).toFixed(1)+' MiB';return (value/1024**3).toFixed(2)+' GiB'}
 const date=(value?:number)=>value?new Date(value).toLocaleString():'元数据缺失'
 const categoryName:Record<InstanceStorageCategory,string>={sessions:'会话与历史',databases:'SQLite 数据库',config:'配置与登录状态',skills:'技能',workspace:'实例工作目录',cache:'缓存',other:'其他文件'}
+const kindName:Record<string,string>={managed:'受管实例',legacy_trash:'历史归档',session_trash:'会话废纸篓备份',transient_staging:'临时暂存'}
+const kindColor:Record<string,string>={managed:'blue',legacy_trash:'orange',session_trash:'purple',transient_staging:'gold'}
 async function scan(){loading.value=true;error.value='';try{inventory.value=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('存储扫描超过界面等待时限，请先处理超大目录后重试。')),35_000);window.manager.scanInstanceStorage().then(value=>{clearTimeout(timer);resolve(value)},cause=>{clearTimeout(timer);reject(cause)})})}catch(cause){error.value=cause instanceof Error?cause.message:String(cause)}finally{loading.value=false}}
 onMounted(()=>void scan())
 </script>
 
 <template>
   <section class="storage-view">
-    <div class="page-heading"><div><h1>存储清单</h1><p>只盘点本管理器的受管实例和历史归档，不自动移动或删除任何内容。</p></div><a-button :loading="loading" @click="scan">重新扫描</a-button></div>
-    <a-alert type="info" show-icon message="显示文件逻辑大小，不能直接当作额外磁盘占用或可回收空间。" description="macOS APFS 克隆可能共享未修改的数据块；文件系统分配空间仅作估算，可能把共享块重复计算。外部 Codex 目录和登记在实例之外的项目工作目录不计入；受管实例内部工作区会单独统计。归档目录缺少可靠的原实例元数据时会标注，不能据此自动恢复或清理。" />
+    <div class="page-heading"><div><h1>存储清单</h1><p>只盘点受管实例、会话废纸篓和已识别暂存目录，不自动移动或删除任何内容。</p></div><a-button :loading="loading" @click="scan">重新扫描</a-button></div>
+    <a-alert type="info" show-icon message="显示文件逻辑大小，不能直接当作额外磁盘占用或可回收空间。" description="macOS APFS 克隆可能共享未修改的数据块；文件系统分配空间仅作估算，可能把共享块重复计算。外部 Codex 目录和登记在实例之外的项目工作目录不计入；受管实例内部工作区会单独统计。会话废纸篓请在会话管理中恢复或清理；损坏的备份记录和暂存数据需先核实，不能据此从清单直接删除。" />
     <a-alert v-if="error" type="error" show-icon :message="error" class="error-banner" />
     <a-spin :spinning="loading">
       <template v-if="inventory">
@@ -25,9 +27,9 @@ onMounted(()=>void scan())
           <a-card><a-statistic title="文件系统分配估算" :value="inventory.filesystemBlocksBytes===undefined?'不可用':bytes(inventory.filesystemBlocksBytes)" /></a-card>
         </div>
         <a-alert v-for="(warning,index) in inventory.warnings" :key="index" type="warning" show-icon :message="warning" class="storage-warning" />
-        <a-empty v-if="!inventory.rows.length" description="没有发现受管实例目录或历史归档。" />
+        <a-empty v-if="!inventory.rows.length" description="没有发现受管实例目录、会话备份或历史归档。" />
         <a-card v-for="row in inventory.rows" :key="row.id" class="storage-row" :data-storage-id="row.id">
-          <template #title><div class="storage-row-title"><span>{{row.name}}</span><a-tag :color="row.kind==='managed'?'blue':'orange'">{{row.kind==='managed'?'受管实例':'历史归档'}}</a-tag><span class="muted storage-path" :title="row.directory">{{row.directory}}</span></div></template>
+          <template #title><div class="storage-row-title"><span>{{row.name}}</span><a-tag :color="kindColor[row.kind]??'default'">{{kindName[row.kind]??row.kind}}</a-tag><span class="muted storage-path" :title="row.directory">{{row.directory}}</span></div></template>
           <template #extra><div class="storage-size"><strong>{{bytes(row.logicalBytes)}}</strong><small class="muted">逻辑大小</small></div></template>
           <a-alert v-if="row.warning" type="warning" show-icon :message="row.warning" class="storage-warning" />
           <a-descriptions size="small" :column="2" bordered>

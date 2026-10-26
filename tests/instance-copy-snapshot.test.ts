@@ -1,12 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {appendFileSync,mkdirSync,mkdtempSync,readFileSync,writeFileSync,rmSync,realpathSync,renameSync,symlinkSync,existsSync,statSync} from 'node:fs'
+import {appendFileSync,copyFileSync,mkdirSync,mkdtempSync,readFileSync,readdirSync,writeFileSync,rmSync,realpathSync,renameSync,symlinkSync,existsSync,statSync} from 'node:fs'
 import {join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {DatabaseSync} from 'node:sqlite'
 import {scanInstanceHome,copyInstanceHome,relocateCopiedProfile} from '../src/main/instanceCopy'
 import {scanSessionHome} from '../src/main/instanceSessionCopy'
-import {copySavedInstanceHome,normalizeSessionDatabaseCopy} from '../src/main/instanceCopySnapshot'
+import {copySavedInstanceHome,normalizeSessionDatabaseCopy,filterSessionSnapshot} from '../src/main/instanceCopySnapshot'
 
 const supported=process.platform==='darwin'
 function fixture(t:{after(fn:()=>void):void}){
@@ -37,6 +37,19 @@ test('session-only inventory ignores large configuration, skills, caches and des
   assert.equal(readFileSync(join(f.target,'sessions','rollout-thread.jsonl'),'utf8'),meta+line)
   assert.deepEqual(JSON.parse(readFileSync(join(f.target,'.codex-global-state.json'),'utf8')),{'local-projects':{project:{id:'project',name:'中文项目',rootPaths:['/fixture/project']}}})
   assert.equal(saved.files,2)
+})
+
+test('selected folder snapshot keeps only chosen rollout and matching state and history rows',{skip:process.platform==='win32'},async t=>{
+  const f=fixture(t),first=JSON.stringify({type:'session_meta',payload:{id:'chosen',cwd:'/fixture/one'}})+'\n'+JSON.stringify({type:'event_msg',payload:{message:'keep body'}})+'\n',second=JSON.stringify({type:'session_meta',payload:{id:'omit',cwd:'/fixture/two'}})+'\n'+JSON.stringify({type:'event_msg',payload:{message:'omit private body'}})+'\n'
+  mkdirSync(join(f.source,'sessions','2026','10'),{recursive:true});writeFileSync(join(f.source,'sessions','2026','10','rollout-chosen.jsonl'),first);writeFileSync(join(f.source,'sessions','2026','10','rollout-omit.jsonl'),second)
+  writeFileSync(join(f.source,'.codex-global-state.json'),JSON.stringify({'thread-project-assignments':{chosen:{projectId:'p',projectKind:'local'},omit:{projectId:'p',projectKind:'local'}},'thread-workspace-root-hints':{chosen:'/fixture/one',omit:'/fixture/two'}}))
+  const state=new DatabaseSync(join(f.source,'state_5.sqlite'));state.exec('PRAGMA foreign_keys=ON; CREATE TABLE projects(id TEXT PRIMARY KEY); CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,project_id TEXT REFERENCES projects(id)); CREATE TABLE thread_dynamic_tools(thread_id TEXT REFERENCES threads(id) ON DELETE CASCADE,name TEXT)');state.exec("INSERT INTO projects VALUES('p')");state.prepare('INSERT INTO threads VALUES(?,?,?,?)').run('chosen',join(f.source,'sessions/2026/10/rollout-chosen.jsonl'),'original','p');state.prepare('INSERT INTO threads VALUES(?,?,?,?)').run('omit',join(f.source,'sessions/2026/10/rollout-omit.jsonl'),'original','p');state.exec("INSERT INTO thread_dynamic_tools VALUES('chosen','keep'); INSERT INTO thread_dynamic_tools VALUES('omit','remove')");state.close()
+  const history=new DatabaseSync(join(f.source,'thread_history_1.sqlite'));history.exec('CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_byte_offset INTEGER NOT NULL); CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,PRIMARY KEY(thread_id,turn_id)); CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_id TEXT,PRIMARY KEY(thread_id,turn_id,item_id)); CREATE TABLE thread_realtime_items(thread_id TEXT,item_id TEXT,PRIMARY KEY(thread_id,item_id))');history.exec("INSERT INTO thread_history_projection_state VALUES('chosen',1),('omit',1); INSERT INTO thread_turns VALUES('chosen','a'),('omit','b'); INSERT INTO thread_items VALUES('chosen','a','1'),('omit','b','2'); INSERT INTO thread_realtime_items VALUES('chosen','1'),('omit','2')");history.close()
+  mkdirSync(join(f.target,'sessions','2026','10'),{recursive:true});copyFileSync(join(f.source,'sessions','2026','10','rollout-chosen.jsonl'),join(f.target,'sessions','2026','10','rollout-chosen.jsonl'));copyFileSync(join(f.source,'sessions','2026','10','rollout-omit.jsonl'),join(f.target,'sessions','2026','10','rollout-omit.jsonl'));copyFileSync(join(f.source,'.codex-global-state.json'),join(f.target,'.codex-global-state.json'));copyFileSync(join(f.source,'state_5.sqlite'),join(f.target,'state_5.sqlite'));copyFileSync(join(f.source,'thread_history_1.sqlite'),join(f.target,'thread_history_1.sqlite'));await filterSessionSnapshot(f.target,new Set(['chosen']),f.signal)
+  const files=readdirSync(join(f.target,'sessions','2026','10'));assert.deepEqual(files,['rollout-chosen.jsonl']);assert.equal(readFileSync(join(f.target,'sessions','2026','10','rollout-chosen.jsonl'),'utf8'),first);assert.equal(readFileSync(join(f.source,'sessions','2026','10','rollout-omit.jsonl'),'utf8'),second)
+  const copied=new DatabaseSync(join(f.target,'state_5.sqlite'),{readOnly:true});try{assert.deepEqual(copied.prepare('SELECT id FROM threads').all().map(row=>row.id),['chosen']);assert.deepEqual(copied.prepare('SELECT name FROM thread_dynamic_tools').all().map(row=>row.name),['keep']);assert.deepEqual(copied.prepare('PRAGMA foreign_key_check').all(),[])}finally{copied.close()}
+  const projection=new DatabaseSync(join(f.target,'thread_history_1.sqlite'),{readOnly:true});try{for(const table of ['thread_history_projection_state','thread_turns','thread_items','thread_realtime_items'])assert.deepEqual(projection.prepare('SELECT DISTINCT thread_id FROM '+table).all().map(row=>row.thread_id),['chosen'])}finally{projection.close()}
+  const stateJson=JSON.parse(readFileSync(join(f.target,'.codex-global-state.json'),'utf8'));assert.deepEqual(Object.keys(stateJson['thread-project-assignments']),['chosen']);assert.deepEqual(Object.keys(stateJson['thread-workspace-root-hints']),['chosen'])
 })
 
 test('session-only inventory refuses a database configured outside the selected home',async t=>{

@@ -37,8 +37,13 @@ const copyMode=ref<'sessions'|'full'>('sessions')
 const sourceHistory=ref<InstanceHistorySummary>(),historyLoading=ref(false),historyError=ref('')
 const pendingCopyPreview=ref<string>()
 let historyRequest=0,launchRequest=0
-const emptyHistory:InstanceHistorySummary={sessions:0,archived:0,projects:[],unassigned:0,issues:[]}
+const emptyHistory:InstanceHistorySummary={sessions:0,archived:0,projects:[],folders:[],unassigned:0,issues:[]}
+const selectedFolderKeys=ref<string[]>([])
+const selectableFolders=computed(()=>chosenHistory.value?.folders??[])
 const chosenHistory=computed(()=>historyMode.value==='empty'&&!copySource.value&&!externalSource.value?emptyHistory:externalSource.value?.history??sourceHistory.value)
+watch(()=>selectableFolders.value.map(folder=>folder.key).join('|'),()=>{selectedFolderKeys.value=selectableFolders.value.map(folder=>folder.key)})
+function selectAllFolders(){selectedFolderKeys.value=selectableFolders.value.map(folder=>folder.key)}
+function clearFolders(){selectedFolderKeys.value=[]}
 const compatibleSources=computed(()=>instances.value.filter(instance=>{try{return resolveAgentClientType(instance.clientType)===form.clientType}catch{return false}}))
 const historySourceLabel=computed(()=>copySource.value?.name??externalSource.value?.name??'空白会话')
 const historyChoice=computed(()=>historyMode.value==='empty'?'empty':historySourceKind.value)
@@ -48,7 +53,7 @@ const historyChoices=[
   {value:'directory' as const,title:'从目录复制',description:'导入其他工具的历史',icon:FolderOpenOutlined}
 ]
 const sourceReady=computed(()=>!!chosenHistory.value&&!historyLoading.value&&!historyError.value&&(!!copySource.value||!!externalSource.value))
-function clearHistorySource(){historyRequest++;discoveryRequest++;discoveryLoading.value=false;historyLoading.value=false;historyError.value='';sourceHistory.value=undefined;copySource.value=undefined;externalSource.value=undefined;discoveredSourceId.value='';sourceClosed.value=false}
+function clearHistorySource(){historyRequest++;discoveryRequest++;discoveryLoading.value=false;historyLoading.value=false;historyError.value='';sourceHistory.value=undefined;copySource.value=undefined;externalSource.value=undefined;discoveredSourceId.value='';sourceClosed.value=false;selectedFolderKeys.value=[]}
 const externalStateLabel=(value:ExternalInstanceSource['runtimeState'])=>value==='running'?'正在运行':value==='not_detected'?'未检测到后台':'运行状态待确认'
 const instanceSourceOptions=computed(()=>[
   ...(compatibleSources.value.length?[{label:'本应用实例',options:compatibleSources.value.map(item=>({value:'managed:'+item.id,label:item.name+' · '+labels[item.status],disabled:item.status!=='stopped'||!!item.copying}))}]:[]),
@@ -615,7 +620,8 @@ async function save(previewAfter=false) {
   const attach=attachingForm.value,previousIds=new Set(instances.value.map(instance=>instance.id)),editingId=editing.value?.id
   committing.value=true
   let savedOk=false
-  try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,copyMode:copyMode.value,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,copyMode:copyMode.value,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
+  const selected=copyMode.value==='sessions'?selectedFolderKeys.value:undefined
+  try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,copyMode:copyMode.value,selectedFolderKeys:selected,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,copyMode:copyMode.value,selectedFolderKeys:selected,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
   finally{committing.value=false}
   if(savedOk&&open.value&&generation===draftGeneration) {
     closeEditor();message.success(attach?'已有目录已登记':source||external?'正在复制实例':'实例已保存')
@@ -768,6 +774,13 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
               <div v-if="historyLoading" class="instance-history-loading" role="status"><LoadingOutlined />正在读取项目与会话概况…</div>
               <a-alert v-if="historyError" type="error" :message="historyError" :show-icon="true" />
               <InstanceHistoryOverview v-if="chosenHistory&&!historyLoading" :history="chosenHistory" aria-label="所选会话概况" />
+              <div v-if="chosenHistory&&!historyLoading&&copyMode==='sessions'" class="instance-copy-folder-choice" aria-label="选择要迁移的文件夹">
+                <div class="instance-copy-folder-toolbar"><strong>迁移哪些文件夹的对话</strong><span>{{selectedFolderKeys.length}} / {{selectableFolders.length}} 个文件夹</span><a-space><a-button size="small" @click="selectAllFolders">全选</a-button><a-button size="small" @click="clearFolders">清空</a-button></a-space></div>
+                <a-checkbox-group v-model:value="selectedFolderKeys" class="instance-copy-folder-list" aria-label="选择会话文件夹">
+                  <label v-for="folder in selectableFolders" :key="folder.key" class="instance-copy-folder-row"><a-checkbox :value="folder.key"/><span class="instance-copy-folder-info"><strong>{{folder.name}}</strong><small>{{folder.unassigned?'无法确定所属工作目录':folder.path}}</small></span><span>{{folder.sessions}} 条</span></label>
+                </a-checkbox-group>
+                <p v-if="!selectableFolders.length" class="muted">没有可迁移的会话。</p>
+              </div>
               <p class="instance-copy-retained"><CopyOutlined />复制后各自保存后续对话，原实例保留；项目继续使用原路径，临时文件和缓存不复制。</p>
             </div>
           </section>

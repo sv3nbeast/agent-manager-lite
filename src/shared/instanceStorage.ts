@@ -11,7 +11,7 @@ export interface InstanceStorageCategoryUsage {
 }
 export interface InstanceStorageRow {
   id:string
-  kind:'managed'|'legacy_trash'
+  kind:'managed'|'legacy_trash'|'session_trash'|'transient_staging'
   name:string
   directory:string
   logicalBytes:number
