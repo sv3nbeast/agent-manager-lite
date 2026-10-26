@@ -137,7 +137,7 @@ test('locale-only hook leaves speed unchanged, while combined hook applies one a
 })
 test('hook validates its pinned mode, count and exact replacement set independently of manifest content digest',t=>{
   const f=fixture(t,'locale'),hook=f.prepare(),body=readFileSync(hook.manifest,'utf8')
-  for(const change of [(v:any)=>{v.enhancements='speed'},(v:any)=>{v.replacements.push(v.replacements[0])},(v:any)=>{v.replacements[0].after='let c=!1,l=`IDE`'}]){
+  for(const change of [(v:any)=>{v.enhancements='speed'},(v:any)=>{v.resources.push(v.resources[0])},(v:any)=>{v.resources[0].replacements[0].after='let c=!1,l=`IDE`'}]){
     const value=JSON.parse(body);change(value);const altered=JSON.stringify(value)
     writeFileSync(hook.manifest,altered)
     const runtime=runHook(f,hook,{cryptoDigest:value=>value===altered?hash(body):f.digest(value)}),handler=()=>response()

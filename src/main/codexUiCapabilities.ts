@@ -108,6 +108,37 @@ export function codexUiAccessMapperImportPaths(source:string):string[] {
     return [imports[0].source.value]
   }catch{return []}
 }
+
+export function codexUiStaticImports(source:string):string[] {
+  try{const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node;return (program.body as Node[]).filter(node=>node.type==='ImportDeclaration'&&typeof node.source?.value==='string').map(node=>node.source.value as string)}catch{return []}
+}
+export function codexUiDynamicImports(source:string):string[] {
+  try{const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node,result:string[]=[];visit(program,node=>{if(node.type==='ImportExpression'&&typeof literal(node.source)==='string')result.push(literal(node.source) as string)});return result}catch{return []}
+}
+export function codexUiLocaleProviderSupported(runtime:string,path:string,providerSource:string):boolean {
+  try{
+    const runtimeProgram=parse(runtime,{ecmaVersion:'latest',sourceType:'module'}) as Node
+    if(!path.startsWith('./')||!path.endsWith('.js'))return false
+    const imports=(runtimeProgram.body as Node[]).filter(node=>node.type==='ImportDeclaration'&&node.source?.value===path)
+    if(!imports.length||!imports.some(declaration=>declaration.specifiers.some((specifier:Node)=>specifier.local?.name&&nodes(runtimeProgram,n=>n.type==='CallExpression'&&n.callee?.type==='Identifier'&&n.callee.name===specifier.local.name).length>0)))return false
+    const provider=parse(providerSource,{ecmaVersion:'latest',sourceType:'module'}) as Node
+    const detected=detectCodexUiCapabilities(providerSource)
+    if(!detected.features.locale.supported||detected.replacements.locale.length!==2)return false
+    const exportedNames=(provider.body as Node[]).flatMap(statement=>{
+      if(statement.type!=='ExportNamedDeclaration'||statement.source!=null)return []
+      const names:string[]=[]
+      if(statement.declaration?.id?.name)names.push(statement.declaration.id.name)
+      for(const specifier of statement.specifiers??[])if(specifier.local?.name)names.push(specifier.exported?.name)
+      return names
+    })
+    const importedNames=imports.flatMap(declaration=>declaration.specifiers.filter((specifier:Node)=>{
+      if(!specifier.local?.name)return false
+      const calls=nodes(runtimeProgram,node=>node.type==='CallExpression'&&node.callee?.type==='Identifier'&&node.callee.name===specifier.local.name)
+      return calls.length>0
+    }).map((specifier:Node)=>specifier.imported?.name??specifier.local?.name))
+    return exportedNames.some(name=>importedNames.includes(name))
+  }catch{return false}
+}
 function textOf(source:string,node:Node):string{return source.slice(node.start,node.end)}
 
 export function detectCodexUiCapabilities(source:string,importedModules:Readonly<Record<string,string>>={}):{features:CodexUiFeatureSupports;replacements:Record<CodexUiFeature,CodexUiReplacement[]>} {

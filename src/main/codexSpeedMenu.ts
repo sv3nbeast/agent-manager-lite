@@ -5,7 +5,7 @@ import {createHash,randomUUID} from 'node:crypto'
 import * as nodeFS from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
-import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiFeatures,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
+import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiDynamicImports,codexUiFeatures,codexUiLocaleProviderSupported,codexUiStaticImports,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
 export type CodexSpeedMenuEnhancements='speed'|'locale'|'speed-locale'
@@ -26,6 +26,7 @@ type CodexReleaseProfile={
   ultraReplacements?:readonly CodexSpeedReplacement[]
   localeReplacement?:CodexSpeedReplacement
   replacements?:readonly CodexSpeedReplacement[]
+  separateLocaleResource?:{id:string;asset:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}
 }
 const legacySpeedReplacements=[
   {begin:'function TRa(e){',end:'}var ERa;',before:'a=i?.authMethod===`chatgpt`,o=',after:'a=i?.authMethod===`chatgpt`||i?.authMethod===`apikey`||r===`local`&&i?.authMethod===null&&i?.requiresAuth===!1,o='},
@@ -65,6 +66,7 @@ const releases:readonly CodexReleaseProfile[]=[
 ]
 const releaseByVersion=new Map(releases.map(profile=>[profile.version,profile]))
 const replacementsFor=(profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):readonly CodexSpeedReplacement[]=>{if(profile.replacements)return profile.replacements;const ultra=profile.ultraReplacements??[],locale=profile.localeReplacement?[profile.localeReplacement]:[];return enhancements==='speed'?[...profile.speedReplacements,...ultra]:enhancements==='locale'?[...ultra,...locale]:[...profile.speedReplacements,...ultra,...locale]}
+function uniqueModuleImports(imports:string[]):string[]{return [...new Set(imports)].filter(path=>path.startsWith('./')&&path.endsWith('.js'))}
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex')
 const sentinel=Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
 
@@ -91,7 +93,7 @@ export interface CodexSpeedMenuReader {
   /** Dependency injection for isolated fixtures; production always uses SHA256. */
   digest?(value:string|Buffer):string
 }
-export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>;transport?:'preload'|'cdp';manifestSha256?:string;patchedBody?:string;features?:readonly CodexUiFeature[]}
+export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>;transport?:'preload'|'cdp';manifestSha256?:string;patchedBody?:string;features?:readonly CodexUiFeature[];resourceIdsByFeature?:Partial<Record<CodexUiFeature,string[]>>}
 export interface CodexSpeedMenuPrepareOptions {
   inspection:CodexSpeedMenuInspection
   directory:string
@@ -100,7 +102,7 @@ export interface CodexSpeedMenuPrepareOptions {
   nonce:string
   hookDirectory?:string
 }
-export interface CodexSpeedMenuStatusScope {statusLog:string;nonce:string;executable:string;directory:string;pid?:number;enhancements?:CodexSpeedMenuEnhancements;feature?:CodexUiFeature}
+export interface CodexSpeedMenuStatusScope {statusLog:string;nonce:string;executable:string;directory:string;pid?:number;enhancements?:CodexSpeedMenuEnhancements;feature?:CodexUiFeature;requiredResourceIds?:readonly string[]}
 export interface CodexSpeedMenuStatus {state:'pending'|'active'|'fallback';reason?:string}
 
 function boundedFile(path:string,limit:number):Buffer {
@@ -174,7 +176,7 @@ const defaultReader:CodexSpeedMenuReader={
   identity:path=>{const s=rawFS.lstatSync(path);if(!s.isFile()||s.isSymbolicLink())throw new Error('resource type');return JSON.stringify([path,s.dev,s.ino,s.size,s.mtimeMs,s.ctimeMs])},
   file:boundedFile,archive:packedFile,fuseWires:scanFuseWires
 }
-const checked=new WeakMap<CodexSpeedMenuInspection,{options:CodexSpeedMenuInspectOptions;reader:CodexSpeedMenuReader;profile:CodexReleaseProfile}>()
+const checked=new WeakMap<CodexSpeedMenuInspection,{options:CodexSpeedMenuInspectOptions;reader:CodexSpeedMenuReader;profile:CodexReleaseProfile;features?:CodexUiFeature[]}>()
 const inspectionCache=new Map<string,CodexSpeedMenuInspection>()
 
 function patch(source:string,profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):string {
@@ -187,6 +189,17 @@ function patch(source:string,profile:CodexReleaseProfile,enhancements:CodexSpeed
     if(end<0)throw new Error('patch end')
     const body=result.slice(start,end)
     if(body.split(replacement.before).length!==2)throw new Error('patch count')
+    result=result.slice(0,start)+body.replace(replacement.before,replacement.after)+result.slice(end)
+  }
+  return result
+}
+function patchSemantic(source:string,replacements:readonly CodexSpeedReplacement[]):string {
+  let result=source
+  for(const replacement of replacements){
+    if(replacement.offset!==undefined){const offset=replacement.offset;if(result.slice(offset,offset+replacement.before.length)!==replacement.before)throw new Error('patch offset');result=result.slice(0,offset)+replacement.after+result.slice(offset+replacement.before.length);continue}
+    const start=result.indexOf(replacement.begin),end=start<0?-1:result.indexOf(replacement.end,start+replacement.begin.length)
+    if(start<0||result.indexOf(replacement.begin,start+1)!==-1||end<0)throw new Error('patch marker')
+    const body=result.slice(start,end);if(body.split(replacement.before).length!==2)throw new Error('patch count')
     result=result.slice(0,start)+body.replace(replacement.before,replacement.after)+result.slice(end)
   }
   return result
@@ -329,15 +342,49 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       if(capabilityCache.size>=4)capabilityCache.delete(capabilityCache.keys().next().value!)
       capabilityCache.set(cacheKey,detected)
     }
-    const featureSupport=structuredClone(detected.features),features=requested.filter(f=>featureSupport[f].supported)
-    const replacements=features.flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
+    let localeResource:CodexReleaseProfile['separateLocaleResource']
+    // An already-supported translation provider is in the inspected resource;
+    // do not discover a second copy elsewhere in the module graph.
+    const localeAlreadySupported=detected.features.locale.supported
+    try{
+      let graphEntries=0,graphBytes=0
+      const readGraphEntry=(path:string,limit:number)=>{if(++graphEntries>256)throw new Error('renderer module graph entry limit');const body=reader.archive(archive,path,limit);graphBytes+=body.length;if(graphBytes>32*1024*1024)throw new Error('renderer module graph byte limit');return body.toString('utf8')}
+      const scripts=[...html.matchAll(/<script[^>]+src="\.\/assets\/([^"]+\.js)"/g)].map(match=>match[1])
+      const localeMatches:{entryPath:string;entry:string;runtimePath:string;runtimeBody:string;path:string;body:string}[]=[]
+      if(!localeAlreadySupported&&scripts.length===1){
+        const entryPath='webview/assets/'+scripts[0],entry=readGraphEntry(entryPath,2*1024*1024)
+        const visited=new Set<string>([entryPath]),graphBodies=new Map<string,string>([[entryPath,entry]]),queue:[string,string,number][]=[]
+        for(const specifier of uniqueModuleImports([...codexUiStaticImports(entry),...codexUiDynamicImports(entry)]))queue.push([entryPath,specifier,1])
+        while(queue.length&&graphEntries<256&&graphBytes<32*1024*1024){
+          const [parent,specifier,depth]=queue.shift()!,path='webview/assets/'+specifier.slice(2)
+          if(visited.has(path))continue
+          visited.add(path)
+          let body:string
+          try{body=readGraphEntry(path,4*1024*1024)}catch{continue}
+          const parentBody=graphBodies.get(parent)
+          if(parentBody&&path!==asset&&codexUiLocaleProviderSupported(parentBody,specifier,body))localeMatches.push({entryPath,entry,runtimePath:parent,runtimeBody:parentBody,path,body})
+          graphBodies.set(path,body)
+          if(depth<5)for(const child of uniqueModuleImports([...codexUiStaticImports(body),...codexUiDynamicImports(body)]))queue.push([path,child,depth+1])
+        }
+      }
+      const uniqueLocaleMatches=[...new Map(localeMatches.map(match=>[match.path,match])).values()]
+      if(!localeAlreadySupported&&uniqueLocaleMatches.length===1){
+        const match=uniqueLocaleMatches[0],locale=detectCodexUiCapabilities(match.body),replacements=locale.replacements.locale,sourceHash=digest(match.body),patched=applyCodexUiReplacements(match.body,replacements)
+        localeResource={id:match.path,asset:match.path,url:'app://-/assets/'+match.path.split('/').pop(),source:sourceHash,sourceBody:match.body,replacements,patchedSha256:digest(patched)}
+        parts.push(match.entryPath,digest(match.entry),match.runtimePath,digest(match.runtimeBody),localeResource.asset,sourceHash,localeResource.patchedSha256,replacements)
+      }
+    }catch{/* Ambiguous locale module graph stays unsupported. */}
+    const featureSupport=structuredClone(detected.features)
+    if(localeResource)featureSupport.locale={supported:true,reason:'页面语言：已验证主入口、懒加载路径和语言提供器'}
+    const features=requested.filter(f=>featureSupport[f].supported)
+    const replacements=features.filter(feature=>feature!=='locale'||!localeResource).flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
     parts.push(featureSupport,features,replacements)
     if(!features.length)return {...fail('客户端页面功能结构尚未兼容'),featureSupport}
-    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:'app://-/assets/'+asset.split('/').pop(),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements}
-    const patchedDigest=digest(patch(source!,profile,'speed-locale'))
+    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:'app://-/assets/'+asset.split('/').pop(),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{})}
+    const patchedDigest=digest(patchSemantic(source!,replacements))
     profile.patched={speed:patchedDigest,locale:patchedDigest,'speed-locale':patchedDigest}
     const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:options.enhancements??'speed-locale',transport:profile.injection})
-    checked.set(result,{options:{...options,features:requested},reader,profile})
+    checked.set(result,{options:{...options,features:requested},reader,profile,features})
     if(cacheKey){if(inspectionCache.size>=16)inspectionCache.delete(inspectionCache.keys().next().value!);inspectionCache.set(cacheKey,result)}
     return result
   }catch{return fail('无法验证 Codex 桌面兼容资源')}
@@ -370,11 +417,11 @@ const hookSource=String.raw`'use strict';
   const expected = __EXPECTED__, manifestDigest = __MANIFEST_DIGEST__;
   const digest = value => createHash('sha256').update(value).digest('hex');
   const privateHookDirectory = () => { const stat=fs.lstatSync(expected.hookDirectory); return stat.isDirectory()&&!stat.isSymbolicLink()&&fs.realpathSync(expected.hookDirectory)===expected.hookDirectory&&(!process.getuid||stat.uid===process.getuid())&&!(stat.mode&0o022); };
-  const log = (kind, reason) => { try {
+  const log = (kind, reason, resourceId) => { try {
     if(!privateHookDirectory())return;
     const fd = fs.openSync(expected.statusLog, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
     try { const stat = fs.fstatSync(fd); if (!stat.isFile() || stat.size > 65536 || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022)) return;
-      fs.writeSync(fd, JSON.stringify({time:Date.now(),pid:process.pid,mainThread:isMainThread,threadId,nonce:expected.nonce,executable:expected.executable,directory:expected.home,kind,...(reason?{reason}:{})})+'\n');
+      fs.writeSync(fd, JSON.stringify({time:Date.now(),pid:process.pid,mainThread:isMainThread,threadId,nonce:expected.nonce,executable:expected.executable,directory:expected.home,kind,...(reason?{reason}:{}),...(resourceId?{resourceId}:{})})+'\n');
     } finally { fs.closeSync(fd); }
   } catch {} };
   const hasArg = value => process.argv.filter(arg => arg === value).length === 1;
@@ -385,7 +432,7 @@ const hookSource=String.raw`'use strict';
     const fd=fs.openSync(expected.manifest,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
     let body; try {const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.size>32768)throw Error();body=fs.readFileSync(fd,'utf8');}finally{fs.closeSync(fd);}
     if(digest(body)!==manifestDigest)throw Error(); manifest=JSON.parse(body);
-    if(manifest.version!==1||manifest.home!==expected.home||manifest.desktopDirectory!==expected.desktopDirectory||manifest.executable!==expected.executable||manifest.nonce!==expected.nonce||manifest.url!==expected.url||manifest.sourceSha256!==expected.sourceSha256||manifest.patchedSha256!==expected.patchedSha256||manifest.enhancements!==expected.enhancements||!Array.isArray(manifest.replacements)||manifest.replacements.length!==expected.replacementCount||digest(JSON.stringify(manifest.replacements))!==expected.replacementsSha256)throw Error();
+    if(manifest.version!==2||manifest.home!==expected.home||manifest.desktopDirectory!==expected.desktopDirectory||manifest.executable!==expected.executable||manifest.nonce!==expected.nonce||manifest.enhancements!==expected.enhancements||!Array.isArray(manifest.resources)||JSON.stringify(manifest.resources)!==JSON.stringify(expected.resources)||JSON.stringify(manifest.resourceIdsByFeature)!==JSON.stringify(expected.resourceIdsByFeature))throw Error();
   } catch {log('disabled','manifest');return;}
   const originalLoad=Module._load;let installed=false,attempted=false;
   Module._load=function(request,parent,isMain){
@@ -400,12 +447,12 @@ const hookSource=String.raw`'use strict';
         log('protocol-wrapped');
         return originalHandle.call(this,scheme,async function(request){
           const response=await handler.apply(this,arguments);
-          if(request.url!==manifest.url)return response;
+          const resource=manifest.resources.find(item=>item.url===request.url);if(!resource)return response;
           try {
-            if(request.signal?.aborted||response.status!==200||response.headers.has('content-encoding')||! /^(text|application)\/(javascript|ecmascript)(;|$)/i.test(response.headers.get('content-type')||'')){log('original','response');return response;}
+            if(request.signal?.aborted||response.status!==200||response.headers.has('content-encoding')||! /^(text|application)\/(javascript|ecmascript)(;|$)/i.test(response.headers.get('content-type')||'')){log('original','response',resource.id);return response;}
             let body=await response.clone().text();
-            if(digest(body)!==manifest.sourceSha256){log('original','source');return response;}
-            for(const replacement of manifest.replacements){
+            if(digest(body)!==resource.sourceSha256){log('original','source',resource.id);return response;}
+            for(const replacement of resource.replacements){
               if(replacement.offset!==undefined){
                 const at=replacement.offset;if(!Number.isSafeInteger(at)||at<0||body.slice(at,at+replacement.before.length)!==replacement.before)throw Error();
                 body=body.slice(0,at)+replacement.after+body.slice(at+replacement.before.length);continue;
@@ -417,11 +464,11 @@ const hookSource=String.raw`'use strict';
               const scope=body.slice(start,end);if(scope.split(replacement.before).length!==2)throw Error();
               body=body.slice(0,start)+scope.replace(replacement.before,replacement.after)+body.slice(end);
             }
-            if(digest(body)!==manifest.patchedSha256||request.signal?.aborted){log('original','patched');return response;}
-            const headers=new Headers(response.headers);headers.set('content-length',String(Buffer.byteLength(body,'utf8')));headers.set('etag','"'+manifest.patchedSha256+'"');
+            if(digest(body)!==resource.patchedSha256||request.signal?.aborted){log('original','patched',resource.id);return response;}
+            const headers=new Headers(response.headers);headers.set('content-length',String(Buffer.byteLength(body,'utf8')));headers.set('etag','"'+resource.patchedSha256+'"');
             for(const name of ['content-md5','digest','content-digest','last-modified'])headers.delete(name);
-            const result=new Response(body,{status:response.status,statusText:response.statusText,headers});log('patched');return result;
-          }catch{log('original','transform');return response;}
+            const result=new Response(body,{status:response.status,statusText:response.statusText,headers});log('patched',undefined,resource.id);return result;
+          }catch{log('original','transform',resource.id);return response;}
         });
       };
       installed=true;log('hook-installed');
@@ -446,17 +493,28 @@ export function prepareCodexSpeedMenu(options:CodexSpeedMenuPrepareOptions):Code
     privateDirectory(base)
     rawFS.mkdirSync(target,{mode:0o700});folder=target
     const manifest=join(target,'manifest.json'),script=join(target,'hook.cjs'),statusLog=join(target,'status.jsonl')
-    const enhancements=proof.options.enhancements??'speed',profile=proof.profile,replacements=replacementsFor(profile,enhancements)
-    const patchedBodyPath=profile.injection==='cdp'?join(target,'patched.js'):undefined
-    const patchedBody=patchedBodyPath?Buffer.from(patch(proof.reader.archive(join(proof.options.application,'Contents','Resources','app.asar'),profile.asset,32*1024*1024).toString('utf8'),profile,enhancements),'utf8'):undefined
-    if(patchedBody&&(hash(patchedBody)!==profile.patched[enhancements]))throw new Error('patch digest')
-    const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,url:profile.url,sourceSha256:profile.source,patchedSha256:profile.patched[enhancements],enhancements,features:options.inspection.features,replacementCount:replacements.length,replacementsSha256:hash(JSON.stringify(replacements)),...(patchedBodyPath&&patchedBody?{patchedBody:patchedBodyPath,patchedBodySha256:hash(patchedBody)}:{})}
-    const manifestBody=JSON.stringify({version:1,...scope,fingerprint:current.fingerprint,replacements},null,2)+'\n'
-    if(patchedBodyPath&&patchedBody)atomicBytes(patchedBodyPath,patchedBody)
+    const enhancements=proof.options.enhancements??'speed',profile=proof.profile
+    const profileForPrepare=profile
+    const assetDigest=proof.reader.digest??hash
+    const groups:Array<{id:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}> = []
+    const activeFeatures=proof.features??options.inspection.features??(enhancements==='speed'?['speed']:enhancements==='locale'?['locale']:['locale','speed'])
+    const mainFeatures=activeFeatures.filter(feature=>feature!=='locale'||!profile.separateLocaleResource)
+    const mainEnhancement:CodexSpeedMenuEnhancements=mainFeatures.includes('speed')&&mainFeatures.includes('locale')?'speed-locale':mainFeatures.includes('locale')?'locale':'speed'
+    const mainReplacements=profile.replacements??replacementsFor(profileForPrepare,mainEnhancement)
+    let mainSource=''
+    if(mainReplacements.length){mainSource=proof.reader.archive(join(proof.options.application,'Contents','Resources','app.asar'),profile.asset,32*1024*1024).toString('utf8');groups.push({id:profile.asset,url:profile.url,source:profile.source,sourceBody:mainSource,replacements:mainReplacements,patchedSha256:assetDigest(patchSemantic(mainSource,mainReplacements))})}
+    if(activeFeatures.includes('locale')&&profile.separateLocaleResource){const resource=profile.separateLocaleResource;groups.push({id:resource.id,url:resource.url,source:resource.source,sourceBody:resource.sourceBody,replacements:resource.replacements,patchedSha256:resource.patchedSha256})}
+    const resources=groups.map((group,index)=>{const body=Buffer.from(patchSemantic(group.sourceBody,group.replacements),'utf8');if(assetDigest(body)!==group.patchedSha256)throw new Error('patch digest');const patchedBodyPath=profile.injection==='cdp'?join(target,'patched-'+index+'.js'):undefined;if(patchedBodyPath)atomicBytes(patchedBodyPath,body);return {id:group.id,url:group.url,sourceSha256:group.source,patchedSha256:group.patchedSha256,replacements:group.replacements,...(patchedBodyPath?{patchedBodyPath,patchedBodySha256:assetDigest(body)}:{})}})
+    const mainResourceId=groups.find(group=>group.id===profile.asset)?.id
+    const resourceIdsByFeature=Object.fromEntries(activeFeatures.map(feature=>[feature,feature==='locale'&&profile.separateLocaleResource?[profile.separateLocaleResource.id]:mainResourceId?[mainResourceId]:[]]))
+    if(!resources.length)throw new Error('no compatibility resources')
+    const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,enhancements,features:activeFeatures,resources,resourceIdsByFeature,url:resources[0].url,sourceSha256:resources[0].sourceSha256,patchedSha256:resources[0].patchedSha256,replacements:resources[0].replacements,replacementCount:resources[0].replacements.length,replacementsSha256:hash(JSON.stringify(resources[0].replacements)),...(resources[0].patchedBodyPath?{patchedBody:resources[0].patchedBodyPath,patchedBodySha256:resources[0].patchedBodySha256}:{})}
+    const legacyResource=resources.length===1?resources[0]:undefined
+    const manifestBody=JSON.stringify({version:2,...scope,fingerprint:current.fingerprint,...(legacyResource?{url:legacyResource.url,sourceSha256:legacyResource.sourceSha256,patchedSha256:legacyResource.patchedSha256,replacements:legacyResource.replacements,replacementCount:legacyResource.replacements.length,replacementsSha256:hash(JSON.stringify(legacyResource.replacements)),...(legacyResource.patchedBodyPath?{patchedBody:legacyResource.patchedBodyPath,patchedBodySha256:legacyResource.patchedBodySha256}:{})}:{})},null,2)+'\n'
     atomicFile(manifest,manifestBody);atomicFile(statusLog,'')
     const source=hookSource.replace('__EXPECTED__',JSON.stringify({...scope,manifest,statusLog,hookDirectory:target})).replace('__MANIFEST_DIGEST__',JSON.stringify(hash(manifestBody)))
     atomicFile(script,source)
-    return {script,manifest,statusLog,transport:profile.injection,features:options.inspection.features,manifestSha256:hash(manifestBody),...(patchedBodyPath?{patchedBody:patchedBodyPath}:{}),env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
+    return {script,manifest,statusLog,transport:profile.injection,features:activeFeatures,resourceIdsByFeature,manifestSha256:hash(manifestBody),...(resources[0].patchedBodyPath?{patchedBody:resources[0].patchedBodyPath}:{}),env:{CML_CODEX_SPEED_MENU_MANIFEST:manifest,CML_CODEX_SPEED_MENU_LOG:statusLog}}
   }catch{
     if(folder)try{privateDirectory(folder);rawFS.rmSync(folder,{recursive:true,force:true})}catch{/* Never follow a replaced directory. */}
     return
@@ -470,6 +528,7 @@ export function readCodexSpeedMenuStatus(scope:CodexSpeedMenuStatusScope,now=Dat
     const lines=boundedFile(scope.statusLog,128*1024).toString('utf8').trim().split('\n')
     let result:CodexSpeedMenuStatus={state:'pending',reason:'等待客户端加载界面'}
     let resourceLoaded=false
+    const latestResourceStatus=new Map<string,{kind:string;reason?:string}>()
     for(const line of lines){
       let value:any;try{value=JSON.parse(line)}catch{continue}
       if(value?.nonce!==scope.nonce||value?.executable!==scope.executable||value?.directory!==scope.directory)continue
@@ -478,12 +537,27 @@ export function readCodexSpeedMenuStatus(scope:CodexSpeedMenuStatusScope,now=Dat
       // the main process's resource handler, even when their PID is identical.
       if((value.mainThread!==undefined&&value.mainThread!==true)||(value.threadId!==undefined&&value.threadId!==0))continue
       const reason=typeof value.reason==='string'&&Object.hasOwn(reasons,value.reason)?reasons[value.reason]:undefined
+      if(typeof value.resourceId==='string')latestResourceStatus.set(value.resourceId,{kind:value.kind,reason})
       // An aborted preload does not uninstall a handler that already served a
       // resource. The latest resource result takes precedence over startup
       // diagnostics; a later real original response still downgrades active.
-      if(value.kind==='patched'){resourceLoaded=true;result={state:'active'}}
-      else if(value.kind==='original'){resourceLoaded=true;result=fallback(reason)}
+      if(value.kind==='patched'){
+        resourceLoaded=true
+        const required=scope.requiredResourceIds??[]
+        result=required.length>0&&!required.every(id=>latestResourceStatus.get(id)?.kind==='patched')?{state:'pending',reason:'正在加载客户端界面资源'}:{state:'active'}
+      }
+      else if(value.kind==='original'){
+        resourceLoaded=true
+        if(!value.resourceId||!scope.requiredResourceIds?.length||scope.requiredResourceIds.includes(value.resourceId))result=fallback(reason)
+      }
       else if(value.kind==='disabled'&&!resourceLoaded)result=fallback(reason)
+    }
+    const required=scope.requiredResourceIds??[]
+    if(result.state!=='fallback'&&required.length){
+      const failed=required.map(id=>latestResourceStatus.get(id)).find(item=>item?.kind==='original')
+      if(failed)result=fallback(failed.reason)
+      else if(required.every(id=>latestResourceStatus.get(id)?.kind==='patched'))result={state:'active'}
+      else result={state:'pending',reason:'正在加载客户端界面资源'}
     }
     if(result.state==='pending'&&now-rawFS.lstatSync(scope.statusLog).birthtimeMs>20000)return fallback()
     return result
