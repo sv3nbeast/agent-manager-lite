@@ -6,6 +6,7 @@ import type { InstanceInput, InstanceLaunchPreview, InstanceView, InstanceWorkin
 import { accountCompatibility, getAgentClient, hasInstanceUpstreamProxy, implementedAgentClients, recommendedInstanceConnectionMode, resolveAgentClientType } from '../../../shared/agentClients'
 import type { AgentClientType } from '../../../shared/agentClients'
 import type { InstanceApplicationChoice } from '../../../shared/types'
+import type { InstanceArchiveView } from '../../../shared/instanceRecycle'
 import { instanceInputSchema, isClaudeDesktopProfile } from '../../../shared/instances'
 import { providerKeyConnection, providerKeyModels } from '../../../shared/providerLibrary'
 import type { ModelContextDefault } from '../../../shared/modelContextWindows'
@@ -36,6 +37,7 @@ const historyMode=ref<'empty'|'copy'>('empty'),historySourceKind=ref<'instance'|
 const copyMode=ref<'sessions'|'full'>('sessions')
 const sourceHistory=ref<InstanceHistorySummary>(),historyLoading=ref(false),historyError=ref('')
 const pendingCopyPreview=ref<string>()
+const archiveOpen=ref(false),archives=ref<InstanceArchiveView[]>([]),archiveLoading=ref(false)
 let historyRequest=0,launchRequest=0
 const emptyHistory:InstanceHistorySummary={sessions:0,archived:0,projects:[],folders:[],unassigned:0,issues:[]}
 const selectedFolderKeys=ref<string[]>([])
@@ -648,16 +650,23 @@ async function start() {
 }
 async function stop(instance:InstanceView) {await manager.execute(()=>window.manager.stopInstance(instance.id))}
 async function focus(instance:InstanceView) {try{await window.manager.focusInstance(instance.id)}catch(cause){message.error(String(cause))}}
+async function loadArchives(){archiveLoading.value=true;try{archives.value=await window.manager.listInstanceArchives()}catch(cause){error.value=String(cause)}finally{archiveLoading.value=false}}
+async function openArchives(){archiveOpen.value=true;await loadArchives()}
 function remove(instance:InstanceView) {
-  Modal.confirm({title:`移除实例“${instance.name}”？`,content:instance.externalHome?'仅移除实例登记并归档本管理器的窗口与启动记录。已有目录及其中的配置、登录和会话保持原位；已有配置登记与凭据关联可继续在客户端配置页管理。':'实例文件会移至本应用的 instance-trash 目录保留，账号不受影响。',okText:instance.externalHome?'移除登记':'移除并归档',cancelText:'取消',
+  Modal.confirm({title:`将实例“${instance.name}”移入回收站？`,content:instance.externalHome?'仅移除实例登记并保留外部目录；本应用的窗口和启动记录会进入实例回收站。':'实例目录会移入实例回收站，账号、外部项目和会话不会被立即删除。之后可在“已归档实例”中恢复或永久删除。',okText:'移入回收站',cancelText:'取消',
     async onOk(){await manager.execute(()=>window.manager.removeInstance({id:instance.id,revision:instance.revision}))}})
 }
+async function restoreArchive(entry:InstanceArchiveView){
+  if(!entry.recoverable)return
+  if(await manager.execute(()=>window.manager.restoreInstanceArchive({id:entry.id,directory:entry.directory}))){message.success('实例已恢复');await loadArchives()}
+}
+function purgeArchive(entry:InstanceArchiveView){Modal.confirm({title:`永久删除归档实例“${entry.name}”？`,content:'归档目录及其中的配置、会话和工作文件将被永久删除，无法通过本应用恢复。外部目录不会被删除。',okText:'确认永久删除',okType:'danger',cancelText:'取消',async onOk(){if(await manager.execute(()=>window.manager.purgeInstanceArchive({id:entry.id,directory:entry.directory}))){message.success('归档已永久删除');await loadArchives()}}})}
 function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',content:'各实例的在途任务将中断，工作文件和会话保留。',okText:'停止全部',cancelText:'取消',async onOk(){await manager.execute(()=>window.manager.closeAllInstances())}})}
 </script>
 
 <template>
   <section class="instances-panel">
-    <div class="page-heading"><div><h1>实例</h1><p>选择客户端和兼容资源，从一个入口启动独立工作空间。</p></div><a-space wrap><a-button v-if="instances.some(value=>value.status!=='stopped')" @click="stopAll">停止全部</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('copy')">从已有目录复制</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('attach')">使用已有目录</a-button><a-button type="primary" @click="edit()"><PlusOutlined />创建实例</a-button></a-space></div>
+    <div class="page-heading"><div><h1>实例</h1><p>选择客户端和兼容资源，从一个入口启动独立工作空间。</p></div><a-space wrap><a-button @click="openArchives">已归档实例</a-button><a-button v-if="instances.some(value=>value.status!=='stopped')" @click="stopAll">停止全部</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('copy')">从已有目录复制</a-button><a-button :disabled="copyRunning||busy" @click="chooseExternal('attach')">使用已有目录</a-button><a-button type="primary" @click="edit()"><PlusOutlined />创建实例</a-button></a-space></div>
     <a-alert v-if="error&&!open&&!preview" type="error" :message="error" class="error-banner" />
     <a-card v-if="copyJob" class="instance-copy-job" size="small"><strong>{{copyJob.sourceName}} → {{copyJob.name}}</strong><p>{{copyJob.status==='scanning'?'正在检查来源':copyJob.status==='copying'?'正在创建会话快照':copyJob.status==='completed'?'副本已创建':copyJob.status==='cancelled'?'复制已取消':'复制未完成'}} · {{copyJob.copyMode==='full'?'完整复制':'仅迁移会话'}} · {{copyJob.files}} / {{copyJob.totalFiles}} 个文件 · {{size(copyJob.bytes)}} / {{size(copyJob.totalBytes)}}</p><a-progress v-if="copyRunning" :percent="copyJob.totalBytes?Math.min(99,Math.floor(copyJob.bytes/copyJob.totalBytes*100)):0" :show-info="false" /><p v-if="copyJob.copyMode==='sessions'" class="muted">只迁移会话 JSONL、会话索引数据库和项目分组状态；账号、配置、技能、缓存与桌面状态由新实例重新生成。</p><p v-else-if="copyJob.skipped" class="muted">已排除 {{copyJob.skipped}} 项登录文件、临时或缓存目录、工作树、后台状态及链接。</p><a-alert v-if="copyJob.omittedSessions" :message="`已跳过 ${copyJob.omittedSessions} 条文件已缺失的会话索引，来源数据未修改。`" type="warning" show-icon /><a-alert v-if="copyJob.error" :message="copyJob.error" type="error" /><a-space><a-button v-if="copyRunning" @click="cancelCopy">取消复制</a-button><template v-if="pendingCopyPreview===copyJob.id"><span class="muted">完成后打开启动预览</span><a-button type="link" @click="cancelCopyPreview">取消自动预览</a-button></template></a-space></a-card>
     <div class="toolbar"><a-input v-model:value="search" allow-clear placeholder="搜索实例、账号或模型" style="max-width:360px" @change="page=1" /><span class="toolbar-spacer" /><span class="muted">{{ instances.length }} 个实例</span><a-button @click="manager.load">刷新状态</a-button></div>
@@ -828,6 +837,15 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <p class="muted instance-local-api-note" v-else-if="preview?.connectionMode==='local_api'&&previewAccount?.kind==='oauth'">本地 API：使用绑定的 ChatGPT 账号转发请求，管理器记录网关调用。<span v-if="preview.launchMode!=='cli'">账号身份验证成功也会保留本地 API 网关界面。需要官方客户端原版界面时，请取消预览后编辑实例，选择「原生账号登录」。</span>停止后恢复原配置与登录文件；会话和工作文件保留。</p>
       <p class="muted" v-else>本地 API：使用所选供应商或 API 凭据连接。纯 API 凭据不会伪造 ChatGPT 登录身份；启动会创建独立连接，并备份、应用模型与连接配置。停止后恢复原配置；会话和工作文件保留。请求中的显式等级优先。</p>
       <a-alert v-if="manager.error" type="error" :message="manager.error" />
+    </a-modal>
+    <a-modal v-model:open="archiveOpen" title="已归档实例" :width="760" :footer="null">
+      <a-spin :spinning="archiveLoading">
+        <a-alert type="info" show-icon message="这里管理移入实例回收站的目录。外部目录始终保留原位；旧归档缺少档案时不能自动恢复。" />
+        <a-empty v-if="!archives.length" description="没有已归档实例" />
+        <a-list v-else :data-source="archives" item-layout="horizontal" class="instance-archive-list">
+          <template #renderItem="{item}"><a-list-item><a-list-item-meta :title="item.name" :description="`${new Date(item.archivedAt).toLocaleString()} · ${item.directory}`" /><template #actions><a-tag v-if="!item.recoverable" color="orange">无法恢复</a-tag><a-button v-if="item.recoverable" type="link" @click="restoreArchive(item)">恢复</a-button><a-button type="link" danger @click="purgeArchive(item)">永久删除</a-button></template><a-alert v-if="item.warning" type="warning" :message="item.warning" /></a-list-item></template>
+        </a-list>
+      </a-spin>
     </a-modal>
   </section>
 </template>

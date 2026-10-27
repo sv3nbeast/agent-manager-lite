@@ -46,7 +46,6 @@ import { ProviderProbes } from './providerProbe'
 import { ProviderModels } from './providerModels'
 import {ProviderUsageQueries} from './providerUsageRefresh'
 import { Instances } from './instances'
-import {scanInstanceStorage} from './instanceStorage'
 import {ExternalInstanceSources} from './externalInstanceSources'
 import { LocalAccess } from './localAccess'
 import {SessionCatalog} from './sessions'
@@ -564,7 +563,9 @@ async function main(): Promise<void> {
       }
       case 'cancelInstanceCopy': await instances.cancelCopy(z.string().uuid().parse(input));break
       case 'removeInstance': instances.remove(input); break
-      case 'scanInstanceStorage': return scanInstanceStorage(resolve(store.directory),store.read().instances??[])
+      case 'listInstanceArchives': return instances.listArchives()
+      case 'restoreInstanceArchive': instances.restoreArchive(input); break
+      case 'purgeInstanceArchive': instances.purgeArchive(input); break
       case 'previewInstanceLaunch': return instances.preview(input)
       case 'previewInstanceHistory': return instances.previewHistory(input)
       case 'startInstance': instances.start(z.string().uuid().parse(input)); break

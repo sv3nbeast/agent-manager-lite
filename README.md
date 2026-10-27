@@ -54,9 +54,6 @@
 
 Sub2API 额度查询独立于模型协议：OpenAI 与 Anthropic Messages 密钥均可查询各自额度。管理器复用供应商已识别的额度接口类型，优先访问 Sub2API 的 `/v1/usage`，保留旧接口回退，并在失败时区分超时、连接 / 代理和服务端拒绝。
 
-## 存储清单
-
-存储清单只读扫描受管实例、会话废纸篓备份及已识别的复制 / 归档暂存目录，按逻辑大小统计会话、SQLite、配置、技能、缓存等文件。暂存区和恢复记录损坏的备份只显示警告，不允许从该页直接删除；会话废纸篓须通过会话管理的恢复流程处理。APFS 克隆可能共用数据块，文件系统分配量只是估算，不等同于可回收空间。
 
 ## Claude 支持范围
 
@@ -177,6 +174,3 @@ npm run test:claude-desktop:runtime -- --upstream-proxy-file /absolute/path/prox
 项目代码按 [CC-BY-NC-SA-4.0](LICENSE) 分发。独立第三方依赖继续适用各自许可证，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
 部分 Codex 管理逻辑适配自 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools)，技术栈和视觉参考 [Kiro Manager Lite](https://github.com/lucks-cloud/kiro-manager-lite)。本项目为独立工具，与 OpenAI、Anthropic 或上述项目无官方关联。
-## 存储清单
-
-「存储清单」只读盘点本管理器的受管实例和可识别的历史归档，按会话文件、SQLite 数据库、配置、技能、缓存及其他文件列出逻辑大小和文件数。扫描跳过符号链接、外部工作目录与未识别归档，并在文件数、目录深度或扫描耗时达到上限时停止。APFS 克隆可能共享底层数据块，因此分配空间是估算值，不等于可回收空间。旧归档缺少来源清单时不能通过此页面恢复或删除。

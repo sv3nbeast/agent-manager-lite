@@ -20,7 +20,6 @@ import {builtInCatalog,parseNativeCatalog} from '../src/main/modelCatalog'
 import { MacDesktopRuntime, desktopEnvironment, macLaunchArgs, type DesktopRuntime, type DesktopPlan, type DesktopProcess } from '../src/main/instanceRuntime'
 import { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
 import { TokenAuthority } from '../src/main/tokens'
-import {scanInstanceStorage} from '../src/main/instanceStorage'
 
 class FixtureDesktop implements DesktopRuntime {
   readonly children=new Map<string,DesktopProcess>()
@@ -391,47 +390,36 @@ test('managed instances persist independently, expose config targets, reject sta
   assert.equal(existsSync(join(f.root,'config.toml')),false)
 })
 
-test('storage inventory is read-only, classifies managed files and exposes legacy trash without following links',async t=>{
-  const f=fixture(t),account=f.account(),instance=f.add(account.id,'Storage fixture'),home=instance.directory
-  mkdirSync(join(home,'sessions','2026'),{recursive:true})
-  mkdirSync(join(home,'skills','sample'),{recursive:true})
-  mkdirSync(join(home,'cache'),{recursive:true})
-  mkdirSync(join(home,'workspace','project'),{recursive:true})
-  writeFileSync(join(home,'sessions','2026','rollout-fixture.jsonl'),'conversation bytes')
-  writeFileSync(join(home,'skills','sample','SKILL.md'),'skill bytes')
-  writeFileSync(join(home,'cache','cache.bin'),'cache bytes')
-  writeFileSync(join(home,'workspace','project','README.md'),'workspace bytes')
-  writeFileSync(join(home,'settings.json'),'{}')
-  const trash=join(f.store.directory,'instance-trash'),archivedId=randomUUID(),archivedName=archivedId+'-'+String(Date.now())
-  mkdirSync(join(trash,archivedName,'home','sessions'),{recursive:true})
-  writeFileSync(join(trash,archivedName,'home','sessions','old.jsonl'),'old archived bytes')
-  mkdirSync(join(trash,'unknown-future-archive','home'),{recursive:true})
-  writeFileSync(join(trash,'unknown-future-archive','home','do-not-scan.bin'),'unknown')
-  mkdirSync(join(f.root,'external-workspace'),{recursive:true});writeFileSync(join(f.root,'external-workspace','external.txt'),'outside')
-  symlinkSync(join(f.root,'external-workspace'),join(home,'linked-workspace'),'dir')
-  const before=readFileSync(join(f.store.directory,'state.vault'))
-  const inventory=await scanInstanceStorage(realpathSync(f.store.directory),f.store.read().instances??[],1234)
-  const managed=inventory.rows.find(row=>row.kind==='managed'&&row.id===instance.id)!
-  const legacy=inventory.rows.find(row=>row.kind==='legacy_trash'&&row.id===archivedId)!
-  assert.equal(inventory.capturedAt,1234)
-  assert.ok(managed.logicalBytes>0);assert.ok(managed.files>0)
-  assert.equal(managed.categories.find(row=>row.category==='sessions')?.files,1)
-  assert.equal(managed.categories.find(row=>row.category==='skills')?.files,1)
-  assert.equal(managed.categories.find(row=>row.category==='cache')?.files,1)
-  assert.equal(managed.categories.find(row=>row.category==='workspace')?.files,1)
-  assert.equal(legacy.warning?.includes('旧归档没有来源清单'),true)
-  assert.equal(inventory.rows.some(row=>row.name==='unknown-future-archive'),false)
-  assert.equal(inventory.rows.some(row=>row.directory.includes('external-workspace')),false)
-  assert.equal(inventory.rows.some(row=>row.directory.includes('linked-workspace')),false)
-  assert.deepEqual(readFileSync(join(f.store.directory,'state.vault')),before)
-  assert.equal(readFileSync(join(home,'sessions','2026','rollout-fixture.jsonl'),'utf8'),'conversation bytes')
-  const partial=await scanInstanceStorage(realpathSync(f.store.directory),f.store.read().instances??[],1234,{maxFiles:1})
-  assert.ok(partial.warnings.some(warning=>warning.includes('已停止')||warning.includes('安全扫描上限')))
-  assert.ok(partial.files<=1)
-  const depthLimited=await scanInstanceStorage(realpathSync(f.store.directory),f.store.read().instances??[],1234,{maxDepth:1})
-  assert.ok(depthLimited.warnings.some(warning=>warning.includes('安全扫描深度')))
+test('instance archive list restores a manifest-backed instance and permanently purges only the selected archive',async t=>{
+  const f=fixture(t),account=f.account(),instance=f.add(account.id,'Archive lifecycle')
+  writeFileSync(join(instance.directory,'archive-fixture'),'keep me')
+  f.instances.remove({id:instance.id,revision:instance.revision})
+  const archived=f.instances.listArchives(),entry=archived.find(value=>value.id===instance.id)
+  assert.ok(entry);assert.equal(entry!.recoverable,true);assert.equal(entry!.profile?.name,'Archive lifecycle');assert.ok(existsSync(join(entry!.directory,'instance-archive.json')))
+  f.instances.restoreArchive({id:entry!.id,directory:entry!.directory})
+  const restored=f.instances.views().find(value=>value.id===instance.id)
+  assert.equal(restored?.name,'Archive lifecycle');assert.equal(readFileSync(join(restored!.directory,'archive-fixture'),'utf8'),'keep me')
+  f.instances.remove({id:restored!.id,revision:restored!.revision})
+  const second=f.instances.listArchives().find(value=>value.id===instance.id);assert.ok(second)
+  f.instances.purgeArchive({id:second!.id,directory:second!.directory})
+  assert.equal(f.instances.listArchives().some(value=>value.id===instance.id),false);assert.equal(existsSync(second!.directory),false);assert.equal(f.store.read().accounts.length,1)
 })
 
+test('external instance archive restores its registration without deleting the external directory',async t=>{
+  const f=fixture(t),account=f.account(),external=join(f.root,'external-home');mkdirSync(external);writeFileSync(join(external,'keep'),'outside')
+  const selected=f.instances.selectCopySource(external,'attach'),details={name:'External archive',applicationId:f.app.id,accountId:account.id,model:'fixture-model',connectionMode:'local_api' as const,extraArgs:[]}
+  await f.instances.attachExisting({ticket:selected.ticket,sourceClosed:true,details})
+  const instance=f.instances.views()[0]!;f.instances.remove({id:instance.id,revision:instance.revision})
+  const entry=f.instances.listArchives().find(value=>value.id===instance.id)!;assert.equal(entry.externalHome?.directory,realpathSync(external))
+  f.instances.restoreArchive({id:entry.id,directory:entry.directory});assert.equal(f.instances.views()[0]?.externalHome?.directory,realpathSync(external));assert.equal(readFileSync(join(external,'keep'),'utf8'),'outside')
+})
+
+test('legacy instance archives are visible but cannot be guessed into a restored profile',t=>{
+  const f=fixture(t),id=randomUUID(),directory=join(f.store.directory,'instance-trash',`${id}-${Date.now()}`)
+  mkdirSync(join(directory,'home'),{recursive:true});writeFileSync(join(directory,'home','legacy-data'),'preserved')
+  const entry=f.instances.listArchives().find(value=>value.id===id)!;assert.equal(entry.recoverable,false);assert.throws(()=>f.instances.restoreArchive({id,directory}),/缺少可验证档案/)
+  f.instances.purgeArchive({id,directory:entry.directory});assert.equal(existsSync(entry.directory),false)
+})
 
 test('two instances own different gateways and credentials; Fast/Standard reach real upstream and stopping one preserves the other',async t=>{
   const received:{key:string|undefined;tier:unknown}[]=[]

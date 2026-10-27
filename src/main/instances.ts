@@ -1,9 +1,9 @@
 import type {NativeProxyService,NativeProxyLease} from './nativeProxy'
 import {accountProxyURL,defaultProxyURL} from './proxyPolicy'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, realpathSync, statSync, renameSync, rmSync, readdirSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync, statSync, renameSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import {mkdir,rename,rm} from 'node:fs/promises'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { z } from 'zod'
 import { isClaudeDesktopProfile, instanceRevisionSchema, saveInstanceSchema, copyInstanceSchema, copyExternalInstanceSchema, attachInstanceSchema, type ExternalInstanceHome, type InstanceCopySource, type InstanceInput, type InstanceCopyView, type InstanceApplication, type InstanceProfile, type InstanceView, type InstanceLaunchPreview, type InstanceWorkingDirectory, type InstanceCopyMode } from '../shared/instances'
 import { resolveServiceTier } from '../shared/serviceTier'
@@ -43,6 +43,7 @@ import {repairSessionProjection} from './sessionProjectionRepair'
 import {readSessionRolloutIndex} from './sessionDisplay'
 import {readInstanceIdentityStatus} from './instanceIdentityStatus'
 import type {prepareCodexSharedSkills} from './codexSkills'
+import { instanceArchiveManifestSchema, type InstanceArchiveManifest, type InstanceArchiveView, instanceArchiveSelectionSchema } from '../shared/instanceRecycle'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
 export interface InstanceSkillsServices {prepare:typeof prepareCodexSharedSkills}
@@ -354,7 +355,9 @@ export class Instances {
     if(hasAuthority&&!profile.externalHome)throw new Error('请先解除此实例的客户端凭据关联')
     if(this.inUse(id) || profile.revision!==revision)throw new Error('实例正在运行或已变化，请先停止并刷新')
     const folder=this.folder(id),trash=join(this.root,'instance-trash');directory(trash,true)
-    const archived=join(trash,`${id}-${Date.now()}`)
+    const archivedAt=Date.now(),archived=join(trash,`${id}-${archivedAt}`)
+    const manifest:InstanceArchiveManifest={version:1,id,archivedAt,profile:structuredClone(profile) as unknown as Record<string,unknown>,...(profile.externalHome?{externalHome:structuredClone(profile.externalHome)}:{})}
+    atomic(join(folder,'instance-archive.json'),JSON.stringify(manifest,null,2)+'\n')
     renameSync(folder,archived)
     try {this.store.transaction(state=>{
       state.instances=state.instances!.filter(value=>value.id!==id)
@@ -363,8 +366,42 @@ export class Instances {
         state.configTargets=[...(state.configTargets??[]).filter(target=>target.id!==id),{id,name:home.previousTargetName??profile.name,directory:home.directory,managed:false,device:home.device,inode:home.inode}]
       }
     })}
-    catch(error){renameSync(archived,folder);throw error}
+    catch(error){renameSync(archived,folder);rmSync(join(folder,'instance-archive.json'),{force:true});throw error}
     this.previews.delete(id)
+  }
+  private archiveManifest(directory:string):InstanceArchiveManifest|undefined {
+    try { const manifest=instanceArchiveManifestSchema.parse(JSON.parse(readFileSync(join(directory,'instance-archive.json'),'utf8')));if(manifest.profile.id!==manifest.id)throw new Error('归档档案 ID 不一致');return manifest } catch { return undefined }
+  }
+  listArchives():InstanceArchiveView[] {
+    const trash=join(this.root,'instance-trash');if(!existsSync(trash))return []
+    const rows:InstanceArchiveView[]=[]
+    for(const name of readdirSync(trash)){
+      const directory=join(trash,name);let stat:ReturnType<typeof lstatSync>
+      try{stat=lstatSync(directory);if(stat.isSymbolicLink()||!stat.isDirectory()||realpathSync(directory)!==directory)continue}catch{continue}
+      const manifest=this.archiveManifest(directory),match=name.match(/^([0-9a-f-]{36})-(\d{13})$/i),id=manifest?.id??match?.[1]
+      if(!id)continue
+      const profile=manifest?.profile as InstanceProfile|undefined
+      rows.push({id,directory,name:profile?.name??'未知归档实例',archivedAt:manifest?.archivedAt??Number(match?.[2]??0),...(profile?{profile}:{ }),recoverable:!!manifest, ...(manifest?.externalHome?{externalHome:{directory:manifest.externalHome.directory,device:manifest.externalHome.device,inode:manifest.externalHome.inode}}:{}),...(manifest?{}:{warning:'旧归档缺少可验证的实例档案，只能永久删除，不能自动恢复'})})
+    }
+    return rows.sort((a,b)=>b.archivedAt-a.archivedAt)
+  }
+  restoreArchive(raw:unknown):void {
+    const input=instanceArchiveSelectionSchema.parse(raw),entry=this.listArchives().find(value=>value.id===input.id&&value.directory===input.directory)
+    if(!entry||!entry.recoverable||!entry.profile)throw new Error('此归档缺少可验证档案，无法恢复')
+    const directoryPath=realpathSync(input.directory);if(directoryPath!==input.directory)throw new Error('归档目录身份异常')
+    if((this.store.read().instances??[]).some(value=>value.id===entry.id)||existsSync(join(this.root,'instances',entry.id)))throw new Error('实例 ID 已被占用，请先处理同名实例')
+    const profile=entry.profile
+    if(profile.externalHome){const home=validateExternalHome(this.root,profile.externalHome);if(home!==profile.externalHome.directory)throw new Error('外部目录身份已变化，请重新选择')}
+    const target=join(this.root,'instances',entry.id);renameSync(directoryPath,target)
+    try{this.store.transaction(state=>{state.instances=[...(state.instances??[]),profile];if(profile.externalHome)state.configTargets=(state.configTargets??[]).filter(value=>value.id!==profile.id)})}
+    catch(error){renameSync(target,directoryPath);throw error}
+  }
+  purgeArchive(raw:unknown):void {
+    const input=instanceArchiveSelectionSchema.parse(raw),entry=this.listArchives().find(value=>value.id===input.id&&value.directory===input.directory)
+    if(!entry)throw new Error('归档不存在或已变化，请刷新回收站')
+    const directoryPath=realpathSync(input.directory);if(directoryPath!==input.directory||!pathContains(this.root,directoryPath)||basename(dirname(directoryPath))!=='instance-trash')throw new Error('归档目录身份异常')
+    if(this.store.read().instances?.some(value=>value.id===entry.id))throw new Error('归档对应实例已重新登记，请刷新后重试')
+    rmSync(directoryPath,{recursive:true,force:false})
   }
   private plan(profile:InstanceProfile,nonce:string,claudeWorkingDirectory?:ClaudeWorkingDirectory):DesktopPlan {
     const application=this.applications().find(app=>app.id===profile.applicationId)

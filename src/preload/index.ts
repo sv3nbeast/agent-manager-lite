@@ -2,7 +2,6 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { ManagerAPI } from '../shared/types'
 
 const api: ManagerAPI = {
-  scanInstanceStorage: () => ipcRenderer.invoke('manager:invoke','scanInstanceStorage'),
   exportDataBackup:input=>ipcRenderer.invoke('manager:invoke','exportDataBackup',input),
   previewDataBackup:input=>ipcRenderer.invoke('manager:invoke','previewDataBackup',input),
   restoreDataBackup:input=>ipcRenderer.invoke('manager:invoke','restoreDataBackup',input),
@@ -144,6 +143,9 @@ const api: ManagerAPI = {
   chooseInstanceWorkingDirectory: () => ipcRenderer.invoke('manager:invoke','chooseInstanceWorkingDirectory'),
   listInstanceWorkingDirectories: () => ipcRenderer.invoke('manager:invoke','listInstanceWorkingDirectories'),
   removeInstance: input => ipcRenderer.invoke('manager:invoke','removeInstance',input),
+  listInstanceArchives: () => ipcRenderer.invoke('manager:invoke','listInstanceArchives'),
+  restoreInstanceArchive: input => ipcRenderer.invoke('manager:invoke','restoreInstanceArchive',input),
+  purgeInstanceArchive: input => ipcRenderer.invoke('manager:invoke','purgeInstanceArchive',input),
   previewInstanceLaunch: input => ipcRenderer.invoke('manager:invoke','previewInstanceLaunch',input),
   previewInstanceHistory: input => ipcRenderer.invoke('manager:invoke','previewInstanceHistory',input),
   startInstance: ticket => ipcRenderer.invoke('manager:invoke','startInstance',ticket),

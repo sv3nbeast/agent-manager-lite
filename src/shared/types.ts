@@ -12,6 +12,7 @@ import type { ProviderSummary, ProviderMutation } from './providerLibrary'
 import type { ProviderProbeInput, ProviderProbeState } from './providerProbe'
 import type { LocalAccessMutation,LocalAccessView } from './localAccess'
 import type { InstanceProfile, InstanceView, InstanceApplication, InstanceInput, InstanceLaunchPreview, InstanceWorkingDirectory, InstanceCopyInput, InstanceCopyView, InstanceCopySource, ExternalInstanceCopyInput, AttachInstanceInput, InstanceHistorySummary, ExternalInstanceDiscovery } from './instances'
+import type { InstanceArchiveView, InstanceArchiveSelection } from './instanceRecycle'
 import type {ClientIdentityInput,ClientIdentityView} from './clientIdentity'
 import type {ClientSwitchView,ClientSwitchPreview} from './clientSwitch'
 import type {ClientAuthorityView} from './clientAuthority'
@@ -152,7 +153,6 @@ export interface InstanceApplicationChoice { application?:InstanceApplication; s
 export interface ImportPreview { entries: { index: number; name: string; kind: Account['kind']; needsVerification?: boolean }[]; errors: string[]; skipped?: number }
 export interface StagedImport { ticket: string; preview: ImportPreview; fileName?: string }
 export interface ManagerAPI {
-  scanInstanceStorage():Promise<import('./instanceStorage').InstanceStorageInventory>
   listSshServers():Promise<SshServersView>
   saveSshServer(input:SshServerInput):Promise<AppSnapshot>
   deleteSshServer(id:string):Promise<AppSnapshot>
@@ -294,6 +294,9 @@ export interface ManagerAPI {
   chooseInstanceWorkingDirectory():Promise<InstanceWorkingDirectory|undefined>
   listInstanceWorkingDirectories():Promise<InstanceWorkingDirectory[]>
   removeInstance(input:Pick<InstanceProfile,'id'|'revision'>):Promise<AppSnapshot>
+  listInstanceArchives():Promise<InstanceArchiveView[]>
+  restoreInstanceArchive(input:InstanceArchiveSelection):Promise<AppSnapshot>
+  purgeInstanceArchive(input:InstanceArchiveSelection):Promise<AppSnapshot>
   previewInstanceLaunch(input:Pick<InstanceProfile,'id'|'revision'>):Promise<InstanceLaunchPreview>
   previewInstanceHistory(input:Pick<InstanceProfile,'id'|'revision'>):Promise<InstanceHistorySummary>
   startInstance(ticket:string):Promise<AppSnapshot>

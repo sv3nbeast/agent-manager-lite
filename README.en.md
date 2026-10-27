@@ -173,6 +173,3 @@ The proxy file must contain only the proxy URL, belong to the current user and h
 Project code is distributed under [CC-BY-NC-SA-4.0](LICENSE). Third-party dependencies retain their own licenses; see [Third-party notices](THIRD_PARTY_NOTICES.md).
 
 Parts of the Codex management logic are adapted from [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools). The technology stack and visual direction are inspired by [Kiro Manager Lite](https://github.com/lucks-cloud/kiro-manager-lite). This is an independent tool with no official affiliation with OpenAI, Anthropic or those projects.
-## Storage inventory
-
-The Storage page read-only scans manager-owned instances, session-trash backups and recognized copy / archive staging directories, reporting logical bytes and file counts for conversation files, SQLite databases, configuration, skills, cache and other files. It skips symbolic links, external workspaces and unrecognized archives, and stops at file-count, nesting-depth or time limits. Damaged recovery journals and staging entries are warnings only and cannot be deleted from this page; process session-trash backups through the Sessions recovery workflow. APFS clones may share underlying blocks, so allocated space is an estimate rather than guaranteed reclaimable space. Legacy archives without a source manifest cannot be restored or deleted from this page.
