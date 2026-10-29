@@ -384,7 +384,7 @@ try {
   for(let i=0;i<50;i++){if(await evaluate('!!document.querySelector(".instance-wizard")'))break;await delay(50)}
   assert.deepEqual(await evaluate('Array.from(document.querySelectorAll(".instance-step")).filter(el=>el.getClientRects().length).map(el=>el.dataset.step)'),['0'])
   assert.equal(await evaluate('document.querySelector("[aria-label=实例客户端]").closest(".ant-select").textContent'),'Codex')
-  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll(".instance-wizard-steps .ant-steps-item-title")).map(el=>el.textContent)'),['客户端','账号或供应商','项目与配置','确认'])
+  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll(".instance-wizard-steps .ant-steps-item-title")).map(el=>el.textContent)'),['客户端','连接资源','项目与配置','确认'])
   assert.equal(await evaluate('Array.from(document.querySelectorAll(".instance-editor input")).some(el=>el.getClientRects().length&&el.getAttribute("aria-label")==="实例名称")'),false)
   assert.equal(await evaluate('document.querySelector(".instance-wizard").closest(".ant-modal-content").querySelector(".ant-modal-footer button.ant-btn-primary").textContent.replace(/\\s/g,"")'),'下一步')
   await evaluate('document.querySelector(".instance-wizard").closest(".ant-modal-content").querySelector(".ant-modal-close").click()')
