@@ -9,6 +9,7 @@ import {ClientConfigs,readBounded} from './clientConfig'
 import {probeClientDaemon} from './clientDaemon'
 import {safeSessionPath} from './sessionFiles'
 import {TomlDocument} from './tomlPatch'
+import {hasIndexedRolloutBytes} from './codexRolloutMetadata'
 import type {ClientConfigTarget} from '../shared/clientConfig'
 import {sessionVisibilityRepairApplySchema,sessionVisibilityRepairInputSchema,type SessionVisibilityRepairInput,type SessionVisibilityRepairInstanceList,type SessionVisibilityRepairInstance,type SessionVisibilityRepairItem,type SessionVisibilityRepairPreview,type SessionVisibilityRepairProviderList,type SessionVisibilityRepairProvider,type SessionVisibilityRepairSummary} from '../shared/sessionVisibility'
 
@@ -118,6 +119,7 @@ function repairContent(content:string,provider:string):string|undefined {
       const value=JSON.parse(line) as Record<string,unknown>
       if(value?.type!=='session_meta'||!value.payload||typeof value.payload!=='object')return segment
       found=true
+      if(hasIndexedRolloutBytes(value))return segment
       const payload=value.payload as Record<string,unknown>
       if(payload.model_provider===provider)return segment
       payload.model_provider=provider;changed=true

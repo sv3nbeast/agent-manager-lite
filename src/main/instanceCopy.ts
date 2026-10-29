@@ -12,6 +12,7 @@ import {atomic,readBounded} from './clientConfig'
 import {TomlDocument,patchToml,scalarRaw,type TomlEdit} from './tomlPatch'
 import {copiedProjectStateFile,copiedProjectStateLimit,projectCopiedProjectState} from './copiedProjectState'
 import {excludedInstanceCopyTree} from './instanceCopyScope'
+import {hasIndexedRolloutBytes} from './codexRolloutMetadata'
 
 export interface CopyEntry {relative:string;directory:boolean;dev:number;ino:number;size:number;mtime:number;ctime:number;mode:number}
 type Entry=CopyEntry
@@ -115,6 +116,7 @@ export async function copyInstanceHome(manifest:CopyManifest,target:string,signa
 export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:string,finalHome:string,signal:AbortSignal,targetProvider?:string):Promise<void>{
   if(targetProvider!==undefined&&(!targetProvider||targetProvider.length>200||/[\r\n\0]/.test(targetProvider)))throw new Error('副本会话 Provider 无效，未创建副本')
   const copied=new Set(manifest.entries.map(entry=>entry.relative))
+  const hasCopiedRollout=(suffix:string)=>copied.has(suffix)||/\.jsonl$/i.test(suffix)&&copied.has(suffix+'.zst')
   const rollouts=new Map<string,boolean>()
   if(targetProvider!==undefined)for(const entry of manifest.entries){
     const parts=entry.relative.split(sep)
@@ -124,7 +126,7 @@ export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:str
     if(!isAbsolute(value))return undefined
     const suffix=relative(manifest.root,value)
     if(suffix==='..'||suffix.startsWith('..'+sep)||isAbsolute(suffix))return undefined
-    if(requireCopied&&!copied.has(suffix))throw new Error('会话索引引用了未复制的来源文件，未创建副本')
+    if(requireCopied&&!hasCopiedRollout(suffix))throw new Error('会话索引引用了未复制的来源文件，未创建副本')
     return join(finalHome,suffix)
   }
   const projectStateEntry=manifest.entries.find(entry=>!entry.directory&&entry.relative.toLowerCase()===copiedProjectStateFile)
@@ -190,7 +192,7 @@ export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:str
                 // Relative session paths remain relative, but external absolute
                 // references cannot become shared writable session files.
                 const suffix=relative(manifest.root,join(manifest.root,row.rollout_path))
-                if(isAbsolute(row.rollout_path)||!copied.has(suffix))throw new Error('Session outside copied profile')
+                if(isAbsolute(row.rollout_path)||!hasCopiedRollout(suffix))throw new Error('Session outside copied profile')
                 if(targetProvider!==undefined)rollouts.set(suffix,true)
               }
             }
@@ -212,6 +214,7 @@ export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:str
   }
   if(targetProvider!==undefined)for(const [path,required]of rollouts){
     signal.throwIfAborted()
+    if(/\.jsonl\.zst$/i.test(path)||!copied.has(path)&&copied.has(path+'.zst'))continue
     await relocateRolloutProvider(join(stagedHome,path),targetProvider,signal,required)
   }
 }
@@ -275,6 +278,10 @@ async function relocateRolloutProvider(path:string,provider:string,signal:AbortS
       if(prefix.length>=8*1024*1024)throw new Error('会话元数据超过可迁移范围，未创建副本')
     }
     if(!meta){if(required)throw new Error('会话缺少可识别的元数据，未创建副本');return}
+    // SQLite's provider is updated above for target visibility. Keep the
+    // durable paginated rollout byte-for-byte so its projection and all fork
+    // boundaries still refer to the same bytes, including compressed ancestors.
+    if(hasIndexedRolloutBytes(meta.value))return
     const payload=meta.value.payload as Record<string,unknown>
     if(payload.model_provider===provider)return
     payload.model_provider=provider

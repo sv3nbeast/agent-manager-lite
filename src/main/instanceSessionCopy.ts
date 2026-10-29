@@ -10,6 +10,7 @@ import {readBounded} from './clientConfig'
 import {configuredSessionDatabaseHome} from './sessionDatabase'
 import {excludedInstanceCopyTree} from './instanceCopyScope'
 import type {CopyEntry,CopyManifest} from './instanceCopy'
+import {isRolloutFile} from './codexRolloutMetadata'
 
 const signature=(relativePath:string,stat:Stats):CopyEntry=>({relative:relativePath,directory:stat.isDirectory(),dev:stat.dev,ino:stat.ino,size:stat.size,mtime:stat.mtimeMs,ctime:stat.ctimeMs,mode:stat.mode})
 const inside=(root:string,path:string)=>{const part=relative(root,path);return part!== '..'&&!part.startsWith('..'+sep)&&!isAbsolute(part)}
@@ -71,7 +72,7 @@ export async function scanSessionHome(root:string,signal:AbortSignal):Promise<Co
       signal.throwIfAborted()
       const child=join(relativePath,name),childStat=await lstat(join(canonical,child))
       if(regularDirectory(childStat))await walkJsonl(child)
-      else if(regularFile(childStat)&&/\.jsonl$/i.test(name))await addFile(child)
+      else if(regularFile(childStat)&&isRolloutFile(name))await addFile(child)
       else if(!regularFile(childStat)&&!regularDirectory(childStat))throw new Error(`会话目录包含不支持的文件（${child}），未创建副本`)
     }
   }

@@ -4,9 +4,10 @@ import {appendFileSync,copyFileSync,mkdirSync,mkdtempSync,readFileSync,readdirSy
 import {join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {DatabaseSync} from 'node:sqlite'
+import {zstdCompressSync} from 'node:zlib'
 import {scanInstanceHome,copyInstanceHome,relocateCopiedProfile} from '../src/main/instanceCopy'
 import {scanSessionHome} from '../src/main/instanceSessionCopy'
-import {copySavedInstanceHome,normalizeSessionDatabaseCopy,filterSessionSnapshot} from '../src/main/instanceCopySnapshot'
+import {copySavedInstanceHome,normalizeSessionDatabaseCopy,filterSessionSnapshot,selectSessionManifest} from '../src/main/instanceCopySnapshot'
 
 const supported=process.platform==='darwin'
 function fixture(t:{after(fn:()=>void):void}){
@@ -16,6 +17,75 @@ function fixture(t:{after(fn:()=>void):void}){
 }
 const meta=JSON.stringify({type:'session_meta',payload:{id:'thread',model_provider:'original'}})+'\n'
 const line=JSON.stringify({type:'response_item',payload:{text:'完整内容 汉字 😀'}})+'\n'
+function createCodexTimestampTriggers(db:DatabaseSync){
+  db.exec(`CREATE TRIGGER threads_created_at_ms_after_insert
+AFTER INSERT ON threads
+WHEN NEW.created_at_ms IS NULL
+BEGIN
+    UPDATE threads
+    SET created_at_ms = NEW.created_at * 1000
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_created_at_ms_after_update
+AFTER UPDATE OF created_at ON threads
+WHEN NEW.created_at != OLD.created_at
+ AND NEW.created_at_ms IS OLD.created_at_ms
+BEGIN
+    UPDATE threads
+    SET created_at_ms = NEW.created_at * 1000
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_recency_at_after_insert
+AFTER INSERT ON threads
+WHEN NEW.recency_at_ms = 0
+BEGIN
+    UPDATE threads
+    SET recency_at = NEW.updated_at,
+        recency_at_ms = COALESCE(NEW.updated_at_ms, NEW.updated_at * 1000)
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_updated_at_ms_after_insert
+AFTER INSERT ON threads
+WHEN NEW.updated_at_ms IS NULL
+BEGIN
+    UPDATE threads
+    SET updated_at_ms = NEW.updated_at * 1000
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_updated_at_ms_after_update
+AFTER UPDATE OF updated_at ON threads
+WHEN NEW.updated_at != OLD.updated_at
+ AND NEW.updated_at_ms IS OLD.updated_at_ms
+BEGIN
+    UPDATE threads
+    SET updated_at_ms = NEW.updated_at * 1000
+    WHERE id = NEW.id;
+END;`)
+}
+
+test('session selection and provider relocation preserve compressed paginated ancestors byte for byte',async t=>{
+  const f=fixture(t),parent=Buffer.from(JSON.stringify({type:'session_meta',ordinal:0,payload:{id:'chosen',cwd:'/fixture/project',history_mode:'paginated',model_provider:'codex_local_access'}})+'\n'+line)
+  const compressed=zstdCompressSync(parent),ancestor=join(f.source,'sessions','rollout-parent.jsonl.zst')
+  writeFileSync(ancestor,compressed)
+  const child=JSON.stringify({type:'session_meta',ordinal:2,payload:{id:'chosen',cwd:'/fixture/project',history_mode:'paginated',model_provider:'codex_local_access',history_base:{thread_id:'parent',end_byte_offset:parent.length,end_ordinal_exclusive:2}}})+'\n'
+  writeFileSync(join(f.source,'sessions','rollout-child.jsonl'),child)
+  writeFileSync(join(f.source,'sessions','rollout-omit.jsonl.zst'),zstdCompressSync(Buffer.from(meta+line)))
+  const db=new DatabaseSync(join(f.source,'state_5.sqlite'))
+  db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT)')
+  db.prepare('INSERT INTO threads VALUES(?,?,?)').run('chosen',ancestor.slice(0,-4),'codex_local_access');db.close()
+  const manifest=await scanSessionHome(f.source,f.signal)
+  assert.ok(manifest.entries.some(entry=>entry.relative.endsWith('rollout-parent.jsonl.zst')))
+  const saved=await copySavedInstanceHome(manifest,f.target,f.signal,()=>{})
+  assert.equal(saved.omittedSessions,0,'A logical JSONL index remains valid when only its Zstandard representation exists')
+  await relocateCopiedProfile(saved,f.target,join(f.root,'final'),f.signal,'cml_instance')
+  await filterSessionSnapshot(f.target,new Set(['chosen']),f.signal)
+  assert.deepEqual(readFileSync(join(f.target,'sessions','rollout-parent.jsonl.zst')),compressed)
+  assert.equal(readFileSync(join(f.target,'sessions','rollout-child.jsonl'),'utf8'),child)
+  assert.equal(existsSync(join(f.target,'sessions','rollout-omit.jsonl.zst')),false)
+  assert.deepEqual(readFileSync(ancestor),compressed)
+  const copied=new DatabaseSync(join(f.target,'state_5.sqlite'),{readOnly:true})
+  try{assert.deepEqual({...copied.prepare('SELECT * FROM threads').get()},{id:'chosen',rollout_path:join(f.root,'final','sessions','rollout-parent.jsonl'),model_provider:'cml_instance'})}finally{copied.close()}
+})
 
 test('session-only inventory ignores large configuration, skills, caches and desktop state',async t=>{
   const f=fixture(t)
@@ -50,6 +120,76 @@ test('selected folder snapshot keeps only chosen rollout and matching state and 
   const copied=new DatabaseSync(join(f.target,'state_5.sqlite'),{readOnly:true});try{assert.deepEqual(copied.prepare('SELECT id FROM threads').all().map(row=>row.id),['chosen']);assert.deepEqual(copied.prepare('SELECT name FROM thread_dynamic_tools').all().map(row=>row.name),['keep']);assert.deepEqual(copied.prepare('PRAGMA foreign_key_check').all(),[])}finally{copied.close()}
   const projection=new DatabaseSync(join(f.target,'thread_history_1.sqlite'),{readOnly:true});try{for(const table of ['thread_history_projection_state','thread_turns','thread_items','thread_realtime_items'])assert.deepEqual(projection.prepare('SELECT DISTINCT thread_id FROM '+table).all().map(row=>row.thread_id),['chosen'])}finally{projection.close()}
   const stateJson=JSON.parse(readFileSync(join(f.target,'.codex-global-state.json'),'utf8'));assert.deepEqual(Object.keys(stateJson['thread-project-assignments']),['chosen']);assert.deepEqual(Object.keys(stateJson['thread-workspace-root-hints']),['chosen'])
+})
+
+test('selected session manifest excludes unselected rollout bytes before staging',{skip:process.platform==='win32'},async t=>{
+  const f=fixture(t),keep=JSON.stringify({type:'session_meta',payload:{id:'keep'}})+'\n'+line,omit=JSON.stringify({type:'session_meta',payload:{id:'omit'}})+'\n'+line
+  mkdirSync(join(f.source,'sessions','2026','10'),{recursive:true})
+  writeFileSync(join(f.source,'sessions','2026','10','rollout-keep.jsonl'),keep);writeFileSync(join(f.source,'sessions','2026','10','rollout-omit.jsonl'),omit)
+  const manifest=await scanInstanceHome(f.source,f.signal,true),selected=await selectSessionManifest(manifest,new Set(['keep']),f.signal)
+  assert.deepEqual(selected.entries.filter(entry=>!entry.directory).map(entry=>entry.relative),['sessions/2026/10/rollout-keep.jsonl'])
+  assert.equal(selected.bytes,Buffer.byteLength(keep));assert.equal(manifest.bytes>selected.bytes,true)
+})
+
+test('strict selected snapshot reconcile does not re-add omitted SQLite rollouts',{skip:process.platform==='win32'},async t=>{
+  const f=fixture(t),keep=join(f.source,'sessions','rollout-keep.jsonl'),omit=join(f.source,'sessions','rollout-omit.jsonl')
+  writeFileSync(keep,JSON.stringify({type:'session_meta',payload:{id:'keep'}})+'\n'+line)
+  writeFileSync(omit,JSON.stringify({type:'session_meta',payload:{id:'omit'}})+'\n'+line)
+  const db=new DatabaseSync(join(f.source,'state_5.sqlite'))
+  db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,created_at INTEGER,created_at_ms INTEGER,updated_at INTEGER,updated_at_ms INTEGER,recency_at INTEGER,recency_at_ms INTEGER)')
+  createCodexTimestampTriggers(db)
+  const insert=db.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)')
+  insert.run('keep',keep,'original',100,null,200,null,200,0);insert.run('omit',omit,'original',100,null,200,null,200,0);db.close()
+  const manifest=await scanInstanceHome(f.source,f.signal,true),selected=await selectSessionManifest(manifest,new Set(['keep']),f.signal)
+  const target=join(f.root,'strict-target'),saved=await copySavedInstanceHome(selected,target,f.signal,()=>{},{strictSessionSelection:true})
+  assert.equal(saved.omittedSessions,1)
+  assert.equal(existsSync(join(target,'sessions','rollout-keep.jsonl')),true)
+  assert.equal(existsSync(join(target,'sessions','rollout-omit.jsonl')),false)
+  const copied=new DatabaseSync(join(target,'state_5.sqlite'),{readOnly:true})
+  try{assert.deepEqual(copied.prepare('SELECT id FROM threads ORDER BY id').all().map(row=>row.id),['keep'])}finally{copied.close()}
+})
+
+test('folder pruning preserves only the five pinned Codex thread timestamp triggers and rejects trigger drift',{skip:process.platform==='win32'},async t=>{
+  const make=async(root:string,unknown=false)=>{
+    const state=join(root,'state_5.sqlite'),db=new DatabaseSync(state)
+    db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,created_at INTEGER,created_at_ms INTEGER,updated_at INTEGER,updated_at_ms INTEGER,recency_at INTEGER,recency_at_ms INTEGER)')
+    createCodexTimestampTriggers(db)
+    const rollout=join(root,'sessions','rollout-selected.jsonl');writeFileSync(rollout,JSON.stringify({type:'session_meta',payload:{id:'selected'}})+'\n'+line)
+    db.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)').run('selected',rollout,'original',100,null,200,null,200,0);db.close()
+    if(unknown){const alter=new DatabaseSync(state);alter.exec('CREATE TRIGGER user_thread_delete AFTER DELETE ON threads BEGIN SELECT 1; END');alter.close()}
+    return state
+  }
+  const f=fixture(t),target=join(f.root,'pruned');mkdirSync(target);mkdirSync(join(target,'sessions'))
+  const sourceState=await make(f.source),targetState=join(target,'state_5.sqlite');copyFileSync(sourceState,targetState)
+  writeFileSync(join(target,'sessions','rollout-selected.jsonl'),readFileSync(join(f.source,'sessions','rollout-selected.jsonl')))
+  await filterSessionSnapshot(target,new Set(['selected']),f.signal)
+  const copied=new DatabaseSync(targetState,{readOnly:true})
+  try{assert.equal(copied.prepare("SELECT count(*) n FROM sqlite_master WHERE type='trigger'").get()!.n,5)}finally{copied.close()}
+  const reject=fixture(t),rejectTarget=join(reject.root,'pruned');mkdirSync(rejectTarget);mkdirSync(join(rejectTarget,'sessions'))
+  await make(reject.source,true);copyFileSync(join(reject.source,'state_5.sqlite'),join(rejectTarget,'state_5.sqlite'));copyFileSync(join(reject.source,'sessions','rollout-selected.jsonl'),join(rejectTarget,'sessions','rollout-selected.jsonl'))
+  await assert.rejects(filterSessionSnapshot(rejectTarget,new Set(['selected']),reject.signal),/未知触发器/)
+})
+
+test('history pruning preserves exact SQLx migration metadata but rejects other non-thread tables',{skip:process.platform==='win32'},async t=>{
+  const setup=async(home:string,unknown=false)=>{
+    mkdirSync(join(home,'sessions'),{recursive:true});writeFileSync(join(home,'sessions','rollout-selected.jsonl'),JSON.stringify({type:'session_meta',payload:{id:'selected'}})+'\n'+line);writeFileSync(join(home,'sessions','rollout-omitted.jsonl'),JSON.stringify({type:'session_meta',payload:{id:'omitted'}})+'\n'+line)
+    const db=new DatabaseSync(join(home,'thread_history_1.sqlite'))
+    db.exec('CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_byte_offset INTEGER NOT NULL); CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,PRIMARY KEY(thread_id,turn_id)); CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_id TEXT,PRIMARY KEY(thread_id,turn_id,item_id)); CREATE TABLE thread_realtime_items(thread_id TEXT,item_id TEXT,PRIMARY KEY(thread_id,item_id)); CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)')
+    db.exec("INSERT INTO thread_history_projection_state VALUES('selected',1),('omitted',1); INSERT INTO thread_turns VALUES('selected','a'),('omitted','b'); INSERT INTO thread_items VALUES('selected','a','1'),('omitted','b','2'); INSERT INTO thread_realtime_items VALUES('selected','1'),('omitted','2')")
+    db.prepare('INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(?,?,?,?,?)').run(1,'fixture migration',1,Buffer.from('fixture checksum'),10)
+    if(unknown){db.exec('CREATE TABLE user_metadata(id INTEGER PRIMARY KEY,value TEXT NOT NULL)');db.prepare('INSERT INTO user_metadata(value) VALUES(?)').run('fixture')}
+    db.close()
+  }
+  const f=fixture(t),history=join(f.source,'thread_history_1.sqlite');await setup(f.source)
+  await filterSessionSnapshot(f.source,new Set(['selected']),f.signal)
+  const db=new DatabaseSync(history,{readOnly:true})
+  try{
+    const migration=db.prepare('SELECT version,description,success,checksum,execution_time FROM _sqlx_migrations').get() as any
+    assert.deepEqual({...migration,checksum:Buffer.from(migration.checksum)},{version:1,description:'fixture migration',success:1,checksum:Buffer.from('fixture checksum'),execution_time:10})
+    for(const table of ['thread_history_projection_state','thread_turns','thread_items','thread_realtime_items'])assert.deepEqual(db.prepare('SELECT DISTINCT thread_id FROM '+table).all().map(row=>row.thread_id),['selected'])
+  }finally{db.close()}
+  const reject=fixture(t);await setup(reject.source,true)
+  await assert.rejects(filterSessionSnapshot(reject.source,new Set(['selected']),reject.signal),/未知表/)
 })
 
 test('session-only inventory refuses a database configured outside the selected home',async t=>{

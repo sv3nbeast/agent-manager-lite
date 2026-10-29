@@ -166,6 +166,27 @@ test('copy selection preserves the draft and wizard; only its successful job tar
   assert.equal(ui.calls.some(call => call.method === 'start'), false)
 })
 
+test('folder migration is opt-in and submits only the explicitly checked folder keys', async t => {
+  const ui = mount(); t.after(ui.unmount)
+  const first = 'a'.repeat(64), second = 'b'.repeat(64)
+  ui.api.previewInstanceHistory = async () => ({ ...history, folders: [
+    { key: first, path: '/fixture/project/one', name: 'one', exists: true, sessions: 2 },
+    { key: second, path: '/fixture/project/two', name: 'two', exists: true, sessions: 3 }
+  ] })
+  await ui.selectCopy()
+  assert.equal(ui.state.selectedFolderKeys.length, 0, 'A source must not silently select every folder')
+  await ui.state.nextStep()
+  assert.equal(ui.state.step, 2)
+  await ui.state.nextStep()
+  assert.match(ui.state.error, /至少选择一个/)
+  assert.equal(ui.calls.some(call => call.method === 'copy'), false)
+  ui.state.selectedFolderKeys = [second]
+  await ui.state.nextStep(); await ui.state.save()
+  const copy = ui.calls.find(call => call.method === 'copy')!
+  assert.equal(copy.input.selectedFolderKeys.length, 1)
+  assert.equal(copy.input.selectedFolderKeys[0], second)
+})
+
 test('external snapshot source selection retains configuration and can preview an independent copy while the source stays open', async t => {
   const ui = mount(); t.after(ui.unmount); ui.draft(); ui.state.historyMode = 'copy'; ui.state.historySourceKind = 'directory'
   await ui.state.chooseHistoryDirectory()

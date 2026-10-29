@@ -20,6 +20,7 @@ import {builtInCatalog,parseNativeCatalog} from '../src/main/modelCatalog'
 import { MacDesktopRuntime, desktopEnvironment, macLaunchArgs, type DesktopRuntime, type DesktopPlan, type DesktopProcess } from '../src/main/instanceRuntime'
 import { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
 import { TokenAuthority } from '../src/main/tokens'
+import { selectedInstanceSessionIds } from '../src/main/instanceHistory'
 
 class FixtureDesktop implements DesktopRuntime {
   readonly children=new Map<string,DesktopProcess>()
@@ -814,13 +815,23 @@ test('instance copy applies selected folder keys to rollout bodies and the copie
   writeFileSync(join(source.directory,'.codex-global-state.json'),JSON.stringify({'local-projects':projects,'project-order':['one','two'],'thread-project-assignments':{'selected-thread':{projectId:'one',projectKind:'local'},'omitted-thread':{projectId:'two',projectKind:'local'}},'thread-workspace-root-hints':{'selected-thread':first,'omitted-thread':second}}))
   const index=new DatabaseSync(join(source.directory,'state_5.sqlite'));index.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,cwd TEXT,source TEXT,thread_source TEXT,has_user_event INTEGER,archived INTEGER,project_id TEXT); CREATE TABLE thread_dynamic_tools(thread_id TEXT,name TEXT)')
   for(const [id,cwd,projectId] of [[ids[0],first,'one'],[ids[1],second,'two']] as const){const rollout=join(source.directory,'sessions','rollout-'+id+'.jsonl'),body=JSON.stringify({type:'session_meta',payload:{id,cwd,model_provider:'original'}})+'\n'+JSON.stringify({type:'event_msg',payload:{type:'user_message',message:'body '+id}})+'\n';writeFileSync(rollout,body);index.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)').run(id,rollout,'original',cwd,'cli','user',1,0,projectId);index.prepare('INSERT INTO thread_dynamic_tools VALUES(?,?)').run(id,'tool-'+id)}index.close()
-  const summary=f.instances.previewHistory({id:source.id,revision:source.revision}),selected=summary.folders?.find(folder=>folder.path===first);assert.ok(selected);assert.equal(selected.sessions,1)
+  const summary=f.instances.previewHistory({id:source.id,revision:source.revision}),selected=summary.folders?.find(folder=>folder.path===first);assert.ok(selected);assert.equal(selected.sessions,1);assert.deepEqual([...selectedInstanceSessionIds(source.directory,[selected.key])].sort(),[ids[0]])
   f.instances.startCopy({...copyInput(source,'Selected folder copy'),selectedFolderKeys:[selected.key]})
   const done=await copyFinished(f.instances);assert.equal(done.status,'completed',done.error)
   const target=f.instances.views().find(value=>value.id===done.targetId)!;assert.deepEqual(readdirSync(join(target.directory,'sessions')).sort(),['rollout-'+ids[0]+'.jsonl'])
   const copied=new DatabaseSync(join(target.directory,'state_5.sqlite'),{readOnly:true});try{assert.deepEqual(copied.prepare('SELECT id FROM threads').all().map(row=>row.id),[ids[0]]);assert.deepEqual(copied.prepare('SELECT thread_id FROM thread_dynamic_tools').all().map(row=>row.thread_id),[ids[0]]);assert.deepEqual(copied.prepare('PRAGMA foreign_key_check').all(),[])}finally{copied.close()}
   const projectState=JSON.parse(readFileSync(join(target.directory,'.codex-global-state.json'),'utf8'));assert.deepEqual(Object.keys(projectState['thread-project-assignments']),[ids[0]]);assert.deepEqual(Object.keys(projectState['thread-workspace-root-hints']),[ids[0]])
   assert.ok(readFileSync(join(source.directory,'sessions','rollout-'+ids[1]+'.jsonl'),'utf8').includes('body '+ids[1]))
+})
+
+test('an explicit empty folder selection never falls back to copying all sessions',{skip:!['darwin','linux'].includes(process.platform)},async t=>{
+  const f=fixture(t),source=f.add(f.account().id,'Empty folder selection source'),folder=join(f.root,'folder-one')
+  mkdirSync(folder);mkdirSync(join(source.directory,'sessions'))
+  writeFileSync(join(source.directory,'.codex-global-state.json'),JSON.stringify({'local-projects':{one:{id:'one',name:'Folder One',rootPaths:[folder]}},'project-order':['one']}))
+  const index=new DatabaseSync(join(source.directory,'state_5.sqlite'));index.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT,cwd TEXT,source TEXT,thread_source TEXT,has_user_event INTEGER,archived INTEGER,project_id TEXT)')
+  const rollout=join(source.directory,'sessions','rollout-thread.jsonl');writeFileSync(rollout,JSON.stringify({type:'session_meta',payload:{id:'thread',cwd:folder,model_provider:'original'}})+'\n'+JSON.stringify({type:'event_msg',payload:{type:'user_message',message:'body'}})+'\n');index.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)').run('thread',rollout,'original',folder,'cli','user',1,0,'one');index.close()
+  const summary=f.instances.previewHistory({id:source.id,revision:source.revision}),selected=summary.folders?.[0];assert.ok(selected)
+  assert.throws(()=>f.instances.startCopy({...copyInput(source,'Empty selected folders'),selectedFolderKeys:[]}),/至少选择一个/)
 })
 
 test('a session-only copy retains its nested index and projection through repeated instance restarts',async t=>{

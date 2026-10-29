@@ -28,7 +28,7 @@ import type {CodexResumeTicketSource} from '../shared/sessions'
 import {readCodexSessionLineage} from './codexSessionLineage'
 import {agentClientTypeSchema,resolveAgentClientType} from '../shared/agentClients'
 import {scanInstanceHome,relocateCopiedProfile} from './instanceCopy'
-import {copySavedInstanceHome,normalizeSessionDatabaseCopy,filterSessionSnapshot} from './instanceCopySnapshot'
+import {copySavedInstanceHome,normalizeSessionDatabaseCopy,filterSessionSnapshot,selectSessionManifest} from './instanceCopySnapshot'
 import {scanSessionHome} from './instanceSessionCopy'
 import {assertClientDaemonStopped,probeClientDaemon} from './clientDaemon'
 import {instanceHomePath,validateExternalHome,pathContains} from './instancePaths'
@@ -282,9 +282,16 @@ export class Instances {
     const id=randomUUID(),controller=new AbortController(),sourceHome=source.directory
     const history=copyMode==='sessions'?readInstanceHistory(sourceHome):undefined
     const available=new Map((history?.folders??[]).map(folder=>[folder.key,folder]))
-    const chosenKeys=folderKeys??[...available.keys()]
+    // An explicit folder selection is authoritative. Only old callers that
+    // omit the field retain the legacy all-folders behavior; an empty array
+    // intentionally means no folders and must never fall back to all.
+    const chosenKeys=folderKeys===undefined?[...available.keys()]:[...folderKeys]
     if(copyMode==='sessions'&&chosenKeys.some(key=>!available.has(key)))throw new Error('所选会话文件夹已变化，请刷新来源后重新选择')
-    const selectedSessionIds=copyMode==='sessions'?selectedInstanceSessionIds(sourceHome,chosenKeys):undefined
+    // Omitted folder keys mean legacy/all-folder copy and must not be treated
+    // as an empty selected-ID set. An explicitly provided array is the only
+    // path that enables pruning.
+    const selectedSessionIds=copyMode==='sessions'&&folderKeys!==undefined?selectedInstanceSessionIds(sourceHome,chosenKeys):undefined
+    if(copyMode==='sessions'&&folderKeys!==undefined&&available.size>0&&chosenKeys.length===0)throw new Error('请至少选择一个要迁移的会话文件夹')
     const verifySelection=()=>{
       if(!selectedSessionIds)return
       const fresh=selectedInstanceSessionIds(sourceHome,chosenKeys)
@@ -298,15 +305,16 @@ export class Instances {
       try{
         verify()
         controller.signal.throwIfAborted()
-        const manifest=copyMode==='sessions'
+        let manifest=copyMode==='sessions'
           ?await scanSessionHome(sourceHome,controller.signal)
           :await scanInstanceHome(sourceHome,controller.signal,true)
+        if(copyMode==='sessions'&&selectedSessionIds)manifest=await selectSessionManifest(manifest,selectedSessionIds,controller.signal)
         Object.assign(view,{status:'copying',totalFiles:manifest.files,totalBytes:manifest.bytes,skipped:manifest.skipped})
         directory(join(this.root,'instance-copies'),true)
         await mkdir(staging,{mode:0o700});created=true;identity=lstatSync(staging)
         atomic(join(staging,'copy.json'),JSON.stringify({id,sourceId:source.id,...source.external?{external:true,sourceName:source.name}:{}}))
         const stagingHome=join(staging,'home')
-        const saved=await copySavedInstanceHome(manifest,stagingHome,controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}))
+        const saved=await copySavedInstanceHome(manifest,stagingHome,controller.signal,(files,bytes)=>Object.assign(view,{files,bytes}),{strictSessionSelection:copyMode==='sessions'&&folderKeys!==undefined})
         if(copyMode==='sessions')await normalizeSessionDatabaseCopy(stagingHome,controller.signal)
         if(copyMode==='sessions'&&selectedSessionIds)await filterSessionSnapshot(stagingHome,selectedSessionIds,controller.signal)
         verifySelection()

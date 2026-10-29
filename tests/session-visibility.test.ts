@@ -57,6 +57,21 @@ test('repair selection is bounded and running daemon protection blocks writes',a
   const db=new DatabaseSync(join(f.home,'state_5.sqlite'));assert.equal((db.prepare('SELECT model_provider FROM threads WHERE id=?').get(id) as {model_provider:string}).model_provider,'openai');db.close();f.repair.discard(preview.ticket)
 })
 
+test('visibility repair changes the index provider without shifting paginated rollout byte boundaries',async t=>{
+  for(const markers of [{history_mode:'paginated'},{history_base:{thread_id:'ancestor',end_ordinal_exclusive:2,end_byte_offset:512}}]){
+    const f=fixture();t.after(f.cleanup);const id=randomUUID(),path=join(f.home,'sessions','rollout.jsonl')
+    mkdirSync(join(f.home,'sessions'))
+    const raw=JSON.stringify({type:'session_meta',payload:{id,model_provider:'codex_local_access',...markers}})+'\r\n'+JSON.stringify({type:'event_msg',payload:{type:'user_message',message:'preserved'}})+'\n'
+    writeFileSync(path,raw);makeDatabase(f.home,id,path)
+    const preview=await f.repair.preview({targetIds:[f.target.id]})
+    assert.equal(preview.changedRolloutFileCount,0);assert.equal(preview.updatedSqliteRowCount,1)
+    await f.repair.apply({ticket:preview.ticket,confirmed:true})
+    assert.equal(readFileSync(path,'utf8'),raw)
+    const db=new DatabaseSync(join(f.home,'state_5.sqlite'),{readOnly:true})
+    try{assert.equal(db.prepare('SELECT model_provider FROM threads WHERE id=?').get(id)?.model_provider,'relay')}finally{db.close()}
+  }
+})
+
 test('a daemon started after preview blocks repair without changing its session files',{skip:!['darwin','linux'].includes(process.platform)},async t=>{
   const f=fixture(()=>false,()=>undefined,'/tmp');t.after(f.cleanup)
   const id=randomUUID(),path=join(f.home,'sessions/rollout.jsonl')
