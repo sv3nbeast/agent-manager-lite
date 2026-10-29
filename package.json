@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.15.19",
+  "version": "0.15.20",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",

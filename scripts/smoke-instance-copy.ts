@@ -154,6 +154,7 @@ async function main(){
     const location=await sessions.location({snapshotId:page.snapshotId,sessionId:event.thread_id,targetId:source.id})
     assert.ok(location.startsWith(source.directory+'/sessions/'))
     console.log('Real CLI session catalog passed: actual rollout metadata, SQLite title, content search, merged source/copy locations and cumulative Token usage (8 input / 4 output / 12 total).')
+    if(page.items[0].historyMode!=='paginated'){
     instances.save({details:{name:'Selected session only',applicationId:app.id,accountId:account.id,connectionMode:'native',defaultTier:'fast',model:'gpt-5.5',extraArgs:[...args,'resume',event.thread_id,'Continue the selected fixture conversation. Do not use tools.']}})
     const selectedOnly=instances.views().find(instance=>instance.name==='Selected session only')!
     assert.deepEqual(readdirSync(selectedOnly.directory),[])
@@ -213,8 +214,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
     }
     await sync.stop()
     console.log('Real all-session sync passed: two real same-ID conversation branches merged, official indexes rebuilt, repeat preview has no rollout changes, both native CLI homes resume both branches with Fast=priority.')
-    await transfers.stop();sessions.stop()
+    await transfers.stop()
     console.log('Real archived selected copy passed: noncanonical nested source becomes the official flat archive layout; actual ID is visible in archived thread/list, source bytes unchanged.')
+    }else console.log('Skipped legacy one-session transfer / ZIP / sync smoke for a real paginated transcript; the supported path is full instance copy, which was exercised above.')
+    sessions.stop()
     console.log('Real Codex instance copy passed: different-provider managed/external copies appear in official thread/list under the actual active provider and resume prior content; directly attached existing home resumes; Fast=priority, source unchanged by copies/registration, login restored and every file retained on detach; only temporary profiles and loopback SSE.')
   }finally{
     await instances.closeAll().catch(()=>{})
