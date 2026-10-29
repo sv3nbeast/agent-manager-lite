@@ -537,7 +537,12 @@ export function readCodexSpeedMenuStatus(scope:CodexSpeedMenuStatusScope,now=Dat
       // the main process's resource handler, even when their PID is identical.
       if((value.mainThread!==undefined&&value.mainThread!==true)||(value.threadId!==undefined&&value.threadId!==0))continue
       const reason=typeof value.reason==='string'&&Object.hasOwn(reasons,value.reason)?reasons[value.reason]:undefined
-      if(typeof value.resourceId==='string')latestResourceStatus.set(value.resourceId,{kind:value.kind,reason})
+      // Early CDP builds wrote the resource path into `reason` for successful
+      // responses. Accept it only when it exactly matches this feature's
+      // manifest scope so already-running instances recover without restart.
+      const legacyResourceId=value.kind==='patched'&&scope.requiredResourceIds?.includes(value.reason)?value.reason:undefined
+      const resourceId=typeof value.resourceId==='string'?value.resourceId:legacyResourceId
+      if(resourceId)latestResourceStatus.set(resourceId,{kind:value.kind,reason})
       // An aborted preload does not uninstall a handler that already served a
       // resource. The latest resource result takes precedence over startup
       // diagnostics; a later real original response still downgrades active.

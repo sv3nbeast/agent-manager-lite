@@ -7,7 +7,7 @@ import {join,resolve} from 'node:path'
 import {runInNewContext} from 'node:vm'
 import {execFileSync} from 'node:child_process'
 import {inspectCodexSpeedMenu,prepareCodexSpeedMenu,readCodexSpeedMenuStatus,type CodexSpeedMenuReader,type CodexSpeedMenuHook,type CodexSpeedMenuEnhancements} from '../src/main/codexSpeedMenu'
-import {codexStartupNavigationSource} from '../src/main/codexSpeedMenuCdp'
+import {CodexSpeedMenuCdpSession,codexStartupNavigationSource} from '../src/main/codexSpeedMenuCdp'
 
 const originalHash='34a75db63c7137eb4caecdba1f36d631c10c7912487e532fd5e9dafb175bb9be',patchedHash='5d8a7434e2ce686bcf359ea16d7d889bc0df9ec4c513d0222992ff7d038807a8'
 const localePatchedHash='f76d1b5e0f1ef29951cf301d1bf31f9155fbebd79e35fcb48c8a203ade2b8754',combinedPatchedHash='a21d5bf01e4280636727813c12f77fa45d87cb555606712f9c4fb98b9ef06b30'
@@ -453,6 +453,34 @@ test('status accepts only instance-scoped records and does not expose arbitrary 
   assert.deepEqual(readCodexSpeedMenuStatus(scope),{state:'pending',reason:'等待客户端加载界面'})
   appendFileSync(hook.statusLog,JSON.stringify({...scope,kind:'disabled',reason:'secret-key-fixture'})+'\n')
   assert.deepEqual(readCodexSpeedMenuStatus(scope),{state:'fallback',reason:'普通 / Fast 菜单未加载，请重启实例后再试'})
+})
+test('legacy CDP patched records recover active feature status from their scoped resource path',t=>{
+  const f=fixture(t,'speed-locale'),hook=f.prepare(),main=runHook(f,hook),required=hook.resourceIdsByFeature!
+  const records=[...new Set(Object.values(required).flat())]
+  for(const resourceId of records)appendFileSync(hook.statusLog,JSON.stringify({...main.scope,kind:'patched',reason:resourceId})+'\n')
+  for(const feature of ['speed','locale','ultra'] as const){const requiredResourceIds=feature==='ultra'?required.speed:required[feature];assert.deepEqual(readCodexSpeedMenuStatus({...main.scope,feature,requiredResourceIds}),{state:'active'})}
+  const wrong=fixture(t,'speed-locale'),wrongHook=wrong.prepare(),wrongMain=runHook(wrong,wrongHook)
+  appendFileSync(wrongHook.statusLog,JSON.stringify({...wrongMain.scope,kind:'patched',reason:'/untrusted/resource.js'})+'\n')
+  assert.equal(readCodexSpeedMenuStatus({...wrongMain.scope,feature:'speed',requiredResourceIds:wrongHook.resourceIdsByFeature!.speed}).state,'pending')
+})
+test('CDP resource outcomes record resource IDs separately from diagnostic reasons',async t=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-cdp-status-'))),directory=join(root,'home'),desktopDirectory=join(root,'desktop'),hookDirectory=join(desktopDirectory,'hook')
+  t.after(()=>rmSync(root,{recursive:true,force:true}))
+  for(const path of [directory,desktopDirectory,hookDirectory])mkdirSync(path,{mode:0o700})
+  const statusLog=join(hookDirectory,'status.jsonl'),manifest=join(hookDirectory,'manifest.json'),patchedBodyPath=join(hookDirectory,'patched-0.js')
+  writeFileSync(statusLog,'',{mode:0o600});const body=Buffer.from('fixture patched renderer'),resourceId='webview/assets/app-initial-fixture.js',url='app://-/assets/app-initial-fixture.js',digest=hash(body),nonce=randomUUID(),executable='/fixture/Codex.app/Contents/MacOS/Codex'
+  writeFileSync(patchedBodyPath,body,{mode:0o600})
+  const manifestBody=JSON.stringify({version:2,home:directory,desktopDirectory,executable,nonce,enhancements:'speed-locale',resources:[{id:resourceId,url,sourceSha256:digest,patchedSha256:digest,replacements:[{begin:'fixture',end:'renderer',before:'patched',after:'verified'}],patchedBodyPath,patchedBodySha256:digest}],resourceIdsByFeature:{speed:[resourceId],locale:[resourceId],ultra:[resourceId]}})
+  writeFileSync(manifest,manifestBody,{mode:0o600})
+  const hook:CodexSpeedMenuHook={script:join(hookDirectory,'hook.cjs'),manifest,statusLog,manifestSha256:hash(manifestBody),transport:'cdp',env:{}}
+  const session=new CodexSpeedMenuCdpSession({hook,directory,desktopDirectory,executable,nonce,pid:12345})
+  const internals=session as unknown as {paused:(sessionId:string|undefined,params:any)=>Promise<void>;fulfill:()=>Promise<boolean>}
+  internals.fulfill=async()=>true
+  await internals.paused(undefined,{request:{url},requestId:'fixture-request'})
+  const record=JSON.parse(readFileSync(statusLog,'utf8').trim())
+  assert.equal(record.kind,'patched');assert.equal(record.resourceId,resourceId);assert.equal(record.reason,undefined)
+  const scope={statusLog,nonce,executable,directory,pid:12345}
+  for(const feature of ['speed','locale','ultra'] as const)assert.deepEqual(readCodexSpeedMenuStatus({...scope,feature,requiredResourceIds:[resourceId]}),{state:'active'})
 })
 test('missing or stalled status becomes a clear fallback instead of remaining pending indefinitely',t=>{
   const f=fixture(t),hook=f.prepare(),scope={statusLog:hook.statusLog,nonce:f.nonce,executable:f.executable,directory:f.directory}

@@ -376,7 +376,7 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.instance-card button','移除')
       await wait(`document.querySelector('.ant-modal-confirm-content')?.textContent.includes('保持原位')`)
       await capture('instances-existing-detach.png')
-      await click('.ant-modal-confirm-btns button','移除登记')
+      await click('.ant-modal-confirm-btns button','移入回收站')
       await wait(`document.querySelectorAll('.instance-card').length===0`)
       assert.equal((await run('window.manager.load()')).instances.some(value=>value.id===attached.id),false)
       assert.equal(readFileSync(join(existingHome,'config.toml'),'utf8'),existingConfig)

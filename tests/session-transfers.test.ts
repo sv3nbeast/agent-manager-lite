@@ -133,6 +133,15 @@ test('large rollout copy is chunked/cancellable and preserves bytes after the me
   const complete=join(f.root,'complete');await copySessionRollout(source,complete,'new',signal(),()=>{});const original=readFileSync(path),copied=readFileSync(complete);assert.deepEqual(copied.subarray(copied.indexOf(10)),original.subarray(original.indexOf(10)))
 })
 
+test('rollout transfer cannot shift indexed bytes even when history_mode is absent',async t=>{
+  const f=fixture(t),id=randomUUID(),path=rollout(f.source,id),page=await f.scan(),[source]=await f.catalog.transferSources(page.snapshotId,[id])
+  const raw=readFileSync(path,'utf8'),at=raw.indexOf('\n'),meta=JSON.parse(raw.slice(0,at));meta.ordinal=0
+  writeFileSync(path,JSON.stringify(meta)+raw.slice(at))
+  const before=readFileSync(path),stat=lstatSync(path),destination=join(f.root,'indexed-copy')
+  await copySessionRollout({...source,size:stat.size,mtime:stat.mtimeMs,ctime:stat.ctimeMs},destination,'x',signal(),()=>{})
+  assert.deepEqual(readFileSync(destination),before);assert.deepEqual(readFileSync(path),before)
+})
+
 test('cancelling a transfer releases busy locks and removes staged files without changing target metadata',async t=>{
   const f=fixture(t),id=randomUUID();rollout(f.source,id);const preview=await f.preview([id]);f.transfers.start({ticket:preview.ticket,clientsClosed:true});assert.equal(f.transfers.busy(f.b.id),true)
   await f.transfers.cancel(f.transfers.view().transfer!.id);assert.equal(f.transfers.view().transfer?.status,'cancelled');assert.equal(f.transfers.busy(f.b.id),false);assert.deepEqual(readdirSync(f.target),[])

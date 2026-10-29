@@ -43,7 +43,11 @@ const emptyHistory:InstanceHistorySummary={sessions:0,archived:0,projects:[],fol
 const selectedFolderKeys=ref<string[]>([])
 const selectableFolders=computed(()=>chosenHistory.value?.folders??[])
 const chosenHistory=computed(()=>historyMode.value==='empty'&&!copySource.value&&!externalSource.value?emptyHistory:externalSource.value?.history??sourceHistory.value)
-watch(()=>selectableFolders.value.map(folder=>folder.key).join('|'),()=>{selectedFolderKeys.value=selectableFolders.value.map(folder=>folder.key)})
+// Folder migration is opt-in. Previously the list was initialized with every
+// folder selected, so checking one folder in the UI still submitted all keys
+// and copied the complete history. Reset only when the source inventory itself
+// changes; ordinary checkbox edits must remain untouched.
+watch(()=>selectableFolders.value.map(folder=>folder.key).join('|'),()=>{selectedFolderKeys.value=[]})
 function selectAllFolders(){selectedFolderKeys.value=selectableFolders.value.map(folder=>folder.key)}
 function clearFolders(){selectedFolderKeys.value=[]}
 const compatibleSources=computed(()=>instances.value.filter(instance=>{try{return resolveAgentClientType(instance.clientType)===form.clientType}catch{return false}}))
@@ -130,6 +134,7 @@ function validHistorySource():boolean{
   if(wizard.value&&historyMode.value==='copy'&&!copySource.value&&!externalSource.value){error.value='请选择要复制的会话来源。';return false}
   if(copySource.value){const current=instances.value.find(item=>item.id===copySource.value!.id);if(!current||current.status!=='stopped'||current.copying||current.revision!==copySource.value.revision){error.value='来源实例已变化或正在运行，请重新选择已停止的实例。';return false}}
   if((copySource.value||externalSource.value)&&!attachingForm.value&&!chosenHistory.value){error.value='无法核对来源会话，请重新选择来源。';return false}
+  if((copySource.value||externalSource.value)&&!attachingForm.value&&copyMode.value==='sessions'&&selectableFolders.value.length>0&&!selectedFolderKeys.value.length){error.value='请至少选择一个要迁移的会话文件夹。';return false}
   if(attachingForm.value&&!sourceClosed.value){error.value='请先关闭使用来源目录的客户端，并确认已关闭。';return false}
   if((copySource.value||externalSource.value)&&!attachingForm.value&&copyRunning.value){error.value='请等待当前复制完成，或先取消当前复制。';return false}
   return true
@@ -622,7 +627,11 @@ async function save(previewAfter=false) {
   const attach=attachingForm.value,previousIds=new Set(instances.value.map(instance=>instance.id)),editingId=editing.value?.id
   committing.value=true
   let savedOk=false
-  const selected=copyMode.value==='sessions'?selectedFolderKeys.value:undefined
+  // Detach the Vue reactive array before crossing the IPC boundary. The
+  // backend treats an explicit empty array as “copy no folders”; it must never
+  // be lost during structured cloning and replaced with the legacy all-folders
+  // default.
+  const selected=copyMode.value==='sessions'?[...selectedFolderKeys.value]:undefined
   try{savedOk=await manager.execute(()=>external?(attach?window.manager.attachExistingInstance({ticket:external.ticket,sourceClosed:true,details}):window.manager.copyExternalInstance({ticket:external.ticket,copyMode:copyMode.value,selectedFolderKeys:selected,details})):source?window.manager.copyInstance({id:source.id,revision:source.revision,copyMode:copyMode.value,selectedFolderKeys:selected,details}):window.manager.saveInstance({id:editingId,revision:editing.value?.revision,details}))}
   finally{committing.value=false}
   if(savedOk&&open.value&&generation===draftGeneration) {
@@ -653,7 +662,7 @@ async function focus(instance:InstanceView) {try{await window.manager.focusInsta
 async function loadArchives(){archiveLoading.value=true;try{archives.value=await window.manager.listInstanceArchives()}catch(cause){error.value=String(cause)}finally{archiveLoading.value=false}}
 async function openArchives(){archiveOpen.value=true;await loadArchives()}
 function remove(instance:InstanceView) {
-  Modal.confirm({title:`将实例“${instance.name}”移入回收站？`,content:instance.externalHome?'仅移除实例登记并保留外部目录；本应用的窗口和启动记录会进入实例回收站。':'实例目录会移入实例回收站，账号、外部项目和会话不会被立即删除。之后可在“已归档实例”中恢复或永久删除。',okText:'移入回收站',cancelText:'取消',
+  Modal.confirm({title:`将实例“${instance.name}”移入回收站？`,content:instance.externalHome?'仅移除实例登记；外部目录保持原位，本应用的窗口和启动记录会进入实例回收站。':'实例目录会移入实例回收站，账号、外部项目和会话不会被立即删除。之后可在“已归档实例”中恢复或永久删除。',okText:'移入回收站',cancelText:'取消',
     async onOk(){await manager.execute(()=>window.manager.removeInstance({id:instance.id,revision:instance.revision}))}})
 }
 async function restoreArchive(entry:InstanceArchiveView){
@@ -688,7 +697,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
     <a-modal :open="open" class="instance-editor-dialog" :closable="!committing" :mask-closable="!committing" :keyboard="!committing" centered :width="740" :body-style="{maxHeight:`calc(100vh - ${wizard?(error||manager.error||historyError?320:240):(error||manager.error||historyError?260:180)}px)`,overflowY:'auto'}" @cancel="closeEditor">
       <template #title>
         <div class="instance-editor-title"><span>{{wizard?'创建实例':attachingForm?'使用已有目录':copyingForm?'复制实例':'编辑实例'}}</span><span v-if="wizard" class="instance-step-count">{{step+1}} / 4</span></div>
-        <a-steps v-if="wizard" class="instance-wizard-steps" :current="step" size="small" :items="[{title:'客户端'},{title:isClaudeDesktop?'客户端登录':'账号或供应商'},{title:'项目与配置'},{title:'确认'}]" />
+        <a-steps v-if="wizard" class="instance-wizard-steps" :current="step" size="small" :items="[{title:'客户端'},{title:isClaudeDesktop?'登录方式':'连接资源'},{title:'项目与配置'},{title:'确认'}]" />
       </template>
       <template #footer>
         <FormFeedback :error="error||manager.error||historyError" class="instance-form-feedback" />
@@ -751,7 +760,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <a-form-item v-if="!isClaudeDesktopLogin&&client.capabilities.models&&(!wizard||step===2)" data-field="model" :validate-status="fieldErrors.model?'error':undefined" :help="fieldErrors.model" label="默认模型"><a-auto-complete v-model:value="form.model" style="width:100%" :options="modelChoices.map(value=>({value}))" @change="modelEdited"><a-input aria-label="实例模型" :maxlength="200" placeholder="选择模型或填写模型 ID" /></a-auto-complete><div v-if="usesNativeModels" class="instance-model-source"><span class="muted">{{modelSourceLabel}}</span><a-button type="link" size="small" aria-label="刷新官方模型列表" :loading="officialModelsLoading" @click="refreshChatGPTModels(true)">刷新</a-button></div></a-form-item>
           </div>
           <a-form-item v-if="client.capabilities.projectDirectoryModes.some(mode=>mode===launchMode)" label="项目目录"><a-select v-model:value="form.workingDirectoryId" aria-label="实例工作目录" allow-clear placeholder="使用实例的独立工作目录" :options="workingDirectories.map(item=>({value:item.id,label:item.path}))" /><a-button type="link" @click="chooseWorkingDirectory">选择工作目录</a-button></a-form-item>
-          <section v-if="wizard&&!isClaude" data-field="history" class="instance-history-choice" aria-label="会话来源选择">
+          <section v-if="(wizard||copyingForm)&&!isClaude" data-field="history" class="instance-history-choice" aria-label="会话来源选择">
             <div class="instance-section-heading"><strong>会话起点</strong><span>选择这次工作从哪里开始</span></div>
             <div class="instance-history-options" role="group" aria-label="实例会话来源">
               <button v-for="choice in historyChoices" :key="choice.value" type="button" :data-history-option="choice.value" :aria-label="choice.title" :aria-pressed="historyChoice===choice.value" :disabled="committing||busy" class="instance-history-option" :class="{selected:historyChoice===choice.value}" @click="selectHistoryChoice(choice.value)">
@@ -788,7 +797,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
                 <a-checkbox-group v-model:value="selectedFolderKeys" class="instance-copy-folder-list" aria-label="选择会话文件夹">
                   <label v-for="folder in selectableFolders" :key="folder.key" class="instance-copy-folder-row"><a-checkbox :value="folder.key"/><span class="instance-copy-folder-info"><strong>{{folder.name}}</strong><small>{{folder.unassigned?'无法确定所属工作目录':folder.path}}</small></span><span>{{folder.sessions}} 条</span></label>
                 </a-checkbox-group>
-                <p v-if="!selectableFolders.length" class="muted">没有可迁移的会话。</p>
+                <p v-if="!selectableFolders.length" class="muted">没有可迁移的会话。</p><p v-else class="muted instance-copy-folder-hint">默认不迁移任何文件夹，请明确勾选要带入的对话。</p>
               </div>
               <p class="instance-copy-retained"><CopyOutlined />复制后各自保存后续对话，原实例保留；项目继续使用原路径，临时文件和缓存不复制。</p>
             </div>
@@ -807,7 +816,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
           </a-collapse-panel></a-collapse>
         </section>
         <section v-if="wizard&&step===3" class="instance-step instance-confirm" data-step="3">
-          <a-descriptions :column="1" bordered size="small"><a-descriptions-item label="客户端">{{clientName(form.clientType,launchMode)}}{{isClaude?'':launchMode==='cli'?' · CLI 终端':' · 桌面应用'}}</a-descriptions-item><a-descriptions-item label="资源">{{resourceLabel}}</a-descriptions-item><a-descriptions-item label="实例">{{form.name}}</a-descriptions-item><a-descriptions-item label="会话来源">{{isClaudeDesktop?'在 Claude Desktop 中管理':historyMode==='copy'?'复制 · '+historySourceLabel:'空白会话'}}</a-descriptions-item><a-descriptions-item v-if="historyMode==='copy'" label="迁移内容">{{copyMode==='sessions'?'仅迁移会话':'完整复制'}}</a-descriptions-item><a-descriptions-item label="项目">{{launchMode==='cli'?(workingDirectories.find(item=>item.id===form.workingDirectoryId)?.path??'独立工作目录'):isClaudeDesktop?'启动后在 Claude Desktop 中选择':'启动后在 Codex 中选择'}}</a-descriptions-item><a-descriptions-item label="模型">{{isClaudeDesktopLogin?'在 Claude Desktop 中选择':form.model}}</a-descriptions-item><a-descriptions-item v-if="!isClaude&&client.capabilities.contextWindow" label="上下文默认值">{{contextLabel}}</a-descriptions-item><a-descriptions-item label="接入方式">{{modeName(form.connectionMode,form.clientType,selectedAccount?.kind)}}</a-descriptions-item><a-descriptions-item v-if="desktopUiLabel(form,selectedAccount?.kind)" label="界面模式"><span class="instance-ui-mode">{{desktopUiLabel(form,selectedAccount?.kind)}}</span></a-descriptions-item></a-descriptions>
+          <a-descriptions :column="1" bordered size="small"><a-descriptions-item label="客户端">{{clientName(form.clientType,launchMode)}}{{isClaude?'':launchMode==='cli'?' · CLI 终端':' · 桌面应用'}}</a-descriptions-item><a-descriptions-item label="资源">{{resourceLabel}}</a-descriptions-item><a-descriptions-item label="实例">{{form.name}}</a-descriptions-item><a-descriptions-item label="会话来源">{{isClaudeDesktop?'在 Claude Desktop 中管理':historyMode==='copy'?'复制 · '+historySourceLabel:'空白会话'}}</a-descriptions-item><a-descriptions-item v-if="historyMode==='copy'" label="迁移内容">{{copyMode==='sessions'?'仅迁移会话':'完整复制'}}</a-descriptions-item><a-descriptions-item v-if="historyMode==='copy'&&copyMode==='sessions'&&selectableFolders.length" label="迁移文件夹">{{selectedFolderKeys.length}} / {{selectableFolders.length}} 个（仅复制已勾选项）</a-descriptions-item><a-descriptions-item label="项目">{{launchMode==='cli'?(workingDirectories.find(item=>item.id===form.workingDirectoryId)?.path??'独立工作目录'):isClaudeDesktop?'启动后在 Claude Desktop 中选择':'启动后在 Codex 中选择'}}</a-descriptions-item><a-descriptions-item label="模型">{{isClaudeDesktopLogin?'在 Claude Desktop 中选择':form.model}}</a-descriptions-item><a-descriptions-item v-if="!isClaude&&client.capabilities.contextWindow" label="上下文默认值">{{contextLabel}}</a-descriptions-item><a-descriptions-item label="接入方式">{{modeName(form.connectionMode,form.clientType,selectedAccount?.kind)}}</a-descriptions-item><a-descriptions-item v-if="desktopUiLabel(form,selectedAccount?.kind)" label="界面模式"><span class="instance-ui-mode">{{desktopUiLabel(form,selectedAccount?.kind)}}</span></a-descriptions-item></a-descriptions>
 <InstanceHistoryOverview v-if="chosenHistory&&!isClaude" :history="chosenHistory" aria-label="所选会话概况" />
           <p class="muted">{{historyMode==='copy'?'复制完成后查看项目分组与实际启动预览，确认后才启动客户端。':'创建后查看实际启动预览，确认后才启动客户端。'}}</p>
         </section>
@@ -838,13 +847,20 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <p class="muted" v-else>本地 API：使用所选供应商或 API 凭据连接。纯 API 凭据不会伪造 ChatGPT 登录身份；启动会创建独立连接，并备份、应用模型与连接配置。停止后恢复原配置；会话和工作文件保留。请求中的显式等级优先。</p>
       <a-alert v-if="manager.error" type="error" :message="manager.error" />
     </a-modal>
-    <a-modal v-model:open="archiveOpen" title="已归档实例" :width="760" :footer="null">
+    <a-modal v-model:open="archiveOpen" title="已归档实例" :width="820" :footer="null" :body-style="{maxHeight:'min(68vh, 620px)',overflowY:'auto'}">
       <a-spin :spinning="archiveLoading">
         <a-alert type="info" show-icon message="这里管理移入实例回收站的目录。外部目录始终保留原位；旧归档缺少档案时不能自动恢复。" />
         <a-empty v-if="!archives.length" description="没有已归档实例" />
-        <a-list v-else :data-source="archives" item-layout="horizontal" class="instance-archive-list">
-          <template #renderItem="{item}"><a-list-item><a-list-item-meta :title="item.name" :description="`${new Date(item.archivedAt).toLocaleString()} · ${item.directory}`" /><template #actions><a-tag v-if="!item.recoverable" color="orange">无法恢复</a-tag><a-button v-if="item.recoverable" type="link" @click="restoreArchive(item)">恢复</a-button><a-button type="link" danger @click="purgeArchive(item)">永久删除</a-button></template><a-alert v-if="item.warning" type="warning" :message="item.warning" /></a-list-item></template>
-        </a-list>
+        <div v-else class="instance-archive-list">
+          <article v-for="item in archives" :key="item.id+item.directory" class="instance-archive-row">
+            <div class="instance-archive-details">
+              <div class="instance-archive-heading"><strong>{{item.name}}</strong><span class="muted">{{new Date(item.archivedAt).toLocaleString()}}</span><a-tag v-if="item.externalHome" color="blue">外部目录保留</a-tag><a-tag v-if="!item.recoverable" color="orange">无法恢复</a-tag></div>
+              <div class="instance-archive-path" :title="item.directory">{{item.directory}}</div>
+              <a-alert v-if="item.warning" type="warning" :message="item.warning" class="instance-archive-warning" />
+            </div>
+            <div class="instance-archive-actions"><a-button v-if="item.recoverable" size="small" @click="restoreArchive(item)">恢复</a-button><a-button size="small" danger @click="purgeArchive(item)">永久删除</a-button></div>
+          </article>
+        </div>
       </a-spin>
     </a-modal>
   </section>
@@ -876,6 +892,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
 .instance-history-option.selected .instance-choice-icon{color:#8b5cf6;opacity:1}
 .instance-choice-check{position:absolute;top:8px;right:8px;color:#8b5cf6;font-size:12px}
 .instance-history-source-panel{margin-top:16px}
+.instance-copy-folder-hint{margin-top:8px}
 .instance-history-overview{margin:12px 0}
 .instance-source-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:7px}
 .instance-source-heading label{font-weight:550}
@@ -906,6 +923,8 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
 .instance-launch-preview :deep(.ant-descriptions-item-label){min-width:128px;white-space:nowrap}
 .instance-editor .ant-form-item:last-of-type{margin-bottom:0}
 .external-copy-source{margin-bottom:20px}
+.instance-archive-list{margin-top:8px}.instance-archive-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;padding:14px 2px;border-bottom:1px solid var(--border,#e8e8e8)}.instance-archive-row:last-child{border-bottom:0}.instance-archive-details{min-width:0}.instance-archive-heading{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}.instance-archive-heading strong{min-width:0;overflow-wrap:anywhere;font-size:14px}.instance-archive-heading .muted{font-size:12px;white-space:nowrap}.instance-archive-path{display:block;max-width:100%;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:ltr;text-align:left;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.68}.instance-archive-warning{margin-top:8px}.instance-archive-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;white-space:nowrap}
+@media(max-width:600px){.instance-archive-row{grid-template-columns:minmax(0,1fr);gap:10px}.instance-archive-actions{justify-content:flex-start}}
 </style>
 
 <style scoped>

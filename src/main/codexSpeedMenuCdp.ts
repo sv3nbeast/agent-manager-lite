@@ -296,7 +296,7 @@ export class CodexSpeedMenuCdpSession {
         const body=readFileSync(String(resource.patchedBodyPath))
         if(hash(body)!==resource.patchedBodySha256||hash(body)!==resource.patchedSha256)throw new Error('patched body')
         if(!await this.fulfill(sessionId,params,body,[],resource.patchedSha256))throw new Error('fulfill')
-        this.patched=true;status(this.options.hook.statusLog,this.scope,'patched',resource.id)
+        this.patched=true;status(this.options.hook.statusLog,this.scope,'patched',undefined,resource.id)
       }catch{status(this.options.hook.statusLog,this.scope,'original','cdpResponse',resource.id);try{await this.call('Fetch.continueRequest',{requestId:params.requestId},sessionId)}catch{}}
       return
     }
@@ -306,7 +306,7 @@ export class CodexSpeedMenuCdpSession {
       if(hash(body)!==resource.patchedBodySha256||hash(body)!==resource.patchedSha256)throw new Error('patched body')
       const source=body.toString('utf8')
       if(!await this.fulfill(sessionId,params,body,params.responseHeaders??[],resource.patchedSha256))throw new Error('fulfill')
-      this.patched=true;status(this.options.hook.statusLog,this.scope,'patched',resource.id)
+      this.patched=true;status(this.options.hook.statusLog,this.scope,'patched',undefined,resource.id)
     }catch{status(this.options.hook.statusLog,this.scope,'original','cdpResponse',resource.id);await this.continue(sessionId,params.requestId)}
   }
 

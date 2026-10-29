@@ -127,6 +127,39 @@ test('copy prevents a configured external session database from becoming shared 
   }
 })
 
+test('copy preserves paginated rollout bytes and fork offsets when the destination provider is shorter',async t=>{
+  const f=fixture(t),signal=new AbortController().signal
+  mkdirSync(join(f.source,'sessions'))
+  const originalProvider='codex_local_access',targetProvider='cml_instance'
+  const parent=Buffer.from(JSON.stringify({type:'session_meta',ordinal:0,payload:{id:'parent',history_mode:'paginated',model_provider:originalProvider}})+'\r\n'+JSON.stringify({type:'event_msg',ordinal:1,payload:{type:'user_message',message:'Unicode 汉字 🌈'}})+'\r\n')
+  const child=Buffer.from(JSON.stringify({type:'session_meta',ordinal:2,payload:{id:'child',history_mode:'paginated',history_base:{thread_id:'parent',end_ordinal_exclusive:2,end_byte_offset:parent.length},model_provider:originalProvider}})+'\n')
+  writeFileSync(join(f.source,'sessions','rollout-parent.jsonl'),parent)
+  writeFileSync(join(f.source,'sessions','rollout-child.jsonl'),child)
+  const state=new DatabaseSync(join(f.source,'state_5.sqlite'))
+  state.exec('CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,model_provider TEXT)')
+  for(const id of ['parent','child'])state.prepare('INSERT INTO threads VALUES(?,?,?)').run(id,join(f.source,'sessions','rollout-'+id+'.jsonl'),originalProvider)
+  state.close()
+  const projection=new DatabaseSync(join(f.source,'thread_history_1.sqlite'))
+  projection.exec('CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY,next_rollout_byte_offset INTEGER,next_rollout_ordinal INTEGER)')
+  projection.prepare('INSERT INTO thread_history_projection_state VALUES(?,?,?)').run('parent',parent.length,2);projection.close()
+  const manifest=await scanInstanceHome(f.source,signal);await copyInstanceHome(manifest,f.target,signal,()=>{})
+  await relocateCopiedProfile(manifest,f.target,join(f.root,'final'),signal,targetProvider)
+  assert.deepEqual(readFileSync(join(f.target,'sessions','rollout-parent.jsonl')),parent)
+  assert.deepEqual(readFileSync(join(f.target,'sessions','rollout-child.jsonl')),child)
+  const copied=new DatabaseSync(join(f.target,'state_5.sqlite'),{readOnly:true})
+  try{assert.deepEqual(copied.prepare('SELECT DISTINCT model_provider FROM threads').all().map(row=>row.model_provider),[targetProvider])}finally{copied.close()}
+  assert.deepEqual(readFileSync(join(f.target,'thread_history_1.sqlite')),readFileSync(join(f.source,'thread_history_1.sqlite')))
+})
+
+test('copy also protects ordinal and history_base headers without a paginated label',async t=>{
+  const f=fixture(t),signal=new AbortController().signal;mkdirSync(join(f.source,'sessions'))
+  const values=[{ordinal:0,payload:{id:'ordinal',model_provider:'long_provider'}},{payload:{id:'base',history_base:{thread_id:'parent'},model_provider:'long_provider'}}]
+  for(const value of values)writeFileSync(join(f.source,'sessions','rollout-'+value.payload.id+'.jsonl'),JSON.stringify({type:'session_meta',...value})+'\n')
+  const manifest=await scanInstanceHome(f.source,signal);await copyInstanceHome(manifest,f.target,signal,()=>{})
+  await relocateCopiedProfile(manifest,f.target,join(f.root,'final'),signal,'x')
+  for(const value of values){const path=join('sessions','rollout-'+value.payload.id+'.jsonl');assert.deepEqual(readFileSync(join(f.target,path)),readFileSync(join(f.source,path)))}
+})
+
 test('named profile config layers relocate internal paths and cannot share an external session database',async t=>{
   const f=fixture(t),signal=new AbortController().signal,finalHome=join(f.root,'final')
   const named='# named layer\nlog_dir='+JSON.stringify(join(f.source,'future-logs'))+'\nmodel_catalog_json='+JSON.stringify(join(f.source,'models.json'))+'\ncustom="keep"\n'

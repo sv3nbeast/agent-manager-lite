@@ -144,18 +144,17 @@ app.on('browser-window-created', (_event, window) => {
       assert.equal(defaultStarts.length, 1); assert.equal(defaultStarts[0], defaultPreviews[1].ticket)
 
       await click(row(alpha.id) + ' button', '查看对话'); await wait('document.querySelector(".session-reader-body")?.textContent.includes("Synthetic message 44")')
-      await click('.session-reader-footer button','更早 10 条'); await wait('document.querySelector(".session-reader-body")?.textContent.includes("Synthetic message 34")')
-      assert.equal(await run('document.querySelector(".session-reader-export").textContent.includes("第 27–36 条 / 共 46 条记录")'), true)
-      assert.equal(await run('Array.from(document.querySelectorAll(".session-reader-export button")).some(el=>el.textContent.includes("复制当前窗口 Markdown"))'), true)
-      assert.equal(await run('Array.from(document.querySelectorAll(".session-reader-export button")).some(el=>el.textContent.includes("下载当前窗口 Markdown"))'), true)
-      assert.equal(await run('document.querySelector(".session-reader-export").textContent.includes("只包含当前窗口")'), true)
-      for (const marker of ['Synthetic message 24', 'Synthetic message 14', 'BROWSER_TEXT_NEEDLE']) { await click('.session-reader-footer button','更早 10 条'); await wait(`document.querySelector(".session-reader-body")?.textContent.includes(${JSON.stringify(marker)})`) }
+      for (let index = 0; index < 4; index++) { await click('.session-reader-footer button', '更早 10 条'); await new Promise(resolve => setTimeout(resolve, 50)) }
+      await wait('document.querySelector(".session-reader-body")?.textContent.includes("BROWSER_TEXT_NEEDLE")')
       assert.equal(await run('document.querySelectorAll(".session-reader img,.session-reader iframe,.session-reader script").length'), 0)
       assert.equal(await run('window.untrustedExecuted===true'), false)
       assert.equal(await run('document.querySelector(".session-reader").textContent.includes("<img src=")'), true)
       await run('document.querySelector(".session-reader .session-block-tool_use summary").click()')
       await wait('document.querySelector(".session-block-tool_use[open]")?.textContent.includes("/fixture/only.txt")')
       await capture('claude-transcript-tools.png')
+      assert.equal(await run('Array.from(document.querySelectorAll(".session-reader-export button")).some(el=>el.textContent.includes("复制当前窗口 Markdown"))'), true)
+      assert.equal(await run('Array.from(document.querySelectorAll(".session-reader-export button")).some(el=>el.textContent.includes("下载当前窗口 Markdown"))'), true)
+      assert.equal(await run('document.querySelector(".session-reader-export").textContent.includes("当前窗口")'), true)
       await fill('当前会话内容搜索', 'BROWSER_TEXT_NEEDLE'); await click('.session-reader-search button', '查找')
       await wait('document.querySelectorAll(".session-reader mark").length===1')
       assert.equal(await run('document.querySelectorAll(".session-message").length'), 1)

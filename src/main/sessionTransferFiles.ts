@@ -7,6 +7,7 @@ import {z} from 'zod'
 import {atomic,readBounded} from './clientConfig'
 import {openSessionFile,safeSessionPath,sessionLines,jsonLine,sessionIdentifier} from './sessionFiles'
 import type {SessionTransferSource} from './sessions'
+import {hasIndexedRolloutBytes} from './codexRolloutMetadata'
 
 export const textHash=(raw:string|null)=>createHash('sha256').update(raw===null?'absent:':'present:'+raw).digest('hex')
 export const sessionRelative=(value:string)=>value.length<=2000&&!isAbsolute(value)&&!value.includes('\\')&&!/[\x00-\x1f\x7f:]/.test(value)&&value.split('/').every(part=>part&&part!=='.'&&part!=='..')&&/^(sessions|archived_sessions)\/(?:[^/]+\/)*rollout-[^/]+\.jsonl$/.test(value)
@@ -61,7 +62,9 @@ export async function copySessionRollout(source:SessionTransferSource,destinatio
         if(!line.toString().trim()){prefix.push(Buffer.concat([line,Buffer.from(consumed>line.length?'\n':'')]));continue}
         const meta=jsonLine(line)
         if(meta?.type!=='session_meta'||sessionIdentifier(meta.payload?.id??meta.payload?.session_id??meta.id??meta.session_id)!==source.record.id||!meta.payload||typeof meta.payload!=='object'||Array.isArray(meta.payload))throw new Error('会话元数据格式无法复制')
-        meta.payload.model_provider=provider;header=Buffer.concat([...prefix,Buffer.from(JSON.stringify(meta)+(consumed>line.length?'\n':''))]);break
+        if(hasIndexedRolloutBytes(meta))header=Buffer.concat([...prefix,line,Buffer.from(consumed>line.length?'\n':'')])
+        else{meta.payload.model_provider=provider;header=Buffer.concat([...prefix,Buffer.from(JSON.stringify(meta)+(consumed>line.length?'\n':''))])}
+        break
       }
       if(!header)throw new Error('来源会话缺少有效元数据')
       const write=async(buffer:Buffer)=>{digest.update(buffer);for(let cursor=0;cursor<buffer.length;){signal.throwIfAborted();const {bytesWritten}=await output.write(buffer,cursor,buffer.length-cursor);if(!bytesWritten)throw new Error('会话副本写入失败');cursor+=bytesWritten;written+=bytesWritten}}
