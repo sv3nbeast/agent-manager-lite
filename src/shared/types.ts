@@ -48,9 +48,9 @@ export const settingsSchema = z.object({
   defaultTier: tierModeSchema.default('follow'),
   port: z.number().int().min(1024).max(65535).default(16321),
   refreshMinutes: z.number().int().min(0).max(1440).default(10),
-  streamOpenTimeoutSeconds: z.number().int().min(1).max(600).default(60),
+  streamOpenTimeoutSeconds: z.number().int().min(0).max(600).default(0),
   streamIdleTimeoutSeconds: z.number().int().min(1).max(600).default(120),
-  imageStreamOpenTimeoutSeconds: z.number().int().min(1).max(600).default(60),
+  imageStreamOpenTimeoutSeconds: z.number().int().min(0).max(600).default(0),
   imageStreamIdleTimeoutSeconds: z.number().int().min(1).max(600).default(180),
   launchAtLogin: z.boolean().default(false),
   closeToTray: z.boolean().default(false)
@@ -299,7 +299,7 @@ export interface ManagerAPI {
   purgeInstanceArchive(input:InstanceArchiveSelection):Promise<AppSnapshot>
   previewInstanceLaunch(input:Pick<InstanceProfile,'id'|'revision'>):Promise<InstanceLaunchPreview>
   previewInstanceHistory(input:Pick<InstanceProfile,'id'|'revision'>):Promise<InstanceHistorySummary>
-  startInstance(ticket:string):Promise<AppSnapshot>
+  startInstance(ticket:string,injectNetworkProxy?:boolean):Promise<AppSnapshot>
   stopInstance(id:string):Promise<AppSnapshot>
   closeAllInstances():Promise<AppSnapshot>
   focusInstance(id:string):Promise<void>

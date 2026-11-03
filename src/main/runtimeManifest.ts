@@ -66,8 +66,8 @@ export function runtimeManifest(profile:RuntimeProfile,settings:Settings,control
     'request-log':false,'logging-to-file':false,'request-retry':0,'ws-auth':true,
     // Cockpit's application defaults differ from the sidecar fallback values.
     // Project them explicitly so a fresh install does not silently use 10s/2 tries.
-    streaming:{'stream-open-timeout-ms':settings.streamOpenTimeoutSeconds*1000,'stream-idle-timeout-ms':settings.streamIdleTimeoutSeconds*1000,
-      'image-stream-open-timeout-ms':settings.imageStreamOpenTimeoutSeconds*1000,'image-stream-idle-timeout-ms':settings.imageStreamIdleTimeoutSeconds*1000,'stream-open-max-attempts':1},
+    streaming:{'stream-open-timeout-ms':settings.streamOpenTimeoutSeconds>0?settings.streamOpenTimeoutSeconds*1000:-1,'stream-idle-timeout-ms':settings.streamIdleTimeoutSeconds*1000,
+      'image-stream-open-timeout-ms':settings.imageStreamOpenTimeoutSeconds>0?settings.imageStreamOpenTimeoutSeconds*1000:-1,'image-stream-idle-timeout-ms':settings.imageStreamIdleTimeoutSeconds*1000,'stream-open-max-attempts':1},
     codex:{'optimize-multi-agent-v2':true,'stream-bootstrap-buffering':false},
     payload:{default:!profile.pool && tier.tier?[{models:['codex','openai','openai-response'].map(protocol=>({name:'*',protocol})),params:{service_tier:tier.tier}}]:[]}}
   if(profile.pool)config.routing={'session-affinity':profile.pool.settings.sessionAffinity,'session-affinity-ttl':`${profile.pool.settings.sessionAffinityTtlMs}ms`}

@@ -12,11 +12,16 @@ import (
 // here: account-pool failover owns pre-output retries and checks commitment.
 func doProviderStream(client *http.Client, req *http.Request, timeouts streamTimeoutProfile) (*http.Response, error) {
 	ctx, cancel := context.WithCancelCause(req.Context())
-	timer := time.AfterFunc(timeouts.open, func() {
-		cancel(relayTimeoutError{phase: "stream_open", timeout: timeouts.open})
-	})
+	var timer *time.Timer
+	if timeouts.open > 0 {
+		timer = time.AfterFunc(timeouts.open, func() {
+			cancel(relayTimeoutError{phase: "stream_open", timeout: timeouts.open})
+		})
+	}
 	response, err := client.Do(req.WithContext(ctx))
-	timer.Stop()
+	if timer != nil {
+		timer.Stop()
+	}
 	if cause := context.Cause(ctx); cause != nil {
 		if response != nil {
 			response.Body.Close()

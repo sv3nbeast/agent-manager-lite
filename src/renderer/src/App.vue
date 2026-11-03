@@ -382,11 +382,11 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
               </a-card>
               <UpstreamProxyPanel />
               <a-card title="流式请求超时" class="settings-card stream-timeouts">
-                <p class="muted">适用于 HTTP 和 WebSocket。按秒设置等待响应与流式空闲时限；WebSocket 每轮等待首个事件也受此限制。已经返回内容的请求不会重新发送。保存后需重启本地服务或实例。</p>
+                <p class="muted">适用于 HTTP 和 WebSocket。等待首个响应事件可设为不限时（0）；流式空闲时限用于中断已建立但停止输出的请求。保存后需重启本地服务或实例。</p>
                 <a-form layout="vertical">
-                  <a-form-item data-settings-field="streamOpenTimeoutSeconds" :validate-status="settingsErrors.streamOpenTimeoutSeconds?'error':undefined" :help="settingsErrors.streamOpenTimeoutSeconds" label="等待上游响应（秒）"><a-input-number v-model:value="settings.streamOpenTimeoutSeconds" :min="1" :max="600" /></a-form-item>
+                  <a-form-item data-settings-field="streamOpenTimeoutSeconds" :validate-status="settingsErrors.streamOpenTimeoutSeconds?'error':undefined" :help="settingsErrors.streamOpenTimeoutSeconds" label="等待上游响应（秒，0 不限）"><a-input-number v-model:value="settings.streamOpenTimeoutSeconds" :min="0" :max="600" /></a-form-item>
                   <a-form-item data-settings-field="streamIdleTimeoutSeconds" :validate-status="settingsErrors.streamIdleTimeoutSeconds?'error':undefined" :help="settingsErrors.streamIdleTimeoutSeconds" label="流式空闲（秒）"><a-input-number v-model:value="settings.streamIdleTimeoutSeconds" :min="1" :max="600" /></a-form-item>
-                  <a-form-item data-settings-field="imageStreamOpenTimeoutSeconds" :validate-status="settingsErrors.imageStreamOpenTimeoutSeconds?'error':undefined" :help="settingsErrors.imageStreamOpenTimeoutSeconds" label="图片请求等待响应（秒）"><a-input-number v-model:value="settings.imageStreamOpenTimeoutSeconds" :min="1" :max="600" /></a-form-item>
+                  <a-form-item data-settings-field="imageStreamOpenTimeoutSeconds" :validate-status="settingsErrors.imageStreamOpenTimeoutSeconds?'error':undefined" :help="settingsErrors.imageStreamOpenTimeoutSeconds" label="图片请求等待响应（秒，0 不限）"><a-input-number v-model:value="settings.imageStreamOpenTimeoutSeconds" :min="0" :max="600" /></a-form-item>
                   <a-form-item data-settings-field="imageStreamIdleTimeoutSeconds" :validate-status="settingsErrors.imageStreamIdleTimeoutSeconds?'error':undefined" :help="settingsErrors.imageStreamIdleTimeoutSeconds" label="图片流式空闲（秒）"><a-input-number v-model:value="settings.imageStreamIdleTimeoutSeconds" :min="1" :max="600" /></a-form-item>
                 </a-form>
               </a-card>

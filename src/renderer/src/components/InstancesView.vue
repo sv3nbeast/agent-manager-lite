@@ -156,7 +156,7 @@ watch(()=>[pendingCopyPreview.value,copyJob.value?.id,copyJob.value?.status,copy
   await launch(target)
 })
 const size=(bytes:number)=>bytes<1024?`${bytes} B`:bytes<1024**2?`${(bytes/1024).toFixed(1)} KiB`:`${(bytes/1024**2).toFixed(1)} MiB`
-const form=reactive<InstanceInput>({clientType:'codex',launchMode:'desktop',name:'',applicationId:'',accountId:'',connectionMode:'local_api',defaultTier:'inherit',model:'',extraArgs:[]}),args=ref('')
+const form=reactive<InstanceInput>({clientType:'codex',launchMode:'desktop',name:'',applicationId:'',accountId:'',connectionMode:'local_api',injectNetworkProxy:true,defaultTier:'inherit',model:'',extraArgs:[]}),args=ref('')
 const lastClientType=ref<AgentClientType>('codex'),lastLaunchMode=ref<'desktop'|'cli'>('desktop')
 const fieldErrors=reactive<Record<string,string>>({})
 let generatedName='',connectionModeTouched=false
@@ -297,7 +297,7 @@ const connectionProblem=computed(()=>{
   if(form.connectionMode!=='native')return ''
   if(resourceKind.value==='provider'&&selectedSupplier.value?.disabled)return selectedSupplier.value.reason??'此连接不支持当前 Claude 接入方式。'
   if(!selectedAccount.value)return ''
-  if(selectedAccount.value.egressProxy?.invalid)return '此账号的网络代理配置无效，请先修正账号或默认代理设置。'
+  if(selectedAccount.value.egressProxy?.invalid&&form.injectNetworkProxy!==false)return '此账号的网络代理配置无效，请先修正账号或关闭实例代理注入。'
   return accountCompatibility(form.clientType,selectedAccount.value,{connectionMode:resourceConnectionMode.value,launchMode:launchMode.value}).reason??''
 })
 watch(connectionProblem,problem=>{if(!problem&&fieldErrors.connectionMode){if(error.value===fieldErrors.connectionMode)error.value='';delete fieldErrors.connectionMode}})
@@ -306,6 +306,7 @@ const connectionDescription=computed(()=>isClaudeDesktopLogin.value?'启动后�
   :selectedAccount.value?.kind==='oauth'?`使用 ChatGPT 账号转发 API 请求；请求仍经本地 API 网关转发，管理器记录网关调用。${launchMode.value==='desktop'?'桌面应用使用本地 API 网关界面，验证账号身份不会切换接入方式。要使用官方客户端原版界面，请选择「原生账号登录」。':''}`:'通过管理器的本地 API 连接使用所选资源，支持兼容的 Chat Completions 供应商和账号网络代理；管理器记录网关调用。')
 const resourceLabel=computed(()=>isClaudeDesktopLogin.value?'在 Claude Desktop 中登录':resourceKind.value==='provider'?selectedSupplier.value?.label:selectedAccount.value?.name)
 function previewNetworkLabel(network:NonNullable<InstanceLaunchPreview['network']>):string {
+  if(preview.value?.injectNetworkProxy===false)return '未注入管理器代理；客户端原生网络设置保留'
   const source=network.source==='account'?'账号网络设置':'管理器设置'
   if(network.mode==='inherit')return source+' · 继承系统网络'
   if(network.mode==='direct')return source+' · 直连'
@@ -551,8 +552,8 @@ function edit(instance?:InstanceView) {
   editing.value=instance;clearValidation();manager.error='';generatedName='';form.clientType=clientType;launchMode.value=instance?savedLaunchMode(instance):lastLaunchMode.value
   connectionModeTouched=!!instance
   const firstAccount=availableAccounts.value.find(account=>account.kind!=='api_key')??availableAccounts.value[0]
-  Object.assign(form,instance ? {clientType,launchMode:launchMode.value,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
-    {clientType,launchMode:launchMode.value,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:firstAccount?.id ?? '',connectionMode:isClaudeDesktop.value?'client_login':clientType==='claude_code'?'native':recommendedInstanceConnectionMode(clientType,firstAccount),workingDirectoryId:undefined,defaultTier:'inherit',model:firstAccount?.models[0] ?? '',extraArgs:[]})
+  Object.assign(form,instance ? {clientType,launchMode:launchMode.value,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',injectNetworkProxy:instance.injectNetworkProxy!==false,workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
+    {clientType,launchMode:launchMode.value,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:firstAccount?.id ?? '',connectionMode:isClaudeDesktop.value?'client_login':clientType==='claude_code'?'native':recommendedInstanceConnectionMode(clientType,firstAccount),injectNetworkProxy:true,workingDirectoryId:undefined,defaultTier:'inherit',model:firstAccount?.models[0] ?? '',extraArgs:[]})
   resourceKind.value=isClaudeDesktop.value||accounts.value.find(account=>account.id===form.accountId)?.kind==='api_key'?'provider':'account'
   if(resourceKind.value==='provider')supplierSelection.value=(supplierChoices.value.find(choice=>choice.account?.id===form.accountId&&!choice.requiresKeyLink)??supplierChoices.value.find(choice=>choice.account?.id===form.accountId))?.value??''
   else supplierSelection.value=''
@@ -655,8 +656,9 @@ async function launch(instance:InstanceView) {
 
 }
 async function start() {
-  if(preview.value && await manager.execute(()=>window.manager.startInstance(preview.value!.ticket)))preview.value=undefined
+  if(preview.value && await manager.execute(()=>window.manager.startInstance(preview.value!.ticket,preview.value!.injectNetworkProxy??true)))preview.value=undefined
 }
+function setPreviewNetworkProxy(value:boolean){if(preview.value)preview.value.injectNetworkProxy=value}
 async function stop(instance:InstanceView) {await manager.execute(()=>window.manager.stopInstance(instance.id))}
 async function focus(instance:InstanceView) {try{await window.manager.focusInstance(instance.id)}catch(cause){message.error(String(cause))}}
 async function loadArchives(){archiveLoading.value=true;try{archives.value=await window.manager.listInstanceArchives()}catch(cause){error.value=String(cause)}finally{archiveLoading.value=false}}
@@ -683,7 +685,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
     <a-empty v-else-if="!filtered.length" description="没有匹配的实例" />
     <div v-else class="instance-grid">
       <a-card v-for="instance in visible" :key="instance.id" class="instance-card" :data-instance-id="instance.id">
-        <div class="instance-heading"><div class="instance-name"><DesktopOutlined /><strong>{{ instance.name }}</strong></div><a-tag :color="instance.status==='running'?'green':instance.status==='error'?'red':['preparing','starting','stopping'].includes(instance.status)?'processing':undefined">{{ labels[instance.status] }}</a-tag></div>
+        <div class="instance-heading"><div class="instance-name"><DesktopOutlined /><strong>{{ instance.name }}</strong></div><a-space><a-tag>{{(instance.injectNetworkProxy??true)?'代理注入开':'代理注入关'}}</a-tag><a-tag :color="instance.status==='running'?'green':instance.status==='error'?'red':['preparing','starting','stopping'].includes(instance.status)?'processing':undefined">{{ labels[instance.status] }}</a-tag></a-space></div>
         <a-descriptions :column="1" size="small"><a-descriptions-item label="客户端">{{clientName(instance.clientType,instance.launchMode,instance.connectionMode)}}</a-descriptions-item><a-descriptions-item label="运行方式">{{instance.launchMode==='cli'?'CLI · Terminal':'桌面应用'}}</a-descriptions-item><a-descriptions-item v-if="desktopUiLabel(instance,accountForInstance(instance)?.kind)" label="界面模式"><span class="instance-ui-mode">{{desktopUiLabel(instance,accountForInstance(instance)?.kind)}}</span></a-descriptions-item><a-descriptions-item label="账号">{{ instanceAccountLabel(instance) }} · {{modeName(instance.connectionMode,instance.clientType,accountForInstance(instance)?.kind)}}</a-descriptions-item><a-descriptions-item label="客户端身份">{{ identityStatusLabel(instance) }}</a-descriptions-item><a-descriptions-item v-if="instance.connectionMode!=='client_login'" label="默认模型">{{ instance.model }}</a-descriptions-item><a-descriptions-item v-if="instance.clientType!=='claude_code'" label="速度"><template v-if="instance.speedMenu==='active'||instance.speedMenu==='pending'">{{instance.speedMenu==='active'?'在 Codex 中选择':'正在启用 Codex 速度菜单'}}<span class="muted"> · 启动时 {{initialSpeedName(instance.initialTier)}}</span></template><template v-else>{{ tierName(instance.defaultTier) }}<span v-if="instance.status==='running'"> · {{instance.connectionMode==='native'?'已写入配置':'启动时'}} {{ initialSpeedName(instance.initialTier??instance.appliedTier) }}</span></template></a-descriptions-item><a-descriptions-item v-if="instance.desktopLocaleCompatibility" label="页面语言">{{instance.desktopLocaleCompatibility==='active'?'跟随 Codex 语言设置':instance.desktopLocaleCompatibility==='pending'?'正在加载内置翻译':'翻译适配未加载'}}</a-descriptions-item><a-descriptions-item v-if="instance.ultraCompatibility" label="Ultra 推理">{{instance.ultraCompatibility==='active'?'支持的模型可选 Ultra':instance.ultraCompatibility==='pending'?'正在加载':'暂未兼容'}}</a-descriptions-item><a-descriptions-item v-if="instance.pid" label="进程">{{ instance.pid }}<span v-if="instance.port"> · 本地端口 {{ instance.port }}</span></a-descriptions-item></a-descriptions>
         <a-alert v-if="(instance.clientType===undefined||instance.clientType==='codex')&&instance.launchMode!=='cli'&&(instance.connectionMode??'local_api')==='local_api'&&accountForInstance(instance)?.kind==='oauth'" type="info" show-icon class="instance-identity-warning" message="账号身份验证成功也会保留本地 API 网关界面。需要官方客户端原版界面时，请在实例停止后点击「编辑」，选择「原生账号登录」。" />
         <p class="instance-path" :title="instance.directory"><a-tag v-if="instance.externalHome">已有目录</a-tag>{{ instance.directory }}</p>
@@ -729,7 +731,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
           <div v-if="isClaudeDesktopLogin" class="instance-client-login" aria-label="Claude Desktop 登录方式">
             <a-alert type="info" show-icon message="在 Claude Desktop 中登录" :description="connectionDescription" />
             <p class="muted">模型、Chat、Code 和 Cowork 在客户端中选择，可用功能由 Claude 账号套餐与客户端版本决定。管理器中添加的订阅账号可用于 CLI；Desktop 的订阅登录在客户端内完成。</p>
-            <p class="muted">网络使用管理器的默认代理设置。客户端原生设置会保留；独立配置和登录目录不限制客户端访问你授予权限的本机文件。</p>
+            <p class="muted">网络代理可在下方单独设置；客户端原生设置会保留。独立配置和登录目录不限制客户端访问你授予权限的本机文件。</p>
           </div>
           <template v-else>
           <a-alert v-if="isClaudeDesktop" type="info" show-icon class="error-banner" message="第三方 Code / Cowork" description="使用原生第三方连接模式，不需要 Claude.ai 浏览器登录。Claude.ai Chat 请使用客户端内登录方式。" />
@@ -748,11 +750,12 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <a-form-item v-if="!isClaudeDesktop" data-field="connectionMode" label="连接方式" :validate-status="fieldErrors.connectionMode?'error':undefined" :help="fieldErrors.connectionMode"><a-select v-model:value="form.connectionMode" aria-label="实例接入方式" :options="isClaude?[{value:'native',label:resourceKind==='account'?'订阅账号':'直接 API'}]:[{value:'native',label:modeName('native',form.clientType,selectedAccount?.kind??(resourceKind==='provider'?'api_key':undefined))},{value:'local_api',label:'本地 API'}]" @change="changeConnectionMode" /></a-form-item>
             <p class="muted instance-connection-description">{{connectionDescription}}</p>
             <a-alert v-if="connectionProblem" type="warning" show-icon :message="connectionProblem" />
-            <p v-if="!connectionProblem&&usesUpstreamProxy" class="muted">实例使用所选账号的网络代理设置（包括继承的默认代理），原生登录同样支持。</p>
+            <p v-if="!connectionProblem&&usesUpstreamProxy" class="muted">本地 API 模式下，账号代理用于网关上游请求；原生模式会按本次代理开关决定是否注入客户端。</p>
             <a-button v-if="!isClaude&&!connectionProblem&&form.connectionMode==='local_api'&&selectedAccount?.kind==='oauth'" type="link" class="instance-use-native" @click="useNativeLogin">切换为原生账号登录</a-button>
             <p v-if="!isClaude&&editing&&form.connectionMode!==(editing.connectionMode??'local_api')" class="muted instance-mode-history-note">切换后已有会话仍保留。若客户端列表不显示，可到「会话 → 修复可见性」选择此实例，使用「按各实例接入方式自动匹配」预览修复。</p>
           </div>
           </template>
+          <a-form-item label="启动时注入网络代理" extra="关闭时清理该客户端继承的代理设置；不会改变本地 API 网关访问上游时使用的账号代理。启动确认页可单次覆盖。"><a-switch v-model:checked="form.injectNetworkProxy" checked-children="开" un-checked-children="关" aria-label="实例注入网络代理" /></a-form-item>
         </section>
         <section v-show="!wizard||step===2" class="instance-step" data-step="2">
           <div class="instance-basics-grid">
@@ -833,6 +836,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <a-alert v-if="preview?.externalHome" class="error-banner" type="info" message="此实例直接使用已有目录。启动会更新该目录的账号连接与配置，停止后恢复；请确认其他客户端已关闭。" />
       <InstanceHistoryOverview v-if="preview?.history" :history="preview.history" :client-type="preview.clientType" aria-label="启动会话概况" />
       <p v-if="preview?.history&&preview.clientType!=='claude_code'" class="muted instance-history-launch-note">统计目录内已保存的主会话，包含归档；客户端可能根据当前连接筛选会话。要使用其他历史，请取消并创建实例，选择「从实例复制」或「从目录复制」；当前实例的历史保持不变。</p>
+      <a-form-item v-if="preview" label="本次启动注入网络代理"><a-switch :checked="preview.injectNetworkProxy??true" checked-children="开" un-checked-children="关" aria-label="本次启动注入网络代理" @change="setPreviewNetworkProxy" /><span class="muted instance-launch-proxy-note">仅本次启动覆盖实例默认设置。</span></a-form-item>
           <a-descriptions v-if="preview" :column="1" bordered size="small" class="instance-launch-preview"><a-descriptions-item label="实例">{{ preview.name }}</a-descriptions-item><a-descriptions-item label="客户端">{{clientName(preview.clientType,preview.launchMode,preview.connectionMode)}}</a-descriptions-item><a-descriptions-item label="接入方式">{{modeName(preview.connectionMode,preview.clientType,previewAccount?.kind)}}</a-descriptions-item><a-descriptions-item v-if="desktopUiLabel(preview,previewAccount?.kind)" label="界面模式"><span class="instance-ui-mode">{{desktopUiLabel(preview,previewAccount?.kind)}}</span></a-descriptions-item><a-descriptions-item label="客户端身份">{{identityStatusLabel(preview,previewAccount)}}</a-descriptions-item><a-descriptions-item label="应用">{{ preview.application }}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode==='cli' && preview.executable!==preview.application" label="实际程序">{{preview.executable}}</a-descriptions-item><a-descriptions-item label="配置与会话">{{ preview.directory }}</a-descriptions-item><a-descriptions-item v-if="preview.launchMode!=='cli'" label="桌面数据">{{ preview.desktopDirectory }}</a-descriptions-item><a-descriptions-item v-else label="CLI 工作目录">{{preview.workingDirectory}}</a-descriptions-item><a-descriptions-item v-if="preview.connectionMode!=='client_login'" label="账号与模型">{{ preview.accountName }} · {{ preview.model }}</a-descriptions-item><a-descriptions-item v-if="preview.network" label="网络">{{previewNetworkLabel(preview.network)}}</a-descriptions-item><a-descriptions-item v-if="preview.connectionMode!=='client_login'" label="供应商名称">{{preview.providerName}}</a-descriptions-item><a-descriptions-item v-if="preview.effectiveContextWindow" label="默认模型上下文">{{formatModelContextWindow(preview.effectiveContextWindow)}}<span class="muted"> · {{contextSourceName(preview.contextWindowSource)}}</span></a-descriptions-item><a-descriptions-item v-if="preview.effectiveAutoCompactTokenLimit" label="自动压缩阈值">{{formatModelContextWindow(preview.effectiveAutoCompactTokenLimit)}}</a-descriptions-item><a-descriptions-item v-if="preview.clientType!=='claude_code'&&preview.launchMode!=='cli'" label="语言偏好">{{previewOfficialDesktop?'在官方客户端中设置':localeLabel(preview.desktopLocale,preview.desktopLocaleSource,preview.desktopEffectiveLocale)}}<span v-if="preview.desktopLocale" class="muted"> · 保留已有选择</span></a-descriptions-item><a-descriptions-item v-if="preview.desktopLocaleCompatibilityAvailable!==undefined" label="页面语言">{{preview.desktopLocaleCompatibilityAvailable?'使用 Codex 内置翻译':preview.desktopLocaleCompatibilityReason}}</a-descriptions-item><a-descriptions-item v-if="preview.clientType!=='claude_code'" :label="preview.speedMenuAvailable?'启动时速度':'默认服务等级'">{{ preview.speedMenuAvailable?initialSpeedName(preview.tier):tierName(preview.tier) }}</a-descriptions-item><a-descriptions-item v-if="preview.speedMenuAvailable!==undefined" label="对话速度">{{preview.speedMenuAvailable?'在 Codex 中选择普通 / Fast':preview.speedMenuReason}}<span v-if="preview.speedMenuAvailable" class="muted"> · 由客户端适配提供，实际是否支持由上游响应决定</span></a-descriptions-item><a-descriptions-item v-if="preview.args.length" label="附加参数"><pre>{{ preview.args.join('\n') }}</pre></a-descriptions-item></a-descriptions>
       <p class="muted instance-official-desktop-note" v-if="previewOfficialDesktop">使用官方客户端原版界面，首页、语言与可用功能由客户端及账号权限决定。已有界面偏好保留。</p>
       <p class="muted" v-else-if="preview && preview.clientType!=='claude_code'&&preview.launchMode!=='cli'">新实例默认自动检测电脑语言，之后保留你在 Codex 中的选择。各项功能独立检测；暂未兼容的功能保留客户端原有行为。</p>
@@ -867,7 +871,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
 </template>
 
 <style scoped>
-.instance-footer-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}.instance-form-feedback{text-align:left}
+.instance-footer-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}.instance-form-feedback{text-align:left}.instance-launch-proxy-note{margin-left:8px}
 .instance-copy-job{margin-bottom:18px}.instance-copy-job p{margin:8px 0}.instance-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px}.instance-heading{display:flex;justify-content:space-between;gap:12px;margin-bottom:20px}.instance-name{display:flex;align-items:center;gap:10px;font-size:17px;min-width:0}.instance-name strong{overflow-wrap:anywhere}.instance-path{font-size:12px;opacity:.65;overflow-wrap:anywhere;margin:10px 0}.instance-note{font-size:12px;margin-top:24px;line-height:1.8}.instance-launch-preview{overflow-wrap:anywhere}.instance-launch-preview pre{white-space:pre-wrap}
  .instance-editor-title{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-right:28px;font-size:19px;font-weight:650;letter-spacing:-.02em}
 .instance-step-count{font-size:12px;font-weight:500;letter-spacing:0;opacity:.5}

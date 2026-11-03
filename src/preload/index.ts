@@ -148,7 +148,7 @@ const api: ManagerAPI = {
   purgeInstanceArchive: input => ipcRenderer.invoke('manager:invoke','purgeInstanceArchive',input),
   previewInstanceLaunch: input => ipcRenderer.invoke('manager:invoke','previewInstanceLaunch',input),
   previewInstanceHistory: input => ipcRenderer.invoke('manager:invoke','previewInstanceHistory',input),
-  startInstance: ticket => ipcRenderer.invoke('manager:invoke','startInstance',ticket),
+  startInstance: (ticket,injectNetworkProxy) => ipcRenderer.invoke('manager:invoke','startInstance',injectNetworkProxy===undefined?ticket:{ticket,injectNetworkProxy}),
   stopInstance: id => ipcRenderer.invoke('manager:invoke','stopInstance',id),
   closeAllInstances: () => ipcRenderer.invoke('manager:invoke','closeAllInstances'),
   focusInstance: id => ipcRenderer.invoke('manager:invoke','focusInstance',id),

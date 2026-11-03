@@ -57,16 +57,16 @@ type responsesWebsocketTurn struct {
 func beginResponsesWebsocketTurn(parent context.Context, cfg *config.SDKConfig, body []byte, writer *responsesWebsocketWriter) *responsesWebsocketTurn {
 	open, idle := 30*time.Second, 5*time.Minute
 	if cfg != nil {
-		if ms := cfg.Streaming.StreamOpenTimeoutMS; ms > 0 {
-			open = time.Duration(ms) * time.Millisecond
+		if ms := cfg.Streaming.StreamOpenTimeoutMS; ms != 0 {
+			open = configuredResponsesWebsocketTimeout(ms, open)
 		}
 		if ms := cfg.Streaming.StreamIdleTimeoutMS; ms > 0 {
 			idle = time.Duration(ms) * time.Millisecond
 		}
 		image := strings.HasPrefix(gjson.GetBytes(body, "model").String(), "gpt-image-") || gjson.GetBytes(body, `tools.#(type=="image_generation")`).Exists()
 		if image {
-			if ms := cfg.Streaming.ImageStreamOpenTimeoutMS; ms > 0 {
-				open = time.Duration(ms) * time.Millisecond
+			if ms := cfg.Streaming.ImageStreamOpenTimeoutMS; ms != 0 {
+				open = configuredResponsesWebsocketTimeout(ms, open)
 			}
 			if ms := cfg.Streaming.ImageStreamIdleTimeoutMS; ms > 0 {
 				idle = time.Duration(ms) * time.Millisecond
@@ -79,6 +79,19 @@ func beginResponsesWebsocketTurn(parent context.Context, cfg *config.SDKConfig, 
 	return turn
 }
 
+// A negative stream-open value is the manager's explicit no-deadline
+// sentinel. Zero means the setting was omitted and keeps the standalone
+// CLIProxyAPI default. Idle timeouts continue to use their positive default.
+func configuredResponsesWebsocketTimeout(value int, fallback time.Duration) time.Duration {
+	if value < 0 {
+		return 0
+	}
+	if value == 0 {
+		return fallback
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
 func (t *responsesWebsocketTurn) arm(timeout time.Duration, phase string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -89,6 +102,12 @@ func (t *responsesWebsocketTurn) arm(timeout time.Duration, phase string) {
 	generation := t.generation
 	if t.timer != nil {
 		t.timer.Stop()
+		t.timer = nil
+	}
+	if timeout <= 0 {
+		// A disabled open timeout must not create a zero-duration timer. The
+		// generation increment above still invalidates any prior timer.
+		return
 	}
 	t.timer = time.AfterFunc(timeout, func() {
 		t.mu.Lock()

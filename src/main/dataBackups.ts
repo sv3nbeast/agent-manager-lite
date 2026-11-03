@@ -83,6 +83,11 @@ export class DataBackups {
         ready()
         const current=this.snapshot(),ids=pending.bundle.state.localAccess?.keys.map(k=>k.id)??[],rawUsage=this.rawUsage(ids)
         const existingUsage=effectiveKeyUsage(this.store.read(),rawUsage),restored=structuredClone(pending.bundle.state)
+        if((restored.streamOpenTimeoutDefaultsVersion??0)<1){
+          if(restored.settings.streamOpenTimeoutSeconds===60)restored.settings.streamOpenTimeoutSeconds=0
+          if(restored.settings.imageStreamOpenTimeoutSeconds===60)restored.settings.imageStreamOpenTimeoutSeconds=0
+          restored.streamOpenTimeoutDefaultsVersion=1
+        }
         for(const key of restored.localAccess?.keys??[]){
           const total=Math.max(pending.bundle.localKeyUsage[key.id]??0,existingUsage[key.id]??0)
           key.restoredUsageOffset=Math.max(0,total-(rawUsage[key.id]??0))

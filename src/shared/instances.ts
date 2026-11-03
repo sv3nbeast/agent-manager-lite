@@ -11,6 +11,7 @@ export const instanceInputSchema = z.object({
   name:text, applicationId:z.string().min(1).max(100), accountId:z.union([z.string().uuid(),z.literal('')]),
   connectionMode:z.enum(['local_api','native','client_login']).default('local_api'),
   launchMode:z.enum(['desktop','cli']).optional(),
+  injectNetworkProxy:z.boolean().optional(),
   workingDirectoryId:z.string().uuid().optional(),
   defaultTier:defaultTierSchema.default('inherit'), model:z.string().trim().max(200),
   extraArgs:z.array(z.string().max(2000).refine(value=>!/[\x00-\x1f\x7f]/.test(value))).max(50).default([])
@@ -65,6 +66,7 @@ export interface InstanceLaunchPreview {
   ticket:string; instanceId:string; name:string; application:string; directory:string; desktopDirectory:string
   workingDirectory:string; args:string[]; accountName:string; model:string; tier?:string; tierSource:string
   connectionMode:'local_api'|'native'|'client_login'
+  injectNetworkProxy?:boolean
   launchMode?:'desktop'|'cli';executable?:string
   externalHome?:boolean
   providerName?:string

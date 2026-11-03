@@ -313,6 +313,20 @@ test('Claude API and Bearer use concurrent owned native processes and consume a 
   await f.instances.stop(second.id)
 })
 
+test('Claude CLI can skip account proxy injection for one launch without changing its default', {skip:!supported},async t=>{
+  const f=fixture(t),instance=f.add('Proxy opt-out')
+  f.store.transaction(state=>{state.accounts.find(value=>value.id===f.api.id)!.proxy={mode:'custom',url:'http://proxy.fixture.invalid:8443'}})
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.injectNetworkProxy,true)
+  f.instances.start(preview.ticket,false)
+  await f.instances.settled(instance.id)
+  assert.equal(f.instances.views().find(value=>value.id===instance.id)?.status,'running')
+  assert.match(f.handoffs[0].script,/export HTTP_PROXY=''/)
+  assert.match(f.handoffs[0].script,/export NO_PROXY='\*'/)
+  assert.equal(f.store.read().instances?.[0].injectNetworkProxy,true)
+  await f.instances.stop(instance.id)
+})
+
 test('Claude subscription launch refreshes before projection, updates live and keeps refresh tokens in the vault', { skip: !supported }, async t => {
   let refreshed = 0
   const f = fixture(t, { ensure: async (id, store) => {
@@ -383,6 +397,26 @@ test('Claude subscription startup failure removes only its projection and preser
   f.instances.start(f.instances.preview({ id: instance.id, revision: current.revision }).ticket); await f.instances.settled(instance.id)
   assert.equal(readFileSync(join(instance.directory, '.credentials.json'), 'utf8'), preserved)
   assert.match(f.instances.views().find(value => value.id === instance.id)!.error ?? '', /已有独立登录|登录凭据|已保留/)
+})
+
+test('Claude subscription one-run proxy override survives credential renewal and manager recovery', {skip:!supported},async t=>{
+  const f=fixture(t,{ensure:async(id,store)=>store.read().accounts.find(value=>value.id===id)!})
+  const subscription=parseClaudeCodeAccountImport(JSON.stringify({accessToken:'fixture-override-access',refreshToken:'fixture-override-refresh',models:['fixture-sonnet']})).accounts[0]
+  f.store.transaction(state=>{state.accounts.push({...subscription,proxy:{mode:'custom',url:'http://proxy.fixture.invalid:8443'}})})
+  const instance=f.add('Subscription override',subscription)
+  f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket,false)
+  await f.instances.settled(instance.id)
+  assert.equal(f.instances.views().at(-1)?.status,'running',f.instances.views().at(-1)?.error)
+  await f.evidence(instance.directory)
+  f.store.transaction(state=>{const account=state.accounts.find(value=>value.id===subscription.id)!;account.credentials.accessToken='fixture-override-renewed';account.generation='fixture-override-generation'})
+  await f.instances.updateCredentials(f.store.read().accounts.find(value=>value.id===subscription.id)!)
+  const credentials=join(instance.directory,'.credentials.json')
+  assert.equal(JSON.parse(readFileSync(credentials,'utf8')).claudeAiOauth.accessToken,'fixture-override-renewed')
+  const recovered=f.create();await recovered.recover()
+  assert.equal(recovered.views().at(-1)?.status,'running',recovered.views().at(-1)?.error)
+  assert.equal(recovered.views().at(-1)?.injectNetworkProxy,false)
+  assert.equal(f.store.read().instances?.at(-1)?.injectNetworkProxy,true)
+  await recovered.stop(instance.id)
 })
 
 test('Claude subscription recovery resumes renewal for an owned process without a vanished relay', { skip: !supported }, async t => {

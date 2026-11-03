@@ -53,10 +53,10 @@ type ClaudeResumeLaunch=CatalogClaudeResumePreview & {cwdDevice:number;cwdInode:
 const claudeWorkingDirectorySchema=z.object({path:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)),canonicalPath:z.string().min(1).max(4096).refine(value=>isAbsolute(value)&&!/[\x00-\x1f\x7f]/.test(value)).optional(),device:z.number().int().nonnegative(),inode:z.number().int().nonnegative()}).strict()
 type ClaudeWorkingDirectory=z.infer<typeof claudeWorkingDirectorySchema>
 type CodexResumeLaunch=CodexResumeTicketSource & {cwdDevice:number;cwdInode:number}
-type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string;claudeSubscriptionFingerprint?:string;claudeResume?:ClaudeResumeLaunch;claudeWorkingDirectory?:ClaudeWorkingDirectory;codexResume?:CodexResumeLaunch}
+type Running={profile:InstanceProfile;plan:DesktopPlan;status:InstanceView['status'];controller:AbortController;injectNetworkProxy?:boolean;gateway?:Gateway;nativeProxy?:NativeProxyLease;child?:DesktopProcess;task?:Promise<void>;stopping?:Promise<void>;error?:string;startedAt?:number;backup?:string;nativeTier?:string;initialTier?:string;speedMenuInspection?:CodexSpeedMenuInspection;localeInspection?:CodexSpeedMenuInspection;ultraInspection?:CodexSpeedMenuInspection;clientVersion?:string;claudeSubscriptionFingerprint?:string;claudeResume?:ClaudeResumeLaunch;claudeWorkingDirectory?:ClaudeWorkingDirectory;codexResume?:CodexResumeLaunch}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const resolveCompatibleApplication=(application:InstanceApplication)=>{try {resolveAgentClientType(application.clientType);return true}catch{return false}}
-const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native','client_login']).optional(),launchMode:z.enum(['desktop','cli']).optional(),nativeTier:z.string().optional(),nativeProxy:z.boolean().optional(),claudeExecutable:z.string().min(1).max(4096).optional(),claudeApplication:z.string().min(1).max(4096).optional(),claudeSubscriptionFingerprint:z.string().regex(/^[a-f0-9]{64}$/).optional(),claudeWorkingDirectory:claudeWorkingDirectorySchema.optional()}).strict()
+const checkpointSchema=z.object({clientType:agentClientTypeSchema.optional(),nonce:z.string().uuid(),backup:z.string().regex(/^\d{13}-[a-f0-9-]{36}$/).optional(),connectionMode:z.enum(['local_api','native','client_login']).optional(),launchMode:z.enum(['desktop','cli']).optional(),nativeTier:z.string().optional(),nativeProxy:z.boolean().optional(),injectNetworkProxy:z.boolean().optional(),claudeExecutable:z.string().min(1).max(4096).optional(),claudeApplication:z.string().min(1).max(4096).optional(),claudeSubscriptionFingerprint:z.string().regex(/^[a-f0-9]{64}$/).optional(),claudeWorkingDirectory:claudeWorkingDirectorySchema.optional()}).strict()
 
 export class Instances {
   private readonly root:string
@@ -160,7 +160,7 @@ export class Instances {
         accountName:state.accounts.find(account=>account.id===profile.accountId)?.name,applicationName:applications.find(app=>app.id===profile.applicationId)?.name,
         status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),menuNotice,localeNotice,ultraNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
         speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState,ultraCompatibility:ultraState,clientVersion:run?.clientVersion,
-        identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId}
+        identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId,injectNetworkProxy:run?.injectNetworkProxy??profile.injectNetworkProxy!==false}
     })
   }
   private validateDetails(details:InstanceInput,id:string):InstanceInput {
@@ -168,7 +168,7 @@ export class Instances {
     if(!application)throw new Error('请先选择已检测或登记的桌面应用或 CLI 程序')
     const launchMode=application.kind??'desktop',adapter=getInstanceClientAdapter(details.clientType,launchMode)
     if(details.launchMode!==undefined&&details.launchMode!==launchMode)throw new Error('实例运行方式与所选应用不一致，请重新选择')
-    details={...details,launchMode}
+    details={...details,launchMode,injectNetworkProxy:details.injectNetworkProxy!==false}
     adapter.validateApplication(details,application)
     if(isClaudeDesktopProfile(details)){
       if(details.connectionMode==='client_login'){
@@ -450,7 +450,7 @@ export class Instances {
     if(saved.launchMode!==undefined&&saved.launchMode!=='cli')throw new Error('Claude CLI 恢复记录的运行方式不一致')
     return {clientType:'claude_code',application:executable,executable,directory:join(folder,'home'),desktopDirectory:join(folder,'desktop'),workingDirectory:saved.claudeWorkingDirectory?.path??join(folder,'workspace'),args:[],nonce:saved.nonce,mode:'cli'}
   }
-  private context(profile:InstanceProfile,nonce:string=randomUUID()) {
+  private context(profile:InstanceProfile,nonce:string=randomUUID(),injectNetworkProxy=this.proxyInjectionEnabled(profile)) {
     const adapter=getInstanceClientAdapter(profile.clientType)
     if(this.store.read().clientSwitches?.some(record=>record.targetId===profile.id))throw new Error('请先恢复此目录的原生账号切换')
     if(profile.connectionMode!=='native'&&this.store.read().clientAuthorities?.some(binding=>binding.targetId===profile.id))throw new Error('此目录正在维护原生登录，请先解除凭据关联后再使用本地 API 启动模式')
@@ -459,7 +459,7 @@ export class Instances {
     adapter.validateAccount(profile,account)
     if(profile.connectionMode==='native'){
       if(!this.nativeAccounts)throw new Error('原生账号服务不可用')
-      this.nativeAccounts.validate(profile)
+      this.nativeAccounts.validate(profile,injectNetworkProxy)
     }
     const configs=new ClientConfigs(this.store),view=configs.view(profile.id)
     const modelContext=configs.instanceModelContext(profile.id,profile.model)
@@ -492,9 +492,10 @@ export class Instances {
     const speedPreference=speedMenu?.supported?previewDesktopServiceTier(this.speedPreferenceOptions(profile.id,plan,tier.tier)):undefined
     const initialTier=speedPreference?speedPreference.tier:tier.tier
     const history=readInstanceHistory(plan.directory)
+    const proxyFingerprint=profile.connectionMode==='native'&&!injectNetworkProxy?undefined:accountProxyURL(account,state)
     const fingerprint=digest([profile,view.revision,plan.application,plan.executable,plan.cliPackage,lstatSync(plan.executable).mtimeMs,lstatSync(plan.executable).ino,lstatSync(plan.workingDirectory).ino,
       ...[folder,plan.directory,plan.desktopDirectory].map(path=>[lstatSync(path).dev,lstatSync(path).ino]),
-      account.id,account.kind,account.baseUrl,account.models,account.wireApi,account.credentials.apiKey,account.providerId,account.providerKeyId,providerName,language?.revision,modelContext.revision,accountProxyURL(account,state),tier,
+      account.id,account.kind,account.baseUrl,account.models,account.wireApi,account.credentials.apiKey,account.providerId,account.providerKeyId,providerName,language?.revision,modelContext.revision,proxyFingerprint,tier,
       profile.connectionMode==='native'?readBounded(join(plan.directory,'auth.json'),2*1024*1024):null,speedMenu?.fingerprint,speedPreference?.revision,localeCandidate?.fingerprint,combined?.fingerprint,compatibility?.fingerprint,history])
     return {account,configs,view,tier,plan,fingerprint,providerName,language,modelContext,speedMenu,speedPreference,initialTier,localeCompatibility,ultraCompatibility,compatibility,history}
   }
@@ -527,7 +528,7 @@ export class Instances {
       desktopLocaleCompatibilityAvailable:context.localeCompatibility?.supported,desktopLocaleCompatibilityReason:context.localeCompatibility?.reason,
       ultraAvailable:context.ultraCompatibility?.supported,ultraReason:context.ultraCompatibility?.reason,clientVersion:context.compatibility?.version,
       identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId,
-      history:context.history}
+      history:context.history,injectNetworkProxy:profile.injectNetworkProxy!==false}
     this.previews.set(id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000})
     return structuredClone(preview)
   }
@@ -560,7 +561,7 @@ export class Instances {
     if(context.plan.mode!=='cli'||context.plan.clientType!=='codex')throw new Error('此会话来源不是 Codex CLI 实例')
     const state=this.store.read(),account=state.accounts.find(value=>value.id===profile.accountId)!
     const ticket=randomUUID(),resume={...source},args=['resume',source.sessionId,...profile.extraArgs],preview:InstanceLaunchPreview & CodexResumeTicketSource & {sessionId:string}={
-      clientType:'codex',ticket,instanceId:profile.id,name:profile.name,application:context.plan.application,executable:context.plan.executable,directory:context.plan.directory,desktopDirectory:context.plan.desktopDirectory,workingDirectory:source.cwd,args,accountName:account.name,model:profile.model,tierSource:'instance',connectionMode:profile.connectionMode??'local_api',launchMode:'cli',identityStatus:'local_api',...resume
+      clientType:'codex',ticket,instanceId:profile.id,name:profile.name,application:context.plan.application,executable:context.plan.executable,directory:context.plan.directory,desktopDirectory:context.plan.desktopDirectory,workingDirectory:source.cwd,args,accountName:account.name,model:profile.model,tierSource:'instance',connectionMode:profile.connectionMode??'local_api',launchMode:'cli',identityStatus:'local_api',injectNetworkProxy:profile.injectNetworkProxy!==false,...resume
     }
     this.previews.set(profile.id,{preview,fingerprint:context.fingerprint,expiresAt:Date.now()+300_000,codexResume:resume});return structuredClone(preview)
   }
@@ -605,67 +606,76 @@ export class Instances {
     // snapshot after the user reviews the preview and immediately before spawn.
     claudeSessionResumeArgs({id:resume.sessionId,locations:[resume.location],conflict:false})
   }
-  start(ticket:string):void {
+  start(ticket:string,injectNetworkProxy?:boolean):void {
     z.string().uuid().parse(ticket)
+    if(injectNetworkProxy!==undefined)z.boolean().parse(injectNetworkProxy)
     const entry=[...this.previews.entries()].find(([,value])=>value.preview.ticket===ticket)
     if(!entry || entry[1].expiresAt<Date.now())throw new Error('启动预览已过期，请重新预览')
     const [id,pending]=entry,profile=this.profile(id)
+    const inject=injectNetworkProxy??this.proxyInjectionEnabled(profile)
     if(pending.codexResume){
       this.validateCodexResume(profile,pending.codexResume)
-      const context=this.context(profile)
-      if(context.fingerprint!==pending.fingerprint)throw new Error('Codex 账号、配置或 CLI 程序已变化，请重新预览')
-      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController()}
+      const baseline=this.context(profile)
+      if(baseline.fingerprint!==pending.fingerprint)throw new Error('Codex 账号、配置或 CLI 程序已变化，请重新预览')
+      const context=inject===this.proxyInjectionEnabled(profile)?baseline:this.context(profile,baseline.plan.nonce,inject)
+      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),injectNetworkProxy:inject}
       run.plan.args=[...profile.extraArgs]
       run.plan.managedArgs=['resume',pending.codexResume.sessionId]
       run.plan.workingDirectory=pending.codexResume.cwd
       run.codexResume=pending.codexResume
       this.previews.delete(id);this.notices.delete(id);this.active.set(id,run)
-      run.task=this.launch(run,context.view.revision,pending.fingerprint).finally(()=>{run.task=undefined});return
+      run.task=this.launch(run,context.view.revision,context.fingerprint).finally(()=>{run.task=undefined});return
     }
     if(isClaudeDesktopProfile(profile)){
       if(this.inUse(id))throw new Error('实例已有启动或运行任务')
+      const baseline=this.claudeDesktopContext(profile)
+      if(baseline.fingerprint!==pending.fingerprint)throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
       this.previews.delete(id)
-      const context=this.claudeDesktopContext(profile)
-      if(context.fingerprint!==pending.fingerprint)throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
-      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController()}
+      const context=this.claudeDesktopContext(profile,undefined,inject)
+      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),injectNetworkProxy:inject}
       this.notices.delete(id);this.active.set(id,run)
-      run.task=this.launch(run,'',pending.fingerprint).finally(()=>{run.task=undefined});return
+      run.task=this.launch(run,'',context.fingerprint).finally(()=>{run.task=undefined});return
     }
     if(profile.clientType==='claude_code'){
       if(this.inUse(id))throw new Error('实例已有启动或运行任务')
-      this.previews.delete(id)
       if(pending.claudeResume)this.validateClaudeResume(profile,pending.claudeResume)
       const claudeWorkingDirectory=pending.claudeResume?{path:pending.claudeResume.cwd,canonicalPath:pending.claudeResume.cwdCanonicalPath,device:pending.claudeResume.cwdDevice,inode:pending.claudeResume.cwdInode}:undefined
-      const context=this.claudeContext(profile,undefined,claudeWorkingDirectory)
-      if(context.fingerprint!==pending.fingerprint)throw new Error('Claude 账号、配置或程序已变化，请重新预览')
-      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),claudeResume:pending.claudeResume,claudeWorkingDirectory}
+      const baseline=this.claudeContext(profile,undefined,claudeWorkingDirectory)
+      if(baseline.fingerprint!==pending.fingerprint)throw new Error('Claude 账号、配置或程序已变化，请重新预览')
+      this.previews.delete(id)
+      const context=this.claudeContext(profile,undefined,claudeWorkingDirectory,inject)
+      const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),injectNetworkProxy:inject,claudeResume:pending.claudeResume,claudeWorkingDirectory}
       this.notices.delete(id);this.active.set(id,run)
-      run.task=this.launch(run,'',pending.fingerprint).finally(()=>{run.task=undefined});return
+      run.task=this.launch(run,'',context.fingerprint).finally(()=>{run.task=undefined});return
     }
-    const context=this.context(profile)
+    const baseline=this.context(profile)
     if(this.inUse(id))throw new Error('实例已有启动或运行任务')
     this.previews.delete(id)
-    if(context.fingerprint!==pending.fingerprint)throw new Error('账号、配置、会话或应用已变化，请重新预览')
-    const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),initialTier:context.initialTier,speedMenuInspection:context.speedMenu,localeInspection:context.localeCompatibility,ultraInspection:context.ultraCompatibility,clientVersion:context.compatibility?.version}
+    if(baseline.fingerprint!==pending.fingerprint)throw new Error('账号、配置、会话或应用已变化，请重新预览')
+    const context=inject===this.proxyInjectionEnabled(profile)?baseline:this.context(profile,baseline.plan.nonce,inject)
+    const run:Running={profile,plan:context.plan,status:'preparing',controller:new AbortController(),injectNetworkProxy:inject,initialTier:context.initialTier,speedMenuInspection:context.speedMenu,localeInspection:context.localeCompatibility,ultraInspection:context.ultraCompatibility,clientVersion:context.compatibility?.version}
     this.notices.delete(id)
     this.active.set(id,run)
-    run.task=this.launch(run,context.view.revision,pending.fingerprint).finally(()=>{run.task=undefined})
+    run.task=this.launch(run,context.view.revision,context.fingerprint).finally(()=>{run.task=undefined})
   }
-  private claudeContext(profile:InstanceProfile,nonce?:string,claudeWorkingDirectory?:ClaudeWorkingDirectory):ClaudeRuntimeContext {
+  private proxyInjectionEnabled(profile:InstanceProfile):boolean {return profile.injectNetworkProxy!==false}
+  private claudeContext(profile:InstanceProfile,nonce?:string,claudeWorkingDirectory?:ClaudeWorkingDirectory,injectNetworkProxy=this.proxyInjectionEnabled(profile)):ClaudeRuntimeContext {
     const account=this.store.read().accounts.find(value=>value.id===profile.accountId)
     if(!account)throw new Error('绑定连接已删除，请重新选择')
-    return claudeRuntimeContext(profile,account,this.plan(profile,nonce??randomUUID(),claudeWorkingDirectory),accountProxyURL(account,this.store.read()))
+    return claudeRuntimeContext(profile,account,this.plan(profile,nonce??randomUUID(),claudeWorkingDirectory),injectNetworkProxy?accountProxyURL(account,this.store.read()):'direct')
   }
-  private claudeDesktopContext(profile:InstanceProfile,nonce?:string):ClaudeDesktopRuntimeContext {
+  private claudeDesktopContext(profile:InstanceProfile,nonce?:string,injectNetworkProxy=this.proxyInjectionEnabled(profile)):ClaudeDesktopRuntimeContext {
     const state=this.store.read(),account=profile.connectionMode==='native'?state.accounts.find(value=>value.id===profile.accountId):undefined
-    return claudeDesktopRuntimeContext(profile,this.plan(profile,nonce??randomUUID()),profile.connectionMode==='native'&&account?accountProxyURL(account,state):defaultProxyURL(this.store.proxyState()),account)
+    const configuredProxy=injectNetworkProxy?(profile.connectionMode==='native'&&account?accountProxyURL(account,state):defaultProxyURL(this.store.proxyState())):undefined
+    return claudeDesktopRuntimeContext(profile,this.plan(profile,nonce??randomUUID()),configuredProxy,account)
   }
   private async launchClaudeDesktop(run:Running,fingerprint:string):Promise<void> {
-    const context=this.claudeDesktopContext(run.profile,run.plan.nonce)
+    const inject=run.injectNetworkProxy!==false
+    const context=this.claudeDesktopContext(run.profile,run.plan.nonce,inject)
     if(context.fingerprint!==fingerprint)throw new Error('Claude Desktop 应用、配置或网络设置已变化，请重新预览')
     const prepared=await prepareClaudeDesktopLaunch(context,run.controller.signal)
     run.controller.signal.throwIfAborted()
-    if(prepared.upstreamProxy!==undefined){
+    if(inject&&prepared.upstreamProxy!==undefined){
       if(!this.nativeProxyService)throw new Error('实例代理服务不可用，请重新安装管理器')
       // The native Desktop accepts its own HTTP egress pin, including when the
       // manager explicitly selects direct. Only the loopback lease is projected.
@@ -680,9 +690,12 @@ export class Instances {
       // snapshotted upstream value so a settings change during preparation is
       // still detected by the comparison below.
       prepared.fingerprint=claudeDesktopRuntimeContext(run.profile,prepared.plan,prepared.upstreamProxy,prepared.account).fingerprint
+    }else if(!inject){
+      prepared.plan.networkRoute={mode:'direct'}
+      prepareClaudeDesktopNetwork(prepared.plan)
     }
     run.controller.signal.throwIfAborted()
-    if(this.claudeDesktopContext(run.profile,run.plan.nonce).fingerprint!==prepared.fingerprint)throw new Error('Claude Desktop 配置或网络在启动准备期间已变化，请重新预览')
+    if(this.claudeDesktopContext(run.profile,run.plan.nonce,inject).fingerprint!==prepared.fingerprint)throw new Error('Claude Desktop 配置或网络在启动准备期间已变化，请重新预览')
     if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('实例代理已退出，请重新启动')
     run.plan=prepared.plan;run.clientVersion=prepared.version
     this.checkpoint(run)
@@ -692,25 +705,29 @@ export class Instances {
     run.status='running';run.startedAt=Date.now()
   }
   private async launchClaude(run:Running,fingerprint:string):Promise<void> {
-    let context=this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory)
+    const inject=run.injectNetworkProxy!==false
+    let context=this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory,inject)
     if(context.fingerprint!==fingerprint)throw new Error('Claude 配置已变化，请重新预览')
     if(isClaudeSubscriptionAccount(context.account)){
       await this.prepareAccount(context.account.id)
       run.controller.signal.throwIfAborted()
-      context=this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory)
+      context=this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory,inject)
       if(context.fingerprint!==fingerprint)throw new Error('Claude 订阅身份或连接在刷新期间已变化，请重新预览')
       run.claudeSubscriptionFingerprint=fingerprint
     }
     run.clientVersion=await prepareClaudeLaunch(context,run.profile.model,run.controller.signal)
-    const proxy=accountProxyURL(context.account,this.store.read())
-    if(proxy==='direct')context.plan.networkRoute={mode:'direct'}
-    else if(proxy!==undefined){
-      if(!this.nativeProxyService)throw new Error('实例代理服务不可用，请重新安装管理器')
-      run.nativeProxy=await this.nativeProxyService.acquire(proxy,run.profile.id,run.controller.signal)
-      context.plan.networkRoute={mode:'proxy',url:run.nativeProxy.url}
+    if(!inject)context.plan.networkRoute={mode:'direct'}
+    else {
+      const proxy=accountProxyURL(context.account,this.store.read())
+      if(proxy==='direct')context.plan.networkRoute={mode:'direct'}
+      else if(proxy!==undefined){
+        if(!this.nativeProxyService)throw new Error('实例代理服务不可用，请重新安装管理器')
+        run.nativeProxy=await this.nativeProxyService.acquire(proxy,run.profile.id,run.controller.signal)
+        context.plan.networkRoute={mode:'proxy',url:run.nativeProxy.url}
+      }
     }
     run.controller.signal.throwIfAborted()
-    if(this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory).fingerprint!==fingerprint)throw new Error('Claude 连接或配置在启动准备期间已变化，请重新预览')
+    if(this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory,inject).fingerprint!==fingerprint)throw new Error('Claude 连接或配置在启动准备期间已变化，请重新预览')
     initializeClaudeCodeOnboarding(context.plan.directory)
     run.plan=context.plan
     this.checkpoint(run)
@@ -718,7 +735,7 @@ export class Instances {
       prepareClaudeSubscriptionCredentials(run.plan,context.account)
       await verifyClaudeSubscriptionLaunch(run.plan,run.controller.signal)
       run.controller.signal.throwIfAborted()
-      if(this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory).fingerprint!==fingerprint)throw new Error('Claude 订阅配置在启动检查期间已变化，请重新预览')
+      if(this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory,inject).fingerprint!==fingerprint)throw new Error('Claude 订阅配置在启动检查期间已变化，请重新预览')
       updateClaudeSubscriptionCredentials(run.plan,this.store.read().accounts.find(value=>value.id===run.profile.accountId)!)
     }
     if(run.claudeResume){
@@ -730,14 +747,14 @@ export class Instances {
     if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('实例代理已退出，请重新启动')
     run.status='running';run.startedAt=Date.now()
   }
-  private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id,false,!run.claudeWorkingDirectory),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,claudeSubscriptionFingerprint:run.claudeSubscriptionFingerprint,claudeWorkingDirectory:run.claudeWorkingDirectory,connectionMode:run.profile.connectionMode??'local_api',launchMode:run.plan.mode??'desktop',nativeTier:run.nativeTier,nativeProxy:run.plan.networkRoute?.mode==='proxy'||undefined,...run.profile.clientType==='claude_code'?{claudeExecutable:run.plan.executable,...isClaudeDesktopProfile(run.profile)?{claudeApplication:run.plan.application}:{}}:{}}))}
+  private checkpoint(run:Running):void {atomic(join(this.folder(run.profile.id,false,!run.claudeWorkingDirectory),'launch.json'),JSON.stringify({clientType:resolveAgentClientType(run.profile.clientType),nonce:run.plan.nonce,backup:run.backup,claudeSubscriptionFingerprint:run.claudeSubscriptionFingerprint,claudeWorkingDirectory:run.claudeWorkingDirectory,connectionMode:run.profile.connectionMode??'local_api',launchMode:run.plan.mode??'desktop',nativeTier:run.nativeTier,nativeProxy:run.plan.networkRoute?.mode==='proxy'||undefined,injectNetworkProxy:run.injectNetworkProxy,...run.profile.clientType==='claude_code'?{claudeExecutable:run.plan.executable,...isClaudeDesktopProfile(run.profile)?{claudeApplication:run.plan.application}:{}}:{}}))}
   private async launch(run:Running,revision:string,fingerprint:string):Promise<void> {
     try {
       if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
       if(isClaudeDesktopProfile(run.profile)){await this.launchClaudeDesktop(run,fingerprint);return}
       if(run.profile.clientType==='claude_code'){await this.launchClaude(run,fingerprint);return}
       if(run.profile.externalHome&&run.profile.connectionMode!=='native')assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))
-      if(run.profile.connectionMode==='native')await this.nativeAccounts!.prepare(run.profile,run.controller.signal)
+      if(run.profile.connectionMode==='native')await this.nativeAccounts!.prepare(run.profile,run.controller.signal,run.injectNetworkProxy!==false)
       await this.prepareAccount(run.profile.accountId)
       // A clean stop followed by a start in the same manager process does not
       // pass through recover(). Apply the same projection repair after account
@@ -754,7 +771,7 @@ export class Instances {
         }
       }
       run.controller.signal.throwIfAborted()
-      let context=this.context(run.profile,run.plan.nonce)
+      let context=this.context(run.profile,run.plan.nonce,run.injectNetworkProxy!==false)
       if(context.fingerprint!==fingerprint)throw new Error('实例配置在凭据准备期间已变化，请重新启动')
       // Personal skills belong to the local user, while credentials and system
       // skills stay in each client's home. Rebuild missing entries on every
@@ -769,12 +786,12 @@ export class Instances {
       }
       if(context.language){
         initializeDesktopLocale(this.localeOptions(run.profile.id,run.plan),context.language.revision)
-        context=this.context(run.profile,run.plan.nonce);fingerprint=context.fingerprint;revision=context.view.revision
+        context=this.context(run.profile,run.plan.nonce,run.injectNetworkProxy!==false);fingerprint=context.fingerprint;revision=context.view.revision
       }
       if(context.speedMenu?.supported){
         if(!context.speedPreference)throw new Error('速度偏好预览已变化，请重新启动')
         initializeDesktopServiceTier(this.speedPreferenceOptions(run.profile.id,run.plan,context.tier.tier),context.speedPreference.revision)
-        context=this.context(run.profile,run.plan.nonce);fingerprint=context.fingerprint;revision=context.view.revision
+        context=this.context(run.profile,run.plan.nonce,run.injectNetworkProxy!==false);fingerprint=context.fingerprint;revision=context.view.revision
         run.initialTier=context.initialTier
       }
       if(context.compatibility?.supported){
@@ -784,27 +801,30 @@ export class Instances {
         else run.plan.desktopLocaleHook=hook
       }
       if(run.profile.connectionMode==='native'){
-        const proxy=accountProxyURL(context.account,this.store.read())
-        if(proxy==='direct')run.plan.networkRoute={mode:'direct'}
-        else if(proxy!==undefined){
-          if(!this.nativeProxyService)throw new Error('原生实例代理服务不可用，请重新安装管理器')
-          run.nativeProxy=await this.nativeProxyService.acquire(proxy,run.profile.id,run.controller.signal)
-          run.plan.networkRoute={mode:'proxy',url:run.nativeProxy.url}
-          run.controller.signal.throwIfAborted()
-          if(!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
-          if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例网络代理或配置在连接准备期间已变化，请重新预览')
+        if(!run.injectNetworkProxy)run.plan.networkRoute={mode:'direct'}
+        else {
+          const proxy=accountProxyURL(context.account,this.store.read())
+          if(proxy==='direct')run.plan.networkRoute={mode:'direct'}
+          else if(proxy!==undefined){
+            if(!this.nativeProxyService)throw new Error('原生实例代理服务不可用，请重新安装管理器')
+            run.nativeProxy=await this.nativeProxyService.acquire(proxy,run.profile.id,run.controller.signal)
+            run.plan.networkRoute={mode:'proxy',url:run.nativeProxy.url}
+            run.controller.signal.throwIfAborted()
+            if(!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
+            if(this.context(run.profile,run.plan.nonce,true).fingerprint!==fingerprint)throw new Error('实例网络代理或配置在连接准备期间已变化，请重新预览')
+          }
         }
         run.nativeTier=context.tier.tier
         const contextPreview=context.configs.previewInstanceContext(run.profile.id,context.view.revision,run.profile.model)
         context.configs.apply(contextPreview.ticket,backup=>{run.backup=backup;this.checkpoint(run)})
-        context=this.context(run.profile,run.plan.nonce);fingerprint=context.fingerprint
+        context=this.context(run.profile,run.plan.nonce,run.injectNetworkProxy!==false);fingerprint=context.fingerprint
         // The nonce is durable before the encrypted auth transaction starts.
         // A crash at any later boundary can locate only this launch's journal.
         this.checkpoint(run)
         await this.nativeAccounts!.inject(run.profile,run.plan.nonce,context.tier.tier,run.controller.signal,()=>{
           if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
-          if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例设置在等待凭据写入期间已变化，请重新预览')
-        })
+          if(this.context(run.profile,run.plan.nonce,run.injectNetworkProxy!==false).fingerprint!==fingerprint)throw new Error('实例设置在等待凭据写入期间已变化，请重新预览')
+        },run.injectNetworkProxy!==false)
         run.controller.signal.throwIfAborted();run.status='starting'
         if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
         run.child=await this.runtime.launch(run.plan,run.controller.signal)
@@ -821,7 +841,7 @@ export class Instances {
       run.controller.signal.throwIfAborted()
       gateway.updateRoutingAccount(this.store.read().accounts.find(value=>value.id===run.profile.accountId)!)
       if(run.profile.externalHome)assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))
-      if(this.context(run.profile,run.plan.nonce).fingerprint!==fingerprint)throw new Error('实例供应商或配置在连接准备期间已变化，请重新预览启动')
+      if(this.context(run.profile,run.plan.nonce,run.injectNetworkProxy!==false).fingerprint!==fingerprint)throw new Error('实例供应商或配置在连接准备期间已变化，请重新预览启动')
       const preview=context.configs.previewInstanceConnection(run.profile.id,revision,{port:status.port!,key:localKey,model:run.profile.model,tier:run.plan.speedMenuHook?context.initialTier:status.defaultTier,manageServiceTier:!run.plan.speedMenuHook})
       context.configs.apply(preview.ticket,backup=>{run.backup=backup;this.checkpoint(run)})
       // Keep the manager-owned loopback Provider for inference while exposing
@@ -832,6 +852,7 @@ export class Instances {
         if(!this.nativeAccounts)throw new Error('账号身份投影服务不可用')
         await this.nativeAccounts.injectLocalApi(run.profile,run.plan.nonce,run.controller.signal)
       }
+      if(!run.injectNetworkProxy)run.plan.networkRoute={mode:'direct'}
       run.status='starting'
       if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
       run.child=await this.runtime.launch(run.plan,run.controller.signal)
@@ -856,7 +877,7 @@ export class Instances {
     if(run.claudeSubscriptionFingerprint&&!releaseClaudeSubscriptionCredentials(run.plan))this.notices.set(run.profile.id,'实例登录凭据已由其他来源修改，原文件已保留；再次启动请使用新实例或检查原生登录')
     if(run.profile.clientType!=='claude_code'&&run.profile.connectionMode==='native'){
       if(!this.nativeAccounts)throw new Error('原生登录恢复服务不可用，文件已保留')
-      await this.nativeAccounts.restore(run.profile,run.plan.nonce)
+      await this.nativeAccounts.restore(run.profile,run.plan.nonce,run.injectNetworkProxy!==false)
     }else if(run.profile.connectionMode==='local_api'&&this.store.read().clientSwitches?.some(record=>record.targetId===run.profile.id&&record.instanceNonce===run.plan.nonce)){
       if(!this.nativeAccounts)throw new Error('账号身份恢复服务不可用，文件已保留')
       await this.nativeAccounts.restoreLocalApi(run.profile,run.plan.nonce)
@@ -904,7 +925,7 @@ export class Instances {
       const latest=this.store.read().accounts.find(value=>value.id===account.id)
       if(!latest||latest.generation!==account.generation||latest.credentials.accessToken!==account.credentials.accessToken
         ||latest.credentials.refreshToken!==account.credentials.refreshToken)return
-      if(this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory).fingerprint!==run.claudeSubscriptionFingerprint)throw new Error('Claude 订阅身份或配置已变化，请停止后重新预览启动')
+      if(this.claudeContext(run.profile,run.plan.nonce,run.claudeWorkingDirectory,run.injectNetworkProxy!==false).fingerprint!==run.claudeSubscriptionFingerprint)throw new Error('Claude 订阅身份或配置已变化，请停止后重新预览启动')
       updateClaudeSubscriptionCredentials(run.plan,latest)
     }))
   }
@@ -988,16 +1009,16 @@ export class Instances {
         if(saved.launchMode!==undefined&&profile.launchMode!==undefined&&saved.launchMode!==profile.launchMode)throw new Error('实例运行方式与恢复记录不一致')
         const plan=this.recoveryPlan(profile,saved)
         if((saved.connectionMode??'local_api')!==(profile.connectionMode??'local_api'))throw new Error('实例启动模式与恢复记录不一致')
-        const run:Running={profile,plan,status:'error',controller:new AbortController(),backup:saved.backup,nativeTier:saved.nativeTier,claudeSubscriptionFingerprint:saved.claudeSubscriptionFingerprint,claudeWorkingDirectory:saved.claudeWorkingDirectory,error:saved.nativeProxy?'上次运行的实例代理已结束，请停止并回收登录状态后重新启动':isClaudeDesktopProfile(profile)?'检测到上次运行的 Claude Desktop，可定位窗口或停止实例':'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
+        const run:Running={profile,plan,status:'error',controller:new AbortController(),injectNetworkProxy:saved.injectNetworkProxy??profile.injectNetworkProxy!==false,backup:saved.backup,nativeTier:saved.nativeTier,claudeSubscriptionFingerprint:saved.claudeSubscriptionFingerprint,claudeWorkingDirectory:saved.claudeWorkingDirectory,error:saved.nativeProxy?'上次运行的实例代理已结束，请停止并回收登录状态后重新启动':isClaudeDesktopProfile(profile)?'检测到上次运行的 Claude Desktop，可定位窗口或停止实例':'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
         this.active.set(profile.id,run);run.child=await this.runtime.find(run.plan)
         if(!run.child){await this.cleanup(run);this.active.delete(profile.id)}
         else if(isClaudeDesktopProfile(profile)&&!saved.nativeProxy){run.status='running';run.error=undefined}
         else if(saved.claudeSubscriptionFingerprint&&!saved.nativeProxy){
           try {
-            const before=this.claudeContext(profile,plan.nonce,saved.claudeWorkingDirectory)
+            const before=this.claudeContext(profile,plan.nonce,saved.claudeWorkingDirectory,run.injectNetworkProxy!==false)
             if(!isClaudeSubscriptionAccount(before.account)||before.fingerprint!==saved.claudeSubscriptionFingerprint)throw new Error('订阅身份或配置已变化')
             await this.prepareAccount(profile.accountId)
-            const current=this.claudeContext(profile,plan.nonce,saved.claudeWorkingDirectory)
+            const current=this.claudeContext(profile,plan.nonce,saved.claudeWorkingDirectory,run.injectNetworkProxy!==false)
             if(current.fingerprint!==saved.claudeSubscriptionFingerprint)throw new Error('订阅身份或配置已变化')
             updateClaudeSubscriptionCredentials(plan,current.account)
             run.status='running';run.error=undefined

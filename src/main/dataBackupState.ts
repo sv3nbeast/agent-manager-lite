@@ -50,7 +50,8 @@ const portable=z.object({localDataArchives:z.array(z.object({id,fingerprint:z.st
   proxyResources:z.array(z.object({id,revision:integer,name:text,url:z.string().max(2*1024*1024),catalog:z.object({sourceId:id,itemId:text,revision:integer,selections:z.record(text),invalid:z.boolean().optional()}).strict().optional()}).strict()).max(500).optional(),
   upstreamProxy:z.object({revision:integer,mode:z.enum(['inherit','direct','custom']),url:text.optional()}).strict().optional(),
   unifiedProxy:z.object({mode:z.enum(['off','all_accounts']),resourceId:id.optional(),snapshot:z.object({url:z.string().max(2*1024*1024),resourceRevision:integer,sourceRevision:integer}).strict().optional(),pending:z.boolean().optional(),staleError:text.optional()}).strict().optional(),
-  proxyCatalogs:z.array(z.object({id,revision:integer,name:text,kind:z.enum(['manual','subscription','strategy']),strategyMembers:z.array(z.object({sourceId:id,itemId:text,name:text,sourceName:text}).strict()).max(64).optional(),catalog:z.object({nodes:z.array(catalogNode).max(4096),groups:z.array(catalogGroup).max(4096)}).strict(),updatedAt:date,default:z.object({itemId:text,selections:z.record(text)}).strict().optional(),defaultInvalidated:z.boolean().optional(),url:text.optional(),autoUpdate:z.boolean().optional(),lastAttemptAt:date.optional(),error:text.optional(),usage:z.object({upload:date,download:date,total:date,expireAt:date.optional(),at:date}).strict().optional()}).strict()).max(32).optional()
+  proxyCatalogs:z.array(z.object({id,revision:integer,name:text,kind:z.enum(['manual','subscription','strategy']),strategyMembers:z.array(z.object({sourceId:id,itemId:text,name:text,sourceName:text}).strict()).max(64).optional(),catalog:z.object({nodes:z.array(catalogNode).max(4096),groups:z.array(catalogGroup).max(4096)}).strict(),updatedAt:date,default:z.object({itemId:text,selections:z.record(text)}).strict().optional(),defaultInvalidated:z.boolean().optional(),url:text.optional(),autoUpdate:z.boolean().optional(),lastAttemptAt:date.optional(),error:text.optional(),usage:z.object({upload:date,download:date,total:date,expireAt:date.optional(),at:date}).strict().optional()}).strict()).max(32).optional(),
+  streamOpenTimeoutDefaultsVersion:z.literal(1).optional()
 }).strict()
 
 export type PortableState=Omit<State,'configTargets'|'codexSessionSources'|'clientAuthorities'|'clientSwitches'>
@@ -114,6 +115,7 @@ export function validateBackup(value:unknown):DataBackupBundle{
 export function backupCounts(s:PortableState):BackupCounts{return {accounts:s.accounts.length,groups:s.groups.length,providers:s.providers?.length??0,localKeys:s.localAccess?.keys.length??0,instances:s.instances?.length??0,recycledAccounts:s.accountRecycle?.length??0}}
 export function exportBackupState(state:State,usage:Record<string,number>,now=Date.now()):DataBackupBundle{
   const {configTargets,codexSessionSources:_codexSessionSources,clientAuthorities,clientSwitches,...portable}=state
+  portable.streamOpenTimeoutDefaultsVersion=1
   return validateBackup({schema:'codex-manager-lite.data-backup',version:1,exportedAt:now,state:portable,localKeyUsage:usage,sourceConnections:(clientAuthorities?.length??0)+(clientSwitches?.length??0),sourceDirectories:configTargets?.length??0})
 }
 export function effectiveKeyUsage(state:State,raw:Record<string,number>):Record<string,number>{

@@ -37,9 +37,6 @@ func (s *relayServer) executeStreamWithOpenTimeout(
 	if attempts <= 0 {
 		attempts = 1
 	}
-	if openTimeout <= 0 {
-		openTimeout = streamOpenTimeout
-	}
 	for attempt := 1; attempt <= attempts; attempt++ {
 		attemptCtx, cancelAttempt := context.WithCancel(ctx)
 		done := make(chan executeStreamResult, 1)
@@ -56,10 +53,17 @@ func (s *relayServer) executeStreamWithOpenTimeout(
 			done <- executeStreamResult{result: result, err: err}
 		}()
 
-		timer := time.NewTimer(openTimeout)
+		var timeout <-chan time.Time
+		var timer *time.Timer
+		if openTimeout > 0 {
+			timer = time.NewTimer(openTimeout)
+			timeout = timer.C
+		}
 		select {
 		case out := <-done:
-			timer.Stop()
+			if timer != nil {
+				timer.Stop()
+			}
 			if out.err != nil || out.result == nil {
 				cancelAttempt()
 				return out.result, out.err
@@ -69,7 +73,9 @@ func (s *relayServer) executeStreamWithOpenTimeout(
 			// 等通道结束（或下游 context 结束）后再释放这次 attempt。
 			return releaseAttemptOnStreamEnd(ctx, out.result, cancelAttempt), nil
 		case <-ctx.Done():
-			timer.Stop()
+			if timer != nil {
+				timer.Stop()
+			}
 			cancelAttempt()
 			s.emitExecutorDiagnostic(
 				c,
@@ -80,7 +86,7 @@ func (s *relayServer) executeStreamWithOpenTimeout(
 				fmt.Sprintf("cancel_source=downstream_context err=%v", ctx.Err()),
 			)
 			return nil, ctx.Err()
-		case <-timer.C:
+		case <-timeout:
 			cancelAttempt()
 			err := relayTimeoutError{phase: fmt.Sprintf("stream_open attempt=%d/%d", attempt, attempts), timeout: openTimeout}
 			detail := fmt.Sprintf("cancel_source=gateway_timeout_cancel %s", err.Error())

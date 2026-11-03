@@ -39,6 +39,13 @@ func durationFromConfigMillis(value int, fallback time.Duration) time.Duration {
 	return time.Duration(value) * time.Millisecond
 }
 
+func streamOpenTimeoutFromConfigMillis(value int, fallback time.Duration) time.Duration {
+	if value < 0 {
+		return 0
+	}
+	return durationFromConfigMillis(value, fallback)
+}
+
 func (s *relayServer) streamOpenMaxAttempts() int {
 	attempts := streamOpenMaxAttempts
 	if s != nil && s.cfg != nil && s.cfg.Streaming.StreamOpenMaxAttempts > 0 {
@@ -59,7 +66,7 @@ func (s *relayServer) streamTimeoutsForRequest(r *http.Request, body []byte, mod
 		idle: durationFromConfigMillis(0, streamIdleTimeout),
 	}
 	if s != nil && s.cfg != nil {
-		profile.open = durationFromConfigMillis(s.cfg.Streaming.StreamOpenTimeoutMS, profile.open)
+		profile.open = streamOpenTimeoutFromConfigMillis(s.cfg.Streaming.StreamOpenTimeoutMS, profile.open)
 		profile.idle = durationFromConfigMillis(s.cfg.Streaming.StreamIdleTimeoutMS, profile.idle)
 	}
 	if !isImageGenerationRequest(r, body, model) {
@@ -68,7 +75,7 @@ func (s *relayServer) streamTimeoutsForRequest(r *http.Request, body []byte, mod
 	profile.open = imageStreamOpenTimeout
 	profile.idle = imageStreamIdleTimeout
 	if s != nil && s.cfg != nil {
-		profile.open = durationFromConfigMillis(s.cfg.Streaming.ImageStreamOpenTimeoutMS, profile.open)
+		profile.open = streamOpenTimeoutFromConfigMillis(s.cfg.Streaming.ImageStreamOpenTimeoutMS, profile.open)
 		profile.idle = durationFromConfigMillis(s.cfg.Streaming.ImageStreamIdleTimeoutMS, profile.idle)
 	}
 	return profile

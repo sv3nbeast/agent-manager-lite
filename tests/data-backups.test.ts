@@ -93,6 +93,28 @@ test('portable encrypted restore preserves accounts, relationships, Fast, existi
   assert.throws(()=>target.service.apply(restore(preview.ticket)),/重启/)
 })
 
+test('backup restore retains explicit 60 second limits and migrates unmarked legacy defaults once',async t=>{
+  const source=fixture(t),target=fixture(t)
+  source.store.transaction(state=>{state.settings.streamOpenTimeoutSeconds=60;state.settings.imageStreamOpenTimeoutSeconds=60})
+  await source.service.export(request(),source.file)
+  const payload=await unpack(source.file)
+  assert.equal(payload.state.streamOpenTimeoutDefaultsVersion,1)
+  const preview=await target.service.preview(request(),source.file)
+  await target.service.apply(restore(preview.ticket))
+  const restored=new Store(target.store.directory,target.codec).read()
+  assert.equal(restored.settings.streamOpenTimeoutSeconds,60)
+  assert.equal(restored.settings.imageStreamOpenTimeoutSeconds,60)
+  const legacyTarget=fixture(t),cipher=await backupCipher(password)
+  delete payload.state.streamOpenTimeoutDefaultsVersion
+  try{await writeBackupArchive(legacyTarget.file,payload,cipher,new AbortController().signal)}finally{cipher.key.fill(0)}
+  const legacyPreview=await legacyTarget.service.preview(request(),legacyTarget.file)
+  await legacyTarget.service.apply(restore(legacyPreview.ticket))
+  const legacy=new Store(legacyTarget.store.directory,legacyTarget.codec)
+  assert.equal(legacy.read().settings.streamOpenTimeoutSeconds,0)
+  legacy.transaction(state=>{state.settings.streamOpenTimeoutSeconds=60})
+  assert.equal(new Store(legacyTarget.store.directory,legacyTarget.codec).read().settings.streamOpenTimeoutSeconds,60)
+})
+
 test('old backups cannot reset consumed tokens; cross-machine re-export and restore do not double count offsets',async t=>{
   const source=fixture(t),keyId=seed(source);await source.service.export(request(),source.file)
   source.usage[keyId]=95

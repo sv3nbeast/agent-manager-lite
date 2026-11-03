@@ -26,7 +26,7 @@ export interface StoredAccount extends Omit<Account, 'credentialConfigured'|'egr
 export interface RecycledAccount {id:string;deletedAt:number;account:StoredAccount;groupIds:string[];providerDefault?:StoredAccount['defaultTier'];providerModelContextWindows?:Record<string,number>}
 export interface LocalDataArchive { id:string; fingerprint:string; importedAt:number; sources:{path:string;format:string;files:{path:string;hash:string;content:unknown}[]}[] }
 export interface StoredCodexSessionSource {id:string;name:string;directory:string;device:number;inode:number;createdAt:number;enabled:boolean}
-export interface State extends ProxyState { localDataArchives?:LocalDataArchive[]; codexSessionSources?:StoredCodexSessionSource[]; proxyCatalogs?:StoredCatalogSource[]; version: 1; settings: Settings; accounts: StoredAccount[]; groups: AccountGroup[]; accountRecycle?:RecycledAccount[]; configTargets?: StoredConfigTarget[]; providers?: StoredProvider[]; instances?:InstanceProfile[]; instanceApplications?:InstanceApplication[];instanceWorkingDirectories?:InstanceWorkingDirectory[]; localAccess?:StoredLocalAccess;clientAuthorities?:StoredClientAuthority[];clientSwitches?:StoredClientSwitch[];wakeup?:StoredWakeupState; sshServers?:SshServersView }
+export interface State extends ProxyState { localDataArchives?:LocalDataArchive[]; codexSessionSources?:StoredCodexSessionSource[]; proxyCatalogs?:StoredCatalogSource[]; streamOpenTimeoutDefaultsVersion?:number; version: 1; settings: Settings; accounts: StoredAccount[]; groups: AccountGroup[]; accountRecycle?:RecycledAccount[]; configTargets?: StoredConfigTarget[]; providers?: StoredProvider[]; instances?:InstanceProfile[]; instanceApplications?:InstanceApplication[];instanceWorkingDirectories?:InstanceWorkingDirectory[]; localAccess?:StoredLocalAccess;clientAuthorities?:StoredClientAuthority[];clientSwitches?:StoredClientSwitch[];wakeup?:StoredWakeupState; sshServers?:SshServersView }
 export interface VaultCodec { encrypt(text: string): Buffer; decrypt(data: Buffer): string }
 
 function stripUnreleasedBindingHints(state: State): void {
@@ -46,11 +46,16 @@ export class Store {
   constructor(readonly directory: string, private readonly codec: VaultCodec) {
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     this.path = join(directory, 'state.vault')
-    this.state = { version: 1, settings: settingsSchema.parse({}), accounts: [], groups: [] }
+    this.state = { version: 1, streamOpenTimeoutDefaultsVersion: 1, settings: settingsSchema.parse({}), accounts: [], groups: [] }
     if (existsSync(this.path)) {
       const state = JSON.parse(codec.decrypt(readFileSync(this.path))) as State
       if (state.version !== 1 || !Array.isArray(state.accounts)) throw new Error('数据版本或格式不兼容，原文件已保留')
       state.settings = settingsSchema.parse(state.settings)
+      if ((state.streamOpenTimeoutDefaultsVersion ?? 0) < 1) {
+        if (state.settings.streamOpenTimeoutSeconds === 60) state.settings.streamOpenTimeoutSeconds = 0
+        if (state.settings.imageStreamOpenTimeoutSeconds === 60) state.settings.imageStreamOpenTimeoutSeconds = 0
+        state.streamOpenTimeoutDefaultsVersion = 1
+      }
       state.groups ??= []
       stripUnreleasedBindingHints(state)
       this.state = state

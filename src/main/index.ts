@@ -568,7 +568,10 @@ async function main(): Promise<void> {
       case 'purgeInstanceArchive': instances.purgeArchive(input); break
       case 'previewInstanceLaunch': return instances.preview(input)
       case 'previewInstanceHistory': return instances.previewHistory(input)
-      case 'startInstance': instances.start(z.string().uuid().parse(input)); break
+      case 'startInstance': {
+        const parsed=typeof input==='string'?{ticket:z.string().uuid().parse(input)}:z.object({ticket:z.string().uuid(),injectNetworkProxy:z.boolean().optional()}).strict().parse(input)
+        instances.start(parsed.ticket,parsed.injectNetworkProxy);break
+      }
       case 'stopInstance': await instances.stop(z.string().uuid().parse(input)); break
       case 'closeAllInstances': await instances.closeAll(); break
       case 'focusInstance': await instances.focus(z.string().uuid().parse(input)); return

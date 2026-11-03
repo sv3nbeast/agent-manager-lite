@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1399,6 +1401,82 @@ func TestRelayServerTimesOutWhenStreamDoesNotOpen(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "upstream_first_byte_timeout") {
 		t.Fatalf("timeout response should expose first-byte timeout code: %s", w.Body.String())
+	}
+}
+
+func TestRelayServerWaitsForStreamOpenWhenTimeoutIsDisabled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stream := make(chan cliproxyexecutor.StreamChunk, 1)
+		stream <- cliproxyexecutor.StreamChunk{Payload: []byte(`[DONE]`)}
+		close(stream)
+		runtime := &fakeRuntime{
+			streamOpenDelay: 61 * time.Second,
+			streamResult: &cliproxyexecutor.StreamResult{
+				Headers: http.Header{"Content-Type": []string{"application/json"}},
+				Chunks:  stream,
+			},
+		}
+		server := &relayServer{runtime: runtime}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		started := time.Now()
+		result, err := server.executeStreamWithOpenTimeout(nil, ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.5"}, cliproxyexecutor.Options{}, "gpt-5.5", started, 0)
+		if err != nil {
+			t.Fatalf("unbounded stream open unexpectedly failed: %v", err)
+		}
+		if time.Since(started) < 61*time.Second {
+			t.Fatal("test did not advance beyond the former one-minute open timeout")
+		}
+		if result == nil || result.Chunks == nil {
+			t.Fatal("expected the delayed stream to open")
+		}
+		if _, ok := <-result.Chunks; !ok {
+			t.Fatal("expected the opened stream to yield its payload")
+		}
+	})
+}
+
+func TestRelayServerWithoutOpenTimeoutStillHonorsDownstreamCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runtime := &fakeRuntime{streamWaitForContext: true}
+		server := &relayServer{runtime: runtime}
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() {
+			_, err := server.executeStreamWithOpenTimeout(nil, ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.5"}, cliproxyexecutor.Options{}, "gpt-5.5", time.Now(), 0)
+			result <- err
+		}()
+
+		synctest.Wait()
+		cancel()
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("downstream cancellation returned %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("downstream cancellation did not stop the pending stream open")
+		}
+	})
+}
+
+func TestStreamTimeoutConfigDisablesOnlyOpenDeadlineWithNegativeSentinel(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Streaming = config.StreamingConfig{
+		StreamOpenTimeoutMS:      -1,
+		StreamIdleTimeoutMS:      90000,
+		ImageStreamOpenTimeoutMS: -1,
+		ImageStreamIdleTimeoutMS: 120000,
+	}
+	server := &relayServer{cfg: cfg}
+	plain := server.streamTimeoutsForRequest(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), nil, "gpt-5.5")
+	if plain.open != 0 || plain.idle != 90*time.Second {
+		t.Fatalf("plain stream profile = %#v, want unlimited open and 90s idle", plain)
+	}
+	image := server.streamTimeoutsForRequest(httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil), nil, "gpt-image-2")
+	if image.open != 0 || image.idle != 120*time.Second {
+		t.Fatalf("image stream profile = %#v, want unlimited open and 120s idle", image)
 	}
 }
 

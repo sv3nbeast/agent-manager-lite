@@ -290,7 +290,11 @@ export function claudeDesktopNetworkFingerprint(plan: DesktopPlan): string {
 export function prepareClaudeDesktopNetwork(plan: DesktopPlan): void {
   const route = plan.networkRoute
   networkRouteEnvironment(route)
-  if (route?.mode === 'direct') throw new Error('Claude Desktop 直连必须先准备本机网络通道')
+  if (route?.mode === 'direct') {
+    const scope = claudeDesktopConfigScope(plan, false)
+    if (scope) restoreNetwork(scope)
+    return
+  }
   const scope = claudeDesktopConfigScope(plan, route !== undefined)
   if (!scope) return
   const previousEntry = restoreNetwork(scope)

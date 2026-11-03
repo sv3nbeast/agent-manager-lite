@@ -198,8 +198,20 @@ test('only a credential-free loopback HTTP route can be persisted', t => {
     assert.equal(existsSync(f.journal), false)
   }
   f.plan.networkRoute = { mode: 'direct' }
-  assert.throws(() => prepareClaudeDesktopNetwork(f.plan), /直连必须先准备/)
+  prepareClaudeDesktopNetwork(f.plan)
   assert.equal(existsSync(`${f.plan.desktopDirectory}-3p`), false)
+})
+
+test('direct mode removes a manager proxy overlay and restores the native entry', t => {
+  const f = fixture(t), original = { egressProxyUrl: 'https://native.invalid:443', egressProxyPacUrl: 'https://native.invalid/pac', theme: 'dark' }
+  const source = f.setup(original)
+  prepareClaudeDesktopNetwork(f.plan)
+  assert.notEqual(f.read(f.meta).appliedId, source.id)
+  f.plan.networkRoute = { mode: 'direct' }
+  prepareClaudeDesktopNetwork(f.plan)
+  assert.deepEqual(f.current(), original)
+  assert.equal(f.read(f.meta).appliedId, source.id)
+  assert.equal(existsSync(f.journal), false)
 })
 
 test('journal stores references and hashes, not native credential values', t => {

@@ -17,6 +17,7 @@ const ownedEnvironment = /^(?:ANTHROPIC_|CLAUDE_|CODEX_|OPENAI_|CML_|NODE_|ELECT
 export interface ClaudeRuntimeContext {
   fingerprint: string
   identity: ClaudeExecutableIdentity
+  profile: InstanceProfile
   account: StoredAccount
   plan: DesktopPlan
 }
@@ -71,7 +72,7 @@ export function claudeRuntimeContext(profile: InstanceProfile, account: StoredAc
     const stat = lstatSync(path)
     return [path, stat.dev, stat.ino]
   })
-  return { account, plan, identity, fingerprint: hash([profile, identity, settings, directories, account.id, account.kind,
+  return { profile, account, plan, identity, fingerprint: hash([profile, identity, settings, directories, account.id, account.kind,
     account.identityService, account.credentialKind, account.protocol, account.baseUrl, account.models, account.credentials.apiKey,
     account.credentials.accountId, account.claudeSubscription?.accountId, account.claudeSubscription?.organizationId, proxy]) }
 }
@@ -83,6 +84,7 @@ export function claudeLaunchPreview(context: ClaudeRuntimeContext): Omit<Instanc
     directory: plan.directory, desktopDirectory: plan.desktopDirectory, workingDirectory: plan.workingDirectory,
     args: [...plan.args], accountName: account.name, providerName: account.name, model: '', tierSource: 'client',
     connectionMode: 'native', launchMode: 'cli', identityStatus: isClaudeSubscriptionAccount(account)?'subscription_configured':'api_configured',
+    injectNetworkProxy: context.profile.injectNetworkProxy!==false,
   }
 }
 

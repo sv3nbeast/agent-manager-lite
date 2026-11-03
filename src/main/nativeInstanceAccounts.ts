@@ -17,11 +17,11 @@ export class NativeInstanceAccounts {
   constructor(private readonly store:Store,private readonly tokens:TokenAuthority,
     private readonly accountInUse:(id:string,targetId:string)=>boolean=()=>false,
     private readonly project:(account:StoredAccount)=>void|Promise<void>=()=>{}){}
-  async prepare(profile:InstanceProfile,signal:AbortSignal):Promise<void> {
-    this.validate(profile)
+  async prepare(profile:InstanceProfile,signal:AbortSignal,injectNetworkProxy=true):Promise<void> {
+    this.validate(profile,injectNetworkProxy)
     const configs=new ClientConfigs(this.store),target=configs.identityTarget(profile.id)
     assertClientDaemonStopped(await probeClientDaemon(target.directory,signal))
-    signal.throwIfAborted();this.validate(profile)
+    signal.throwIfAborted();this.validate(profile,injectNetworkProxy)
     if(this.tokens.busy(profile.accountId))throw new Error('账号正在刷新，请完成后再启动原生实例')
     const config=readBounded(join(target.directory,'config.toml'),1024*1024),raw=readBounded(join(target.directory,'auth.json'),2*1024*1024),doc=new TomlDocument(config??'')
     assertNativeFileMode(doc)
@@ -32,18 +32,18 @@ export class NativeInstanceAccounts {
     // manager considers refreshing a stale library token with the same identity.
     if(observed&&sameNativeAccount(account,observed)&&JSON.stringify(account.credentials)!==JSON.stringify(observed.credentials))this.store.transaction(state=>adoptNative(state,account.id,observed))
   }
-  validate(profile:InstanceProfile):void {
+  validate(profile:InstanceProfile,injectNetworkProxy=true):void {
     const state=this.store.read(),account=state.accounts.find(value=>value.id===profile.accountId)
     if(!account)throw new Error('绑定账号不存在')
     if(account.identityService === 'anthropic' || account.protocol === 'anthropic_messages')throw new Error('Anthropic 凭据不能写入 Codex 原生登录目录，请使用 Claude Code 实例')
-    accountProxyURL(account,state) // Validate the route; Instances applies it before injecting credentials.
+    if(injectNetworkProxy)accountProxyURL(account,state) // Instances applies an enabled route before injecting credentials.
     if(account.kind==='agent_identity')throw new Error('Agent Identity 仅支持本地 API 接入，请切换实例的账号接入方式')
     if(account.kind==='api_key'&&(account.wireApi!=='responses'||!account.models.includes(profile.model)))throw new Error('原生 API 接入需要 Responses 协议和账号支持的模型，请改用本地 API 或调整模型')
     if((ownsRefreshChain(account)||account.credentials.refreshToken)&&this.accountInUse(account.id,profile.id))throw new Error('此账号正在被其他服务或实例使用，请先停止后再启动原生实例')
     if(state.clientAuthorities?.some(binding=>binding.accountId===account.id&&binding.targetId!==profile.id)||state.clientSwitches?.some(record=>record.targetId===profile.id||account.credentials.refreshToken&&(record.accountId===account.id||record.previousAccountId===account.id)))throw new Error('此账号或目录仍有原生登录关联或恢复记录，请先处理后再启动实例')
   }
-  private service(profile:InstanceProfile,nonce:string,tier?:string,connectionMode:'native'|'local_api'='native'):ClientSwitches {
-    const owner:InstanceSwitchOwner={instanceId:profile.id,nonce,model:profile.model,tier,connectionMode}
+  private service(profile:InstanceProfile,nonce:string,tier?:string,connectionMode:'native'|'local_api'='native',injectNetworkProxy=true):ClientSwitches {
+    const owner:InstanceSwitchOwner={instanceId:profile.id,nonce,model:profile.model,tier,connectionMode,injectNetworkProxy}
     return new ClientSwitches(this.store,new ClientConfigs(this.store),this.tokens,id=>{
       const account=this.store.read().accounts.find(value=>value.id===id)
       return !!account&&(ownsRefreshChain(account)||!!account.credentials.refreshToken)&&this.accountInUse(id,profile.id)
@@ -54,15 +54,15 @@ export class NativeInstanceAccounts {
     this.operation=current.catch(()=>{})
     return current
   }
-  inject(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal,verify:()=>void=()=>{}):Promise<void> {
-    return this.serial(()=>{verify();return this.injectNow(profile,nonce,tier,signal,'native')})
+  inject(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal,verify:()=>void=()=>{},injectNetworkProxy=true):Promise<void> {
+    return this.serial(()=>{verify();return this.injectNow(profile,nonce,tier,signal,'native',injectNetworkProxy)})
   }
   injectLocalApi(profile:InstanceProfile,nonce:string,signal:AbortSignal,verify:()=>void=()=>{}):Promise<void> {
     return this.serial(()=>{verify();return this.injectNow(profile,nonce,undefined,signal,'local_api')})
   }
-  private async injectNow(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal,connectionMode:'native'|'local_api'):Promise<void> {
-    signal.throwIfAborted();connectionMode==='local_api'?this.validateLocalApi(profile):this.validate(profile)
-    const service=this.service(profile,nonce,tier,connectionMode),cancel=()=>service.stop()
+  private async injectNow(profile:InstanceProfile,nonce:string,tier:string|undefined,signal:AbortSignal,connectionMode:'native'|'local_api',injectNetworkProxy=true):Promise<void> {
+    signal.throwIfAborted();connectionMode==='local_api'?this.validateLocalApi(profile):this.validate(profile,injectNetworkProxy)
+    const service=this.service(profile,nonce,tier,connectionMode,injectNetworkProxy),cancel=()=>service.stop()
     signal.addEventListener('abort',cancel,{once:true})
     try{
       const preview=service.preview({targetId:profile.id,accountId:profile.accountId})
@@ -73,13 +73,13 @@ export class NativeInstanceAccounts {
       catch{throw new Error('账号身份已保存，但其他本地连接尚未同步，请重试启动')}
     }finally{signal.removeEventListener('abort',cancel);service.stop()}
   }
-  restore(profile:InstanceProfile,nonce:string):Promise<void> {return this.serial(()=>this.restoreNow(profile,nonce,'native'))}
+  restore(profile:InstanceProfile,nonce:string,injectNetworkProxy=true):Promise<void> {return this.serial(()=>this.restoreNow(profile,nonce,'native',injectNetworkProxy))}
   restoreLocalApi(profile:InstanceProfile,nonce:string):Promise<void> {return this.serial(()=>this.restoreNow(profile,nonce,'local_api'))}
-  private async restoreNow(profile:InstanceProfile,nonce:string,connectionMode:'native'|'local_api'):Promise<void> {
+  private async restoreNow(profile:InstanceProfile,nonce:string,connectionMode:'native'|'local_api',injectNetworkProxy=true):Promise<void> {
     const records=this.store.read().clientSwitches?.filter(record=>record.targetId===profile.id)??[]
     if(records.length){
       if(records.length!==1||records[0].instanceNonce!==nonce)throw new Error('实例登录恢复记录归属不一致，已保留原文件')
-      const service=this.service(profile,nonce,undefined,connectionMode)
+      const service=this.service(profile,nonce,undefined,connectionMode,injectNetworkProxy)
       try{await service.applyWhenClosed({ticket:service.previewRestore({targetId:profile.id}).ticket,clientClosed:true})}
       finally{service.stop()}
     }

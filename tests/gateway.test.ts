@@ -81,7 +81,7 @@ test('saved stream timeouts reach the source-built sidecar, close upstream and n
   const start = () => gateway.start({ id:account.id, port:0, account, apiKey:'fixture-client' }, settings)
   let status = await start()
   const config = JSON.parse(readFileSync(join(gateway.runtimeDirectory()!, 'config.json'), 'utf8'))
-  assert.deepEqual(config.streaming, {'stream-open-timeout-ms':1000,'stream-idle-timeout-ms':1000,'image-stream-open-timeout-ms':60000,'image-stream-idle-timeout-ms':180000,'stream-open-max-attempts':1})
+  assert.deepEqual(config.streaming, {'stream-open-timeout-ms':1000,'stream-idle-timeout-ms':1000,'image-stream-open-timeout-ms':-1,'image-stream-idle-timeout-ms':180000,'stream-open-max-attempts':1})
   const call = (tier?:string) => fetch(`http://127.0.0.1:${status.port}/v1/responses`, {method:'POST',headers:{Authorization:'Bearer fixture-client','Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'fixture',stream:true,service_tier:tier}),signal:AbortSignal.timeout(4000)})
   for (const [phase, tier] of [['before_headers',undefined],['headers_only','default'],['after_delta','auto']] as const) {
     mode = phase

@@ -125,6 +125,7 @@ export function claudeDesktopLaunchPreview(context: ClaudeDesktopRuntimeContext)
     directory: plan.directory, desktopDirectory: api?`${plan.desktopDirectory}-3p`:plan.desktopDirectory, workingDirectory: plan.workingDirectory,
     args: [...plan.args], accountName: account?.name??'在 Claude Desktop 内登录', ...(account?{providerName:account.name}:{}), model: api?profile.model:'', tierSource: 'client',
     connectionMode: profile.connectionMode, launchMode: 'desktop', identityStatus: api?'api_configured':'client_login', clientVersion: context.version,
+    injectNetworkProxy: profile.injectNetworkProxy!==false,
     network:context.upstreamProxy===undefined?{mode:'inherit',source}:context.upstreamProxy==='direct'?{mode:'direct',source}:{mode:'proxy',source,proxy:proxyAddressView(context.upstreamProxy)},
   }
 }

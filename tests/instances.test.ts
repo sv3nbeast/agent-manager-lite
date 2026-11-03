@@ -91,6 +91,23 @@ test('instance views and launch previews expose local API identity semantics',t=
   assert.equal(preview.identityEmail,undefined)
 })
 
+test('saved proxy opt-out reaches previews and one-run overrides leave the preference intact',async t=>{
+  const f=fixture(t),instance=f.add(f.account().id)
+  f.instances.save({id:instance.id,revision:instance.revision,details:{clientType:'codex',launchMode:'desktop',name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:'local_api',injectNetworkProxy:false,defaultTier:instance.defaultTier,model:instance.model,extraArgs:[]}})
+  const current=f.instances.views()[0],preview=f.instances.preview({id:current.id,revision:current.revision})
+  assert.equal(preview.injectNetworkProxy,false)
+  f.instances.start(preview.ticket,preview.injectNetworkProxy)
+  await f.instances.settled(current.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.deepEqual(f.runtime.plans.at(-1)?.networkRoute,{mode:'direct'})
+  await f.instances.stop(current.id)
+  f.instances.start(f.instances.preview({id:current.id,revision:current.revision}).ticket,true)
+  await f.instances.settled(current.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.equal(f.runtime.plans.at(-1)?.networkRoute,undefined)
+  assert.equal(f.store.read().instances?.[0].injectNetworkProxy,false)
+})
+
 test('history previews are scoped to a stopped instance and included in launch review without changing files',async t=>{
   const f=fixture(t),instance=f.add(f.account().id)
   const statePath=join(instance.directory,'.codex-global-state.json')

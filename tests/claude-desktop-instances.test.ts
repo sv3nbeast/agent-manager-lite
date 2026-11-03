@@ -317,6 +317,32 @@ desktopTest('Desktop stop and natural exit preserve login, configuration and tra
   for (const path of userFiles) assert.equal(readFileSync(path, 'utf8'), 'client-owned state')
 })
 
+desktopTest('Desktop launch can skip the configured account proxy for one run without changing its default',async t=>{
+  const f=fixture(t),{instance,account}=f.addApi()
+  f.store.transaction(state=>{state.accounts.find(value=>value.id===account.id)!.proxy={mode:'custom',url:'http://proxy.fixture.invalid:8443'}})
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  assert.equal(preview.injectNetworkProxy,true)
+  assert.equal(preview.network?.mode,'proxy')
+  f.instances.start(preview.ticket,false)
+  await f.instances.settled(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.deepEqual(f.runtime.plans[0].networkRoute,{mode:'direct'})
+  assert.equal(f.store.read().instances?.[0].injectNetworkProxy,true)
+  await f.instances.stop(instance.id)
+})
+
+desktopTest('a saved disabled proxy setting skips an invalid account proxy',async t=>{
+  const f=fixture(t),{instance,account}=f.addApi(),stored=f.store.read().instances![0]
+  f.instances.save({id:stored.id,revision:stored.revision,details:{clientType:'claude_code',launchMode:'desktop',name:stored.name,applicationId:stored.applicationId,connectionMode:'native',accountId:account.id,model:stored.model,extraArgs:[],injectNetworkProxy:false}})
+  f.store.transaction(state=>{state.accounts.find(value=>value.id===account.id)!.proxy={mode:'custom',url:'invalid-proxy-address'}})
+  const current=f.instances.views()[0],preview=f.instances.preview({id:current.id,revision:current.revision})
+  assert.equal(preview.injectNetworkProxy,false)
+  f.instances.start(preview.ticket)
+  await f.instances.settled(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.deepEqual(f.runtime.plans.at(-1)?.networkRoute,{mode:'direct'})
+})
+
 desktopTest('Desktop default proxy leases isolate instances and never expose upstream credentials',async t=>{
   const leases:Array<{scope:string;proxy:string;live:boolean;stops:number}>=[]
   const f=fixture(t,{async acquire(proxy,scope){

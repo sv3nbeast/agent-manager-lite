@@ -23,7 +23,7 @@ export interface StoredClientSwitch {
   paths?:string[][];providerGuards?:string[]
   instanceNonce?:string
 }
-export interface InstanceSwitchOwner {instanceId:string;nonce:string;model:string;tier?:string;connectionMode?:'native'|'local_api'}
+export interface InstanceSwitchOwner {instanceId:string;nonce:string;model:string;tier?:string;connectionMode?:'native'|'local_api';injectNetworkProxy?:boolean}
 interface Snapshot {target:ClientSwitchPreview['target'];auth:string|null;config:string|null;device:number;inode:number}
 interface Pending {view:ClientSwitchPreview;snapshot:Snapshot;stateHash:string;expires:number;record:StoredClientSwitch;auth:string|null;config:string;observed?:StoredAccount;observedId?:string}
 const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -66,7 +66,8 @@ export class ClientSwitches {
   private stateHash(record:StoredClientSwitch):string {
     const state=this.store.read(),ids=[record.accountId,record.previousAccountId]
     const accounts=state.accounts.filter(a=>ids.includes(a.id)),providers=new Set(accounts.map(account=>account.providerId))
-    return hash([accounts,accounts.map(a=>accountProxyURL(a,state)),state.settings.defaultTier,state.providers?.filter(provider=>providers.has(provider.id)),state.clientAuthorities,state.clientSwitches,
+    const routes=this.instance?.injectNetworkProxy===false?[]:accounts.map(a=>accountProxyURL(a,state))
+    return hash([accounts,routes,state.settings.defaultTier,state.providers?.filter(provider=>providers.has(provider.id)),state.clientAuthorities,state.clientSwitches,
       this.instance?state.instances?.find(profile=>profile.id===record.targetId):null])
   }
   preview(input:unknown):ClientSwitchPreview {

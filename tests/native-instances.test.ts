@@ -73,6 +73,19 @@ test('native explicit direct overrides inherited proxy without allocating a help
   await f.instances.stop(profile.id)
 })
 
+test('native instance with proxy injection disabled skips an invalid account proxy',async t=>{
+  const f=fixture(t,undefined,undefined,{async acquire(){assert.fail('Disabled instance proxy must not allocate a helper')}})
+  const initial=f.add(),stored=f.store.read().instances![0]
+  f.instances.save({id:initial.id,revision:initial.revision,details:{name:stored.name,accountId:stored.accountId,applicationId:stored.applicationId,connectionMode:'native',model:stored.model,defaultTier:stored.defaultTier,extraArgs:[],injectNetworkProxy:false}})
+  f.store.transaction(state=>{state.accounts.find(value=>value.id===stored.accountId)!.proxy={mode:'custom',url:'invalid-proxy-address'}})
+  const current=f.instances.views()[0],preview=f.instances.preview({id:current.id,revision:current.revision})
+  assert.equal(preview.injectNetworkProxy,false)
+  f.instances.start(preview.ticket);await f.instances.settled(current.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.deepEqual(f.plans[0].networkRoute,{mode:'direct'})
+  await f.instances.stop(current.id)
+})
+
 test('native proxy changes invalidate preview and async preparation before credentials are written',async t=>{
   let releases=0
   const f=fixture(t,undefined,undefined,{async acquire(){
