@@ -322,6 +322,22 @@ export class ClientConfigs {
       catalogFile={name:createHash('sha256').update(content).digest('hex')+'.json',content}
       if(override===undefined&&positive(configured)&&!globalCompact)compact=Math.floor(configured*0.9)
     }
+    // Native API instances bypass the local gateway, so the desktop client
+    // reads the provider model directly from its own catalog. A supplier key
+    // can legitimately expose a model absent from Codex's embedded catalog;
+    // without a per-instance catalog the client renders no usable composer
+    // and the user cannot start a conversation. Keep this projection scoped to
+    // API-key native instances and leave official-account behavior untouched.
+    if(catalogFile===undefined&&instance.connectionMode==='native'&&account.kind==='api_key'&&!template.known){
+      const generated=buildModelCatalog([{
+        modelId:model,displayName:model,reasoningEfforts:null,contextWindow:null,
+        autoCompactTokenLimit:null,supportsVision:null
+      }],catalog.catalog,null,model)
+      const content=JSON.stringify(generated,null,2)+'\n'
+      if(Buffer.byteLength(content)>16*1024*1024)throw new Error('原生 API 实例模型目录超过 16 MiB，请调整供应商模型')
+      parseNativeCatalog(content)
+      catalogFile={name:createHash('sha256').update(content).digest('hex')+'.json',content}
+    }
     const supportsFast=Array.isArray(template.model.service_tiers)&&template.model.service_tiers.some(tier=>tier&&typeof tier==='object'&&tier.id==='priority')
     return {window,compact,origin,override,dependency:catalog.dependency,catalogFile,supportsFast,
       revision:hash(JSON.stringify([model,catalog.revision,instance.accountId,account.kind,account.providerId,account.providerKeyId,providerWindows??null,connectionWindows??null,window,compact,origin,catalogFile?.name]))}

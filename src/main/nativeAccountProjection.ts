@@ -83,8 +83,11 @@ export function nativeConfig(source:string|null,account:StoredAccount,state:Stat
     return {config,paths:edits.filter(edit=>doc.raw(edit.path)!==edit.raw).map(edit=>edit.path),providerGuards:['cml_instance']}
   }
   set(['model_provider'],account.kind==='api_key'?nativeProvider:'openai')
-  // Cockpit only aligns an existing forced login choice; absence stays absent.
-  if(doc.raw(['forced_login_method'])!==null)set(['forced_login_method'],account.kind==='api_key'?'api':'chatgpt')
+  // Native API must explicitly open the client in API mode. Newer desktop
+  // clients otherwise render their signed-in composer while the projected
+  // auth file is API-key-only, leaving the instance open but unable to start
+  // a conversation. OAuth keeps the prior preference unless one already exists.
+  if(account.kind==='api_key'||doc.raw(['forced_login_method'])!==null)set(['forced_login_method'],account.kind==='api_key'?'api':'chatgpt')
   set(['openai_base_url'],null)
   if(account.kind==='api_key'){
     providerURLSchema.parse(account.baseUrl)

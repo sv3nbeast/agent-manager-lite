@@ -18,7 +18,8 @@ const {codexBundledCli}=require('../src/main/codexPrograms.ts')
 async function main(){
   assert.equal(process.platform,'darwin','native desktop smoke requires macOS')
   const application=process.env.CML_CODEX_APP_PATH??'/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
-  const inspection=inspectCodexDesktopUi({application,executable})
+  const nativeApi=process.env.CML_CODEX_UI_NATIVE_API==='1',modelId=process.env.CML_CODEX_MODEL??'gpt-6.1-sol',modelLabel=modelId==='gpt-6.1-sol'?'6.1 Sol':modelId.split('/').at(-1)
+  const inspection=inspectCodexDesktopUi({application,executable,...nativeApi?{features:['locale']}: {}})
   // Capabilities are intentionally discovered from the installed bundle. A
   // newer Codex may expose only a subset (or none) while still being a valid
   // client; the smoke should exercise exactly what was detected instead of
@@ -33,7 +34,7 @@ async function main(){
   let socket,plan,capture=async()=>{};const requests=[]
   const server=createServer((req,res)=>{
     res.setHeader('content-type','application/json')
-    if(req.method==='GET'){res.end(JSON.stringify({object:'list',data:[{id:'gpt-6.1-sol',object:'model',owned_by:'fixture'}]}));return}
+    if(req.method==='GET'){res.end(JSON.stringify({object:'list',data:[{id:modelId,object:'model',owned_by:'fixture'}]}));return}
     let body='';req.on('data',chunk=>body+=chunk);req.on('end',()=>{
       const input=JSON.parse(body||'{}')
       // A continued thread carries earlier mode messages in its history. The
@@ -53,18 +54,20 @@ async function main(){
   })
   try{
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
-    const catalog=buildModelCatalog([{modelId:'gpt-6.1-sol',displayName:'GPT-6.1 Sol',reasoningEfforts:null,contextWindow:null,autoCompactTokenLimit:null,supportsVision:null}],builtInCatalog,null,'gpt-6.1-sol')
-    const model=catalog.models.find(entry=>entry.slug==='gpt-6.1-sol')
+    const catalog=buildModelCatalog([{modelId,displayName:modelId,reasoningEfforts:null,contextWindow:null,autoCompactTokenLimit:null,supportsVision:null}],builtInCatalog,null,modelId)
+    const model=catalog.models.find(entry=>entry.slug===modelId)
     assert.ok(model,'compatibility model must be present in the isolated catalog')
     // The default fixture previously erased the bundled model's speed tiers,
     // which made the current picker hide its speed control even though the UI
     // capability patch had loaded. Preserve only the actual Fast entitlement.
-    model.service_tiers=structuredClone(builtInCatalog.models.find(entry=>entry.slug==='gpt-6.1-sol')?.service_tiers??[])
+    model.service_tiers=structuredClone(builtInCatalog.models.find(entry=>entry.slug===modelId)?.service_tiers??[])
     writeFileSync(join(directory,'catalog.json'),JSON.stringify(catalog))
     writeFileSync(join(directory,'.codex-global-state.json'),JSON.stringify({'electron-saved-workspace-roots':[root],'electron-active-workspace-roots':[root],'electron-persisted-atom-state':{'electron:onboarding-override':'app','electron:onboarding-projectless-completed':true}}))
-    writeFileSync(join(directory,'config.toml'),`model="gpt-6.1-sol"\nmodel_provider="fixture"\nmodel_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.fixture]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nexperimental_bearer_token="fixture-only-key"\n`)
+    const provider=nativeApi?'cml_native_account':'fixture',apiKey=nativeApi?'fixture-native-api-key':'fixture-only-key'
+    writeFileSync(join(directory,'config.toml'),`model=${JSON.stringify(modelId)}\nmodel_provider=${JSON.stringify(provider)}\n${nativeApi?'forced_login_method="api"\ncli_auth_credentials_store="file"\n':''}model_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.${provider}]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nexperimental_bearer_token=${JSON.stringify(apiKey)}\n`)
+    if(nativeApi)writeFileSync(join(directory,'auth.json'),JSON.stringify({auth_mode:'apikey',OPENAI_API_KEY:apiKey})+'\n',{mode:0o600})
     let nativeUltra
-    if(supports('ultra')){
+    if(!nativeApi&&supports('ultra')){
       const reference=join(root,'native-reference');mkdirSync(reference,{mode:0o700})
       writeFileSync(join(reference,'config.toml'),readFileSync(join(directory,'config.toml')))
       const before=requests.length
@@ -121,8 +124,8 @@ async function main(){
       await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point})
     }
     const key=async key=>{await call('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});await call('Input.dispatchKeyEvent',{type:'keyUp',key,code:key})}
-    if(supports('speed')||supports('ultra')){
-      const modelButton=await evaluate('(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"));if(!b)return null;const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()')
+    if(!nativeApi&& (supports('speed')||supports('ultra'))){
+      const modelButton=await evaluate(`(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes(${JSON.stringify(modelLabel)}));if(!b)return null;const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`)
       assert.ok(modelButton,'native model selector is unavailable for detected UI capabilities')
       await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...modelButton});await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...modelButton})
       await delay(1000)
@@ -157,7 +160,7 @@ async function main(){
       await delay(1500)
       return request
     }
-    if(supports('speed')){
+    if(!nativeApi&&supports('speed')){
       await chooseSpeed(false)
       await key('Escape');await key('Escape')
     }else if(supports('ultra'))await key('Escape')
@@ -170,8 +173,8 @@ async function main(){
       await key('Escape');await key('Escape')
       accelerated=await send('Reply with one sentence for the Fast compatibility test.')
       assert.equal(accelerated.serviceTier,'priority',JSON.stringify(requests))
-    }else console.log('Fast capability was not detected; only the default request was verified')
-    if(supports('ultra')){
+    }else if(!nativeApi) console.log('Fast capability was not detected; only the default request was verified')
+    if(!nativeApi&&supports('ultra')){
       await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
       await evaluate('document.querySelector("[data-reasoning-slider]").focus()')
       // The client can change the number of intensity stops. Select the visible
@@ -216,9 +219,11 @@ async function main(){
       assert.equal(restored.reasoningEffort,nativeUltra.reasoningEffort,JSON.stringify(requests))
       assert.equal(restored.multiAgentMode,nativeUltra.multiAgentMode)
       assert.equal(restored.serviceTier,ultra.serviceTier,JSON.stringify(requests))
-    }else console.log('Ultra capability was not detected; Ultra-specific controls were skipped')
+    }else if(!nativeApi) console.log('Ultra capability was not detected; Ultra-specific controls were skipped')
     await capture('codex-verified.png')
-    console.log(JSON.stringify({stage:'verified',version:inspection.version,features,language:await evaluate('document.documentElement.lang'),requests}))
+    assert.ok(requests.filter(request=>request.prompt.includes('compatibility test')).every(request=>request.model===modelId))
+    if(nativeApi)assert.ok(requests.some(request=>request.prompt.includes('standard compatibility test')&&request.model===modelId),'native API desktop must send a conversation to its selected provider')
+    console.log(JSON.stringify({stage:'verified',mode:nativeApi?'native-api':'local-api',version:inspection.version,features,language:await evaluate('document.documentElement.lang'),requests}))
     console.log(`Native Codex smoke passed for detected capabilities: ${features.join(', ')||'none (official UI)'}`)
   }catch(error){
     await capture('codex-failure.png').catch(()=>{})
@@ -242,7 +247,7 @@ async function main(){
       }
     }catch{/* Helpers may already have exited. */}
     server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await delay(200)
-    rmSync(root,{recursive:true,force:true})
+    for(let attempt=0;attempt<10;attempt++){try{rmSync(root,{recursive:true,force:true});break}catch{await delay(200)}}
   }
 }
 main().catch(error=>{console.error(error);process.exitCode=1})

@@ -375,6 +375,24 @@ test('API/PAT native modes use real file shapes, support repeated starts, and do
   assert.equal(f.children.size,0);assert.equal(f.store.read().clientSwitches?.length,0)
 })
 
+test('native API projects an instance catalog when the supplier model is absent from the embedded Codex catalog',async t=>{
+  const f=fixture(t),api=createAPIAccount({name:'Unknown model API',apiKey:'fixture-unknown-model-key',baseUrl:'https://unknown-model.invalid/v1',models:['vendor/unknown-model'],wireApi:'responses',defaultTier:'standard'})
+  importParsedAccounts(f.store,[api])
+  const instance=f.add(api.id,'Unknown model','vendor/unknown-model','standard')
+  const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+  f.instances.start(preview.ticket);await f.instances.settled(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',JSON.stringify(f.instances.views()))
+  const doc=new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8'))
+  const catalogPath=doc.scalar(['model_catalog_json'])
+  assert.equal(typeof catalogPath,'string')
+  const catalog=JSON.parse(readFileSync(catalogPath as string,'utf8'))
+  assert.ok(catalog.models.some((model:Record<string,unknown>)=>model.slug==='vendor/unknown-model'))
+  assert.equal(doc.scalar(['model_provider']),'cml_native_account')
+  assert.equal(doc.scalar(['forced_login_method']),'api')
+  await f.instances.stop(instance.id)
+  assert.equal(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).raw(['model_catalog_json']),null)
+})
+
 test('native API instances show the actual provider name, reject rename-stale tickets and restore the original config',async t=>{
   const f=fixture(t),api=createAPIAccount({name:'Independent connection',apiKey:'fixture-provider-key',baseUrl:'https://provider-native.invalid/v1',models:['api-model'],wireApi:'responses',defaultTier:'standard'})
   importParsedAccounts(f.store,[api])
@@ -390,6 +408,7 @@ test('native API instances show the actual provider name, reject rename-stale ti
   assert.equal(doc.scalar(['model_providers','cml_native_account','base_url']),api.baseUrl)
   assert.equal(doc.scalar(['model_providers','cml_native_account','experimental_bearer_token']),api.credentials.apiKey)
   assert.equal(doc.scalar(['model_provider']),'cml_native_account')
+  assert.equal(doc.scalar(['forced_login_method']),'api','A fresh native API profile must open the client in API mode')
   await f.instances.stop(first.id)
   assert.equal(readFileSync(join(first.directory,'config.toml'),'utf8'),original)
   const preview=f.instances.preview({id:first.id,revision:first.revision}),current=f.store.read().providers![0]

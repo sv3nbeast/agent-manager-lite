@@ -81,16 +81,15 @@ try{
   await run();await run(['-c','service_tier="default"']);await run(['-c','service_tier="flex"']);await run(['-c','service_tier="auto"'])
   await switches.applyWhenClosed({ticket:switches.preview({targetId:target.id,accountId:second.id}).ticket,clientClosed:true})
   await run()
-  // Observe the actual native consumer: only Fast emits a tier in this build.
-  // Explicit non-Fast JSON preservation is verified separately at our gateway.
+  // Observe the actual native consumer: Fast and explicit Flex reach the API.
   assert.deepEqual(seen,[
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:'priority',model:'gpt-5.5'},
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:undefined,model:'gpt-5.5'},
-    {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:undefined,model:'gpt-5.5'},
+    {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:'flex',model:'gpt-5.5'},
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:undefined,model:'gpt-5.5'},
     {path:'/second/v1/responses',key:'Bearer fixture-second-key',tier:undefined,model:'gpt-5.5'}
   ])
-  console.log('Native Codex CLI passed: generated terminal command, verified native PID, file config, real SSE reply, API endpoint/key switch, Fast=priority; native Standard/flex/auto omit the field in this CLI build, so non-Fast propagation is not claimed; only loopback fixture upstream.')
+  console.log('Native Codex CLI passed: generated terminal command, verified native PID, file config, real SSE reply, API endpoint/key switch, Fast=priority and explicit flex; only loopback fixture upstream.')
 }finally{
   for(const child of children)child.kill('SIGKILL')
   await tokens.stop();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()))
