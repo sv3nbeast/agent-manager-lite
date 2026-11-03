@@ -93,6 +93,40 @@ test('module-level arrows and function expressions remain compatible after a cli
   assert.match(patched,/const  requestRole=async \(e,t\) => \{let n=await identityRole\(e,t\);if\(n!==`chatgpt`/)
 })
 
+test('bundled startup and an intermediate renderer entry retain independent capabilities',t=>{
+  const f=fixture(t)
+  f.entries.set('.vite/build/early-bootstrap.js',Buffer.from('require("electron");app.protocol.handle("app",async()=>new Response());r.u=id=>"entry-"+id+"-"+({1:"fixture"})[id]+".js";r.f.require=id=>require("./"+r.u(id));'))
+  f.entries.set('.vite/build/entry-1-fixture.js',Buffer.from('process.env.CODEX_ELECTRON_USER_DATA_PATH;'))
+  f.entries.set('webview/assets/index-renamed.js',Buffer.from('import("./next-loader.js")'))
+  f.entries.set('webview/assets/next-loader.js',Buffer.from('import "./app-initial-renamed.js"'))
+  const result=f.inspect()
+  assert.deepEqual(result.features,['locale','speed','ultra'],result.reason)
+  f.entries.set('.vite/build/entry-1-fixture.js',Buffer.from('process.env.CODEX_ELECTRON_USER_DATA_PATH;app.protocol.handle("app",()=>new Response());'))
+  assert.equal(f.inspect().supported,false,'a second app protocol is ambiguous')
+  f.entries.set('.vite/build/entry-1-fixture.js',Buffer.from('process.env.OTHER_HOME;'))
+  assert.match(f.inspect().reason,/隔离接口/)
+})
+
+test('intermediate loaders cannot hide two composer resources',t=>{
+  const f=fixture(t)
+  f.entries.set('webview/assets/index-renamed.js',Buffer.from('import("./next-loader.js")'))
+  f.entries.set('webview/assets/next-loader.js',Buffer.from('import "./app-initial-renamed.js";import "./app-initial-second.js";'))
+  assert.match(f.inspect().reason,/无法唯一识别/)
+})
+
+test('Ultra supports the direct settings Set while retaining the account preference branch',()=>{
+  const body=source.replace(source.split('\n').find(line=>line.startsWith('function initLevels'))!,'function initLevels(){if(signedIn)return new Set(accountLevels);let configured=readSetting(settings.enabledReasoningEfforts);return new Set(configured)}')
+  const result=patches(body,['ultra'])
+  assert.equal(result.detected.features.ultra.supported,true)
+  const create=new Function('signedIn','accountLevels','readSetting','settings',result.body.split('\n').find(line=>line.startsWith('function initLevels'))+';return initLevels();')
+  assert.deepEqual([...create(false,[],()=>['high','max'],{enabledReasoningEfforts:[]})],['high','max','ultra'])
+  assert.deepEqual([...create(true,['high'],()=>['max'],{enabledReasoningEfforts:[]})],['high'])
+  for(const invalid of [
+    'function initLevels(){function unrelated(){let configured=readSetting(settings.enabledReasoningEfforts)}return new Set(configured)}',
+    'function initLevels(){let configured=readSetting(settings.enabledReasoningEfforts);configured=other;return new Set(configured)}'
+  ])assert.equal(patches(source.replace(source.split('\n').find(line=>line.startsWith('function initLevels'))!,invalid),['ultra']).detected.features.ultra.supported,false)
+})
+
 test('nested functions do not create a duplicate module-level feature role',t=>{
   const nested=`function wrapper(){${source.split('\n')[0]}}\n`
   const body=source+'\n'+nested,f=fixture(t,body),result=f.inspect()

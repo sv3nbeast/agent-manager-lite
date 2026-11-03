@@ -5,6 +5,7 @@ import {createHash,randomUUID} from 'node:crypto'
 import * as nodeFS from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
+import {codexDesktopStartupImports} from './codexDesktopResources'
 import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiDynamicImports,codexUiFeatures,codexUiLocaleProviderSupported,codexUiStaticImports,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
@@ -305,14 +306,25 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     if(/<script\b[^>]*\bintegrity\s*=/i.test(html)||/strict-dynamic/i.test(html))return fail('Codex 页面完整性策略不兼容')
     const early=reader.archive(archive,pkg.main,1024*1024).toString('utf8')
     const bootstrapNames=[...early.matchAll(/require\(["']\.\/(bootstrap-[\w-]+\.js)["']\)/g)].map(m=>m[1])
-    if(bootstrapNames.length!==1)return fail('Codex 桌面启动入口已变化')
-    const bootstrap='.vite/build/'+bootstrapNames[0],boot=reader.archive(archive,bootstrap,16*1024*1024).toString('utf8')
-    if(!boot.includes('require("electron")')||!boot.includes('CODEX_ELECTRON_USER_DATA_PATH'))return fail('Codex 桌面隔离接口已变化')
-    const protocolChunks=[...new Set([...boot.matchAll(/require\(["']\.\/([\w-]+\.js)["']\)/g)].map(m=>'.vite/build/'+m[1]))]
-    const protocolSources=[{path:bootstrap,body:boot},...protocolChunks.map(path=>({path,body:reader.archive(archive,path,16*1024*1024).toString('utf8')}))]
+    if(bootstrapNames.length>1)return fail('Codex 桌面启动入口已变化')
+    const bootstrap=bootstrapNames.length?'.vite/build/'+bootstrapNames[0]:pkg.main,boot=bootstrap===pkg.main?early:reader.archive(archive,bootstrap,16*1024*1024).toString('utf8')
+    const startup=[{path:bootstrap,body:boot}],startupPaths=new Set([bootstrap])
+    let startupBytes=Buffer.byteLength(boot)
+    for(let i=0;i<startup.length;i++)for(const specifier of codexDesktopStartupImports(startup[i].body)){
+      const path='.vite/build/'+specifier.slice(2)
+      if(startupPaths.has(path))continue
+      if(startupPaths.size>=64)throw new Error('desktop startup graph limit')
+      startupPaths.add(path)
+      const body=reader.archive(archive,path,16*1024*1024).toString('utf8')
+      startupBytes+=Buffer.byteLength(body)
+      if(startupBytes>32*1024*1024)throw new Error('desktop startup bytes limit')
+      startup.push({path,body})
+    }
+    if(!startup.some(({body})=>/require\(["']electron["']\)/.test(body))||!startup.some(({body})=>body.includes('CODEX_ELECTRON_USER_DATA_PATH')))return fail('Codex 桌面隔离接口已变化')
+    const protocolSources=startup
       .filter(entry=>/\.protocol\.handle\(\s*["'`]app["'`]\s*,/.test(entry.body))
     if(protocolSources.length!==1)return fail('Codex 应用协议注册方式尚未适配')
-    parts.push(digest(html),digest(early),digest(boot),protocolSources[0].path,digest(protocolSources[0].body))
+    parts.push(digest(html),digest(early),...startup.map(({path,body})=>[path,digest(body)]),protocolSources[0].path)
     const audited=version?releaseByVersion.get(version):undefined
     let asset=audited?.asset,source:string|undefined
     if(asset)try{source=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{asset=undefined}
@@ -321,7 +333,26 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       if(scripts.length!==1)return fail('Codex 页面入口无法唯一识别')
       const loader=reader.archive(archive,'webview/assets/'+scripts[0],2*1024*1024).toString('utf8')
       parts.push(digest(loader))
-      const initial=[...new Set(loader.match(/app-initial-[\w-]+\.js/g)??[])]
+      let initial=[...new Set(loader.match(/app-initial-[\w-]+\.js/g)??[])]
+      // The entry may delegate to another module before loading the composer.
+      // Follow actual local imports with bounded breadth; never scan unrelated
+      // archive entries or accept a second composer at the same graph depth.
+      let frontier=[loader],entries=0,bytes=0
+      const visited=new Set<string>(['./'+scripts[0]])
+      for(let depth=0;!initial.length&&depth<3;depth++){
+        const next:string[]=[],found=new Set<string>()
+        for(const parent of frontier)for(const specifier of uniqueModuleImports([...codexUiDynamicImports(parent),...codexUiStaticImports(parent)])){
+          if(visited.has(specifier))continue
+          visited.add(specifier)
+          if(++entries>64)throw new Error('renderer entry graph limit')
+          let body:string
+          try{body=reader.archive(archive,'webview/assets/'+specifier.slice(2),2*1024*1024).toString('utf8')}catch{continue}
+          bytes+=Buffer.byteLength(body);if(bytes>16*1024*1024)throw new Error('renderer entry bytes limit')
+          parts.push(specifier,digest(body));next.push(body)
+          for(const child of uniqueModuleImports([...codexUiStaticImports(body),...codexUiDynamicImports(body)]))if(/^\.\/app-initial-[\w-]+\.js$/.test(child))found.add(child.slice(2))
+        }
+        initial=[...found];frontier=next
+      }
       if(initial.length!==1)return fail('Codex 功能页面无法唯一识别')
       asset='webview/assets/'+initial[0];source=reader.archive(archive,asset,32*1024*1024).toString('utf8')
     }
@@ -354,7 +385,7 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       if(!localeAlreadySupported&&scripts.length===1){
         const entryPath='webview/assets/'+scripts[0],entry=readGraphEntry(entryPath,2*1024*1024)
         const visited=new Set<string>([entryPath]),graphBodies=new Map<string,string>([[entryPath,entry]]),queue:[string,string,number][]=[]
-        for(const specifier of uniqueModuleImports([...codexUiStaticImports(entry),...codexUiDynamicImports(entry)]))queue.push([entryPath,specifier,1])
+        for(const specifier of uniqueModuleImports([...codexUiDynamicImports(entry),...codexUiStaticImports(entry)]))queue.push([entryPath,specifier,1])
         while(queue.length&&graphEntries<256&&graphBytes<32*1024*1024){
           const [parent,specifier,depth]=queue.shift()!,path='webview/assets/'+specifier.slice(2)
           if(visited.has(path))continue
@@ -364,7 +395,7 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
           const parentBody=graphBodies.get(parent)
           if(parentBody&&path!==asset&&codexUiLocaleProviderSupported(parentBody,specifier,body))localeMatches.push({entryPath,entry,runtimePath:parent,runtimeBody:parentBody,path,body})
           graphBodies.set(path,body)
-          if(depth<5)for(const child of uniqueModuleImports([...codexUiStaticImports(body),...codexUiDynamicImports(body)]))queue.push([path,child,depth+1])
+          if(depth<5)for(const child of uniqueModuleImports([...codexUiDynamicImports(body),...codexUiStaticImports(body)]))queue.push([path,child,depth+1])
         }
       }
       const uniqueLocaleMatches=[...new Map(localeMatches.map(match=>[match.path,match])).values()]

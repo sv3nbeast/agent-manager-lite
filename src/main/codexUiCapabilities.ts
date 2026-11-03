@@ -117,6 +117,9 @@ export function codexUiDynamicImports(source:string):string[] {
 }
 export function codexUiLocaleProviderSupported(runtime:string,path:string,providerSource:string):boolean {
   try{
+    // Most reachable chunks are unrelated to translation. Avoid parsing their
+    // (potentially large) importer for each edge in the startup module graph.
+    if(!['locale_source','enable_i18n','systemLocale','ideLocale','Failed to load locale messages'].every(term=>providerSource.includes(term)))return false
     const runtimeProgram=parse(runtime,{ecmaVersion:'latest',sourceType:'module'}) as Node
     if(!path.startsWith('./')||!path.endsWith('.js'))return false
     const imports=(runtimeProgram.body as Node[]).filter(node=>node.type==='ImportDeclaration'&&node.source?.value===path)
@@ -299,8 +302,19 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
     // Lazy module initializers can nest the settings atom in several callbacks.
     // Match the unique Set expression itself: wrapper/function ownership is a
     // bundler detail, and no bindings move across scopes in this edit.
-    const values=one(functions.flatMap(fn=>nodes(fn,n=>n.type==='NewExpression'&&n.callee.name==='Set'&&n.arguments.length===1&&n.arguments[0].type==='ArrayExpression'&&n.arguments[0].elements.some((e:Node)=>e?.type==='SpreadElement'&&nodes(e,n=>property(n)==='enabledReasoningEfforts').length===1)&&n.arguments[0].elements.some((e:Node)=>literal(e)==='persistent')))).arguments[0]
-    const levels=values.elements.some((e:Node)=>literal(e)==='ultra')?[]:[edit(values,text(values).slice(0,-1)+',`ultra`]')]
+    const settingsSets=functions.flatMap(fn=>nodes(fn,n=>{
+      if(n.type!=='NewExpression'||n.callee.name!=='Set'||n.arguments.length!==1)return false
+      const value=n.arguments[0]
+      if(value.type==='ArrayExpression')return value.elements.some((e:Node)=>e?.type==='SpreadElement'&&nodes(e,c=>property(c)==='enabledReasoningEfforts').length===1)&&value.elements.some((e:Node)=>literal(e)==='persistent')
+      if(value.type!=='Identifier')return false
+      const block=nodes(fn,c=>c.type==='BlockStatement'&&c.start<value.start&&c.end>value.end).sort((a,b)=>(a.end-a.start)-(b.end-b.start))[0]
+      if(!block)return false
+      const declarations=(block.body as Node[]).filter(c=>c.type==='VariableDeclaration'&&c.end<n.start).flatMap(c=>c.declarations).filter(c=>c.id?.name===value.name)
+      if(nodes(block,c=>c.type==='AssignmentExpression'&&c.left?.name===value.name||c.type==='UpdateExpression'&&c.argument?.name===value.name).length)return false
+      return declarations.length===1&&declarations[0].init?.type==='CallExpression'&&nodes(declarations[0].init,c=>property(c)==='enabledReasoningEfforts').length===1
+    }))
+    const values=one(settingsSets).arguments[0]
+    const levels=values.type==='ArrayExpression'&&values.elements.some((e:Node)=>literal(e)==='ultra')?[]:[edit(values,values.type==='ArrayExpression'?text(values).slice(0,-1)+',`ultra`]':`[...${text(values)},\`ultra\`]`)]
     const catalogue=one(functionsWith('includeUltraReasoningEffort','hasModelSupportingUltraReasoningEffort','supportedReasoningEfforts.filter'))
     const availability=one(nodes(catalogue,n=>n.type==='VariableDeclarator'&&n.init?.type==='LogicalExpression'&&n.init.operator==='&&'&&text(n.init.right).includes('supportedReasoningEfforts')&&text(n.init.right).includes('ultra'))).init
     const filtered=one(nodes(catalogue,n=>n.type==='ConditionalExpression'&&property(n.consequent)==='supportedReasoningEfforts'&&text(n.alternate).includes('supportedReasoningEfforts.filter')&&text(n.alternate).includes('ultra')))
