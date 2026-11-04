@@ -1,9 +1,13 @@
 // Profile-scoped socket probing adapted from Cockpit codex_cli_daemon.rs.
 // Connect and immediately close. Never send a command, restart, or kill a daemon.
-import {lstatSync,realpathSync} from 'node:fs'
+import {lstatSync,realpathSync,symlinkSync,unlinkSync} from 'node:fs'
 import {join,isAbsolute} from 'node:path'
+import {randomBytes} from 'node:crypto'
 import {createConnection,type Socket} from 'node:net'
 
+// macOS sockaddr_un.sun_path holds 104 bytes, Linux 108. connect() can only
+// use a path that fits; a longer path cannot be reached directly.
+const SUN_PATH_LIMIT=process.platform==='darwin'?104:108
 export type ClientDaemonState='not_detected'|'running'|'unavailable'|'unsupported'|'cancelled'
 export async function probeClientDaemon(directory:string,signal?:AbortSignal):Promise<ClientDaemonState> {
   const states:ClientDaemonState[]=[]
@@ -26,8 +30,35 @@ async function probeClientSocket(directory:string,folderName:string,socketName:s
     if(folder.isSymbolicLink()||!folder.isDirectory())return 'unavailable'
     const socket=lstatSync(path)
     if(socket.isSymbolicLink()||!socket.isSocket())return 'unavailable'
-    if(Buffer.byteLength(path)>=(process.platform==='darwin'?104:108))return 'unavailable'
   }catch(error){return (error as NodeJS.ErrnoException).code==='ENOENT'?'not_detected':'unavailable'}
+  // A socket whose absolute path exceeds sun_path cannot be reached by connect()
+  // directly even though a live daemon may have bound it from a shorter relative
+  // path. Probe liveness through a short-lived symlink so an over-long path never
+  // masks a dead socket (whose file lingers after the client exits) as
+  // 'unavailable' — which would permanently block stop and native restore.
+  if(Buffer.byteLength(path)>=SUN_PATH_LIMIT)return probeViaShortLink(path,signal)
+  return connectProbe(path,signal)
+}
+// Connect through a random short-named symlink to the already validated socket.
+// connect() copies only the symlink path into sun_path and resolves it in the
+// kernel, so the real over-long target is still reached.
+async function probeViaShortLink(target:string,signal?:AbortSignal):Promise<ClientDaemonState> {
+  if(signal?.aborted)return 'cancelled'
+  // Keep the link under /tmp with a short name: connect() copies this string
+  // into sun_path, so it must fit the limit regardless of how deep the real
+  // socket lives. /tmp is always present on the only platforms probed here.
+  let link:string|undefined
+  for(let attempt=0;attempt<5&&!link;attempt++){
+    const candidate=`/tmp/.cml-dp-${randomBytes(8).toString('hex')}.sock`
+    if(Buffer.byteLength(candidate)>=SUN_PATH_LIMIT)return 'unavailable'
+    try{symlinkSync(target,candidate);link=candidate}
+    catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST')return 'unavailable'}
+  }
+  if(!link)return 'unavailable'
+  try{return await connectProbe(link,signal)}
+  finally{try{unlinkSync(link)}catch{/* best-effort cleanup of our own probe symlink */}}
+}
+function connectProbe(connectPath:string,signal?:AbortSignal):Promise<ClientDaemonState> {
   return new Promise(resolve=>{
     let socket:Socket|undefined,finished=false
     const finish=(state:ClientDaemonState)=>{
@@ -39,7 +70,7 @@ async function probeClientSocket(directory:string,folderName:string,socketName:s
     signal?.addEventListener('abort',cancel,{once:true})
     if(signal?.aborted){cancel();return}
     try{
-      socket=createConnection({path})
+      socket=createConnection({path:connectPath})
       socket.once('connect',()=>finish('running'))
       socket.once('error',(error:NodeJS.ErrnoException)=>finish(error.code==='ENOENT'||error.code==='ECONNREFUSED'?'not_detected':'unavailable'))
     }catch{finish('unavailable')}
