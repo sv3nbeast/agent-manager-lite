@@ -41,7 +41,7 @@ function fixture(t:Context,systemLanguages:readonly string[]=['en-US'],speedMenu
   const events:Record<string,unknown>[]=[]
   let prepare=async(id:string)=>store.read().accounts.find(value=>value.id===id)!
   let now=Date.now()
-  const create=()=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event));gateways.push(gateway);return gateway},id=>prepare(id),runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus)
+  const create=(runtimeOverride?:DesktopRuntime)=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event));gateways.push(gateway);return gateway},id=>prepare(id),runtimeOverride??runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus)
   const instances=create(),app=instances.registerApplication(application)
   t.after(async()=>{await instances.closeAll().catch(()=>{});await Promise.all(gateways.map(gateway=>gateway.stop()));await tokens.stop();rmSync(root,{recursive:true,force:true})})
   function account(url='http://127.0.0.1:9',key='fixture-upstream',models=['fixture-model']) {const a=createAPIAccount({name:`Account ${randomUUID()}`,apiKey:key,baseUrl:url,models,wireApi:'responses',defaultTier:'inherit',note:'',tags:[]});store.transaction(state=>state.accounts.push(a));return a}
@@ -685,6 +685,26 @@ test('restart recovery retains owned live instances, restores dead instances, an
   const damaged=f.create();await damaged.recover()
   assert.equal(damaged.views()[0].status,'error')
   assert.throws(()=>damaged.preview({id:instance.id,revision:instance.revision}),/正在运行/)
+})
+
+test('a recovery whose cleanup failed is retried and cleared by a later stop instead of wedging forever',async t=>{
+  const f=fixture(t),account=f.account(),instance=f.add(account.id)
+  f.instances.start(f.instances.preview({id:instance.id,revision:instance.revision}).ticket);await f.instances.settled(instance.id)
+  // Reopen with a fresh runtime (no live children, so the desktop process is
+  // treated as gone) whose first stop throws: recover() rebuilds the run from
+  // the persisted checkpoint, finds no live process and fails mid-cleanup,
+  // leaving the instance wedged in both active and recoveryErrors — the pre-fix
+  // permanent deadlock where stop() only ever rethrew the stored error.
+  class FlakyStopRuntime extends FixtureDesktop {private failed=false;override async stop(plan:DesktopPlan){if(!this.failed){this.failed=true;throw new Error('fixture cleanup interrupted')}return super.stop(plan)}}
+  const reopened=f.create(new FlakyStopRuntime())
+  await reopened.recover()
+  assert.equal(reopened.views()[0].status,'error')
+  assert.throws(()=>reopened.preview({id:instance.id,revision:instance.revision}),/正在运行/)
+  await reopened.stop(instance.id) // Retries the rollback; the runtime's second stop succeeds.
+  assert.equal(reopened.views()[0].status,'stopped')
+  assert.equal(reopened.inUse(instance.id),false)
+  assert.equal(existsSync(join(f.store.directory,'instances',instance.id,'launch.json')),false)
+  assert.doesNotThrow(()=>reopened.preview({id:instance.id,revision:instance.revision}))
 })
 
 test('macOS LaunchServices uses two isolated homes, verifies real PIDs and refuses a mismatched executable',async t=>{

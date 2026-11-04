@@ -899,13 +899,47 @@ export class Instances {
   }
   async stop(id:string):Promise<void> {
     this.profile(id)
-    if(this.recoveryErrors.has(id))throw new Error(this.recoveryErrors.get(id))
     const run=this.active.get(id)
-    if(!run)return
+    // A recovery whose cleanup threw leaves the instance in both active (stale
+    // run) and recoveryErrors. Prefer the active run so stop retries its
+    // rollback and clears the flag on success; fall back to a checkpoint-only
+    // retry when no run survived. Previously this method rethrew the stored
+    // recoveryErrors message unconditionally, so a once-failed recovery could
+    // never be stopped and the flag was never cleared.
+    if(!run){if(this.recoveryErrors.has(id))await this.retryRecovery(id);return}
     if(run.stopping)return run.stopping
     run.controller.abort();run.status='stopping'
-    run.stopping=(async()=>{await run.task;try{await this.cleanup(run);this.active.delete(id)}catch(cause){run.status='error';run.error='停止或恢复配置失败，文件已保留：'+(cause instanceof Error?cause.message:'请检查后重试');throw new Error(run.error)}})().finally(()=>{run.stopping=undefined})
+    run.stopping=(async()=>{await run.task;try{await this.cleanup(run);this.active.delete(id);this.recoveryErrors.delete(id)}catch(cause){run.status='error';run.error='停止或恢复配置失败，文件已保留：'+(cause instanceof Error?cause.message:'请检查后重试');throw new Error(run.error)}})().finally(()=>{run.stopping=undefined})
     return run.stopping
+  }
+  // A recovery left the instance wedged in recoveryErrors without a surviving
+  // active run (the checkpoint failed to reconstruct, or cleanup never ran).
+  // Rebuild the error-status run from its launch checkpoint and retry the
+  // rollback; clear the flag only when cleanup finishes, otherwise record the
+  // real failure so the next stop retries instead of replaying a stale message.
+  private async retryRecovery(id:string):Promise<void> {
+    const profile=this.profile(id)
+    let run:Running|undefined
+    try{run=this.reconstructCheckpoint(profile)}
+    catch(cause){const message=cause instanceof Error?cause.message:'上次实例记录无法安全恢复，已保留原目录；请检查应用路径与 launch.json 后重开管理器';this.recoveryErrors.set(id,message);throw new Error(message)}
+    if(!run){this.recoveryErrors.delete(id);return}
+    try{await this.cleanup(run);this.recoveryErrors.delete(id)}
+    catch(cause){const message='停止或恢复配置失败，文件已保留：'+(cause instanceof Error?cause.message:'请检查后重试');this.recoveryErrors.set(id,message);throw new Error(message)}
+  }
+  // Rebuild the error-status run a prior session left behind from its launch
+  // checkpoint, reusing recover()'s validation. Returns undefined when no
+  // checkpoint remains (nothing to roll back); throws when the checkpoint is
+  // damaged or contradicts the profile.
+  private reconstructCheckpoint(profile:InstanceProfile):Running|undefined {
+    const content=readBounded(join(this.folder(profile.id,false,profile.clientType!=='claude_code'||isClaudeDesktopProfile(profile)),'launch.json'),8192)
+    if(!content){if(this.store.read().clientSwitches?.some(record=>record.targetId===profile.id&&record.instanceNonce))throw new Error('原生恢复记录缺少启动归属');return undefined}
+    const saved=checkpointSchema.parse(JSON.parse(content))
+    if(resolveAgentClientType(saved.clientType)!==resolveAgentClientType(profile.clientType))throw new Error('实例客户端与恢复记录不一致')
+    if(saved.claudeWorkingDirectory&&(profile.clientType!=='claude_code'||isClaudeDesktopProfile(profile)))throw new Error('会话项目目录与恢复记录的客户端不一致')
+    if(saved.launchMode!==undefined&&profile.launchMode!==undefined&&saved.launchMode!==profile.launchMode)throw new Error('实例运行方式与恢复记录不一致')
+    const plan=this.recoveryPlan(profile,saved)
+    if((saved.connectionMode??'local_api')!==(profile.connectionMode??'local_api'))throw new Error('实例启动模式与恢复记录不一致')
+    return {profile,plan,status:'error',controller:new AbortController(),injectNetworkProxy:saved.injectNetworkProxy??profile.injectNetworkProxy!==false,backup:saved.backup,nativeTier:saved.nativeTier,claudeSubscriptionFingerprint:saved.claudeSubscriptionFingerprint,claudeWorkingDirectory:saved.claudeWorkingDirectory,error:'检测到上次运行的实例，请停止并回收登录状态后重新启动'}
   }
   async focus(id:string):Promise<void> {const run=this.active.get(id);if(!run || run.status!=='running')throw new Error('实例未运行');await this.runtime.focus(run.plan)}
   async completeDesktopLogin(id:string,url:string):Promise<void> {
