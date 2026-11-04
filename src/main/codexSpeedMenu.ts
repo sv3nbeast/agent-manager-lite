@@ -5,6 +5,7 @@ import {createHash,randomUUID} from 'node:crypto'
 import * as nodeFS from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
+import {parse as parseScript} from 'acorn'
 import {codexDesktopStartupImports} from './codexDesktopResources'
 import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiDynamicImports,codexUiFeatures,codexUiLocaleProviderSupported,codexUiStaticImports,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
@@ -69,6 +70,80 @@ const releaseByVersion=new Map(releases.map(profile=>[profile.version,profile]))
 const replacementsFor=(profile:CodexReleaseProfile,enhancements:CodexSpeedMenuEnhancements):readonly CodexSpeedReplacement[]=>{if(profile.replacements)return profile.replacements;const ultra=profile.ultraReplacements??[],locale=profile.localeReplacement?[profile.localeReplacement]:[];return enhancements==='speed'?[...profile.speedReplacements,...ultra]:enhancements==='locale'?[...ultra,...locale]:[...profile.speedReplacements,...ultra,...locale]}
 function uniqueModuleImports(imports:string[]):string[]{return [...new Set(imports)].filter(path=>path.startsWith('./')&&path.endsWith('.js'))}
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex')
+// Composer anchors — the rare term combination that uniquely marks the module
+// holding the locale and reasoning-effort (ultra) feature structures. Used only
+// as a cheap prefilter to pick a single reachable chunk; capability detection
+// then runs on that chunk and remains the authority for any actual edit.
+type Node={type:string;start:number;end:number;[key:string]:any}
+const composerAnchors=['locale_source','enable_i18n','systemLocale','ideLocale','Failed to load locale messages','includeUltraReasoningEffort','hasModelSupportingUltraReasoningEffort','supportedReasoningEfforts.filter']
+const rspackChunkRefs=(source:string):string[]=>{const ids=new Set<string>();for(const match of source.matchAll(/\.e\((\d{1,9})\)/g))ids.add(match[1]);return [...ids]}
+// The runtime maps a chunk id to its hashed filename inside `__webpack_require__.u`
+// as `"assets/async/"+e+"."+({id:"hash",…})[e]+".js"`. Parse that single large
+// string→string object from the entry scripts; empty for a non-rspack page.
+function rspackChunkHashes(entrySources:readonly string[]):Record<string,string> {
+  const hashes:Record<string,string>={}
+  for(const source of entrySources){
+    if(!source.includes('"assets/async/"'))continue
+    let program:Node
+    try{program=parseScript(source,{ecmaVersion:'latest',sourceType:'module'}) as unknown as Node}catch{continue}
+    const stack:Node[]=[program]
+    while(stack.length){
+      const node=stack.pop()!
+      if(node.type==='MemberExpression'&&node.computed&&node.object?.type==='ObjectExpression'&&node.object.properties.length>1000){
+        for(const property of node.object.properties){
+          if(property.type!=='Property'||property.value?.type!=='Literal'||typeof property.value.value!=='string')continue
+          const key=property.key.type==='Literal'?String(property.key.value):property.key.name
+          if(typeof key==='string'&&/^\d+$/.test(key))hashes[key]=property.value.value
+        }
+      }
+      for(const value of Object.values(node)){
+        if(value&&typeof value==='object'&&typeof (value as Node).type==='string')stack.push(value as Node)
+        else if(Array.isArray(value))for(const child of value)if(child&&typeof child.type==='string')stack.push(child)
+      }
+    }
+  }
+  return hashes
+}
+/**
+ * rspack renderers (Codex 26.1029+) split the page into `.e(id)`-loaded chunks
+ * instead of one `app-initial-*.js` composer. Walk the chunk-load graph from the
+ * verified entry scripts, bounded in depth, count and bytes, and return the one
+ * reachable chunk carrying the composer anchors. Ambiguity or absence yields
+ * undefined so the caller can fail closed exactly like the single-file path.
+ */
+function discoverRspackComposer(reader:CodexSpeedMenuReader,archive:string,entryScripts:readonly string[],parts:unknown[]):{asset:string;source:string}|undefined {
+  const digest=reader.digest??hash
+  const entrySources=entryScripts.map(name=>reader.archive(archive,'webview/assets/'+name,4*1024*1024).toString('utf8'))
+  const hashes=rspackChunkHashes(entrySources)
+  if(!Object.keys(hashes).length)return undefined
+  let frontier=new Set<string>();for(const source of entrySources)for(const id of rspackChunkRefs(source))frontier.add(id)
+  const visited=new Set<string>(),matches:{asset:string;source:string}[]=[]
+  let depth=0,reads=0,bytes=0
+  // Breadth-first by chunk-load depth. Stop expanding at the first depth that
+  // yields a composer match: uniqueness is decided among that level's chunks,
+  // so a single page needs only the levels up to its composer (two for 26.1029)
+  // rather than the exponential full graph. Caps are a safety ceiling.
+  while(frontier.size&&depth<6&&!matches.length){
+    const next=new Set<string>()
+    for(const id of frontier){
+      if(visited.has(id))continue
+      visited.add(id)
+      const chunkHash=hashes[id];if(!chunkHash)continue
+      if(++reads>1024)throw new Error('rspack chunk graph entry limit')
+      const asset='webview/assets/async/'+id+'.'+chunkHash+'.js'
+      let body:string
+      try{body=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{continue}
+      bytes+=Buffer.byteLength(body);if(bytes>128*1024*1024)throw new Error('rspack chunk graph byte limit')
+      if(composerAnchors.every(term=>body.includes(term)))matches.push({asset,source:body})
+      for(const child of rspackChunkRefs(body))if(!visited.has(child))next.add(child)
+    }
+    depth++
+    frontier=next
+  }
+  if(matches.length!==1)return undefined
+  parts.push('rspack',matches[0].asset,digest(matches[0].source))
+  return matches[0]
+}
 const sentinel=Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
 
 export interface CodexSpeedMenuInspection {
@@ -330,7 +405,15 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     if(asset)try{source=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{asset=undefined}
     if(!asset){
       const scripts=[...html.matchAll(/<script\b[^>]*\bsrc=["'](?:\.\/|\/)?assets\/([\w.-]+\.js)["'][^>]*>/g)].map(m=>m[1])
-      if(scripts.length!==1)return fail('Codex 页面入口无法唯一识别')
+      if(scripts.length!==1){
+        // rspack renderers (26.1029+) ship several entry scripts and no single
+        // app-initial composer. Discover the composer chunk from the chunk-load
+        // graph instead; fail closed on ambiguity just like the single file.
+        if(!scripts.length)return fail('Codex 页面入口无法唯一识别')
+        const composer=discoverRspackComposer(reader,archive,scripts,parts)
+        if(!composer)return fail('Codex 功能页面无法唯一识别')
+        asset=composer.asset;source=composer.source
+      }else{
       const loader=reader.archive(archive,'webview/assets/'+scripts[0],2*1024*1024).toString('utf8')
       parts.push(digest(loader))
       let initial=[...new Set(loader.match(/app-initial-[\w-]+\.js/g)??[])]
@@ -355,6 +438,7 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       }
       if(initial.length!==1)return fail('Codex 功能页面无法唯一识别')
       asset='webview/assets/'+initial[0];source=reader.archive(archive,asset,32*1024*1024).toString('utf8')
+      }
     }
     const sourceDigest=digest(source!)
     parts.push(asset,sourceDigest)

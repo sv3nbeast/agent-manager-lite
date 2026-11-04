@@ -406,3 +406,58 @@ test('installed desktop client reports any currently supported capabilities',t=>
   assert.deepEqual(hook.features,result.features)
   assert.ok(readFileSync(hook.patchedBody,'utf8').length>0)
 })
+
+// Codex 26.1029+ ships an rspack renderer: feature functions live inside the
+// per-module factories of a `__webpack_modules__` object, not at Program scope.
+// Wrap the semantic fixture that way and confirm detection still finds every
+// role (moduleFunctions must treat each factory body as a module scope).
+function rspackModuleWrapped(body:string):string {
+  return `export const __webpack_modules__={jAbU(e,t,r){${body}\nt.exports={}},qZ1x(e,t,r){function unrelated(){return 1}t.exports=unrelated}};`
+}
+test('rspack module-factory renderer: feature roles inside __webpack_modules__ are detected',()=>{
+  const detected=detectCodexUiCapabilities(rspackModuleWrapped(source))
+  for(const feature of ['locale','speed','ultra'] as const)assert.equal(detected.features[feature].supported,true,`${feature}: ${detected.features[feature].reason}`)
+  assert.equal(detected.replacements.locale.length,2)
+  assert.ok(detected.replacements.ultra.length>=3)
+})
+test('rspack ultra settings Set built directly from the persisted setting is still patched', ()=>{
+  // Newer clients wrap the enabled-efforts read in `new Set(read(settings,…))`
+  // inside an inline arrow at the factory body — not the old array-spread form.
+  const direct=source.split('\n').map(line=>line.startsWith('function initLevels')
+    ?'const initLevels=({get:g})=>g(acctFlag)?new Set(g(accountLevels)):new Set(readSetting(settings.enabledReasoningEfforts))'
+    :line).join('\n')
+  const detected=detectCodexUiCapabilities(rspackModuleWrapped(direct))
+  assert.equal(detected.features.ultra.supported,true,detected.features.ultra.reason)
+  const patched=applyCodexUiReplacements(rspackModuleWrapped(direct),detected.replacements.ultra)
+  assert.match(patched,/new Set\(\[\.\.\.readSetting\(settings\.enabledReasoningEfforts\),`ultra`\]\)/)
+})
+
+test('rspack entry discovery walks the chunk-load graph to the unique composer',t=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-rspack-'))),application=join(root,'Fixture.app'),executable=join(application,'Contents/MacOS/ChatGPT')
+  t.after(()=>rmSync(root,{recursive:true,force:true}))
+  const composerId='24191',composerHash='589dcc9878',midId='77001',midHash='abcdef0123'
+  // The runtime chunk-id→hash table (`__webpack_require__.u`). Pad past the
+  // 1000-entry threshold that distinguishes it from incidental object literals.
+  const map:Record<string,string>={};for(let i=0;i<1100;i++)map[String(100000+i)]='0'.repeat(10)
+  map[composerId]=composerHash;map[midId]=midHash
+  const u=`e=>"assets/async/"+e+"."+(${JSON.stringify(map)})[e]+".js"`
+  const entries=new Map<string,Buffer>([
+    ['package.json',Buffer.from(JSON.stringify({name:'openai-codex-electron',version:'26.1029.61003',main:'.vite/build/early-bootstrap.js'}))],
+    // Two entry scripts (rspack), no single app-initial composer.
+    ['webview/index.html',Buffer.from('<meta content="script-src &#39;self&#39;"><script type="module" src="/assets/a.1.js"></script><script type="module" src="/assets/b.2.js"></script>')],
+    ['webview/assets/a.1.js',Buffer.from(`globalThis.u=${u};r.e(${midId});`)],
+    ['webview/assets/b.2.js',Buffer.from('export const x=1')],
+    // Mid chunk loads the composer; composer carries the real feature roles.
+    [`webview/assets/async/${midId}.${midHash}.js`,Buffer.from(`r.e(${composerId});`)],
+    [`webview/assets/async/${composerId}.${composerHash}.js`,Buffer.from(source)],
+    ['.vite/build/early-bootstrap.js',Buffer.from('require("./bootstrap-renamed.js")')],
+    ['.vite/build/bootstrap-renamed.js',Buffer.from('require("electron");process.env.CODEX_ELECTRON_USER_DATA_PATH;require("./app-protocol-renamed.js");')],
+    ['.vite/build/app-protocol-renamed.js',Buffer.from('app.protocol.handle(`app`,async()=>new Response());')]
+  ])
+  const reader:CodexSpeedMenuReader={canonical:p=>p,identity:p=>p,file:()=>Buffer.alloc(0),archive:(_a,p)=>{const b=entries.get(p);if(!b)throw new Error('missing fixture '+p);return b},fuseWires:()=>[Buffer.from([1,9,48,49,48,48,49,49,48,48,49])]}
+  const result=inspectCodexDesktopUi({application,executable,platform:'darwin',features:['locale']},reader)
+  assert.equal(result.version,'26.1029.61003')
+  assert.equal(result.supported,true,result.reason)
+  assert.equal(result.assetURL,`app://-/assets/${composerId}.${composerHash}.js`)
+  assert.ok(result.featureSupport!.locale.supported)
+})
