@@ -458,6 +458,6 @@ test('rspack entry discovery walks the chunk-load graph to the unique composer',
   const result=inspectCodexDesktopUi({application,executable,platform:'darwin',features:['locale']},reader)
   assert.equal(result.version,'26.1029.61003')
   assert.equal(result.supported,true,result.reason)
-  assert.equal(result.assetURL,`app://-/assets/${composerId}.${composerHash}.js`)
+  assert.equal(result.assetURL,`app://-/assets/async/${composerId}.${composerHash}.js`)
   assert.ok(result.featureSupport!.locale.supported)
 })

@@ -77,6 +77,10 @@ const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex
 type Node={type:string;start:number;end:number;[key:string]:any}
 const composerAnchors=['locale_source','enable_i18n','systemLocale','ideLocale','Failed to load locale messages','includeUltraReasoningEffort','hasModelSupportingUltraReasoningEffort','supportedReasoningEfforts.filter']
 const rspackChunkRefs=(source:string):string[]=>{const ids=new Set<string>();for(const match of source.matchAll(/\.e\((\d{1,9})\)/g))ids.add(match[1]);return [...ids]}
+// The app:// URL the renderer requests mirrors the archive path under webview/.
+// Keep every segment after `webview/` (e.g. assets/async/<id>.<hash>.js); a
+// basename-only URL silently misses chunks that live in a subdirectory.
+const assetUrl=(asset:string):string=>'app://-/'+asset.replace(/^webview\//,'')
 // The runtime maps a chunk id to its hashed filename inside `__webpack_require__.u`
 // as `"assets/async/"+e+"."+({id:"hash",…})[e]+".js"`. Parse that single large
 // string→string object from the entry scripts; empty for a non-rspack page.
@@ -485,7 +489,7 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       const uniqueLocaleMatches=[...new Map(localeMatches.map(match=>[match.path,match])).values()]
       if(!localeAlreadySupported&&uniqueLocaleMatches.length===1){
         const match=uniqueLocaleMatches[0],locale=detectCodexUiCapabilities(match.body),replacements=locale.replacements.locale,sourceHash=digest(match.body),patched=applyCodexUiReplacements(match.body,replacements)
-        localeResource={id:match.path,asset:match.path,url:'app://-/assets/'+match.path.split('/').pop(),source:sourceHash,sourceBody:match.body,replacements,patchedSha256:digest(patched)}
+        localeResource={id:match.path,asset:match.path,url:assetUrl(match.path),source:sourceHash,sourceBody:match.body,replacements,patchedSha256:digest(patched)}
         parts.push(match.entryPath,digest(match.entry),match.runtimePath,digest(match.runtimeBody),localeResource.asset,sourceHash,localeResource.patchedSha256,replacements)
       }
     }catch{/* Ambiguous locale module graph stays unsupported. */}
@@ -495,7 +499,7 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     const replacements=features.filter(feature=>feature!=='locale'||!localeResource).flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
     parts.push(featureSupport,features,replacements)
     if(!features.length)return {...fail('客户端页面功能结构尚未兼容'),featureSupport}
-    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:'app://-/assets/'+asset.split('/').pop(),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{})}
+    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:assetUrl(asset),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{})}
     const patchedDigest=digest(patchSemantic(source!,replacements))
     profile.patched={speed:patchedDigest,locale:patchedDigest,'speed-locale':patchedDigest}
     const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:options.enhancements??'speed-locale',transport:profile.injection})
