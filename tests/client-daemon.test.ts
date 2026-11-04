@@ -61,3 +61,32 @@ test('current Codex ipc socket blocks reuse of a profile even without the older 
   assert.throws(()=>assertClientDaemonStopped('running'),/仍在运行/)
   assert.equal(server.listening,true)
 })
+test('a socket whose absolute path exceeds sun_path still reports dead vs live instead of blocking as unavailable',{skip:!unix},async t=>{
+  // A deep managed home pushes the ipc socket path past the 104-byte macOS
+  // sun_path limit. The daemon binds it from a short relative path, so the
+  // socket file lives at an unreachable-by-full-path location. A stale file
+  // left after exit must read as not_detected (stoppable), and a live daemon
+  // must still read as running — length alone must never force unavailable.
+  const root=realpathSync(mkdtempSync('/tmp/cml-daemon-long-'))
+  const client=join(root,'p'.repeat(90)),ipc=join(client,'ipc'),socket=join(ipc,'ipc.sock')
+  mkdirSync(ipc,{recursive:true})
+  assert.ok(Buffer.byteLength(socket)>=104,`socket path must exceed sun_path for this test (${Buffer.byteLength(socket)})`)
+  t.after(()=>rmSync(root,{recursive:true,force:true}))
+  // Bind via a short symlink to the ipc dir so the kernel creates the socket
+  // file at the real over-long path while sun_path stays within the limit.
+  const shortDir=realpathSync(mkdtempSync('/tmp/s-')),shortIpc=join(shortDir,'i'),shortSocket=join(shortIpc,'ipc.sock')
+  symlinkSync(ipc,shortIpc);t.after(()=>rmSync(shortDir,{recursive:true,force:true}))
+  const server=createServer(s=>s.end());t.after(()=>server.close())
+  await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(shortSocket,resolve)})
+  assert.ok(existsSync(socket))
+  assert.equal(await probeClientDaemon(client),'running') // live daemon reached through the long path
+  const closed=once(server,'close');server.close();await closed // graceful close unlinks the file
+  // Recreate the socket file and abandon it via SIGKILL so it lingers like a
+  // crashed daemon's debris — the exact state that wedged the real instance.
+  const child=spawn(process.execPath,['-e',"require('node:net').createServer().listen(process.argv[1],()=>process.stdout.write('ready\\n'))",shortSocket],{stdio:['ignore','pipe','pipe']})
+  t.after(()=>child.kill('SIGKILL'))
+  const ready=await Promise.race([once(child.stdout!,'data').then(([data])=>String(data)),once(child,'error').then(([error])=>{throw error})])
+  assert.equal(ready,'ready\n');const exited=once(child,'exit');child.kill('SIGKILL');await exited
+  assert.ok(existsSync(socket),'stale socket file lingers after a SIGKILLed daemon')
+  assert.equal(await probeClientDaemon(client),'not_detected') // dead socket is stoppable, not unavailable
+})

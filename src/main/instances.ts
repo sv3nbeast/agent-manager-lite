@@ -1058,7 +1058,14 @@ export class Instances {
             run.status='running';run.error=undefined
           }catch {run.error='Claude 订阅刷新归属暂无法恢复；实例仍保留，请停止后重新启动'}
         }
-      } catch {this.recoveryErrors.set(profile.id,'上次实例记录无法安全恢复，已保留原目录；请检查应用路径与 launch.json 后重开管理器')}
+      } catch(error) {
+        // Preserve the real cause: a bare catch here discarded why recovery
+        // failed, leaving only a generic message and no way to diagnose a
+        // wedged instance. Log it and fold the detail into the recovery error.
+        console.warn('instance recovery failed',profile.id,error)
+        const detail=error instanceof Error?error.message:String(error)
+        this.recoveryErrors.set(profile.id,`上次实例记录无法安全恢复，已保留原目录：${detail}`)
+      }
     }
   }
   async closeAll():Promise<void> {for(const controller of this.attaching)controller.abort();if(this.copying())await this.cancelCopy(this.copy!.view.id);const results=await Promise.allSettled([...this.active.keys()].map(id=>this.stop(id)));if(results.some(result=>result.status==='rejected'))throw new Error('部分实例未停止或恢复，请逐项检查')}
