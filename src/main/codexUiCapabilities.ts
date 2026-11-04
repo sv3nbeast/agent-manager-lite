@@ -40,23 +40,59 @@ function moduleFunctions(program:Node):Node[] {
     if(name)fn.__cmlBindingName=name
     functions.push(fn)
   }
-  const statement=(node:Node|undefined)=>{
-    if(!node)return
-    if(node.type==='FunctionDeclaration'){
-      if(node.id?.type==='Identifier')add(node,node.id.name)
-      return
-    }
-    if(node.type==='VariableDeclaration'){
-      for(const declaration of node.declarations??[]){
-        if(declaration.id?.type==='Identifier'&&isFunction(declaration.init))add(declaration.init,declaration.id.name)
+  // Collect the top-level function bindings of one lexical scope — Program, or a
+  // bundler module factory body (see rspackModuleScopes). A nested helper is
+  // never promoted here; detectors treat it as part of its owner.
+  const scope=(body:readonly Node[]|undefined)=>{
+    for(const node of body??[]){
+      if(node.type==='FunctionDeclaration'){
+        if(node.id?.type==='Identifier')add(node,node.id.name)
+        continue
       }
-      return
+      if(node.type==='VariableDeclaration'){
+        for(const declaration of node.declarations??[]){
+          if(declaration.id?.type==='Identifier'&&isFunction(declaration.init))add(declaration.init,declaration.id.name)
+        }
+        continue
+      }
+      // A module export still binds its declaration at Program scope.
+      if(['ExportNamedDeclaration','ExportDefaultDeclaration'].includes(node.type)&&node.declaration){
+        if(node.declaration.type==='FunctionDeclaration'){if(node.declaration.id?.type==='Identifier')add(node.declaration,node.declaration.id.name)}
+        else if(node.declaration.type==='VariableDeclaration')for(const declaration of node.declaration.declarations??[])if(declaration.id?.type==='Identifier'&&isFunction(declaration.init))add(declaration.init,declaration.id.name)
+      }
     }
-    // A module export still binds its declaration at Program scope.
-    if(['ExportNamedDeclaration','ExportDefaultDeclaration'].includes(node.type))statement(node.declaration)
   }
-  for(const node of program.body??[])statement(node)
+  const factories=rspackModuleFactories(program)
+  if(factories.length)for(const factory of factories)scope(factory.body?.body)
+  else scope(program.body)
   return functions
+}
+
+/**
+ * rspack/webpack split the renderer into a `__webpack_modules__` object whose
+ * values are per-module factory functions `id(e,t,r){...}`. Each factory body
+ * is the real module scope; the Program body holds only the registration
+ * wrapper. Return those factory functions so the single-file and bundled
+ * layouts share one notion of "module scope". Empty for a classic single file.
+ */
+function rspackModuleFactories(program:Node):Node[] {
+  const factories:Node[]=[]
+  const fromObject=(object:Node|undefined)=>{
+    if(object?.type!=='ObjectExpression')return
+    for(const property of object.properties??[]){
+      const value=property.type==='Property'?(property.value??(property.method?property.value:undefined)):undefined
+      if(isFunction(value))factories.push(value)
+    }
+  }
+  const scan=(node:Node|undefined)=>{
+    if(!node)return
+    const declaration=['ExportNamedDeclaration','ExportDefaultDeclaration'].includes(node.type)?node.declaration:node
+    if(declaration?.type==='VariableDeclaration')for(const item of declaration.declarations??[]){
+      if(item.id?.type==='Identifier'&&item.id.name==='__webpack_modules__')fromObject(item.init)
+    }
+  }
+  for(const node of program.body??[])scan(node)
+  return factories
 }
 
 const functionName=(fn:Node):string|undefined=>fn.__cmlBindingName??fn.id?.name
@@ -302,12 +338,22 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
     // Lazy module initializers can nest the settings atom in several callbacks.
     // Match the unique Set expression itself: wrapper/function ownership is a
     // bundler detail, and no bindings move across scopes in this edit.
-    const settingsSets=functions.flatMap(fn=>nodes(fn,n=>{
+    // rspack keeps the settings atom inside an inline arrow at the module
+    // factory body, not in a top-level function. Search the whole factory body
+    // in that layout; a classic single file keeps searching its module-scope
+    // functions so existing bundles behave identically.
+    const factories=rspackModuleFactories(program)
+    const settingsRoots=factories.length?factories:functions
+    const settingsSets=settingsRoots.flatMap(root=>nodes(root,n=>{
       if(n.type!=='NewExpression'||n.callee.name!=='Set'||n.arguments.length!==1)return false
       const value=n.arguments[0]
       if(value.type==='ArrayExpression')return value.elements.some((e:Node)=>e?.type==='SpreadElement'&&nodes(e,c=>property(c)==='enabledReasoningEfforts').length===1)&&value.elements.some((e:Node)=>literal(e)==='persistent')
+      // Newer clients build the enabled set directly from the persisted setting:
+      // `new Set(read(settings, …enabledReasoningEfforts))`. The call result is
+      // the source of truth, so append ultra around that whole expression.
+      if(value.type==='CallExpression')return nodes(value,c=>property(c)==='enabledReasoningEfforts').length===1&&nodes(value,c=>c.type==='NewExpression'&&c.callee?.name==='Set').length===0
       if(value.type!=='Identifier')return false
-      const block=nodes(fn,c=>c.type==='BlockStatement'&&c.start<value.start&&c.end>value.end).sort((a,b)=>(a.end-a.start)-(b.end-b.start))[0]
+      const block=nodes(root,c=>c.type==='BlockStatement'&&c.start<value.start&&c.end>value.end).sort((a,b)=>(a.end-a.start)-(b.end-b.start))[0]
       if(!block)return false
       const declarations=(block.body as Node[]).filter(c=>c.type==='VariableDeclaration'&&c.end<n.start).flatMap(c=>c.declarations).filter(c=>c.id?.name===value.name)
       if(nodes(block,c=>c.type==='AssignmentExpression'&&c.left?.name===value.name||c.type==='UpdateExpression'&&c.argument?.name===value.name).length)return false
