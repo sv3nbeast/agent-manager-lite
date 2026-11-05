@@ -205,7 +205,7 @@ export interface CodexSpeedMenuPrepareOptions {
   nonce:string
   hookDirectory?:string
 }
-export interface CodexSpeedMenuStatusScope {statusLog:string;nonce:string;executable:string;directory:string;pid?:number;enhancements?:CodexSpeedMenuEnhancements;feature?:CodexUiFeature;requiredResourceIds?:readonly string[]}
+export interface CodexSpeedMenuStatusScope {statusLog:string;nonce:string;executable:string;directory:string;pid?:number;enhancements?:CodexSpeedMenuEnhancements;feature?:CodexUiFeature;requiredResourceIds?:readonly string[];requiredMode?:'all'|'any'}
 export interface CodexSpeedMenuStatus {state:'pending'|'active'|'fallback';reason?:string}
 
 function boundedFile(path:string,limit:number):Buffer {
@@ -762,23 +762,40 @@ export function readCodexSpeedMenuStatus(scope:CodexSpeedMenuStatusScope,now=Dat
       // An aborted preload does not uninstall a handler that already served a
       // resource. The latest resource result takes precedence over startup
       // diagnostics; a later real original response still downgrades active.
+      // `any` mode (inlined duplicate copies, e.g. the rspack service-tier UI
+      // replicated across chunks): exactly one copy is ever requested at
+      // runtime, so a single patched copy means the feature is live and the
+      // never-loaded duplicates must not hold it in pending. The final
+      // reconciliation below is authoritative; keep per-line results coarse.
+      const anyMode=scope.requiredMode==='any'
       if(value.kind==='patched'){
         resourceLoaded=true
         const required=scope.requiredResourceIds??[]
-        result=required.length>0&&!required.every(id=>latestResourceStatus.get(id)?.kind==='patched')?{state:'pending',reason:'正在加载客户端界面资源'}:{state:'active'}
+        const satisfied=anyMode?required.some(id=>latestResourceStatus.get(id)?.kind==='patched'):required.every(id=>latestResourceStatus.get(id)?.kind==='patched')
+        result=required.length>0&&!satisfied?{state:'pending',reason:'正在加载客户端界面资源'}:{state:'active'}
       }
       else if(value.kind==='original'){
         resourceLoaded=true
-        if(!value.resourceId||!scope.requiredResourceIds?.length||scope.requiredResourceIds.includes(value.resourceId))result=fallback(reason)
+        // In any-of mode a single unpatched duplicate is not failure while
+        // another copy still serves patched; let the reconciliation decide.
+        if(!anyMode&&(!value.resourceId||!scope.requiredResourceIds?.length||scope.requiredResourceIds.includes(value.resourceId)))result=fallback(reason)
       }
       else if(value.kind==='disabled'&&!resourceLoaded)result=fallback(reason)
     }
     const required=scope.requiredResourceIds??[]
-    if(result.state!=='fallback'&&required.length){
-      const failed=required.map(id=>latestResourceStatus.get(id)).find(item=>item?.kind==='original')
-      if(failed)result=fallback(failed.reason)
-      else if(required.every(id=>latestResourceStatus.get(id)?.kind==='patched'))result={state:'active'}
-      else result={state:'pending',reason:'正在加载客户端界面资源'}
+    const anyMode=scope.requiredMode==='any'
+    if(required.length&&(anyMode||result.state!=='fallback')){
+      const anyPatched=required.some(id=>latestResourceStatus.get(id)?.kind==='patched')
+      if(anyMode){
+        // The loaded copy is patched → active, regardless of the dead duplicates.
+        const anyOriginal=required.some(id=>latestResourceStatus.get(id)?.kind==='original')
+        result=anyPatched?{state:'active'}:anyOriginal?fallback(required.map(id=>latestResourceStatus.get(id)).find(item=>item?.kind==='original')?.reason):{state:'pending',reason:'正在加载客户端界面资源'}
+      }else{
+        const failed=required.map(id=>latestResourceStatus.get(id)).find(item=>item?.kind==='original')
+        if(failed)result=fallback(failed.reason)
+        else if(required.every(id=>latestResourceStatus.get(id)?.kind==='patched'))result={state:'active'}
+        else result={state:'pending',reason:'正在加载客户端界面资源'}
+      }
     }
     if(result.state==='pending'&&now-rawFS.lstatSync(scope.statusLog).birthtimeMs>20000)return fallback()
     return result

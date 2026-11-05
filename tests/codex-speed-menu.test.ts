@@ -482,6 +482,24 @@ test('CDP resource outcomes record resource IDs separately from diagnostic reaso
   const scope={statusLog,nonce,executable,directory,pid:12345}
   for(const feature of ['speed','locale','ultra'] as const)assert.deepEqual(readCodexSpeedMenuStatus({...scope,feature,requiredResourceIds:[resourceId]}),{state:'active'})
 })
+test('any-of speed copies go active on the one loaded copy and never wedge on never-requested duplicates',t=>{
+  // The rspack service-tier UI is inlined into several chunks; the runtime loads
+  // exactly one. Patching all copies means whichever loads is covered, but the
+  // never-requested duplicates must not hold the feature in pending forever.
+  const f=fixture(t),hook=f.prepare(),base={statusLog:hook.statusLog,nonce:f.nonce,executable:f.executable,directory:f.directory,pid:12345}
+  const copies=['assets/async/a.1.js','assets/async/b.2.js','assets/async/c.3.js']
+  // Only the loaded copy (b) ever gets requested and patched.
+  appendFileSync(hook.statusLog,JSON.stringify({...base,kind:'patched',resourceId:copies[1]})+'\n')
+  assert.deepEqual(readCodexSpeedMenuStatus({...base,feature:'speed',requiredResourceIds:copies,requiredMode:'any'}),{state:'active'},'one patched copy is active in any-of mode')
+  // All-of mode (locale/ultra single resource) still demands every id patched.
+  assert.equal(readCodexSpeedMenuStatus({...base,feature:'speed',requiredResourceIds:copies,requiredMode:'all'}).state,'pending','all-of still waits for the rest')
+  // Before any copy loads, any-of stays pending (not a premature fallback).
+  const g=fixture(t),gh=g.prepare(),gbase={statusLog:gh.statusLog,nonce:g.nonce,executable:g.executable,directory:g.directory,pid:999}
+  assert.equal(readCodexSpeedMenuStatus({...gbase,feature:'speed',requiredResourceIds:copies,requiredMode:'any'}).state,'pending')
+  // If the loaded copy serves the original (patch did not match), any-of falls back.
+  appendFileSync(gh.statusLog,JSON.stringify({...gbase,kind:'original',resourceId:copies[0]})+'\n')
+  assert.equal(readCodexSpeedMenuStatus({...gbase,feature:'speed',requiredResourceIds:copies,requiredMode:'any'}).state,'fallback')
+})
 test('missing or stalled status becomes a clear fallback instead of remaining pending indefinitely',t=>{
   const f=fixture(t),hook=f.prepare(),scope={statusLog:hook.statusLog,nonce:f.nonce,executable:f.executable,directory:f.directory}
   assert.equal(readCodexSpeedMenuStatus(scope,Date.now()+21000).state,'fallback')
