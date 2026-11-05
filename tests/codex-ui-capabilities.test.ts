@@ -461,3 +461,60 @@ test('rspack entry discovery walks the chunk-load graph to the unique composer',
   assert.equal(result.assetURL,`app://-/assets/async/${composerId}.${composerHash}.js`)
   assert.ok(result.featureSupport!.locale.supported)
 })
+
+test('speed discovery patches every inlined service-tier copy via a cheap text-gated walk',t=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-speed-'))),application=join(root,'Fixture.app'),executable=join(application,'Contents/MacOS/ChatGPT')
+  t.after(()=>rmSync(root,{recursive:true,force:true}))
+  // Composer carries locale/ultra. The service-tier UI module (uiMod) is inlined
+  // into several chunks reachable from the composer; the access mapper (mapMod)
+  // lives in its own chunk. Only chunks resolving the mapper are patched.
+  const composerId='24191',composerHash='589dcc9878'
+  const uiModChunks=[['31001','aa01010101'],['31002','bb02020202'],['31003','cc03030303']] as const
+  const mapChunkId='40001',mapChunkHash='dd04040404',incidentalId='50001',incidentalHash='ee05050505'
+  const map:Record<string,string>={};for(let i=0;i<1100;i++)map[String(100000+i)]='0'.repeat(10)
+  map[composerId]=composerHash;map[mapChunkId]=mapChunkHash;map[incidentalId]=incidentalHash;for(const [id,h] of uiModChunks)map[id]=h
+  const u=`e=>"assets/async/"+e+"."+(${JSON.stringify(map)})[e]+".js"`
+  // Service-tier UI module: the composer `menu`/`speedControls` roles moved into
+  // their own module that resolves the mapper cross-chunk as `(0,ns.W6)(data)`
+  // with `ns=a("mapMod")`. Minified require-binding names differ per copy, just
+  // like the real inlined duplicates. speedControls is the named UI consumer.
+  const uiModule=(ns:string)=>`{ipV4(e,t,a){var ${ns}=a("mapMod");function menu(e){let r=e?.hostId??\`local\`,i=readIdentity(r),allowed=i?.authMethod===\`chatgpt\`||i?.authMethod===\`personalAccessToken\`;const key={authMethod:i?.authMethod,hostId:r};let {data:c,isPending:l}=readQuery(key),loading=!!i?.isLoading||allowed&&l,access=allowed&&!loading&&c!=null?(0,${ns}.W6)(c):null;return {serviceTierAccess:access,isLoading:loading,key}}function speedControls(thread){const {data:x,isPending:S}=readQuery({}),{serviceTierAccess:E}=menu({hostId:\`local\`});const loading=thread==null&&S;return {serviceTierAccess:E,serviceTierSettings:{isLoading:loading,availableOptions:[\`standard\`,\`fast\`]},setServiceTier:()=>{}}}a.d(t,{U:()=>menu})}}`
+  const uiChunkBody=(ns:string)=>`r.e(${mapChunkId});export const __webpack_modules__=${uiModule(ns)}`
+  // The real composer carries only locale + ultra; the service-tier UI moved out
+  // to its own chunk. Strip the speed functions so speed must be found by the
+  // multi-chunk discovery rather than inline in the composer.
+  const composerSource=source.split('\n').filter(line=>!/^(async )?function (menu|speedControls|confirm|accountMethod)\b/.test(line)).join('\n')
+  const mapperBody='export const __webpack_modules__={mapMod(e,t,n){function W(e){let t=e.requirements?.featureRequirements,r=t?.fast_mode!==!1;return{fast:r,ultrafast:("supportsIndependentSpeedModes"in e&&!0===e.supportsIndependentSpeedModes||r)&&t?.ultrafast_mode!==!1}}n.d(t,{W6:()=>W})}}'
+  const entries=new Map<string,Buffer>([
+    ['package.json',Buffer.from(JSON.stringify({name:'openai-codex-electron',version:'26.1029.61003',main:'.vite/build/early-bootstrap.js'}))],
+    ['webview/index.html',Buffer.from('<meta content="script-src &#39;self&#39;"><script type="module" src="/assets/a.1.js"></script><script type="module" src="/assets/b.2.js"></script>')],
+    ['webview/assets/a.1.js',Buffer.from(`globalThis.u=${u};r.e(${composerId});${uiModChunks.map(([id])=>`r.e(${id})`).join(';')};r.e(${incidentalId});`)],
+    ['webview/assets/b.2.js',Buffer.from('export const x=1')],
+    [`webview/assets/async/${composerId}.${composerHash}.js`,Buffer.from(composerSource)],
+    [`webview/assets/async/${mapChunkId}.${mapChunkHash}.js`,Buffer.from(mapperBody)],
+    // An incidental chunk that mentions the control terms but has no resolvable
+    // service-tier UI module — it must be excluded from the patched set.
+    [`webview/assets/async/${incidentalId}.${incidentalHash}.js`,Buffer.from('const serviceTierAccess=1,setServiceTier=2,availableOptions=3;export const y=1')],
+    ['.vite/build/early-bootstrap.js',Buffer.from('require("./bootstrap-renamed.js")')],
+    ['.vite/build/bootstrap-renamed.js',Buffer.from('require("electron");process.env.CODEX_ELECTRON_USER_DATA_PATH;require("./app-protocol-renamed.js");')],
+    ['.vite/build/app-protocol-renamed.js',Buffer.from('app.protocol.handle(`app`,async()=>new Response());')]
+  ])
+  for(const [i,[id,h]] of uiModChunks.entries())entries.set(`webview/assets/async/${id}.${h}.js`,Buffer.from(uiChunkBody(['s','n','r'][i])))
+  const reader:CodexSpeedMenuReader={canonical:p=>p,identity:p=>p,file:()=>Buffer.alloc(0),archive:(_a,p)=>{const b=entries.get(p);if(!b)throw new Error('missing fixture '+p);return b},fuseWires:()=>[Buffer.from([1,9,48,49,48,48,49,49,48,48,49])]}
+  const home=join(root,'home'),desktop=join(root,'desktop');mkdirSync(home,{mode:0o700});mkdirSync(desktop,{mode:0o700})
+  const result=inspectCodexSpeedMenu({application,executable,platform:'darwin',features:['speed'],enhancements:'speed'},reader)
+  assert.equal(result.supported,true,result.reason)
+  assert.ok(result.featureSupport!.speed.supported,result.featureSupport!.speed.reason)
+  // The reason reports how many inlined copies were verified: all three, never
+  // the incidental control-term chunk that has no resolvable service-tier module.
+  assert.match(result.featureSupport!.speed.reason,/已在 3 个档位 chunk/)
+  // Prepare emits one patched resource per live copy, each with real edits.
+  const hook=prepareCodexSpeedMenu({inspection:result,directory:home,desktopDirectory:desktop,executable,nonce:randomUUID()})!
+  assert.ok(hook,'prepare should succeed')
+  const manifest=JSON.parse(readFileSync(hook.manifest,'utf8'))
+  assert.equal(manifest.resourceIdsByFeature.speed.length,3)
+  const ids=new Set<string>(manifest.resourceIdsByFeature.speed)
+  for(const [id,h] of uiModChunks)assert.ok(ids.has(`webview/assets/async/${id}.${h}.js`))
+  assert.ok(!ids.has(`webview/assets/async/${incidentalId}.${incidentalHash}.js`))
+  for(const resource of manifest.resources)assert.ok(resource.replacements.length>0)
+})

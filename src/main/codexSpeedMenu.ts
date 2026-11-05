@@ -126,7 +126,11 @@ function rspackChunkHashes(entrySources:readonly string[]):Record<string,string>
 // module rspack inlines into several chunks). Bodies are read one at a time and
 // discarded unless matched, so the caps bound cumulative reads, not memory.
 function walkRspackChunks(reader:CodexSpeedMenuReader,archive:string,entryScripts:readonly string[],predicate:(body:string)=>boolean,mode:'unique'|'all',maxDepth:number):{asset:string;source:string}[] {
-  const entrySources=entryScripts.map(name=>reader.archive(archive,'webview/assets/'+name,4*1024*1024).toString('utf8'))
+  // One parsed asar header for the whole walk (thousands of reads) when the
+  // reader offers it; otherwise per-entry archive reads (fixtures).
+  const indexed=reader.archiveIndex?.(archive)
+  const readEntry=(entry:string,limit:number)=>indexed?indexed(entry,limit):reader.archive(archive,entry,limit)
+  const entrySources=entryScripts.map(name=>readEntry('webview/assets/'+name,4*1024*1024).toString('utf8'))
   const hashes=rspackChunkHashes(entrySources)
   if(!Object.keys(hashes).length)return []
   let frontier=new Set<string>();for(const source of entrySources)for(const id of rspackChunkRefs(source))frontier.add(id)
@@ -141,7 +145,7 @@ function walkRspackChunks(reader:CodexSpeedMenuReader,archive:string,entryScript
       if(++reads>8192)throw new Error('rspack chunk graph entry limit')
       const asset='webview/assets/async/'+id+'.'+chunkHash+'.js'
       let body:string
-      try{body=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{continue}
+      try{body=readEntry(asset,32*1024*1024).toString('utf8')}catch{continue}
       bytes+=Buffer.byteLength(body);if(bytes>512*1024*1024)throw new Error('rspack chunk graph byte limit')
       if(predicate(body))matches.push({asset,source:body})
       for(const child of rspackChunkRefs(body))if(!visited.has(child))next.add(child)
@@ -186,6 +190,11 @@ export interface CodexSpeedMenuReader {
   fuseWires(path:string):Buffer[]
   /** Dependency injection for isolated fixtures; production always uses SHA256. */
   digest?(value:string|Buffer):string
+  /** Optional: parse the asar header once and return a per-entry reader. The
+   * graph walk reads thousands of chunks, so re-parsing the multi-MB header per
+   * entry (what `archive` does) is O(n²); production supplies this. Fixtures may
+   * omit it and the walk falls back to `archive`. */
+  archiveIndex?(path:string):(entry:string,limit:number)=>Buffer
 }
 export interface CodexSpeedMenuHook {script:string;manifest:string;statusLog:string;env:Record<string,string>;transport?:'preload'|'cdp';manifestSha256?:string;patchedBody?:string;features?:readonly CodexUiFeature[];resourceIdsByFeature?:Partial<Record<CodexUiFeature,string[]>>}
 export interface CodexSpeedMenuPrepareOptions {
@@ -265,10 +274,43 @@ function scanFuseWires(path:string):Buffer[] {
     return wires
   }finally{rawFS.closeSync(fd)}
 }
+// Parse the asar header once and keep the fd open, so each entry read is offset
+// arithmetic + one pread instead of re-parsing the multi-MB header. Used for the
+// chunk-graph walk, which reads thousands of entries. Same validation as
+// packedFile. The caller must stay within one synchronous pass (fd lifetime).
+function openPackedIndex(path:string):(entry:string,limit:number)=>Buffer {
+  const fd=rawFS.openSync(path,rawFS.constants.O_RDONLY|rawFS.constants.O_NOFOLLOW|rawFS.constants.O_NONBLOCK)
+  const read=(offset:number,length:number)=>{
+    const result=Buffer.alloc(length);let count=0
+    while(count<length){const n=rawFS.readSync(fd,result,count,length-count,offset+count);if(!n)throw new Error('short archive read');count+=n}
+    return result
+  }
+  const stat=rawFS.fstatSync(fd)
+  if(!stat.isFile()||stat.size<16){rawFS.closeSync(fd);throw new Error('archive type')}
+  const size=read(0,8)
+  if(size.readUInt32LE(0)!==4){rawFS.closeSync(fd);throw new Error('archive size pickle')}
+  const headerSize=size.readUInt32LE(4)
+  if(headerSize<8||headerSize>32*1024*1024||headerSize+8>stat.size){rawFS.closeSync(fd);throw new Error('archive header limit')}
+  const header=read(8,headerSize),jsonSize=header.readUInt32LE(4)
+  if(header.readUInt32LE(0)!==headerSize-4||jsonSize>headerSize-8){rawFS.closeSync(fd);throw new Error('archive header pickle')}
+  const root=JSON.parse(header.subarray(8,8+jsonSize).toString('utf8')) as any
+  const base=8+headerSize
+  return (entry:string,limit:number):Buffer=>{
+    let item:any=root
+    for(const part of entry.split('/')){
+      if(!part||part==='.'||part==='..'||!item?.files||!Object.hasOwn(item.files,part))throw new Error('archive entry')
+      item=item.files[part]
+    }
+    if(item?.link||item?.unpacked||item?.files||!Number.isSafeInteger(item?.size)||item.size<0||item.size>limit||typeof item.offset!=='string'||!/^\d+$/.test(item.offset))throw new Error('archive entry type')
+    const offset=Number(item.offset)+base
+    if(!Number.isSafeInteger(offset)||offset<base||offset+item.size>stat.size)throw new Error('archive entry bounds')
+    return read(offset,item.size)
+  }
+}
 const defaultReader:CodexSpeedMenuReader={
   canonical:path=>rawFS.realpathSync(path),
   identity:path=>{const s=rawFS.lstatSync(path);if(!s.isFile()||s.isSymbolicLink())throw new Error('resource type');return JSON.stringify([path,s.dev,s.ino,s.size,s.mtimeMs,s.ctimeMs])},
-  file:boundedFile,archive:packedFile,fuseWires:scanFuseWires
+  file:boundedFile,archive:packedFile,fuseWires:scanFuseWires,archiveIndex:openPackedIndex
 }
 const checked=new WeakMap<CodexSpeedMenuInspection,{options:CodexSpeedMenuInspectOptions;reader:CodexSpeedMenuReader;profile:CodexReleaseProfile;features?:CodexUiFeature[]}>()
 const inspectionCache=new Map<string,CodexSpeedMenuInspection>()
@@ -515,19 +557,21 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     // and detect Fast there as an independent patch resource.
     let speedResources:CodexReleaseProfile['separateSpeedResources']
     const entryScriptsForGraph=[...html.matchAll(/<script\b[^>]*\bsrc=["'](?:\.\/|\/)?assets\/([\w.-]+\.js)["'][^>]*>/g)].map(m=>m[1])
-    // Opt-in: the service-tier UI module is inlined into ~8 chunks spread across
-    // hops 3-4 of the renderer graph, so patching every live copy means reading
-    // most of the ~700MB bundle (~100s cold, cached after). That cost is too
-    // high for the default launch path, so gate it behind an explicit flag until
-    // a cheaper module-to-chunk resolution exists. locale/ultra are unaffected.
-    if(process.env.CML_CODEX_SPEED_PATCH==='1'&&requested.includes('speed')&&!featureSupport.speed.supported&&entryScriptsForGraph.length>1)try{
-      // The service-tier UI module is inlined into several chunks. Collect every
-      // chunk that both mentions the control terms (cheap gate) and yields a
-      // resolvable access-mapper module (unique AST signature), so every live
-      // copy is patched. The mapper module id is shared across copies.
-      const speedChunks=walkRspackChunks(reader,archive,entryScriptsForGraph,body=>['serviceTierAccess','setServiceTier','availableOptions','authMethod','isLoading'].every(term=>body.includes(term))&&!!codexUiRspackMapperModule(body),'all',5)
-      const mapperModule=speedChunks.length?codexUiRspackMapperModule(speedChunks[0].source):undefined
-      if(speedChunks.length&&mapperModule){
+    // rspack inlines the service-tier UI module into several chunks spread across
+    // graph hops 3-4, and which copy executes is set by runtime chunk-load order
+    // (last registration before first require wins) — not knowable statically. So
+    // patch every copy. Discovery stays cheap by gating the BFS on a plain-text
+    // control-term filter (~10 candidates) and running the AST confirmation only
+    // on those, never on every traversed chunk. locale/ultra are unaffected.
+    if(requested.includes('speed')&&!featureSupport.speed.supported&&entryScriptsForGraph.length>1)try{
+      const candidates=walkRspackChunks(reader,archive,entryScriptsForGraph,body=>['serviceTierAccess','setServiceTier','availableOptions'].every(term=>body.includes(term)),'all',4)
+      // Confirm each candidate is the real UI chunk by resolving its access
+      // mapper module; group by module id so only genuine copies (sharing one
+      // mapper) are patched and an incidental match cannot wedge the set.
+      const byMapper=new Map<string,typeof candidates>()
+      for(const chunk of candidates){const mod=codexUiRspackMapperModule(chunk.source);if(mod){const list=byMapper.get(mod)??[];list.push(chunk);byMapper.set(mod,list)}}
+      const [mapperModule,speedChunks]=[...byMapper.entries()].sort((a,b)=>b[1].length-a[1].length)[0]??[]
+      if(mapperModule&&speedChunks?.length){
         const mapperChunk=findRspackChunk(reader,archive,entryScriptsForGraph,body=>body.includes(mapperModule)&&['fast_mode','ultrafast_mode','supportsIndependentSpeedModes'].every(term=>body.includes(term)))
         if(mapperChunk){
           const resources:Array<NonNullable<CodexReleaseProfile['separateSpeedResources']>[number]>=[]
