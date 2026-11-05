@@ -40,9 +40,12 @@ function status(path:string,scope:{home:string;desktopDirectory:string;executabl
 function readManifest(hook:CodexSpeedMenuHook):Manifest {
   if(!hook.manifestSha256||!privateFile(hook.manifest))throw new Error('manifest')
   const body=readFileSync(hook.manifest,'utf8')
-  if(body.length>32768||hash(body)!==hook.manifestSha256)throw new Error('manifest')
+  if(body.length>65536||hash(body)!==hook.manifestSha256)throw new Error('manifest')
   const value=JSON.parse(body) as Manifest
-  if(value.version!==2||!Array.isArray(value.resources)||value.resources.length<1||value.resources.length>4)throw new Error('manifest')
+  // Multi-copy features (the rspack service-tier UI is inlined across chunks)
+  // emit one resource per patched copy, so the bound covers the composer, the
+  // locale chunk and every service-tier duplicate while staying DoS-bounded.
+  if(value.version!==2||!Array.isArray(value.resources)||value.resources.length<1||value.resources.length>16)throw new Error('manifest')
   const ids=new Set<string>(),urls=new Set<string>()
   for(const [index,resource] of value.resources.entries()){
     if(!resource||typeof resource.id!=='string'||typeof resource.url!=='string'||ids.has(resource.id)||urls.has(resource.url)||!Array.isArray(resource.replacements)||resource.replacements.length<1)throw new Error('manifest resource')

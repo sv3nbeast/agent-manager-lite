@@ -645,7 +645,7 @@ const hookSource=String.raw`'use strict';
   try {
     if(!privateHookDirectory())throw Error();
     const fd=fs.openSync(expected.manifest,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
-    let body; try {const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.size>32768)throw Error();body=fs.readFileSync(fd,'utf8');}finally{fs.closeSync(fd);}
+    let body; try {const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.size>65536)throw Error();body=fs.readFileSync(fd,'utf8');}finally{fs.closeSync(fd);}
     if(digest(body)!==manifestDigest)throw Error(); manifest=JSON.parse(body);
     if(manifest.version!==2||manifest.home!==expected.home||manifest.desktopDirectory!==expected.desktopDirectory||manifest.executable!==expected.executable||manifest.nonce!==expected.nonce||manifest.enhancements!==expected.enhancements||!Array.isArray(manifest.resources)||JSON.stringify(manifest.resources)!==JSON.stringify(expected.resources)||JSON.stringify(manifest.resourceIdsByFeature)!==JSON.stringify(expected.resourceIdsByFeature))throw Error();
   } catch {log('disabled','manifest');return;}

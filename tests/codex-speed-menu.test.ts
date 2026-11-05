@@ -482,6 +482,29 @@ test('CDP resource outcomes record resource IDs separately from diagnostic reaso
   const scope={statusLog,nonce,executable,directory,pid:12345}
   for(const feature of ['speed','locale','ultra'] as const)assert.deepEqual(readCodexSpeedMenuStatus({...scope,feature,requiredResourceIds:[resourceId]}),{state:'active'})
 })
+test('CDP accepts a multi-copy manifest (composer + locale + inlined speed copies) and patches the one loaded copy',async t=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'cml-cdp-multi-'))),directory=join(root,'home'),desktopDirectory=join(root,'desktop'),hookDirectory=join(desktopDirectory,'hook')
+  t.after(()=>rmSync(root,{recursive:true,force:true}))
+  for(const path of [directory,desktopDirectory,hookDirectory])mkdirSync(path,{mode:0o700})
+  const statusLog=join(hookDirectory,'status.jsonl'),manifest=join(hookDirectory,'manifest.json');writeFileSync(statusLog,'',{mode:0o600})
+  const nonce=randomUUID(),executable='/fixture/Codex.app/Contents/MacOS/Codex'
+  // Nine resources: one composer + one locale + seven inlined speed duplicates —
+  // past the old length>4 cap. Each has its own patched-N.js body.
+  const speedIds=Array.from({length:7},(_,i)=>`assets/async/speed-${i}.js`)
+  const ids=['assets/composer.js','assets/locale.js',...speedIds]
+  const resources=ids.map((id,index)=>{const body=Buffer.from('fixture body '+id+' XXmarkXX tail'),patchedBodyPath=join(hookDirectory,'patched-'+index+'.js');writeFileSync(patchedBodyPath,body,{mode:0o600});const digest=hash(body);return {id,url:'app://-/'+id,sourceSha256:digest,patchedSha256:digest,replacements:[{begin:'fixture',end:'tail',before:'XXmarkXX',after:'PATCHED'}],patchedBodyPath,patchedBodySha256:digest}})
+  const manifestBody=JSON.stringify({version:2,home:directory,desktopDirectory,executable,nonce,enhancements:'speed-locale',resources,resourceIdsByFeature:{locale:[ids[1]],speed:speedIds,ultra:[ids[0]]}})
+  writeFileSync(manifest,manifestBody,{mode:0o600})
+  const hook:CodexSpeedMenuHook={script:join(hookDirectory,'hook.cjs'),manifest,statusLog,manifestSha256:hash(manifestBody),transport:'cdp',resourceIdsByFeature:{locale:[ids[1]],speed:speedIds,ultra:[ids[0]]},env:{}}
+  const session=new CodexSpeedMenuCdpSession({hook,directory,desktopDirectory,executable,nonce,pid:12345})
+  const internals=session as unknown as {paused:(sessionId:string|undefined,params:any)=>Promise<void>;fulfill:()=>Promise<boolean>}
+  internals.fulfill=async()=>true
+  // Only one speed copy (index 4) is ever requested at runtime.
+  await internals.paused(undefined,{request:{url:'app://-/'+speedIds[2]},requestId:'r'})
+  const record=JSON.parse(readFileSync(statusLog,'utf8').trim());assert.equal(record.kind,'patched');assert.equal(record.resourceId,speedIds[2])
+  const scope={statusLog,nonce,executable,directory,pid:12345}
+  assert.deepEqual(readCodexSpeedMenuStatus({...scope,feature:'speed',requiredResourceIds:speedIds,requiredMode:'any'}),{state:'active'},'one loaded speed copy is active across the duplicate set')
+})
 test('any-of speed copies go active on the one loaded copy and never wedge on never-requested duplicates',t=>{
   // The rspack service-tier UI is inlined into several chunks; the runtime loads
   // exactly one. Patching all copies means whichever loads is covered, but the
