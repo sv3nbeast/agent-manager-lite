@@ -145,6 +145,30 @@ export function codexUiAccessMapperImportPaths(source:string):string[] {
   }catch{return []}
 }
 
+// The rspack module id of the access mapper the speed UI calls as
+// `(0,ns.member)(data)` with `ns = require(id)`. Lets the caller fetch that
+// module's chunk across the graph and supply it to detectCodexUiCapabilities as
+// importedModules[id]. Undefined when the page is single-file or the UI is absent.
+export function codexUiRspackMapperModule(source:string):string|undefined {
+  try{
+    const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node
+    const functions=moduleFunctions(program)
+    const uiCandidates=functions.filter(fn=>textOf(source,fn).includes('authMethod')&&textOf(source,fn).includes('isLoading')&&nodes(fn,n=>n.type==='Property'&&n.key?.name==='serviceTierAccess').length===1)
+    const ui=one(uiCandidates.filter(fn=>{
+      const query=nodes(fn,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending'))
+      if(query.length!==1)return false
+      const data=query[0].id.properties.find((p:Node)=>p.key.name==='data')?.value?.name
+      return nodes(fn,n=>accessMapperCall(n,data)).length===1
+    }))
+    const query=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending')))
+    const data=one<Node>(query.id.properties.filter((p:Node)=>p.key.name==='data')).value.name
+    const call=one(nodes(ui,n=>accessMapperCall(n,data)))
+    const callee=mapperCallee(call)
+    if(callee?.type!=='MemberExpression')return undefined
+    return rspackRequireId(enclosingScope(program,ui),callee.object?.name)
+  }catch{return undefined}
+}
+
 export function codexUiStaticImports(source:string):string[] {
   try{const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node;return (program.body as Node[]).filter(node=>node.type==='ImportDeclaration'&&typeof node.source?.value==='string').map(node=>node.source.value as string)}catch{return []}
 }
@@ -179,6 +203,124 @@ export function codexUiLocaleProviderSupported(runtime:string,path:string,provid
   }catch{return false}
 }
 function textOf(source:string,node:Node):string{return source.slice(node.start,node.end)}
+// The access mapper is invoked as `fn(data)` in single-file builds and as the
+// Babel/rspack interop form `(0,ns.member)(data)` once bundled. Accept either
+// so detection does not depend on the bundler's call shape.
+function mapperCallee(node:Node|undefined):Node|undefined {
+  if(node?.type!=='CallExpression'||node.arguments?.length!==1)return undefined
+  const callee=unwrap(node.callee)
+  if(callee.type==='Identifier')return callee
+  // `(0,ns.member)` parses as a SequenceExpression whose final element is the
+  // member read; the leading `0` is the interop `this`-stripping convention.
+  if(callee.type==='SequenceExpression'&&callee.expressions.length===2){
+    const last=unwrap(callee.expressions[1])
+    if(last.type==='MemberExpression'&&!last.computed&&last.object?.type==='Identifier')return last
+  }
+  return undefined
+}
+function accessMapperCall(node:Node,argName:string|undefined):boolean {
+  const callee=mapperCallee(node)
+  return !!callee&&argName!==undefined&&unwrap((node as Node).arguments[0])?.name===argName
+}
+// Return the rspack module id a namespace identifier is bound to, i.e. the
+// string literal in `ns = require("id")` (require minified to any single name).
+function rspackRequireId(scope:Node,namespace:string|undefined):string|undefined {
+  if(!namespace)return undefined
+  // The namespace binding (`r = require("id")`) lives in the UI's own module
+  // factory. Minified names like `r` are reused across factories, so search the
+  // enclosing scope, not the whole chunk, to keep the binding unambiguous.
+  const bindings=nodes(scope,n=>n.type==='VariableDeclarator'&&n.id?.type==='Identifier'&&n.id.name===namespace&&n.init?.type==='CallExpression'&&n.init.arguments?.length===1&&typeof literal(n.init.arguments[0])==='string')
+  if(bindings.length!==1)return undefined
+  return literal(bindings[0].init.arguments[0]) as string
+}
+// The smallest module factory body (rspack) or Program that encloses a node.
+function enclosingScope(program:Node,node:Node):Node {
+  const factories=rspackModuleFactories(program).filter(factory=>factory.start<=node.start&&factory.end>=node.end)
+  return factories.sort((a,b)=>(a.end-a.start)-(b.end-b.start))[0]??program
+}
+// The rspack module id + export name a function is published under, from its
+// enclosing factory's `d(t,{export:()=>localFn})` table and the factory's key
+// in __webpack_modules__. Lets a consumer reference be matched across factories
+// through the `(0,require(id).export)()` interop call. Undefined for single file.
+function moduleExportRef(program:Node,fn:Node):{moduleId:string;exportName:string}|undefined {
+  const fnName=functionName(fn)
+  for(const node of program.body??[]){
+    const declaration=['ExportNamedDeclaration','ExportDefaultDeclaration'].includes(node.type)?node.declaration:node
+    if(declaration?.type!=='VariableDeclaration')continue
+    for(const item of declaration.declarations??[]){
+      if(item.id?.name!=='__webpack_modules__'||item.init?.type!=='ObjectExpression')continue
+      for(const factory of item.init.properties){
+        if(factory.type!=='Property'||!isFunction(factory.value)||factory.value.start>fn.start||factory.value.end<fn.end)continue
+        const moduleId=factory.key.type==='Literal'?String(factory.key.value):factory.key.name
+        const exports=nodes(factory.value,n=>n.type==='CallExpression'&&property(unwrap(n.callee))==='d'&&n.arguments?.length>=2&&n.arguments[1].type==='ObjectExpression').flatMap(call=>call.arguments[1].properties)
+        const match=exports.filter((p:Node)=>p.type==='Property'&&p.value?.type==='ArrowFunctionExpression'&&p.value.body?.type==='Identifier'&&p.value.body.name===fnName)
+        if(match.length===1&&typeof moduleId==='string')return {moduleId,exportName:match[0].key?.name}
+      }
+    }
+  }
+  return undefined
+}
+// The called target of any CallExpression, unwrapping the `(0,ns.member)`
+// interop sequence — independent of argument count (unlike mapperCallee, which
+// is specific to the single-argument access-mapper call).
+function callTarget(node:Node):Node|undefined {
+  if(node.type!=='CallExpression')return undefined
+  const callee=unwrap(node.callee)
+  if(callee.type==='Identifier')return callee
+  if(callee.type==='SequenceExpression'&&callee.expressions.length===2){
+    const last=unwrap(callee.expressions[1])
+    if(last.type==='MemberExpression'&&!last.computed&&last.object?.type==='Identifier')return last
+  }
+  return undefined
+}
+// True when `node` calls `fn` either directly by name, or through the rspack
+// interop form `(0,ns.export)()` where `ns = require(fn's module id)` in scope.
+function callsUiFunction(node:Node,uiName:string|undefined,exportRef:{moduleId:string;exportName:string}|undefined,scope:Node):boolean {
+  const callee=callTarget(node)
+  if(callee?.type==='Identifier')return callee.name===uiName
+  if(callee?.type==='MemberExpression'&&exportRef)return callee.property?.name===exportRef.exportName&&rspackRequireId(scope,callee.object?.name)===exportRef.moduleId
+  return false
+}
+// Find the factory function body of a given module id inside a chunk's
+// `__webpack_modules__` object (rspack inlines shared modules per chunk).
+function rspackFactoryBody(program:Node,moduleId:string):Node|undefined {
+  for(const node of program.body??[]){
+    const declaration=['ExportNamedDeclaration','ExportDefaultDeclaration'].includes(node.type)?node.declaration:node
+    if(declaration?.type!=='VariableDeclaration')continue
+    for(const item of declaration.declarations??[]){
+      if(item.id?.name!=='__webpack_modules__'||item.init?.type!=='ObjectExpression')continue
+      for(const property of item.init.properties){
+        if(property.type!=='Property')continue
+        const key=property.key.type==='Literal'?String(property.key.value):property.key.name
+        if(key===moduleId&&isFunction(property.value))return property.value
+      }
+    }
+  }
+  return undefined
+}
+// Resolve the access mapper when the composer calls `(0,ns.member)(data)` and
+// `ns = require("id")`. The id's module lives in another chunk whose source the
+// caller supplies in importedModules. rspack exports members through
+// `n.d(exports,{member:()=>localFn})`; bind that member back to its function.
+function resolveRspackMapper(scope:Node,namespace:string|undefined,member:string|undefined,importedModules:Readonly<Record<string,string>>):Node|undefined {
+  if(!namespace||!member)return undefined
+  const moduleId=rspackRequireId(scope,namespace)
+  if(!moduleId)return undefined
+  const external=importedModules[moduleId]
+  if(!external)throw new Error('missing imported access mapper')
+  const externalProgram=parse(external,{ecmaVersion:'latest',sourceType:'module'}) as Node
+  const factory=rspackFactoryBody(externalProgram,moduleId)
+  if(!factory)throw new Error('access mapper module not found')
+  // Export table: `d(t,{member:()=>localFn,…})`.
+  const exportArgs=nodes(factory,n=>n.type==='CallExpression'&&property(unwrap(n.callee))==='d'&&n.arguments?.length>=2&&n.arguments[1].type==='ObjectExpression').flatMap(call=>call.arguments[1].properties)
+  const entries=exportArgs.filter((p:Node)=>p.type==='Property'&&p.key?.name===member&&p.value?.type==='ArrowFunctionExpression'&&p.value.body?.type==='Identifier')
+  if(entries.length!==1)throw new Error('ambiguous exported access mapper')
+  const localName=entries[0].value.body.name
+  const body=factory.body?.body??[]
+  const found=body.filter((n:Node)=>n.type==='FunctionDeclaration'&&n.id?.name===localName).concat(
+    body.filter((n:Node)=>n.type==='VariableDeclaration').flatMap((n:Node)=>n.declarations).filter((d:Node)=>d.id?.name===localName&&isFunction(d.init)).map((d:Node)=>{d.init.__cmlBindingName=localName;return d.init}))
+  return found.length===1?found[0]:undefined
+}
 
 export function detectCodexUiCapabilities(source:string,importedModules:Readonly<Record<string,string>>={}):{features:CodexUiFeatureSupports;replacements:Record<CodexUiFeature,CodexUiReplacement[]>} {
   const features={} as CodexUiFeatureSupports,replacements:Record<CodexUiFeature,CodexUiReplacement[]>={locale:[],speed:[],ultra:[]}
@@ -223,7 +365,7 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
       const queries=nodes(fn,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending'))
       if(queries.length!==1)return false
       const dataName=queries[0].id.properties.find((p:Node)=>p.key.name==='data')?.value?.name
-      return nodes(fn,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.arguments.length===1&&n.arguments[0].name===dataName).length===1
+      return nodes(fn,n=>accessMapperCall(n,dataName)).length===1
     }))
     const capability=one(nodes(ui,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name))).key.name
     const accessObject=capability==='serviceTierAccess'
@@ -236,10 +378,14 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
     const pending=one<Node>(query.id.properties.filter((p:Node)=>p.key.name==='isPending')).value.name
     const loading=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.init&&text(n.init).includes('isLoading')))
     const queryPending=one(nodes(loading.init,n=>n.type==='LogicalExpression'&&n.operator==='&&'&&n.left.name===auth.id.name&&n.right.name===pending))
-    const needsData=one(nodes(ui,n=>n.type==='BinaryExpression'&&n.operator==='!='&&n.left.name===data&&literal(n.right)===null))
-    const accessCall=accessObject?one(nodes(ui,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.arguments.length===1&&n.arguments[0].name===data)):undefined
-    const access=accessCall?.callee.name
-    const mapper=access
+    // The data guard appears as `data!=null` or, after bundling, `null!=data`.
+    const needsData=one(nodes(ui,n=>n.type==='BinaryExpression'&&n.operator==='!='&&((n.left.name===data&&literal(n.right)===null)||(n.right.name===data&&literal(n.left)===null))))
+    const accessCall=accessObject?one(nodes(ui,n=>accessMapperCall(n,data))):undefined
+    const accessCallee=accessCall?mapperCallee(accessCall):undefined
+    // For `(0,ns.member)(data)` the mapper is the namespace member; for `fn(data)`
+    // it is the identifier itself. Track both the local name and the member.
+    const access=accessCallee?.type==='Identifier'?accessCallee.name:undefined
+    const mapper=accessCallee?.type==='Identifier'?accessCallee.name:accessCallee?.object?.name
     const confirmations=functionsWith('authMethod:').filter(fn=>fn.async&&text(fn).includes('fast_mode'))
     // The newer menu obtains its access decision from the existing per-host
     // requirements query and maps it with the client's fCe requirements
@@ -250,7 +396,13 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
       // The current composer gets its tier decision from the shared access
       // mapper, with no request-time callback. Keep that server result as the
       // entitlement source and extend only the explicit local API-key gate.
-      let accessMapper=functions.find(fn=>functionName(fn)===mapper)
+      // rspack form `(0,ns.member)(data)` resolves through the require binding
+      // and export table — not by the namespace's local name, which is a reused
+      // minified identifier that would otherwise collide with an unrelated
+      // top-level function. Only the single-file `fn(data)` form binds by name.
+      let accessMapper=accessCallee?.type==='MemberExpression'
+        ? resolveRspackMapper(enclosingScope(program,ui),mapper,accessCallee.property?.name,importedModules)
+        : functions.find(fn=>functionName(fn)===mapper)
       if(!accessMapper){
         const references=nodes(program,n=>n.type==='ImportDeclaration'&&n.specifiers.some((specifier:Node)=>specifier.local?.name===mapper))
         const reference=one<Node>(references),specifier=one<Node>(reference.specifiers.filter((item:Node)=>item.local?.name===mapper))
@@ -265,6 +417,7 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
         const localName=directDeclarations.length?importedName:one<Node>(exportedNodes.flatMap((declaration:Node)=>declaration.specifiers.filter((item:Node)=>item.exported?.name===importedName))).local?.name
         accessMapper=one(moduleFunctions(externalProgram).filter(fn=>functionName(fn)===localName))
       }
+      if(!accessMapper)throw new Error('missing access mapper')
       const mapperInput=accessMapper.params?.[0]?.type==='Identifier'?accessMapper.params[0].name:undefined
       if(!mapperInput||accessMapper.params.length!==1)throw new Error('access mapper input contract')
       const returns=nodes(accessMapper,n=>n.type==='ReturnStatement'&&n.argument?.type==='ObjectExpression')
@@ -281,15 +434,34 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
         }
         return value.type==='BinaryExpression'&&value.operator==='!=='&&booleanLiteral(value.right)===false&&resolvedMemberPath(value.left,accessMapper).join('.')===`${mapperInput}.requirements.featureRequirements.${mode}`
       }
-      if(!resolveMode(fastValue,'fast_mode')||ultraValue.type!=='LogicalExpression'||ultraValue.operator!=='&&'||!resolveMode(ultraValue.right,'ultrafast_mode'))throw new Error('access mapper entitlement result')
-      const fastName=fastValue.type==='Identifier'?fastValue.name:undefined,left=ultraValue.left
-      const independentValues=nodes(left,n=>n.type==='BinaryExpression'&&n.operator==='==='&&((resolvedMemberPath(n.left,accessMapper).join('.')===`${mapperInput}.supportsIndependentSpeedModes`&&booleanLiteral(n.right)===true)||(resolvedMemberPath(n.right,accessMapper).join('.')===`${mapperInput}.supportsIndependentSpeedModes`&&booleanLiteral(n.left)===true)))
-      if(!fastName||left.type!=='LogicalExpression'||left.operator!=='||'||!nodes(left,n=>n.type==='Identifier'&&n.name===fastName).length||independentValues.length!==1)throw new Error('independent Ultra Fast entitlement')
+      if(!resolveMode(fastValue,'fast_mode'))throw new Error('access mapper entitlement result')
+      const fastName=fastValue.type==='Identifier'?fastValue.name:undefined
+      if(!fastName)throw new Error('access mapper entitlement result')
+      const independentCheck=(scope:Node):boolean=>nodes(scope,n=>n.type==='BinaryExpression'&&n.operator==='==='&&((resolvedMemberPath(n.left,accessMapper).join('.')===`${mapperInput}.supportsIndependentSpeedModes`&&booleanLiteral(n.right)===true)||(resolvedMemberPath(n.right,accessMapper).join('.')===`${mapperInput}.supportsIndependentSpeedModes`&&booleanLiteral(n.left)===true))).length===1
+      // Ultra Fast stays gated by ultrafast_mode and (Fast || independent speed
+      // modes). Bundlers emit this either as `(fast||independent)&&ultrafast` or
+      // as the ternary `independent ? ultrafast : fast&&ultrafast`. Accept both
+      // so the entitlement contract — never the syntax — is what is verified.
+      if(ultraValue.type==='LogicalExpression'&&ultraValue.operator==='&&'){
+        const left=ultraValue.left
+        if(!resolveMode(ultraValue.right,'ultrafast_mode')||left.type!=='LogicalExpression'||left.operator!=='||'||!nodes(left,n=>n.type==='Identifier'&&n.name===fastName).length||!independentCheck(left))throw new Error('independent Ultra Fast entitlement')
+      }else if(ultraValue.type==='ConditionalExpression'){
+        const alternate=unwrap(ultraValue.alternate)
+        if(!independentCheck(ultraValue.test)||!resolveMode(ultraValue.consequent,'ultrafast_mode')||alternate.type!=='LogicalExpression'||alternate.operator!=='&&'||!nodes(alternate,n=>n.type==='Identifier'&&n.name===fastName).length||!resolveMode(alternate.right,'ultrafast_mode'))throw new Error('independent Ultra Fast entitlement')
+      }else throw new Error('independent Ultra Fast entitlement')
       const uiName=functionName(ui)
       if(!uiName)throw new Error('access UI binding')
-      const providers=functions.filter(fn=>fn!==ui&&['serviceTierSettings','availableOptions','setServiceTier'].every(term=>text(fn).includes(term))&&nodes(fn,n=>n.type==='CallExpression'&&n.callee.type==='Identifier'&&n.callee.name===uiName).length===1&&nodes(fn,n=>n.type==='Property'&&n.key?.name===capability).length>=1)
-      const provider=one(providers)
-      if(!functionName(provider))throw new Error('access consumer contract')
+      // Consumers call the UI either as `uiName(...)` or, once bundled, as the
+      // export form `(0,require("id").export)()`. Match both so the consumer
+      // sanity check holds across the single-file and rspack layouts.
+      const uiExport=moduleExportRef(program,ui)
+      const consumes=(fn:Node)=>nodes(fn,n=>callsUiFunction(n,uiName,uiExport,enclosingScope(program,fn))).length===1
+      const providers=functions.filter(fn=>fn!==ui&&['serviceTierSettings','availableOptions','setServiceTier'].every(term=>text(fn).includes(term))&&consumes(fn)&&nodes(fn,n=>n.type==='Property'&&n.key?.name===capability).length>=1)
+      // At least one named service-tier settings consumer must read this UI. The
+      // composer inline menu and the settings panel are both legitimate
+      // consumers in newer clients, so require one-or-more (all named) rather
+      // than exactly one. This gate only confirms the UI; it drives no edit.
+      if(!providers.length||!providers.every(fn=>functionName(fn)))throw new Error('access consumer contract')
       const verifiedLocalApi=`${host}===\`local\`&&(${account}?.authMethod===\`apikey\`||${account}?.authMethod===null&&${account}?.requiresAuth===!1)`
       const edits=[edit(auth.init,`${text(auth.init)}||${verifiedLocalApi}`),edit(queryPending,`${text(queryPending)}&&!(${custom})`),edit(needsData,`(${text(needsData)}||(${custom}))`)]
       if(accessCall)edits.push(edit(accessCall.arguments[0],`${data}??{requirements:{featureRequirements:{fast_mode:!0,ultrafast_mode:!1}}}`))

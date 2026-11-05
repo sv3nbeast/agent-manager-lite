@@ -7,7 +7,7 @@ import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
 import {parse as parseScript} from 'acorn'
 import {codexDesktopStartupImports} from './codexDesktopResources'
-import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiDynamicImports,codexUiFeatures,codexUiLocaleProviderSupported,codexUiStaticImports,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
+import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiDynamicImports,codexUiFeatures,codexUiLocaleProviderSupported,codexUiRspackMapperModule,codexUiStaticImports,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
 export type CodexSpeedMenuEnhancements='speed'|'locale'|'speed-locale'
@@ -29,6 +29,10 @@ type CodexReleaseProfile={
   localeReplacement?:CodexSpeedReplacement
   replacements?:readonly CodexSpeedReplacement[]
   separateLocaleResource?:{id:string;asset:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}
+  // rspack inlines the service-tier UI module into several chunks; only the
+  // copy registered first at runtime executes, and which that is cannot be known
+  // statically. Patch every copy so the live one is always covered.
+  separateSpeedResources?:ReadonlyArray<{id:string;asset:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}>
 }
 const legacySpeedReplacements=[
   {begin:'function TRa(e){',end:'}var ERa;',before:'a=i?.authMethod===`chatgpt`,o=',after:'a=i?.authMethod===`chatgpt`||i?.authMethod===`apikey`||r===`local`&&i?.authMethod===null&&i?.requiresAuth===!1,o='},
@@ -115,38 +119,48 @@ function rspackChunkHashes(entrySources:readonly string[]):Record<string,string>
  * reachable chunk carrying the composer anchors. Ambiguity or absence yields
  * undefined so the caller can fail closed exactly like the single-file path.
  */
-function discoverRspackComposer(reader:CodexSpeedMenuReader,archive:string,entryScripts:readonly string[],parts:unknown[]):{asset:string;source:string}|undefined {
-  const digest=reader.digest??hash
+// Walk the chunk-load graph breadth-first from the verified entry scripts,
+// bounded by depth/reads/bytes. mode 'unique' stops at the first depth with a
+// match and returns it only if that level is unambiguous (the composer). mode
+// 'all' keeps going to maxDepth and returns every match (the service-tier UI
+// module rspack inlines into several chunks). Bodies are read one at a time and
+// discarded unless matched, so the caps bound cumulative reads, not memory.
+function walkRspackChunks(reader:CodexSpeedMenuReader,archive:string,entryScripts:readonly string[],predicate:(body:string)=>boolean,mode:'unique'|'all',maxDepth:number):{asset:string;source:string}[] {
   const entrySources=entryScripts.map(name=>reader.archive(archive,'webview/assets/'+name,4*1024*1024).toString('utf8'))
   const hashes=rspackChunkHashes(entrySources)
-  if(!Object.keys(hashes).length)return undefined
+  if(!Object.keys(hashes).length)return []
   let frontier=new Set<string>();for(const source of entrySources)for(const id of rspackChunkRefs(source))frontier.add(id)
   const visited=new Set<string>(),matches:{asset:string;source:string}[]=[]
   let depth=0,reads=0,bytes=0
-  // Breadth-first by chunk-load depth. Stop expanding at the first depth that
-  // yields a composer match: uniqueness is decided among that level's chunks,
-  // so a single page needs only the levels up to its composer (two for 26.1029)
-  // rather than the exponential full graph. Caps are a safety ceiling.
-  while(frontier.size&&depth<6&&!matches.length){
+  while(frontier.size&&depth<maxDepth&&(mode==='all'||!matches.length)){
     const next=new Set<string>()
     for(const id of frontier){
       if(visited.has(id))continue
       visited.add(id)
       const chunkHash=hashes[id];if(!chunkHash)continue
-      if(++reads>1024)throw new Error('rspack chunk graph entry limit')
+      if(++reads>8192)throw new Error('rspack chunk graph entry limit')
       const asset='webview/assets/async/'+id+'.'+chunkHash+'.js'
       let body:string
       try{body=reader.archive(archive,asset,32*1024*1024).toString('utf8')}catch{continue}
-      bytes+=Buffer.byteLength(body);if(bytes>128*1024*1024)throw new Error('rspack chunk graph byte limit')
-      if(composerAnchors.every(term=>body.includes(term)))matches.push({asset,source:body})
+      bytes+=Buffer.byteLength(body);if(bytes>512*1024*1024)throw new Error('rspack chunk graph byte limit')
+      if(predicate(body))matches.push({asset,source:body})
       for(const child of rspackChunkRefs(body))if(!visited.has(child))next.add(child)
     }
     depth++
     frontier=next
   }
-  if(matches.length!==1)return undefined
-  parts.push('rspack',matches[0].asset,digest(matches[0].source))
-  return matches[0]
+  return matches
+}
+function findRspackChunk(reader:CodexSpeedMenuReader,archive:string,entryScripts:readonly string[],predicate:(body:string)=>boolean):{asset:string;source:string}|undefined {
+  const matches=walkRspackChunks(reader,archive,entryScripts,predicate,'unique',6)
+  return matches.length===1?matches[0]:undefined
+}
+function discoverRspackComposer(reader:CodexSpeedMenuReader,archive:string,entryScripts:readonly string[],parts:unknown[]):{asset:string;source:string}|undefined {
+  const digest=reader.digest??hash
+  const match=findRspackChunk(reader,archive,entryScripts,body=>composerAnchors.every(term=>body.includes(term)))
+  if(!match)return undefined
+  parts.push('rspack',match.asset,digest(match.source))
+  return match
 }
 const sentinel=Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
 
@@ -495,11 +509,49 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
     }catch{/* Ambiguous locale module graph stays unsupported. */}
     const featureSupport=structuredClone(detected.features)
     if(localeResource)featureSupport.locale={supported:true,reason:'页面语言：已验证主入口、懒加载路径和语言提供器'}
+    // rspack moves the service-tier UI into its own chunk, away from the locale/
+    // ultra composer. When Fast is requested and absent from the composer, find
+    // that chunk by its control anchors, resolve its cross-chunk access mapper,
+    // and detect Fast there as an independent patch resource.
+    let speedResources:CodexReleaseProfile['separateSpeedResources']
+    const entryScriptsForGraph=[...html.matchAll(/<script\b[^>]*\bsrc=["'](?:\.\/|\/)?assets\/([\w.-]+\.js)["'][^>]*>/g)].map(m=>m[1])
+    // Opt-in: the service-tier UI module is inlined into ~8 chunks spread across
+    // hops 3-4 of the renderer graph, so patching every live copy means reading
+    // most of the ~700MB bundle (~100s cold, cached after). That cost is too
+    // high for the default launch path, so gate it behind an explicit flag until
+    // a cheaper module-to-chunk resolution exists. locale/ultra are unaffected.
+    if(process.env.CML_CODEX_SPEED_PATCH==='1'&&requested.includes('speed')&&!featureSupport.speed.supported&&entryScriptsForGraph.length>1)try{
+      // The service-tier UI module is inlined into several chunks. Collect every
+      // chunk that both mentions the control terms (cheap gate) and yields a
+      // resolvable access-mapper module (unique AST signature), so every live
+      // copy is patched. The mapper module id is shared across copies.
+      const speedChunks=walkRspackChunks(reader,archive,entryScriptsForGraph,body=>['serviceTierAccess','setServiceTier','availableOptions','authMethod','isLoading'].every(term=>body.includes(term))&&!!codexUiRspackMapperModule(body),'all',5)
+      const mapperModule=speedChunks.length?codexUiRspackMapperModule(speedChunks[0].source):undefined
+      if(speedChunks.length&&mapperModule){
+        const mapperChunk=findRspackChunk(reader,archive,entryScriptsForGraph,body=>body.includes(mapperModule)&&['fast_mode','ultrafast_mode','supportsIndependentSpeedModes'].every(term=>body.includes(term)))
+        if(mapperChunk){
+          const resources:Array<NonNullable<CodexReleaseProfile['separateSpeedResources']>[number]>=[]
+          for(const chunk of speedChunks){
+            const speedDetected=detectCodexUiCapabilities(chunk.source,{[mapperModule]:mapperChunk.source})
+            if(!speedDetected.features.speed.supported||!speedDetected.replacements.speed.length){resources.length=0;break}
+            const reps=speedDetected.replacements.speed,speedHash=digest(chunk.source),patched=applyCodexUiReplacements(chunk.source,reps)
+            resources.push({id:chunk.asset,asset:chunk.asset,url:assetUrl(chunk.asset),source:speedHash,sourceBody:chunk.source,replacements:reps,patchedSha256:digest(patched)})
+          }
+          if(resources.length){
+            speedResources=resources
+            featureSupport.speed={supported:true,reason:`普通 / Fast：已在 ${resources.length} 个档位 chunk 验证访问映射与授权契约`}
+            for(const resource of resources)parts.push(resource.asset,resource.source,resource.patchedSha256,resource.replacements)
+            parts.push(mapperModule,digest(mapperChunk.source))
+          }
+        }
+      }
+    }catch{/* Ambiguous or unreachable speed chunk stays on the official page. */}
     const features=requested.filter(f=>featureSupport[f].supported)
-    const replacements=features.filter(feature=>feature!=='locale'||!localeResource).flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
+    const separated=(feature:CodexUiFeature):boolean=>(feature==='locale'&&!!localeResource)||(feature==='speed'&&!!speedResources)
+    const replacements=features.filter(feature=>!separated(feature)).flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
     parts.push(featureSupport,features,replacements)
     if(!features.length)return {...fail('客户端页面功能结构尚未兼容'),featureSupport}
-    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:assetUrl(asset),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{})}
+    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:assetUrl(asset),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{}),...(speedResources?{separateSpeedResources:speedResources}:{})}
     const patchedDigest=digest(patchSemantic(source!,replacements))
     profile.patched={speed:patchedDigest,locale:patchedDigest,'speed-locale':patchedDigest}
     const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:options.enhancements??'speed-locale',transport:profile.injection})
@@ -617,15 +669,16 @@ export function prepareCodexSpeedMenu(options:CodexSpeedMenuPrepareOptions):Code
     const assetDigest=proof.reader.digest??hash
     const groups:Array<{id:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}> = []
     const activeFeatures=proof.features??options.inspection.features??(enhancements==='speed'?['speed']:enhancements==='locale'?['locale']:['locale','speed'])
-    const mainFeatures=activeFeatures.filter(feature=>feature!=='locale'||!profile.separateLocaleResource)
+    const mainFeatures=activeFeatures.filter(feature=>!((feature==='locale'&&profile.separateLocaleResource)||(feature==='speed'&&profile.separateSpeedResources)))
     const mainEnhancement:CodexSpeedMenuEnhancements=mainFeatures.includes('speed')&&mainFeatures.includes('locale')?'speed-locale':mainFeatures.includes('locale')?'locale':'speed'
     const mainReplacements=profile.replacements??replacementsFor(profileForPrepare,mainEnhancement)
     let mainSource=''
     if(mainReplacements.length){mainSource=proof.reader.archive(join(proof.options.application,'Contents','Resources','app.asar'),profile.asset,32*1024*1024).toString('utf8');groups.push({id:profile.asset,url:profile.url,source:profile.source,sourceBody:mainSource,replacements:mainReplacements,patchedSha256:assetDigest(patchSemantic(mainSource,mainReplacements))})}
     if(activeFeatures.includes('locale')&&profile.separateLocaleResource){const resource=profile.separateLocaleResource;groups.push({id:resource.id,url:resource.url,source:resource.source,sourceBody:resource.sourceBody,replacements:resource.replacements,patchedSha256:resource.patchedSha256})}
+    if(activeFeatures.includes('speed')&&profile.separateSpeedResources)for(const resource of profile.separateSpeedResources)groups.push({id:resource.id,url:resource.url,source:resource.source,sourceBody:resource.sourceBody,replacements:resource.replacements,patchedSha256:resource.patchedSha256})
     const resources=groups.map((group,index)=>{const body=Buffer.from(patchSemantic(group.sourceBody,group.replacements),'utf8');if(assetDigest(body)!==group.patchedSha256)throw new Error('patch digest');const patchedBodyPath=profile.injection==='cdp'?join(target,'patched-'+index+'.js'):undefined;if(patchedBodyPath)atomicBytes(patchedBodyPath,body);return {id:group.id,url:group.url,sourceSha256:group.source,patchedSha256:group.patchedSha256,replacements:group.replacements,...(patchedBodyPath?{patchedBodyPath,patchedBodySha256:assetDigest(body)}:{})}})
     const mainResourceId=groups.find(group=>group.id===profile.asset)?.id
-    const resourceIdsByFeature=Object.fromEntries(activeFeatures.map(feature=>[feature,feature==='locale'&&profile.separateLocaleResource?[profile.separateLocaleResource.id]:mainResourceId?[mainResourceId]:[]]))
+    const resourceIdsByFeature=Object.fromEntries(activeFeatures.map(feature=>[feature,feature==='locale'&&profile.separateLocaleResource?[profile.separateLocaleResource.id]:feature==='speed'&&profile.separateSpeedResources?profile.separateSpeedResources.map(resource=>resource.id):mainResourceId?[mainResourceId]:[]]))
     if(!resources.length)throw new Error('no compatibility resources')
     const scope={home:options.directory,desktopDirectory:options.desktopDirectory,executable:options.executable,nonce:options.nonce,enhancements,features:activeFeatures,resources,resourceIdsByFeature,url:resources[0].url,sourceSha256:resources[0].sourceSha256,patchedSha256:resources[0].patchedSha256,replacements:resources[0].replacements,replacementCount:resources[0].replacements.length,replacementsSha256:hash(JSON.stringify(resources[0].replacements)),...(resources[0].patchedBodyPath?{patchedBody:resources[0].patchedBodyPath,patchedBodySha256:resources[0].patchedBodySha256}:{})}
     const legacyResource=resources.length===1?resources[0]:undefined
