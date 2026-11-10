@@ -124,10 +124,10 @@ async function main(){
       await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point})
     }
     const key=async key=>{await call('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});await call('Input.dispatchKeyEvent',{type:'keyUp',key,code:key})}
+    const modelMenuTrigger='document.querySelector("[data-composer-navigation-target=reasoning]")||Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes('+JSON.stringify(modelLabel)+'))'
+    const openModelMenu=async()=>{await wait(`!!(${modelMenuTrigger})`);await click(modelMenuTrigger)}
     if(!nativeApi&& (supports('speed')||supports('ultra'))){
-      const modelButton=await evaluate(`(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes(${JSON.stringify(modelLabel)}));if(!b)return null;const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`)
-      assert.ok(modelButton,'native model selector is unavailable for detected UI capabilities')
-      await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...modelButton});await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...modelButton})
+      await openModelMenu()
       await delay(1000)
       console.log(JSON.stringify({stage:'model-menu',text:await evaluate('document.body.innerText.slice(-2600)'),controls:await evaluate('Array.from(document.querySelectorAll("select,input,[role=menuitem],[role=menuitemradio]")).map(el=>({tag:el.tagName,role:el.getAttribute("role"),text:el.innerText,value:el.value})).slice(-25)')}))
       await capture('codex-model-menu.png')
@@ -168,14 +168,14 @@ async function main(){
     assert.ok(standard.serviceTier==null||standard.serviceTier==='default',JSON.stringify(requests))
     let accelerated
     if(supports('speed')){
-      await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
+      await openModelMenu()
       await chooseSpeed(true)
       await key('Escape');await key('Escape')
       accelerated=await send('Reply with one sentence for the Fast compatibility test.')
       assert.equal(accelerated.serviceTier,'priority',JSON.stringify(requests))
     }else if(!nativeApi) console.log('Fast capability was not detected; only the default request was verified')
     if(!nativeApi&&supports('ultra')){
-      await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
+      await openModelMenu()
       await evaluate('document.querySelector("[data-reasoning-slider]").focus()')
       // The client can change the number of intensity stops. Select the visible
       // Ultra level instead of advancing a fixed count into a different level.
@@ -211,7 +211,7 @@ async function main(){
       await click(thread)
       await wait('document.body.innerText.includes("Reply with one sentence for the Ultra reasoning compatibility test.")')
       await wait('Array.from(document.querySelectorAll("button")).some(b=>b.innerText.includes("6.1 Sol"))')
-      await click('Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes("6.1 Sol"))')
+      await openModelMenu()
       await wait('document.querySelector("[data-model-picker-view-toggle]")?.innerText.includes("Ultra")')
       await capture('codex-ultra-restored.png')
       await key('Escape')

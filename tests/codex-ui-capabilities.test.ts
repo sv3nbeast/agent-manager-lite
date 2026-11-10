@@ -4,7 +4,7 @@ import {randomUUID} from 'node:crypto'
 import {existsSync,mkdtempSync,mkdirSync,readFileSync,rmSync,realpathSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
-import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,detectCodexUiCapabilities,type CodexUiFeature} from '../src/main/codexUiCapabilities'
+import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiRspackHasServiceTierConsumer,codexUiRspackLocaleReplacements,codexUiRspackModules,codexUiRspackServiceTierHookReplacements,codexUiRspackServiceTierMapperModule,codexUiRspackUltraCatalogueReplacements,codexUiRspackUltraGateReplacements,detectCodexUiCapabilities,type CodexUiFeature} from '../src/main/codexUiCapabilities'
 import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,type CodexSpeedMenuReader} from '../src/main/codexSpeedMenu'
 
 // A synthetic module models semantic roles without copying an upstream bundle.
@@ -357,6 +357,40 @@ test('shared access mapper must bind Fast and Ultra Fast results to upstream res
   assert.deepEqual(codexUiAccessMapperImportPaths(accessSource.replace('./app-shared.js','../app-shared.js')),[])
 })
 
+test('Rspack module exports keep locale, Ultra catalogue and gates scoped to exact factories',()=>{
+  const localeBody=source.split('\n')[0].replace('function translated','function')
+  const catalogueBody=source.split('\n').find(line=>line.startsWith('function catalogue'))!.replace('function catalogue','function')
+  const gateBody=source.split('\n').find(line=>line.startsWith('function savedReasoning'))!.replace('function savedReasoning','function')
+  const bundle=`export const __webpack_modules__={
+    HHvo(e,t,n){n.d(t,{},{locale:${localeBody}})},
+    Xvtr(e,t,n){n.d(t,{},{catalogue:${catalogueBody}})},
+    Gate(e,t,n){n.d(t,{},{save:${gateBody}})}
+  }`
+  const modules=codexUiRspackModules(bundle)
+  assert.deepEqual(modules.map(module=>module.id),['HHvo','Xvtr','Gate'])
+  const locale=modules.find(module=>module.id==='HHvo')!,catalogue=modules.find(module=>module.id==='Xvtr')!,gate=modules.find(module=>module.id==='Gate')!
+  assert.equal(codexUiRspackLocaleReplacements(locale.source).length,2)
+  assert.equal(codexUiRspackUltraCatalogueReplacements(catalogue.source).length,2)
+  assert.equal(codexUiRspackUltraGateReplacements(gate.source).length,1)
+})
+
+test('Rspack shared service-tier hook admits only verified local API identities and preserves W6 entitlements',()=>{
+  const hook=`var a=n("mapper"),s=n("account");n.d(t,{},{U:function(e){let u=(0,s.tn)("local"),p=e?.hostId??"local",g=(0,s.tn)(p),m=g?.authMethod==="chatgpt"||g?.authMethod==="personalAccessToken"||g?.authMethod==="amazonBedrock",{data:f,isPending:b}=(0,r.query)({authMethod:g?.authMethod??null,hostId:p}),x=!!g?.isLoading||m&&b,n=m&&!x&&null!=f?(0,a.W6)(f):null;return {serviceTierAccess:n,isLoading:x}}})`
+  const mapperChunk=`export const __webpack_modules__={mapper(e,t,n){n.d(t,{},{W6:function(e){let r=e.requirements?.featureRequirements,f=r?.fast_mode!==!1;return {fast:f,ultrafast:"supportsIndependentSpeedModes"in e&&e.supportsIndependentSpeedModes===!0?r?.ultrafast_mode!==!1:f&&r?.ultrafast_mode!==!1}}})}}`
+  assert.equal(codexUiRspackServiceTierMapperModule(hook),'mapper')
+  assert.ok(codexUiRspackHasServiceTierConsumer(`export const __webpack_modules__={consumer(e,t,n){let m=n("provider");function C(){let {serviceTierAccess:a}=m.U({hostId:"local"});return {serviceTierSettings:{availableOptions:[]},setServiceTier(){},serviceTierAccess:a}}}}`, 'provider'))
+  const replacements=codexUiRspackServiceTierHookReplacements(hook,{mapper:mapperChunk})
+  assert.equal(replacements.length,4)
+  const patched=applyCodexUiReplacements(hook,replacements)
+  assert.match(patched,/authMethod===`apikey`/)
+  assert.match(patched,/ultrafast_mode:!1/)
+  assert.match(patched,/supportsIndependentSpeedModes:!1/)
+  for(const mapper of [
+    `export const __webpack_modules__={mapper(e,t,n){n.d(t,{},{W6:function(e){return {fast:!0,ultrafast:!0}}})}}`,
+    `export const __webpack_modules__={mapper(e,t,n){n.d(t,{},{W6:function(e){let r=e.requirements?.featureRequirements,f=r?.fast_mode!==!1;return {fast:f,ultrafast:f}}})}}`
+  ])assert.throws(()=>codexUiRspackServiceTierHookReplacements(hook,{mapper}),/entitlement contract/)
+})
+
 test('ambiguous access roles disable Fast without leaving partial edits',t=>{
   const body=accessSource+'\n'+accessSource.split('\n').find(line=>line.startsWith('function menu'))!
   const detected=detectCodexUiCapabilities(body),f=fixture(t,body)
@@ -399,6 +433,7 @@ test('installed desktop client reports any currently supported capabilities',t=>
   const application='/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
   if(process.platform!=='darwin'||!existsSync(executable)){t.skip('current desktop client is not installed');return}
   const result=inspectCodexDesktopUi({application,executable})
+  if(result.version==='26.1103.60933')assert.deepEqual(result.features,['locale','speed','ultra'],result.reason)
   if(!result.supported||!result.features?.length){t.skip(`optional diagnostic: ${result.reason}`);return}
   assert.ok(result.features.length>=1)
   const f=fixture(t),hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable,nonce:randomUUID()})

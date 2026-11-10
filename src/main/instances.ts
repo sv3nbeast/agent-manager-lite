@@ -144,7 +144,7 @@ export class Instances {
       try {clientType=resolveAgentClientType(profile.clientType)}catch(error){clientError=error instanceof Error?error.message:'客户端尚未接入'}
       const run=this.active.get(profile.id),gateway=run?.gateway?.current()
       const hook=run?.plan.speedMenuHook??run?.plan.desktopLocaleHook
-      const featureStatus=(feature:'speed'|'locale'|'ultra',inspection?:CodexSpeedMenuInspection)=>run&&hook&&inspection?.supported?this.speedMenuServices.readStatus({statusLog:hook.statusLog,nonce:run.plan.nonce,executable:run.plan.executable,directory:run.plan.directory,pid:run.child?.pid,feature,requiredResourceIds:hook.resourceIdsByFeature?.[feature],requiredMode:(hook.resourceIdsByFeature?.[feature]?.length??0)>1?'any':'all'}):undefined
+      const featureStatus=(feature:'speed'|'locale'|'ultra',inspection?:CodexSpeedMenuInspection)=>run&&hook&&inspection?.supported?this.speedMenuServices.readStatus({statusLog:hook.statusLog,nonce:run.plan.nonce,executable:run.plan.executable,directory:run.plan.directory,pid:run.child?.pid,feature,requiredResourceIds:hook.resourceIdsByFeature?.[feature],requiredMode:hook.requiredModeByFeature?.[feature]??((hook.resourceIdsByFeature?.[feature]?.length??0)>1?'any':'all')}):undefined
       const menu=featureStatus('speed',run?.speedMenuInspection),locale=featureStatus('locale',run?.localeInspection),ultra=featureStatus('ultra',run?.ultraInspection)
       const speedMenu:InstanceView['speedMenu']=menu?.state??(run?.speedMenuInspection?'unavailable':undefined)
       const menuNotice=menu?.state==='fallback'?menu.reason:run?.speedMenuInspection&&!run.speedMenuInspection.supported?run.speedMenuInspection.reason:undefined

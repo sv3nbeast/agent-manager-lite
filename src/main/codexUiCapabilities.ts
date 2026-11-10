@@ -65,6 +65,17 @@ function moduleFunctions(program:Node):Node[] {
   const factories=rspackModuleFactories(program)
   if(factories.length)for(const factory of factories)scope(factory.body?.body)
   else scope(program.body)
+  // Rspack module source exports some semantic roles as direct values inside
+  // `d(exports, {}, {name: function(){...}})` rather than local bindings.
+  // Only direct export values are promoted; nested callbacks stay owned.
+  if(!factories.length)for(const statement of program.body??[])visit(statement,node=>{
+    if(node.type!=='CallExpression'||property(node.callee)!=='d')return
+    for(const object of node.arguments.slice(1).filter((argument:Node)=>argument.type==='ObjectExpression'))
+      for(const entry of object.properties??[]){
+        const value=entry.type==='Property'?entry.value:undefined
+        if(isFunction(value))add(value,entry.key?.name??String(entry.key?.value??''))
+      }
+  })
   return functions
 }
 
@@ -75,13 +86,14 @@ function moduleFunctions(program:Node):Node[] {
  * wrapper. Return those factory functions so the single-file and bundled
  * layouts share one notion of "module scope". Empty for a classic single file.
  */
-function rspackModuleFactories(program:Node):Node[] {
-  const factories:Node[]=[]
+function rspackModuleEntries(program:Node):{id:string;factory:Node}[] {
+  const factories:{id:string;factory:Node}[]=[]
   const fromObject=(object:Node|undefined)=>{
     if(object?.type!=='ObjectExpression')return
     for(const property of object.properties??[]){
       const value=property.type==='Property'?(property.value??(property.method?property.value:undefined)):undefined
-      if(isFunction(value))factories.push(value)
+      const id=property.key?.type==='Literal'?String(property.key.value):property.key?.name
+      if(isFunction(value)&&typeof id==='string')factories.push({id,factory:value})
     }
   }
   const scan=(node:Node|undefined)=>{
@@ -93,6 +105,14 @@ function rspackModuleFactories(program:Node):Node[] {
   }
   for(const node of program.body??[])scan(node)
   return factories
+}
+function rspackModuleFactories(program:Node):Node[]{return rspackModuleEntries(program).map(entry=>entry.factory)}
+export interface CodexUiRspackModule {id:string;start:number;end:number;source:string}
+export function codexUiRspackModules(source:string):CodexUiRspackModule[] {
+  try{
+    const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node
+    return rspackModuleEntries(program).flatMap(({id,factory})=>factory.body?.type==='BlockStatement'?[{id,start:factory.body.start+1,end:factory.body.end-1,source:source.slice(factory.body.start+1,factory.body.end-1)}]:[])
+  }catch{return []}
 }
 
 const functionName=(fn:Node):string|undefined=>fn.__cmlBindingName??fn.id?.name
@@ -312,14 +332,104 @@ function resolveRspackMapper(scope:Node,namespace:string|undefined,member:string
   const factory=rspackFactoryBody(externalProgram,moduleId)
   if(!factory)throw new Error('access mapper module not found')
   // Export table: `d(t,{member:()=>localFn,…})`.
-  const exportArgs=nodes(factory,n=>n.type==='CallExpression'&&property(unwrap(n.callee))==='d'&&n.arguments?.length>=2&&n.arguments[1].type==='ObjectExpression').flatMap(call=>call.arguments[1].properties)
-  const entries=exportArgs.filter((p:Node)=>p.type==='Property'&&p.key?.name===member&&p.value?.type==='ArrowFunctionExpression'&&p.value.body?.type==='Identifier')
+  const exportArgs=nodes(factory,n=>n.type==='CallExpression'&&property(unwrap(n.callee))==='d'&&n.arguments?.length>=2).flatMap(call=>call.arguments.slice(1).filter((argument:Node)=>argument.type==='ObjectExpression').flatMap((argument:Node)=>argument.properties))
+  const entries=exportArgs.filter((p:Node)=>p.type==='Property'&&(p.key?.name??p.key?.value)===member&&(isFunction(p.value)||p.value?.type==='ArrowFunctionExpression'&&p.value.body?.type==='Identifier'))
   if(entries.length!==1)throw new Error('ambiguous exported access mapper')
+  if(['FunctionExpression','FunctionDeclaration'].includes(entries[0].value?.type)&&entries[0].value.body?.type==='BlockStatement')return entries[0].value
   const localName=entries[0].value.body.name
   const body=factory.body?.body??[]
   const found=body.filter((n:Node)=>n.type==='FunctionDeclaration'&&n.id?.name===localName).concat(
     body.filter((n:Node)=>n.type==='VariableDeclaration').flatMap((n:Node)=>n.declarations).filter((d:Node)=>d.id?.name===localName&&isFunction(d.init)).map((d:Node)=>{d.init.__cmlBindingName=localName;return d.init}))
   return found.length===1?found[0]:undefined
+}
+
+function rspackRequirementsMapperSupported(mapper:Node):boolean {
+  const input=mapper.params?.[0]?.type==='Identifier'?mapper.params[0].name:undefined
+  if(!input||mapper.params.length!==1)return false
+  const returns=nodes(mapper,node=>node.type==='ReturnStatement'&&node.argument?.type==='ObjectExpression')
+  if(returns.length!==1)return false
+  const properties=returns[0].argument.properties,fast=properties.filter((item:Node)=>item.type==='Property'&&item.key?.name==='fast'),ultra=properties.filter((item:Node)=>item.type==='Property'&&item.key?.name==='ultrafast')
+  if(fast.length!==1||ultra.length!==1)return false
+  const resolveMode=(value:Node,mode:string,seen=new Set<string>()):boolean=>{
+    value=unwrap(value)
+    if(value.type==='Identifier'){
+      if(seen.has(value.name))return false
+      seen.add(value.name)
+      const declarations=nodes(mapper,node=>node.type==='VariableDeclarator'&&node.id?.type==='Identifier'&&node.id.name===value.name)
+      return declarations.length===1&&!!declarations[0].init&&resolveMode(declarations[0].init,mode,seen)
+    }
+    return value.type==='BinaryExpression'&&value.operator==='!=='&&booleanLiteral(value.right)===false&&resolvedMemberPath(value.left,mapper).join('.')===`${input}.requirements.featureRequirements.${mode}`
+  }
+  const fastValue=fast[0].value,ultraValue=unwrap(ultra[0].value),fastName=fastValue.type==='Identifier'?fastValue.name:undefined
+  if(!fastName||!resolveMode(fastValue,'fast_mode'))return false
+  const independentCheck=(scope:Node)=>nodes(scope,node=>node.type==='BinaryExpression'&&node.operator==='==='&&((resolvedMemberPath(node.left,mapper).join('.')===`${input}.supportsIndependentSpeedModes`&&booleanLiteral(node.right)===true)||(resolvedMemberPath(node.right,mapper).join('.')===`${input}.supportsIndependentSpeedModes`&&booleanLiteral(node.left)===true))).length===1
+  if(ultraValue.type==='LogicalExpression'&&ultraValue.operator==='&&'){
+    const left=ultraValue.left
+    return resolveMode(ultraValue.right,'ultrafast_mode')&&left.type==='LogicalExpression'&&left.operator==='||'&&nodes(left,node=>node.type==='Identifier'&&node.name===fastName).length>0&&independentCheck(left)
+  }
+  if(ultraValue.type==='ConditionalExpression'){
+    const alternate=unwrap(ultraValue.alternate),test=unwrap(ultraValue.test)
+    const ownPropertyGuard=nodes(test,node=>node.type==='BinaryExpression'&&node.operator==='in'&&literal(node.left)==='supportsIndependentSpeedModes'&&node.right?.name===input).length===1
+    return (independentCheck(test)||ownPropertyGuard)&&resolveMode(ultraValue.consequent,'ultrafast_mode')&&alternate.type==='LogicalExpression'&&alternate.operator==='&&'&&nodes(alternate,node=>node.type==='Identifier'&&node.name===fastName).length>0&&resolveMode(alternate.right,'ultrafast_mode')
+  }
+  return false
+}
+
+export function codexUiRspackServiceTierMapperModule(source:string):string|undefined {
+  try{
+    const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node,functions=moduleFunctions(program),matches=new Set<string>()
+    for(const hook of functions){
+      const body=textOf(source,hook)
+      if(!['serviceTierAccess','isPending','amazonBedrock','personalAccessToken'].every(term=>body.includes(term)))continue
+      for(const call of nodes(hook,node=>node.type==='CallExpression'&&node.arguments?.length===1&&node.arguments[0]?.type==='Identifier')){
+        const callee=mapperCallee(call)
+        if(callee?.type!=='MemberExpression'||callee.property?.name!=='W6'||callee.object?.type!=='Identifier')continue
+        const id=rspackRequireId(program,callee.object.name)
+        if(id)matches.add(id)
+      }
+    }
+    return matches.size===1?[...matches][0]:undefined
+  }catch{return undefined}
+}
+
+export function codexUiRspackHasServiceTierConsumer(source:string,providerModuleId:string):boolean {
+  return codexUiRspackModules(source).some(module=>module.source.includes(`("${providerModuleId}")`)&&['serviceTierAccess','serviceTierSettings','availableOptions','setServiceTier'].every(term=>module.source.includes(term)))
+}
+
+export function codexUiRspackServiceTierHookReplacements(source:string,importedModules:Readonly<Record<string,string>>):CodexUiReplacement[] {
+  const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node,functions=moduleFunctions(program),text=(node:Node)=>textOf(source,node)
+  const unique=<T>(values:readonly T[],role:string):T=>{if(values.length!==1)throw new Error(`Rspack ${role} role count ${values.length}`);return values[0]}
+  const edit=(node:Node,after:string):CodexUiReplacement=>({begin:'',end:'',before:text(node),after,offset:node.start})
+  const hook=unique(functions.filter(fn=>['serviceTierAccess','isPending','amazonBedrock','personalAccessToken'].every(term=>text(fn).includes(term))),'service-tier hook')
+  const queries=nodes(hook,node=>node.type==='VariableDeclarator'&&node.id?.type==='ObjectPattern'&&node.id.properties.some((item:Node)=>item.key?.name==='data')&&node.id.properties.some((item:Node)=>item.key?.name==='isPending'))
+  const query=unique(queries,'requirements query'),dataName=query.id.properties.find((item:Node)=>item.key?.name==='data')?.value?.name,pendingName=query.id.properties.find((item:Node)=>item.key?.name==='isPending')?.value?.name
+  if(!dataName||!pendingName)throw new Error('Rspack requirements query binding')
+  const mapperCalls=nodes(hook,node=>accessMapperCall(node,dataName)).filter(node=>mapperCallee(node)?.type==='MemberExpression')
+  const mapperCall=unique(mapperCalls,'requirements mapper call'),mapperCalleeNode=mapperCallee(mapperCall)!
+  if(mapperCalleeNode.property?.name!=='W6'||mapperCalleeNode.object?.type!=='Identifier')throw new Error('Rspack requirements mapper export')
+  const mapperModuleId=rspackRequireId(program,mapperCalleeNode.object.name),mapper=resolveRspackMapper(program,mapperCalleeNode.object.name,'W6',importedModules)
+  if(!mapperModuleId||!mapper||!rspackRequirementsMapperSupported(mapper))throw new Error('Rspack Fast/Ultra-Fast entitlement contract')
+  const gate=unique(nodes(hook,node=>node.type==='VariableDeclarator'&&node.id?.type==='Identifier'&&node.init&&['chatgpt','personalAccessToken','amazonBedrock'].every(method=>nodes(node.init,(child:Node)=>child.type==='BinaryExpression'&&child.operator==='==='&&literal(child.right)===method).length>0)),'account gate')
+  const comparisons=nodes(gate.init,node=>node.type==='BinaryExpression'&&node.operator==='==='&&typeof literal(node.right)==='string'&&['chatgpt','personalAccessToken','amazonBedrock'].includes(literal(node.right) as string))
+  if(comparisons.length!==3)throw new Error('Rspack account gate contract')
+  const authPaths=comparisons.map(node=>memberPath(node.left).join('.'))
+  if(!authPaths[0]?.endsWith('.authMethod')||!authPaths.every(path=>path===authPaths[0]))throw new Error('Rspack account identity binding')
+  const identityName=authPaths[0].split('.')[0],hostRead=unique(nodes(hook,node=>node.type==='MemberExpression'&&property(node)==='hostId'&&node.object?.name===hook.params?.[0]?.name),'host scope')
+  const hostBinding=unique(nodes(hook,node=>node.type==='VariableDeclarator'&&node.id?.type==='Identifier'&&node.init&&nodes(node.init,child=>child===hostRead).length===1),'host binding'),hostName=hostBinding.id.name
+  const identityRead=unique(nodes(hook,node=>node.type==='VariableDeclarator'&&node.id?.type==='Identifier'&&node.init?.type==='CallExpression'&&node.init.arguments?.some((arg:Node)=>arg.type==='Identifier'&&arg.name===hostName)&&property(callTarget(node.init)??undefined)==='tn'),'account reader')
+  if(identityRead.id.name!==identityName)throw new Error('Rspack account identity scope')
+  const loading=unique(nodes(hook,node=>node.type==='VariableDeclarator'&&node.id?.type==='Identifier'&&node.init?.type==='LogicalExpression'&&node.init.operator==='||'&&nodes(node.init,child=>child.type==='MemberExpression'&&property(child)==='isLoading'&&memberPath(child).join('.')===`${identityName}.isLoading`).length===1&&nodes(node.init,child=>child.type==='LogicalExpression'&&child.operator==='&&'&&child.left?.name===gate.id.name&&child.right?.name===pendingName).length===1),'requirements loading gate')
+  const access=unique(nodes(hook,node=>node.type==='ConditionalExpression'&&nodes(node,child=>child===mapperCall).length===1&&literal(node.alternate)===null),'access result'),test=access.test
+  const hasIdentity=nodes(test,node=>node.type==='Identifier'&&node.name===gate.id.name).length>0,hasLoading=nodes(test,node=>node.type==='Identifier'&&node.name===loading.id.name).length>0,hasDataCheck=nodes(test,node=>node.type==='BinaryExpression'&&['!=','!=='].includes(node.operator)&&((node.left?.name===dataName&&literal(node.right)===null)||(node.right?.name===dataName&&literal(node.left)===null))).length===1
+  if(!hasIdentity||!hasLoading||!hasDataCheck)throw new Error('Rspack access gate contract')
+  const localApi=`${hostName}===\`local\`&&(${identityName}?.authMethod===\`apikey\`||${identityName}?.authMethod===null&&${identityName}?.requiresAuth===!1)`
+  const pendingGate=unique(nodes(loading.init,node=>node.type==='LogicalExpression'&&node.operator==='&&'&&node.left?.name===gate.id.name&&node.right?.name===pendingName),'pending query gate')
+  return [
+    edit(gate.init,`(${text(gate.init)})||(${localApi})`),
+    edit(pendingGate,`${gate.id.name}&&!(${localApi})&&${pendingName}`),
+    edit(test,`${gate.id.name}&&!${loading.id.name}&&(${dataName}!=null||${localApi})`),
+    edit(mapperCall.arguments[0],`${dataName}??{requirements:{featureRequirements:{fast_mode:!0,ultrafast_mode:!1}},supportsIndependentSpeedModes:!1}`)
+  ]
 }
 
 export function detectCodexUiCapabilities(source:string,importedModules:Readonly<Record<string,string>>={}):{features:CodexUiFeatureSupports;replacements:Record<CodexUiFeature,CodexUiReplacement[]>} {
@@ -360,13 +470,14 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
     // one boolean. Follow the returned capability and its requirements mapper;
     // preserve the official tier rules rather than depending on build names.
     const uiCandidates=functionsWith('authMethod','isLoading').filter(fn=>nodes(fn,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name)).length===1)
-    const ui=one(uiCandidates.filter(fn=>{
+    const uiRoles=uiCandidates.filter(fn=>{
       if(!nodes(fn,n=>n.type==='Property'&&n.key.name==='serviceTierAccess').length)return true
       const queries=nodes(fn,n=>n.type==='VariableDeclarator'&&n.id.type==='ObjectPattern'&&n.id.properties.some((p:Node)=>p.key.name==='data')&&n.id.properties.some((p:Node)=>p.key.name==='isPending'))
       if(queries.length!==1)return false
       const dataName=queries[0].id.properties.find((p:Node)=>p.key.name==='data')?.value?.name
       return nodes(fn,n=>accessMapperCall(n,dataName)).length===1
-    }))
+    })
+    const ui=one(uiRoles)
     const capability=one(nodes(ui,n=>n.type==='Property'&&['isServiceTierAllowed','serviceTierAccess'].includes(n.key.name))).key.name
     const accessObject=capability==='serviceTierAccess'
     const auth=one(nodes(ui,n=>n.type==='VariableDeclarator'&&n.init&&text(n.init).includes('authMethod')&&nodes(n.init,c=>c.type==='BinaryExpression'&&c.operator==='==='&&literal(c.right)==='chatgpt').length===1))
@@ -546,6 +657,45 @@ export function detectCodexUiCapabilities(source:string,importedModules:Readonly
     return [...levels,edit(availability,text(availability.right)),edit(filtered,text(filtered.consequent)),...unique.map(gate=>edit(gate,'!0'))]
   })
   return {features,replacements}
+}
+
+function rspackEdit(source:string,node:Node,after:string):CodexUiReplacement {
+  return {begin:'',end:'',offset:node.start,before:source.slice(node.start,node.end),after}
+}
+
+/** Detect the locale provider inside one isolated Rspack module factory. */
+export function codexUiRspackLocaleReplacements(source:string):CodexUiReplacement[] {
+  const detected=detectCodexUiCapabilities(source)
+  if(!detected.features.locale.supported||detected.replacements.locale.length!==2)throw new Error('Rspack locale provider contract')
+  return detected.replacements.locale
+}
+
+/** Patch only the Ultra catalogue's global visibility gate and filter. Model
+ * specific advertised reasoning efforts and enabled-level preferences remain
+ * authoritative.
+ */
+export function codexUiRspackUltraCatalogueReplacements(source:string):CodexUiReplacement[] {
+  const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node,functions=moduleFunctions(program),text=(node:Node)=>source.slice(node.start,node.end)
+  const catalogue=one(functions.filter(fn=>text(fn).includes('includeUltraReasoningEffort')&&text(fn).includes('hasModelSupportingUltraReasoningEffort')&&text(fn).includes('supportedReasoningEfforts')))
+  const parameter=one<Node>(catalogue.params.flatMap((param:Node)=>param.type==='ObjectPattern'?param.properties:[]).filter((entry:Node)=>entry.key?.name==='includeUltraReasoningEffort'))
+  const include=parameter.value?.type==='Identifier'?parameter.value.name:parameter.key?.name
+  if(!include)throw new Error('Rspack Ultra catalogue input')
+  const availability=one(nodes(catalogue,node=>node.type==='VariableDeclarator'&&node.init?.type==='LogicalExpression'&&node.init.operator==='&&'&&node.init.left?.name===include&&text(node.init.right).includes('supportedReasoningEfforts')&&text(node.init.right).includes('ultra')))
+  const filtered=one(nodes(catalogue,node=>node.type==='ConditionalExpression'&&property(node.consequent)==='supportedReasoningEfforts'&&text(node.alternate).includes('supportedReasoningEfforts.filter')&&text(node.alternate).includes('ultra')))
+  return [rspackEdit(source,availability.init,text(availability.init.right)),rspackEdit(source,filtered,text(filtered.consequent))]
+}
+
+/** Remove only persistence checks for the Ultra reasoning effort in the
+ * module's reasoning update functions; keep the rest of each mutation intact.
+ */
+export function codexUiRspackUltraGateReplacements(source:string):CodexUiReplacement[] {
+  const program=parse(source,{ecmaVersion:'latest',sourceType:'module'}) as Node,functions=moduleFunctions(program),gates:Node[]=[]
+  for(const fn of functions){
+    const body=source.slice(fn.start,fn.end)
+    if(!body.includes('536305374')||!body.includes('ultra')||!['thinkingEffort','reasoningEffort','includeUltraReasoningEffort'].some(term=>body.includes(term)))continue
+    gates.push(...nodes(fn,node=>node.type==='CallExpression'&&node.arguments.length===2&&literal(node.arguments[1])==='536305374'&&(node.callee.type==='Identifier'||property(unwrap(node.callee))==='get')))
+  }
+  return [...new Map(gates.map(gate=>[gate.start,gate])).values()].map(gate=>rspackEdit(source,gate,'!0'))
 }
 
 export function applyCodexUiReplacements(source:string,replacements:readonly CodexUiReplacement[]):string {
