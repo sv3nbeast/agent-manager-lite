@@ -4,7 +4,7 @@ import { open, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { setImmediate } from 'node:timers/promises'
-import { historyFilterSchema, historyQuerySchema, type HistoryBreakdownRow, type HistoryEntry, type HistoryFilter, type HistoryPage, type HistoryQuery } from '../shared/history'
+import { historyFilterSchema, historyQuerySchema, safeHistoryErrorCategory, type HistoryBreakdownRow, type HistoryEntry, type HistoryFilter, type HistoryPage, type HistoryQuery } from '../shared/history'
 
 const text = (v: unknown, max = 256) => typeof v === 'string' ? v.slice(0, max) : ''
 const count = (v: unknown) => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0
@@ -22,11 +22,14 @@ function where(filter: HistoryFilter): { sql: string; params: (string | number)[
     params.push(...Array(6).fill(filter.search))
   }
   if (filter.outcome !== 'all') { clauses.push('success = ?'); params.push(filter.outcome === 'success' ? 1 : 0) }
+  if(filter.outcome==='canceled')clauses.push("errorCategory = 'client_canceled'")
+  if(filter.outcome==='interrupted')clauses.push("errorCategory IN ('stream_interrupted','downstream_write_error','upstream_stream_timeout','gateway_context_canceled','response_incomplete')")
+  if(filter.outcome==='upstream_error')clauses.push("errorCategory IN ('upstream_error','upstream_response_failed','auth_failed','model_not_available','quota_or_rate_limit','upstream_first_byte_timeout')")
   if (filter.from !== undefined) { clauses.push('requestedAt >= ?'); params.push(filter.from) }
   if (filter.to !== undefined) { clauses.push('requestedAt <= ?'); params.push(filter.to) }
   return { sql: clauses.length ? clauses.join(' AND ') : '1', params }
 }
-const columns = ['requestId','requestedAt','model','upstreamModel','accountId','success','status','latencyMs','inputTokens','outputTokens','cachedTokens','inboundTier','outboundTier','responseTier','tierSource','apiKeyId','apiKeyLabel','totalTokens'] as const
+const columns = ['requestId','requestedAt','model','upstreamModel','accountId','success','status','latencyMs','inputTokens','outputTokens','cachedTokens','inboundTier','outboundTier','responseTier','tierSource','apiKeyId','apiKeyLabel','totalTokens','errorCategory'] as const
 
 export class History {
   private readonly db: DatabaseSync
@@ -48,7 +51,7 @@ export class History {
       CREATE INDEX IF NOT EXISTS requests_time ON requests(requestedAt);
       CREATE INDEX IF NOT EXISTS requests_outcome ON requests(success, seq);`)
     const present=new Set((this.db.prepare('PRAGMA table_info(requests)').all() as {name:string}[]).map(column=>column.name))
-    for(const [name,type] of [['apiKeyId',"TEXT NOT NULL DEFAULT ''"],['apiKeyLabel',"TEXT NOT NULL DEFAULT ''"],['totalTokens','INTEGER NOT NULL DEFAULT 0']])if(!present.has(name))this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`)
+    for(const [name,type] of [['apiKeyId',"TEXT NOT NULL DEFAULT ''"],['apiKeyLabel',"TEXT NOT NULL DEFAULT ''"],['totalTokens','INTEGER NOT NULL DEFAULT 0'],['errorCategory',"TEXT NOT NULL DEFAULT ''"]])if(!present.has(name))this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`)
     if(!present.has('totalTokens'))this.db.exec('UPDATE requests SET totalTokens = inputTokens + outputTokens')
     this.db.exec('CREATE INDEX IF NOT EXISTS requests_api_key ON requests(apiKeyId)')
     this.insert = this.db.prepare(`INSERT OR IGNORE INTO requests (identity, ${columns.join(',')}) VALUES (${Array(columns.length+1).fill('?').join(',')})`)
@@ -62,7 +65,7 @@ export class History {
       text(event.requestedModel || event.model), text(event.upstreamModel || event.model), text(event.accountId), event.success === true ? 1 : 0,
       count(event.status), count(event.latencyMs), count(usage.inputTokens), count(usage.outputTokens), count(usage.cachedTokens),
       tier(event.inboundServiceTier), tier(event.outboundServiceTier), tier(event.responseServiceTier) || null,
-      ['request','instance','account','provider','global','follow','transformed'].includes(String(event.tierSource)) ? event.tierSource : 'unknown',text(event.apiKeyId),text(event.apiKeyLabel),count(usage.totalTokens)||count(usage.inputTokens)+count(usage.outputTokens)])
+      ['request','instance','account','provider','global','follow','transformed'].includes(String(event.tierSource)) ? event.tierSource : 'unknown',text(event.apiKeyId),text(event.apiKeyLabel),count(usage.totalTokens)||count(usage.inputTokens)+count(usage.outputTokens),event.success===true?'':safeHistoryErrorCategory(event.errorCategory)])
     if (this.pending.length >= 200 && !this.error) this.flush()
     else if (!this.timer) { this.timer = setTimeout(() => this.flush(), 250); this.timer.unref() }
   }

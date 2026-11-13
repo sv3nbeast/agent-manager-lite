@@ -1,6 +1,6 @@
 {
   "name": "codex-manager-lite",
-  "version": "0.15.29",
+  "version": "0.15.30",
   "description": "Lightweight Agent client, instance, account and provider manager",
   "private": true,
   "main": "out/main/index.js",
@@ -61,6 +61,7 @@
     "preview:isolated": "electron scripts/preview-product.cjs",
     "test:desktop:agent-manager": "node scripts/run-desktop-smoke.cjs --agent-manager",
     "test:desktop:codex-ui": "node scripts/smoke-codex-ui.cjs",
+    "test:desktop:history": "node scripts/smoke-history-outcomes.cjs",
     "test:desktop:upstream-proxy": "node scripts/run-desktop-smoke.cjs --upstream-proxy",
     "check:public": "node scripts/check-public-repository.mjs",
     "release:check": "node scripts/check-release-version.mjs",

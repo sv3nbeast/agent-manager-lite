@@ -761,6 +761,7 @@ func (s *relayServer) writeProviderGatewayResponsesStream(c *gin.Context, body i
 	}
 	itemIDRewriter := newProviderGatewayItemIDRewriter()
 	state := &providerUsageObserver{}
+	observer, _ := body.(*providerUsageObserver)
 	reader := bufio.NewReaderSize(body, 64*1024)
 	var frame []byte
 	for {
@@ -778,24 +779,42 @@ func (s *relayServer) writeProviderGatewayResponsesStream(c *gin.Context, body i
 			line = itemIDRewriter.RewriteSSEFrame(line)
 			frame = append(frame, line...)
 			if complete {
+				terminalSuccess := false
 				// The metadata observer deliberately caps retained bytes. Completion
 				// must still be recognized in a large (e.g. image) event already
 				// buffered here, without retaining the response in the usage record.
 				if payload, ok := responsesSSEDataPayload(frame); ok {
 					state.observeJSON(payload)
-					if observer, ok := body.(*providerUsageObserver); ok && state.responseTerminal && !observer.responseTerminal {
+					if observer != nil && state.responseTerminal && !observer.responseTerminal {
 						observer.observeJSON(payload)
 					}
+					terminalSuccess = state.terminal && state.responseTerminal && !state.failed
 				}
-				if _, writeErr := c.Writer.Write(frame); writeErr != nil {
+				written, writeErr := c.Writer.Write(frame)
+				if writeErr == nil && written != len(frame) {
+					writeErr = io.ErrShortWrite
+				}
+				if writeErr != nil {
+					if observer != nil {
+						observer.writeErr = writeErr
+					}
 					return
 				}
 				c.Writer.Flush()
+				if observer != nil && terminalSuccess {
+					observer.responseDelivered = true
+				}
 				frame = frame[:0]
 			}
 		}
 		if err != nil {
 			if relayContext(c).Err() == nil && !state.responseTerminal {
+				if observer != nil {
+					observer.failureCategory = errorCategory(200, err.Error(), false)
+					if observer.failureCategory != "upstream_first_byte_timeout" && observer.failureCategory != "upstream_stream_timeout" {
+						observer.failureCategory = "stream_interrupted"
+					}
+				}
 				if err == io.EOF {
 					err = relayStatusError{status: http.StatusBadGateway, message: "upstream stream closed before a Responses terminal event"}
 				}

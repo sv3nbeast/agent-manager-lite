@@ -23,9 +23,14 @@ type providerUsageObserver struct {
 	responseTier               string
 	terminal, failed           bool
 	responseTerminal, doneSeen bool
-	wireAPI                    string
-	imageEventType             string
-	readErr                    error
+	// Upstream observation is not delivery: a buffered read may contain a
+	// completion frame whose downstream write later fails.
+	responseDelivered bool
+	writeErr          error
+	failureCategory   string
+	wireAPI           string
+	imageEventType    string
+	readErr           error
 }
 
 func (o *providerUsageObserver) observeJSON(payload []byte) {
@@ -53,9 +58,19 @@ func (o *providerUsageObserver) observeJSON(payload []byte) {
 		o.terminal = true
 		o.responseTerminal = true
 	}
-	if kind == "error" || kind == "response.failed" || kind == "response.incomplete" || gjson.GetBytes(payload, "error").Exists() {
+	responseStatus := gjson.GetBytes(payload, "response.status").String()
+	errorValue := gjson.GetBytes(payload, "error")
+	responseError := gjson.GetBytes(payload, "response.error")
+	if kind == "error" || kind == "response.failed" || kind == "response.incomplete" ||
+		(errorValue.Exists() && errorValue.Type != gjson.Null) ||
+		(responseError.Exists() && responseError.Type != gjson.Null) ||
+		responseStatus == "failed" || responseStatus == "incomplete" || responseStatus == "cancelled" {
 		o.failed = true
 		o.responseTerminal = true
+		o.failureCategory = "upstream_response_failed"
+		if kind == "response.incomplete" || responseStatus == "incomplete" {
+			o.failureCategory = "response_incomplete"
+		}
 	}
 	if reason := gjson.GetBytes(payload, "choices.0.finish_reason"); reason.Exists() && reason.Type == gjson.String {
 		o.terminal = true
@@ -145,6 +160,12 @@ func (s *relayServer) recordProviderUsage(c *gin.Context, model string, inbound,
 		streamComplete = observer.responseTerminal
 	}
 	success := status < 400 && c.Request.Context().Err() == nil && !observer.failed && ((!stream && observer.readErr == nil) || (stream && streamComplete))
+	if stream && observer.wireAPI == "responses" {
+		// A client may close immediately after consuming response.completed.
+		// Do not retroactively turn that delivered completion into a failure.
+		// Reading a terminal event alone (or a bare [DONE]) is insufficient.
+		success = status >= 200 && status < 300 && observer.responseDelivered && !observer.failed
+	}
 	spec, _ := c.Request.Context().Value(clientAPIKeyContextKey).(*apiKeySpec)
 	requested, _ := c.Request.Context().Value(requestModelContextKey).(string)
 	payload := usagePayload{Type: "usage", RequestID: internallogging.GetRequestID(c.Request.Context()), Provider: "provider_gateway", Model: model, UpstreamModel: model, RequestedModel: requested,
@@ -152,9 +173,29 @@ func (s *relayServer) recordProviderUsage(c *gin.Context, model string, inbound,
 		InboundServiceTier: &in, OutboundServiceTier: &out, ResponseServiceTier: observer.responseTier, ServiceTier: normalizedUsageServiceTier(observer.responseTier),
 		Usage: usageDetails{InputTokens: observer.detail.InputTokens, OutputTokens: observer.detail.OutputTokens, CachedTokens: observer.detail.CachedTokens, ReasoningTokens: observer.detail.ReasoningTokens, TotalTokens: observer.detail.TotalTokens, TokenBreakdown: observer.detail.TokenBreakdown}}
 	if !success {
-		payload.ErrorCategory = "upstream_error"
-		if observer.readErr != nil {
+		switch {
+		case observer.failed:
+			payload.ErrorCategory = observer.failureCategory
+			if payload.ErrorCategory == "" {
+				payload.ErrorCategory = "upstream_response_failed"
+			}
+		case observer.failureCategory != "":
+			payload.ErrorCategory = observer.failureCategory
+		case observer.writeErr != nil:
+			payload.ErrorCategory = "downstream_write_error"
+		case c.Request.Context().Err() != nil:
+			payload.ErrorCategory = "client_canceled"
+		case observer.readErr != nil:
 			payload.ErrorCategory = errorCategory(status, observer.readErr.Error(), false)
+			if stream && status < 400 && payload.ErrorCategory != "upstream_first_byte_timeout" && payload.ErrorCategory != "upstream_stream_timeout" {
+				payload.ErrorCategory = "stream_interrupted"
+			}
+		case status >= 400:
+			payload.ErrorCategory = errorCategory(status, "", false)
+		case stream:
+			payload.ErrorCategory = "stream_interrupted"
+		default:
+			payload.ErrorCategory = "upstream_error"
 		}
 	}
 	s.policy.tracker.mu.Lock()
