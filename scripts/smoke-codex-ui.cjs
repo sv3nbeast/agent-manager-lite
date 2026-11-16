@@ -17,21 +17,31 @@ const {codexBundledCli}=require('../src/main/codexPrograms.ts')
 
 async function main(){
   assert.equal(process.platform,'darwin','native desktop smoke requires macOS')
+  const forkSmoke=process.env.CML_CODEX_UI_FORK==='1'
+  const unmodified=process.env.CML_CODEX_UI_UNMODIFIED==='1'
   const application=process.env.CML_CODEX_APP_PATH??'/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
   const nativeApi=process.env.CML_CODEX_UI_NATIVE_API==='1',modelId=process.env.CML_CODEX_MODEL??'gpt-6.1-sol',modelLabel=modelId==='gpt-6.1-sol'?'6.1 Sol':modelId.split('/').at(-1)
-  const inspection=inspectCodexDesktopUi({application,executable,...nativeApi?{features:['locale']}: {}})
+  const inspection=inspectCodexDesktopUi({application,executable,...nativeApi||forkSmoke?{features:['locale']}: {}})
   // Capabilities are intentionally discovered from the installed bundle. A
   // newer Codex may expose only a subset (or none) while still being a valid
   // client; the smoke should exercise exactly what was detected instead of
   // turning a missing optional feature into a version-specific failure.
-  const features=inspection.features??[]
+  const features=unmodified?[]:inspection.features??[]
   const supports=feature=>features.includes(feature)&&inspection.featureSupport?.[feature]?.supported===true
-  console.log(JSON.stringify({stage:'capabilities',version:inspection.version,features,featureSupport:inspection.featureSupport,reason:inspection.reason}))
+  console.log(JSON.stringify({stage:'capabilities',version:inspection.version,features,featureSupport:inspection.featureSupport,forkCompatibility:inspection.forkCompatibility,reason:inspection.reason}))
+  if(forkSmoke&&!unmodified)assert.equal(inspection.forkCompatibility,true,'native fork compatibility must be detected before testing')
   for(const feature of (process.env.CML_CODEX_UI_REQUIRE??'').split(',').filter(Boolean))assert.ok(supports(feature),`required capability was not detected: ${feature}`)
   const root=mkdtempSync(join(realpathSync(tmpdir()),'cml-native-ui-')),directory=join(root,'home'),desktopDirectory=join(root,'desktop')
   mkdirSync(directory,{mode:0o700});mkdirSync(desktopDirectory,{mode:0o700})
+  if(forkSmoke){
+    execFileSync('git',['init','-b','main',root],{stdio:'ignore'})
+    writeFileSync(join(root,'.gitignore'),'home/\ndesktop/\nnative-reference/\n')
+    writeFileSync(join(root,'README.md'),'Disposable fork compatibility fixture.\n')
+    execFileSync('git',['-C',root,'add','README.md','.gitignore'])
+    execFileSync('git',['-C',root,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','Initialize disposable fork fixture'],{stdio:'ignore'})
+  }
   const runtime=new MacDesktopRuntime(),nonce=randomUUID(),cdpPort=await reserveCodexCdpPort()
-  let socket,plan,capture=async()=>{};const requests=[]
+  let socket,plan,capture=async()=>{};const requests=[],diagnostics=[]
   const server=createServer((req,res)=>{
     res.setHeader('content-type','application/json')
     if(req.method==='GET'){res.end(JSON.stringify({object:'list',data:[{id:modelId,object:'model',owned_by:'fixture'}]}));return}
@@ -63,11 +73,16 @@ async function main(){
     model.service_tiers=structuredClone(builtInCatalog.models.find(entry=>entry.slug===modelId)?.service_tiers??[])
     writeFileSync(join(directory,'catalog.json'),JSON.stringify(catalog))
     writeFileSync(join(directory,'.codex-global-state.json'),JSON.stringify({'electron-saved-workspace-roots':[root],'electron-active-workspace-roots':[root],'electron-persisted-atom-state':{'electron:onboarding-override':'app','electron:onboarding-projectless-completed':true}}))
+    {
+      const state=JSON.parse(readFileSync(join(directory,'.codex-global-state.json'),'utf8')),projectId='compatibility-fixture'
+      Object.assign(state,{'local-projects':{[projectId]:{id:projectId,name:'Compatibility fixture',rootPaths:[root],createdAt:Date.now(),updatedAt:Date.now()}},'project-order':[projectId],'selected-project':{type:'local',projectId},'active-workspace-roots':[root]})
+      writeFileSync(join(directory,'.codex-global-state.json'),JSON.stringify(state))
+    }
     const provider=nativeApi?'cml_native_account':'fixture',apiKey=nativeApi?'fixture-native-api-key':'fixture-only-key'
-    writeFileSync(join(directory,'config.toml'),`model=${JSON.stringify(modelId)}\nmodel_provider=${JSON.stringify(provider)}\n${nativeApi?'forced_login_method="api"\ncli_auth_credentials_store="file"\n':''}model_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.${provider}]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nexperimental_bearer_token=${JSON.stringify(apiKey)}\n`)
+    writeFileSync(join(directory,'config.toml'),`model=${JSON.stringify(modelId)}\nmodel_provider=${JSON.stringify(provider)}\nforced_login_method="api"\ncli_auth_credentials_store="file"\nmodel_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.${provider}]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nexperimental_bearer_token=${JSON.stringify(apiKey)}\n`)
     if(nativeApi)writeFileSync(join(directory,'auth.json'),JSON.stringify({auth_mode:'apikey',OPENAI_API_KEY:apiKey})+'\n',{mode:0o600})
     let nativeUltra
-    if(!nativeApi&&supports('ultra')){
+    if(!forkSmoke&&!nativeApi&&supports('ultra')){
       const reference=join(root,'native-reference');mkdirSync(reference,{mode:0o700})
       writeFileSync(join(reference,'config.toml'),readFileSync(join(directory,'config.toml')))
       const before=requests.length
@@ -82,20 +97,20 @@ async function main(){
         console.log(JSON.stringify({stage:'native-ultra-reference',request:nativeUltra}))
       }finally{clearTimeout(timeout);if(cli.exitCode===null)cli.kill('SIGKILL')}
     }
-    const hook=prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce})
+    const hook=unmodified?undefined:prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce})
     if(features.length)assert.ok(hook,inspection.reason)
     else assert.equal(hook,undefined,inspection.reason)
-    plan={application,executable,directory,desktopDirectory,workingDirectory:root,args:['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling'],nonce,mode:'desktop',speedMenuHook:hook,cdpPort}
+    plan={application,executable,directory,desktopDirectory,workingDirectory:root,args:['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling',...(!hook?[`--remote-debugging-port=${cdpPort}`,'--remote-debugging-address=127.0.0.1']:[])],nonce,mode:'desktop',speedMenuHook:hook,cdpPort}
     const child=await runtime.launch(plan,new AbortController().signal)
     let target
     for(let i=0;i<150&&!target;i++){
-      const targets=await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()
+      const targets=await fetch(`http://127.0.0.1:${cdpPort}/json/list`).then(response=>response.json()).catch(()=>[])
       target=targets.find(t=>t.type==='page'&&(t.url.startsWith('app://-/')||t.url==='about:blank'||t.url===''))
       if(!target)await delay(100)
     }
     assert.ok(target,'isolated client page target was not created');socket=new WebSocket(target.webSocketDebuggerUrl)
     await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true})})
-    let id=0;const pending=new Map(),diagnostics=[]
+    let id=0;const pending=new Map()
     socket.addEventListener('message',e=>{const v=JSON.parse(String(e.data));if(v.id&&pending.has(v.id)){pending.get(v.id)(v);pending.delete(v.id)}else if(['Runtime.exceptionThrown','Log.entryAdded'].includes(v.method))diagnostics.push(v)})
     const call=async(method,params={})=>{const messageId=++id;const result=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(messageId);reject(new Error('native CDP command timeout'))},10000);pending.set(messageId,v=>{clearTimeout(timer);resolve(v)});socket.send(JSON.stringify({id:messageId,method,params}))});if(result.error)throw new Error(result.error.message);return result.result}
     const evaluate=async expression=>(await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true})).result.value
@@ -117,7 +132,12 @@ async function main(){
     }else console.log('No optional Codex UI capability was detected; the official UI remains unmodified')
     if(supports('locale'))assert.equal(await wait('document.documentElement.lang.startsWith("zh")&&document.documentElement.lang'),'zh-CN')
     const click=async expression=>{
-      const point=await evaluate(`(()=>{const el=${expression};if(!el)return null;const r=el.getBoundingClientRect();return r.width&&r.height?{x:r.x+r.width/2,y:r.y+r.height/2}:null})()`)
+      const geometry=`(()=>{const el=${expression};if(!el||el.disabled)return null;const r=el.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2;return r.width&&r.height&&el.contains(document.elementFromPoint(x,y))?{x,y}:null})()`
+      let point,previous;const deadline=Date.now()+10000
+      do{
+        previous=point;await delay(100);point=await evaluate(geometry)
+        assert.ok(Date.now()<deadline,'native control did not settle: '+expression)
+      }while(!point||!previous||Math.abs(point.x-previous.x)>0.5||Math.abs(point.y-previous.y)>0.5)
       assert.ok(point,'native control missing: '+expression)
       await call('Input.dispatchMouseEvent',{type:'mouseMoved',...point})
       await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point})
@@ -133,13 +153,14 @@ async function main(){
       await capture('codex-model-menu.png')
     }
     const chooseSpeed=async fast=>{
-      await wait('!!document.querySelector("[data-fast-mode-enabled]")')
-      const direct=await evaluate('!!document.querySelector("[data-fast-mode-enabled][role=menuitemcheckbox]")')
+      const toggle='Array.from(document.querySelectorAll("[role=menuitemcheckbox][aria-checked]")).find(el=>el.hasAttribute("data-fast-mode-enabled")||/fast|standard|快速|标准|普通|加速/i.test(el.getAttribute("aria-label")||""))'
+      await wait(`!!document.querySelector("[data-fast-mode-enabled]")||!!(${toggle})`)
+      const direct=await evaluate(`!!(${toggle})`)
       if(direct){
-        const enabled=await evaluate('document.querySelector("[data-fast-mode-enabled][role=menuitemcheckbox]").getAttribute("aria-checked")==="true"')
-        if(enabled!==fast)await click('document.querySelector("[data-fast-mode-enabled][role=menuitemcheckbox]")')
-        await wait(`document.querySelector("[data-fast-mode-enabled][role=menuitemcheckbox]")?.getAttribute("aria-checked")===${JSON.stringify(String(fast))}`)
-        console.log(JSON.stringify({stage:'speed-toggle',fast,label:await evaluate('document.querySelector("[data-fast-mode-enabled][role=menuitemcheckbox]").getAttribute("aria-label")')}))
+        const enabled=await evaluate(`(${toggle}).getAttribute("aria-checked")==="true"`)
+        if(enabled!==fast)await click(toggle)
+        await wait(`(${toggle})?.getAttribute("aria-checked")===${JSON.stringify(String(fast))}`)
+        console.log(JSON.stringify({stage:'speed-toggle',fast,label:await evaluate(`(${toggle}).getAttribute("aria-label")`)}))
       }else{
         await click('document.querySelector("[data-fast-mode-enabled]").closest("[role=menuitem]")')
         await wait('Array.from(document.querySelectorAll("[role=menuitemradio],[role=menuitem]")).some(el=>el.innerText.startsWith("Fast"))')
@@ -152,7 +173,11 @@ async function main(){
       const before=requests.length
       await click('document.querySelector("[contenteditable=true]")')
       await call('Input.insertText',{text})
-      await click('Array.from(document.querySelectorAll("button")).find(b=>{const label=(b.getAttribute("aria-label")||"").trim();return !b.disabled&&/^(发送|Send|Submit)$/i.test(label)})||document.querySelector("button[type=submit]:not([disabled])")')
+      await delay(300)
+      await wait('Array.from(document.querySelectorAll("button")).some(b=>!b.disabled&&/^(发送|Send|Submit)$/i.test((b.getAttribute("aria-label")||"").trim()))||!!document.querySelector("button[type=submit]:not([disabled])")')
+      // Activate the real enabled button directly: a worktree fork can finish
+      // rearranging its composer after the pointer coordinates were measured.
+      assert.equal(await evaluate('(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>{const label=(b.getAttribute("aria-label")||"").trim();return !b.disabled&&/^(发送|Send|Submit)$/i.test(label)})||document.querySelector("button[type=submit]:not([disabled])");if(!b)return false;b.click();return true})()'),true)
       const deadline=Date.now()+60000
       let request
       while(!(request=requests.slice(before).find(request=>request.prompt===text))){assert.ok(Date.now()<deadline,'native request was not sent: '+JSON.stringify(requests.slice(before)));await delay(100)}
@@ -166,6 +191,10 @@ async function main(){
     }else if(supports('ultra'))await key('Escape')
     const standard=await send('Reply with one sentence for the standard compatibility test.')
     assert.ok(standard.serviceTier==null||standard.serviceTier==='default',JSON.stringify(requests))
+    if(forkSmoke){
+      await require('./smoke-codex-fork.cjs')({evaluate,wait,click,send,capture,directory,root,diagnostics})
+      return
+    }
     let accelerated
     if(supports('speed')){
       await openModelMenu()
@@ -196,13 +225,8 @@ async function main(){
       assert.equal(ultra.multiAgentMode,nativeUltra.multiAgentMode)
       assert.notEqual(ultra.multiAgentMode,standard.multiAgentMode)
       assert.equal(ultra.serviceTier,supports('speed')?'priority':standard.serviceTier,JSON.stringify(requests))
-      // Recent configurations are recorded on submission in newer clients.
-      // Verify the persisted selection after a real turn, then reload the UI
-      // and send again without selecting Ultra a second time.
-      const saved=JSON.parse(readFileSync(join(directory,'.codex-global-state.json'),'utf8'))
-      const recent=saved['electron-persisted-atom-state']['composer-recent-model-configurations-v1']
-      assert.equal(recent[0].model,'gpt-6.1-sol')
-      assert.equal(recent[0].reasoningEffort,'ultra')
+      // Verify persistence through the native UI and a new request after a
+      // reload; clients may store preferences in JSON or SQLite.
       await call('Page.reload')
       // The desktop router restores the home screen after a page reload.
       // Reopen the same persisted thread before checking its reasoning preset.
@@ -226,6 +250,7 @@ async function main(){
     console.log(JSON.stringify({stage:'verified',mode:nativeApi?'native-api':'local-api',version:inspection.version,features,language:await evaluate('document.documentElement.lang'),requests}))
     console.log(`Native Codex smoke passed for detected capabilities: ${features.join(', ')||'none (official UI)'}`)
   }catch(error){
+    console.error(JSON.stringify({stage:'native-failure',diagnostics:diagnostics.slice(-20)}))
     await capture('codex-failure.png').catch(()=>{})
     const evidence=process.env.CML_CODEX_UI_EVIDENCE
     if(evidence){

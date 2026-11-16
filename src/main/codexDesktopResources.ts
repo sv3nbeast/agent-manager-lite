@@ -16,6 +16,35 @@ function nodes(root:Node,predicate:(node:Node)=>boolean):Node[]{
 const member=(node:Node|undefined,key:string)=>node?.type==='MemberExpression'&&!node.computed&&node.property?.name===key
 const literal=(node:Node):unknown=>node.type==='Literal'?node.value:undefined
 
+/** Count page-protocol registrations, excluding handlers on a proven separate
+ * Electron session. New clients also register an app:// networking document in
+ * a disposable fromPartition session; it cannot serve the desktop renderer. */
+export function codexDesktopAppProtocolCount(source:string):number {
+  const program=parse(source,{ecmaVersion:'latest',sourceType:'script'}) as Node
+  let count=0
+  const visit=(node:Node,scope:Node)=>{
+    if(['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression'].includes(node.type))scope=node
+    if(node.type==='CallExpression'&&member(node.callee,'handle')&&member(node.callee.object,'protocol')){
+      const scheme=node.arguments[0],value=scheme?.type==='TemplateLiteral'&&scheme.expressions.length===0?scheme.quasis[0].value.cooked:scheme&&literal(scheme)
+      if(value==='app'){
+        const receiver=node.callee.object.object
+        const declarations=(scope.body?.body??[]).flatMap((statement:Node)=>statement.type==='VariableDeclaration'?statement.declarations:[])
+          .filter((declaration:Node)=>receiver.type==='Identifier'&&declaration.id?.name===receiver.name)
+        const init=declarations.length===1?declarations[0].init:undefined
+        const isolated=init?.type==='CallExpression'&&member(init.callee,'fromPartition')&&member(init.callee.object,'session')&&
+          !nodes(scope,n=>n.type==='AssignmentExpression'&&n.left?.name===receiver.name||n.type==='UpdateExpression'&&n.argument?.name===receiver.name).length
+        if(!isolated)count++
+      }
+    }
+    for(const value of Object.values(node)){
+      if(value&&typeof value==='object'&&typeof value.type==='string')visit(value,scope)
+      else if(Array.isArray(value))for(const child of value)if(child&&typeof child.type==='string')visit(child,scope)
+    }
+  }
+  visit(program,program)
+  return count
+}
+
 /** Read the bundler's chunk filename contract without executing client code.
  * Both CommonJS split entries and Webpack's static filename map are supported.
  * Paths, map size and expression forms are deliberately bounded. */

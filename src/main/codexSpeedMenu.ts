@@ -6,7 +6,8 @@ import * as nodeFS from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname,join,isAbsolute,relative,sep} from 'node:path'
 import {parse as parseScript} from 'acorn'
-import {codexDesktopStartupImports} from './codexDesktopResources'
+import {codexDesktopAppProtocolCount,codexDesktopStartupImports} from './codexDesktopResources'
+import {codexForkPlacementContract,codexForkPlacementReplacements} from './codexForkCompatibility'
 import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiDynamicImports,codexUiFeatures,codexUiLocaleProviderSupported,codexUiRspackHasServiceTierConsumer,codexUiRspackLocaleReplacements,codexUiRspackMapperModule,codexUiRspackModules,codexUiRspackServiceTierHookReplacements,codexUiRspackServiceTierMapperModule,codexUiRspackUltraCatalogueReplacements,codexUiRspackUltraGateReplacements,codexUiStaticImports,detectCodexUiCapabilities,type CodexUiFeature,type CodexUiFeatureSupports,type CodexUiReplacement} from './codexUiCapabilities'
 
 const rawFS:typeof nodeFS=process.versions.electron?createRequire(join(dirname(process.execPath),'cml-runtime.cjs'))('original-fs'):nodeFS
@@ -34,6 +35,7 @@ type CodexReleaseProfile={
   // statically. Patch every copy so the live one is always covered.
   separateSpeedResources?:ReadonlyArray<{id:string;asset:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}>
   separateUltraResources?:ReadonlyArray<{id:string;asset:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}>
+  forkResources?:ReadonlyArray<{id:string;asset:string;url:string;source:string;sourceBody:string;replacements:readonly CodexSpeedReplacement[];patchedSha256:string}>
 }
 const legacySpeedReplacements=[
   {begin:'function TRa(e){',end:'}var ERa;',before:'a=i?.authMethod===`chatgpt`,o=',after:'a=i?.authMethod===`chatgpt`||i?.authMethod===`apikey`||r===`local`&&i?.authMethod===null&&i?.requiresAuth===!1,o='},
@@ -186,6 +188,7 @@ export interface CodexSpeedMenuInspection {
   transport?:'preload'|'cdp'
   features?:readonly CodexUiFeature[]
   featureSupport?:CodexUiFeatureSupports
+  forkCompatibility?:boolean
 }
 export interface CodexSpeedMenuInspectOptions {application:string;executable:string;platform?:NodeJS.Platform;enhancements?:CodexSpeedMenuEnhancements;features?:readonly CodexUiFeature[]}
 export interface CodexSpeedMenuReader {
@@ -463,9 +466,8 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
       startup.push({path,body})
     }
     if(!startup.some(({body})=>/require\(["']electron["']\)/.test(body))||!startup.some(({body})=>body.includes('CODEX_ELECTRON_USER_DATA_PATH')))return fail('Codex 桌面隔离接口已变化')
-    const protocolSources=startup
-      .filter(entry=>/\.protocol\.handle\(\s*["'`]app["'`]\s*,/.test(entry.body))
-    if(protocolSources.length!==1)return fail('Codex 应用协议注册方式尚未适配')
+    const protocolSources=startup.map(entry=>({...entry,count:codexDesktopAppProtocolCount(entry.body)})).filter(entry=>entry.count>0)
+    if(protocolSources.length!==1||protocolSources[0].count!==1)return fail('Codex 应用协议注册方式尚未适配')
     parts.push(digest(html),digest(early),...startup.map(({path,body})=>[path,digest(body)]),protocolSources[0].path)
     const audited=version?releaseByVersion.get(version):undefined
     let asset=audited?.asset,source:string|undefined
@@ -659,15 +661,29 @@ export function inspectCodexDesktopUi(options:CodexSpeedMenuInspectOptions,reade
         }
       }
     }catch{/* Ambiguous or unreachable speed chunk stays on the official page. */}
+    let forkResources:CodexReleaseProfile['forkResources']
+    try{
+      const contract=codexForkPlacementContract(source!)
+      if(contract&&entryScriptsForGraph.length>1){
+        const chunks=walkRspackChunks(reader,archive,entryScriptsForGraph,body=>body.includes('App-server fork is not ready:')&&body.includes('forkConversationFromLatest')&&body.includes('readResumeInputs'),'all',4)
+        const copies=chunks.flatMap(chunk=>codexUiRspackModules(chunk.source).filter(module=>module.source.includes('App-server fork is not ready:')&&module.source.includes('readResumeInputs')).map(module=>({chunk,module,replacements:codexForkPlacementReplacements(module.source,contract)})))
+        // The same module is inlined into several chunks. Any of those copies
+        // can register first, so patch the verified role in every copy.
+        if(copies.length&&new Set(copies.map(copy=>copy.module.id)).size===1&&copies.every(copy=>copy.replacements.length===2)){
+          forkResources=copies.map(({chunk,module,replacements})=>rspackFeatureResource(reader,chunk.asset,chunk.source,offsetRspackReplacements(replacements,module.start)))
+        }
+      }
+      if(forkResources)for(const resource of forkResources)parts.push(resource.asset,resource.source,resource.patchedSha256,resource.replacements)
+    }catch{/* Unknown placement contracts keep the original client behavior. */}
     const features=requested.filter(f=>featureSupport[f].supported)
     const separated=(feature:CodexUiFeature):boolean=>(feature==='locale'&&!!localeResource)||(feature==='speed'&&!!speedResources)||(feature==='ultra'&&!!ultraResources)
     const replacements=features.filter(feature=>!separated(feature)).flatMap(f=>detected.replacements[f]).sort((a,b)=>(b.offset??0)-(a.offset??0))
     parts.push(featureSupport,features,replacements)
-    if(!features.length)return {...fail('客户端页面功能结构尚未兼容'),featureSupport}
-    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:assetUrl(asset),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{}),...(speedResources?{separateSpeedResources:speedResources}:{}),...(ultraResources?{separateUltraResources:ultraResources}:{})}
+    if(!features.length&&!forkResources?.length)return {...fail('客户端页面功能结构尚未兼容'),featureSupport}
+    const profile:CodexReleaseProfile={id:'capabilities',version:version??'',injection:wires[0][4]===49?'preload':'cdp',asset,url:assetUrl(asset),source:sourceDigest,patched:{speed:'',locale:'','speed-locale':''},earlyBootstrap:pkg.main,bootstrap,speedReplacements:[],replacements,...(localeResource?{separateLocaleResource:localeResource}:{}),...(speedResources?{separateSpeedResources:speedResources}:{}),...(ultraResources?{separateUltraResources:ultraResources}:{}),...(forkResources?{forkResources}:{})}
     const patchedDigest=digest(patchSemantic(source!,replacements))
     profile.patched={speed:patchedDigest,locale:patchedDigest,'speed-locale':patchedDigest}
-    const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:options.enhancements??'speed-locale',transport:profile.injection})
+    const result:CodexSpeedMenuInspection=Object.freeze({supported:true,reason:features.length===requested.length?'所选功能已通过兼容检测':'部分功能可用，请查看各项兼容状态',fingerprint:hash(JSON.stringify(parts)),version,features,featureSupport,...(forkResources?{forkCompatibility:true}:{}),assetURL:profile.url,sourceSha256:sourceDigest,patchedSha256:patchedDigest,enhancements:options.enhancements??'speed-locale',transport:profile.injection})
     checked.set(result,{options:{...options,features:requested},reader,profile,features})
     if(cacheKey){if(inspectionCache.size>=16)inspectionCache.delete(inspectionCache.keys().next().value!);inspectionCache.set(cacheKey,result)}
     return result
@@ -790,6 +806,7 @@ export function prepareCodexSpeedMenu(options:CodexSpeedMenuPrepareOptions):Code
     if(activeFeatures.includes('locale')&&profile.separateLocaleResource){const resource=profile.separateLocaleResource;groups.push({id:resource.id,url:resource.url,source:resource.source,sourceBody:resource.sourceBody,replacements:resource.replacements,patchedSha256:resource.patchedSha256})}
     if(activeFeatures.includes('speed')&&profile.separateSpeedResources)for(const resource of profile.separateSpeedResources)groups.push({id:resource.id,url:resource.url,source:resource.source,sourceBody:resource.sourceBody,replacements:resource.replacements,patchedSha256:resource.patchedSha256})
     if(activeFeatures.includes('ultra')&&profile.separateUltraResources)for(const resource of profile.separateUltraResources)groups.push({id:resource.id,url:resource.url,source:resource.source,sourceBody:resource.sourceBody,replacements:resource.replacements,patchedSha256:resource.patchedSha256})
+    if(profile.forkResources)groups.push(...profile.forkResources)
     const grouped=new Map<string,{id:string;url:string;source:string;sourceBody:string;replacements:CodexSpeedReplacement[]}>()
     for(const group of groups){
       const current=grouped.get(group.id)??{id:group.id,url:group.url,source:group.source,sourceBody:group.sourceBody,replacements:[]}

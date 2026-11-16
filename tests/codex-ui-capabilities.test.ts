@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {applyCodexUiReplacements,codexUiAccessMapperImportPaths,codexUiRspackHasServiceTierConsumer,codexUiRspackLocaleReplacements,codexUiRspackModules,codexUiRspackServiceTierHookReplacements,codexUiRspackServiceTierMapperModule,codexUiRspackUltraCatalogueReplacements,codexUiRspackUltraGateReplacements,detectCodexUiCapabilities,type CodexUiFeature} from '../src/main/codexUiCapabilities'
 import {inspectCodexDesktopUi,inspectCodexSpeedMenu,prepareCodexSpeedMenu,type CodexSpeedMenuReader} from '../src/main/codexSpeedMenu'
+import {forkPlacementFixture,forkWrapper} from './fixtures/codex-fork-placement'
 
 // A synthetic module models semantic roles without copying an upstream bundle.
 const source=[
@@ -75,6 +76,26 @@ test('semantic detection survives function names and accepts an unregistered 26.
   assert.deepEqual(result.features,['locale','speed','ultra']);assert.equal(Object.values(result.featureSupport!).every(f=>f.supported),true)
   const hook=prepareCodexSpeedMenu({inspection:result,directory:f.home,desktopDirectory:f.desktop,executable:f.options.executable,nonce:randomUUID()})!
   assert.ok(hook);assert.equal(readFileSync(hook.patchedBody!,'utf8'),patches(renamed).body)
+})
+
+test('fork readiness compatibility is independent of optional menu capabilities',t=>{
+  for(const menus of [true,false]){
+    const body=menus?forkPlacementFixture.replace('={','={menus(e,t,r){'+source+'},'):'const anchors='+JSON.stringify(source)+';'+forkPlacementFixture
+    const f=fixture(t,body),hashes=Object.fromEntries(Array.from({length:1100},(_,i)=>[String(i),'fixture']))
+    f.entries.set('webview/index.html',Buffer.from('<script src="./assets/a.js"></script><script src="./assets/b.js"></script>'))
+    f.entries.set('webview/assets/a.js',Buffer.from(`r.u=id=>"assets/async/"+id+"."+(${JSON.stringify(hashes)})[id]+".js";r.e(100)`))
+    f.entries.set('webview/assets/b.js',Buffer.from('export const b=1'))
+    f.entries.set('webview/assets/async/100.fixture.js',Buffer.from(body+';r.e(101)'))
+    f.entries.set('webview/assets/async/101.fixture.js',Buffer.from(`export const __webpack_modules__={forkModule(e,t,n){${forkWrapper}}}`))
+    const inspection=f.inspect()
+    assert.equal(inspection.supported,true)
+    assert.equal(inspection.forkCompatibility,true)
+    const hook=prepareCodexSpeedMenu({inspection,directory:f.home,desktopDirectory:f.desktop,executable:f.options.executable,nonce:randomUUID()})!
+    assert.ok(hook)
+    const manifest=JSON.parse(readFileSync(hook.manifest,'utf8'))
+    assert.equal(manifest.resources.length,2,'all registered copies must be covered')
+    for(const resource of manifest.resources)assert.match(readFileSync(resource.patchedBodyPath,'utf8'),/__cmlReadForkAtoms/)
+  }
 })
 
 test('module-level arrows and function expressions remain compatible after a client update',t=>{
