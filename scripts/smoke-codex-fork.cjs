@@ -53,6 +53,7 @@ module.exports=async({evaluate,capture,click,wait,send,directory,root,diagnostic
       assert.equal(realpathSync(resolve(created.cwd,common)),realpathSync(join(root,'.git')))
     }
     await wait('document.body.innerText.includes("Compatibility check complete.")&&!/正在创建聊天|Creating chat/.test(document.body.innerText)')
+    if(mode==='worktree')await wait(`document.body.innerText.includes(${JSON.stringify(created.cwd)})&&!/正在创建聊天|Creating chat/.test(document.body.innerText)`)
     await delay(2000)
     const prompt=`Continue the ${mode} fork fixture. Reply with one sentence without tools.`
     await send(prompt)

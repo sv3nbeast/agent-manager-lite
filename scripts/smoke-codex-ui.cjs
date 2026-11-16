@@ -174,10 +174,11 @@ async function main(){
       await click('document.querySelector("[contenteditable=true]")')
       await call('Input.insertText',{text})
       await delay(300)
-      await wait('Array.from(document.querySelectorAll("button")).some(b=>!b.disabled&&/^(发送|Send|Submit)$/i.test((b.getAttribute("aria-label")||"").trim()))||!!document.querySelector("button[type=submit]:not([disabled])")')
+      const submit='Array.from(document.querySelectorAll("button")).find(b=>{const label=(b.getAttribute("aria-label")||"").trim(),r=b.getBoundingClientRect();return !b.disabled&&(/^(发送|Send|Submit)$/i.test(label)||b.type==="submit")&&r.width>0&&r.height>0&&b.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})'
+      await wait(`!!(${submit})`)
       // Activate the real enabled button directly: a worktree fork can finish
       // rearranging its composer after the pointer coordinates were measured.
-      assert.equal(await evaluate('(()=>{const b=Array.from(document.querySelectorAll("button")).find(b=>{const label=(b.getAttribute("aria-label")||"").trim();return !b.disabled&&/^(发送|Send|Submit)$/i.test(label)})||document.querySelector("button[type=submit]:not([disabled])");if(!b)return false;b.click();return true})()'),true)
+      assert.equal(await evaluate(`(()=>{const b=${submit};if(!b)return false;b.click();return true})()`),true)
       const deadline=Date.now()+60000
       let request
       while(!(request=requests.slice(before).find(request=>request.prompt===text))){assert.ok(Date.now()<deadline,'native request was not sent: '+JSON.stringify(requests.slice(before)));await delay(100)}
