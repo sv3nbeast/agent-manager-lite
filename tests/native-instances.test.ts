@@ -375,6 +375,50 @@ test('API/PAT native modes use real file shapes, support repeated starts, and do
   assert.equal(f.children.size,0);assert.equal(f.store.read().clientSwitches?.length,0)
 })
 
+test('a stopped official-account instance can switch to a legacy API account and back without losing its original files',async t=>{
+  const f=fixture(t),api=createAPIAccount({name:'Legacy API',apiKey:'fixture-legacy-key',baseUrl:'https://legacy.invalid/v1',models:['api-model'],wireApi:'responses'})
+  delete api.identityService;delete api.protocol;delete api.credentialKind
+  importParsedAccounts(f.store,[api])
+  const instance=f.add(),configFile=join(instance.directory,'config.toml'),authFile=join(instance.directory,'auth.json')
+  const original='model="original-model"\nforced_login_method="chatgpt"\n[tools]\nfuture=true\n'
+  writeFileSync(configFile,original)
+  await f.start(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  writeFileSync(authFile,auth('alpha','before-api-switch',7200))
+  await f.instances.stop(instance.id)
+  assert.equal(readFileSync(configFile,'utf8'),original)
+  assert.equal(existsSync(authFile),false)
+  const change=(accountId:string,model:string)=>{
+    const view=f.instances.views()[0]
+    f.instances.save({id:view.id,revision:view.revision,details:{name:view.name,accountId,applicationId:f.app.id,connectionMode:'native',model,defaultTier:'standard',extraArgs:[]}})
+  }
+  change(api.id,'api-model')
+  for(let launch=0;launch<2;launch++){
+    await f.start(instance.id)
+    const view=f.instances.views()[0]
+    assert.equal(view.status,'running',view.error)
+    assert.equal(view.identityStatus,'native_verified')
+    assert.equal(view.directory,instance.directory)
+    const doc=new TomlDocument(readFileSync(configFile,'utf8')),projected=JSON.parse(readFileSync(authFile,'utf8'))
+    assert.equal(doc.scalar(['forced_login_method']),'api')
+    assert.equal(doc.scalar(['model_providers','cml_native_account','base_url']),api.baseUrl)
+    assert.equal(projected.OPENAI_API_KEY,api.credentials.apiKey)
+    assert.equal(projected.tokens,undefined)
+    await f.instances.stop(instance.id)
+    assert.equal(readFileSync(configFile,'utf8'),original)
+    assert.equal(existsSync(authFile),false)
+    assert.equal(f.store.read().clientSwitches?.length,0)
+    assert.equal(f.store.read().clientAuthorities?.length,0)
+  }
+  change(f.alpha.id,'native-model')
+  await f.start(instance.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.equal(JSON.parse(readFileSync(authFile,'utf8')).tokens.refresh_token,'fixture-native-rt-before-api-switch')
+  assert.equal(new TomlDocument(readFileSync(configFile,'utf8')).scalar(['model_provider']),'openai')
+  await f.instances.stop(instance.id)
+  assert.equal(readFileSync(configFile,'utf8'),original)
+})
+
 test('native API projects an instance catalog when the supplier model is absent from the embedded Codex catalog',async t=>{
   const f=fixture(t),api=createAPIAccount({name:'Unknown model API',apiKey:'fixture-unknown-model-key',baseUrl:'https://unknown-model.invalid/v1',models:['vendor/unknown-model'],wireApi:'responses',defaultTier:'standard'})
   importParsedAccounts(f.store,[api])

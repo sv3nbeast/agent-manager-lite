@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import {spawn} from 'node:child_process'
 import {createServer} from 'node:http'
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync,realpathSync,existsSync} from 'node:fs'
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,realpathSync,existsSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join,isAbsolute} from 'node:path'
 import {randomUUID} from 'node:crypto'
@@ -13,7 +13,7 @@ import {Store} from '../src/main/store'
 import {ClientConfigs} from '../src/main/clientConfig'
 import {ClientSwitches} from '../src/main/clientSwitch'
 import {TokenAuthority} from '../src/main/tokens'
-import {createAPIAccount,importParsedAccounts} from '../src/main/accounts'
+import {createAPIAccount,importParsedAccounts,parseAccountImport} from '../src/main/accounts'
 
 async function main(){
 const selected=process.env.CML_TEST_CODEX_BINARY
@@ -72,24 +72,37 @@ async function run(extra:string[]=[]){
   finally{if(timer)clearTimeout(timer);await runtime.stop(plan);if(child)children.delete(child)}
 }
 try{
-  writeFileSync(join(client,'config.toml'),'cli_auth_credentials_store="file"\nmodel="gpt-5.5"\nweb_search="disabled"\n[analytics]\nenabled=false\n')
+  const originalConfig='cli_auth_credentials_store="file"\nforced_login_method="chatgpt"\nmodel="gpt-5.5"\nweb_search="disabled"\n[analytics]\nenabled=false\n'
+  const jwt='fixture.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+3600,'https://api.openai.com/auth':{chatgpt_account_id:'fixture-workspace',chatgpt_user_id:'fixture-user'}})).toString('base64url')+'.signature'
+  const originalAuth=JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:jwt,id_token:jwt,refresh_token:'fixture-refresh',account_id:'fixture-workspace'}})
+  writeFileSync(join(client,'config.toml'),originalConfig)
+  writeFileSync(join(client,'auth.json'),originalAuth)
   const first=createAPIAccount({name:'Native first',apiKey:'fixture-first-key',baseUrl:`http://127.0.0.1:${address.port}/first/v1`,models:['gpt-5.5'],wireApi:'responses',defaultTier:'fast',tags:[],note:''})
   const second=createAPIAccount({name:'Native second',apiKey:'fixture-second-key',models:['gpt-5.5'],wireApi:'responses',tags:[],note:'',baseUrl:`http://127.0.0.1:${address.port}/second/v1`,defaultTier:'standard'})
+  // Existing vaults can have no explicit identity/protocol metadata at all.
+  delete first.identityService;delete first.protocol;delete first.credentialKind
   // createAPIAccount validates the public input; do not pass stored fields.
-  importParsedAccounts(store,[first,second])
+  importParsedAccounts(store,[...parseAccountImport(originalAuth).accounts,first,second])
   await switches.applyWhenClosed({ticket:switches.preview({targetId:target.id,accountId:first.id}).ticket,clientClosed:true})
   await run();await run(['-c','service_tier="default"']);await run(['-c','service_tier="flex"']);await run(['-c','service_tier="auto"'])
   await switches.applyWhenClosed({ticket:switches.preview({targetId:target.id,accountId:second.id}).ticket,clientClosed:true})
   await run()
+  await switches.applyWhenClosed({ticket:switches.previewRestore({targetId:target.id}).ticket,clientClosed:true})
+  await run()
+  await switches.applyWhenClosed({ticket:switches.previewRestore({targetId:target.id}).ticket,clientClosed:true})
+  assert.equal(readFileSync(join(client,'config.toml'),'utf8'),originalConfig)
+  assert.deepEqual(JSON.parse(readFileSync(join(client,'auth.json'),'utf8')).tokens,JSON.parse(originalAuth).tokens)
+  assert.equal(switches.views().length,0)
   // Observe the actual native consumer: Fast and explicit Flex reach the API.
   assert.deepEqual(seen,[
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:'priority',model:'gpt-5.5'},
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:undefined,model:'gpt-5.5'},
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:'flex',model:'gpt-5.5'},
     {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:undefined,model:'gpt-5.5'},
-    {path:'/second/v1/responses',key:'Bearer fixture-second-key',tier:undefined,model:'gpt-5.5'}
+    {path:'/second/v1/responses',key:'Bearer fixture-second-key',tier:undefined,model:'gpt-5.5'},
+    {path:'/first/v1/responses',key:'Bearer fixture-first-key',tier:'priority',model:'gpt-5.5'}
   ])
-  console.log('Native Codex CLI passed: generated terminal command, verified native PID, file config, real SSE reply, API endpoint/key switch, Fast=priority and explicit flex; only loopback fixture upstream.')
+  console.log('Native Codex CLI passed: generated terminal command, verified native PID, file config, real SSE reply, synthetic OAuth to legacy API switch and restoration, API endpoint/key switch, Fast=priority and explicit flex; only loopback fixture upstream.')
 }finally{
   for(const child of children)child.kill('SIGKILL')
   await tokens.stop();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()))

@@ -33,10 +33,22 @@ export function compareIdentity(left:IdentitySummary,right:IdentitySummary):'mat
   return left.email.toLowerCase()===right.email.toLowerCase()?'matched':'mismatched'
 }
 
+function apiIdentityType(account:StoredAccount) {
+  // Missing metadata denotes a legacy OpenAI connection, as in account import.
+  // Resolve defaults only for comparison; preserve explicit types and the vault.
+  const identityService=account.identityService??'openai'
+  return {identityService,
+    protocol:account.protocol??(identityService==='anthropic'?'anthropic_messages':account.wireApi==='chat_completions'?'openai_chat_completions':'openai_responses'),
+    credentialKind:account.credentialKind??(identityService==='anthropic'?'anthropic_api_key':'openai_api_key')}
+}
+
 export function sameNativeAccount(a:StoredAccount,b:StoredAccount):boolean {
   if(a.kind!==b.kind)return false
-  if(a.kind==='api_key')return a.identityService===b.identityService&&a.protocol===b.protocol&&a.credentialKind===b.credentialKind
-    &&!!a.credentials.apiKey&&a.credentials.apiKey===b.credentials.apiKey&&providerEndpoint(a.baseUrl)===providerEndpoint(b.baseUrl)&&a.wireApi===b.wireApi
+  if(a.kind==='api_key'){
+    const left=apiIdentityType(a),right=apiIdentityType(b)
+    return left.identityService===right.identityService&&left.protocol===right.protocol&&left.credentialKind===right.credentialKind
+      &&!!a.credentials.apiKey&&a.credentials.apiKey===b.credentials.apiKey&&providerEndpoint(a.baseUrl)===providerEndpoint(b.baseUrl)&&a.wireApi===b.wireApi
+  }
   const left=accountIdentity(a),right=accountIdentity(b)
   if(strongIdentityConflict(left,right))return false
   if(compareIdentity(left,right)==='matched')return true

@@ -237,6 +237,31 @@ test('native API switching aligns key, endpoint and model and restores OAuth wit
   assert.equal(new TomlDocument(readFileSync(f.config,'utf8')).scalar(['openai_base_url']),'https://old-relay.invalid/v1')
 })
 
+test('legacy API identities remain identifiable through switching, restore and partial-write recovery',async t=>{
+  for(const failAt of [0,1,2]){
+    const f=fixture(t),account=api(f),original=readFileSync(f.config,'utf8')
+    f.store.transaction(state=>{
+      const legacy=state.accounts.find(value=>value.id===account.id)!
+      delete legacy.identityService;delete legacy.protocol;delete legacy.credentialKind
+    })
+    const preview=f.switches.preview({targetId:f.target.id,accountId:account.id})
+    if(failAt){
+      f.failWrite(failAt)
+      assert.throws(()=>f.apply(preview.ticket),/未完整提交/)
+    }else{
+      f.apply(preview.ticket)
+      assert.deepEqual((await f.identities.read({id:f.target.id})).matchedAccountIds,[account.id])
+      f.apply(f.switches.preview({targetId:f.target.id,accountId:f.next.id}).ticket)
+      f.restore()
+      assert.deepEqual((await f.identities.read({id:f.target.id})).matchedAccountIds,[account.id])
+    }
+    f.restore()
+    assert.equal(readFileSync(f.config,'utf8'),original)
+    assert.equal(JSON.parse(readFileSync(f.file,'utf8')).tokens.account_id,'old')
+    assert.equal(f.switches.views().length,0)
+  }
+})
+
 test('successive API switches inherit defaults correctly and unwind endpoint-key pairs even when keys are identical',t=>{
   const f=fixture(t),first=api(f),second=api(f,'Second API','https://second.invalid/v1')
   writeFileSync(f.config,'model="gpt-fixture"\n')
