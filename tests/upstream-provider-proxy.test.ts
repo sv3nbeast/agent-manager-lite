@@ -66,6 +66,23 @@ test('a failed API proxy returns an error without reaching a reachable direct up
   assert.ok(reply.status>=400);assert.equal(direct,0)
 })
 
+test('an explicit instance opt-out bypasses account and global proxies without changing their settings',async t=>{
+  const f=fixture(t);let direct=0
+  const target=await server(t,(_req,res)=>{direct++;res.setHeader('Content-Type','application/json');res.end(JSON.stringify(response()))})
+  f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:'http://127.0.0.1:1'}})
+  const account=createAPIAccount({name:'API',apiKey:'fixture-key',baseUrl:target+'/v1',models:['fixture-model'],wireApi:'responses'})
+  account.proxy={mode:'resource',resourceId:randomUUID()}
+  const before=JSON.stringify(account.proxy),gateway=f.gateway()
+  const status=await gateway.start({id:randomUUID(),port:0,account,apiKey:'fixture-client-key',injectNetworkProxy:false},f.store.read().settings)
+  assert.equal((await conversation(status.port!,'fixture-client-key')).status,200)
+  assert.equal(direct,1)
+  const manifest=JSON.parse(readFileSync(join(gateway.runtimeDirectory()!,'manifest.json'),'utf8'))
+  assert.equal(manifest.apiKeys[0].providerGateway.proxyUrl,'direct')
+  assert.equal(JSON.stringify(account.proxy),before)
+  assert.equal(f.store.proxyState().upstreamProxy?.url,'http://127.0.0.1:1')
+  await assert.rejects(f.gateway().start({id:randomUUID(),port:0,account,apiKey:'fixture-client-key'},f.store.read().settings),/代理资源/)
+})
+
 test('OAuth and Agent Identity auth projections retain the selected upstream proxy',async t=>{
   const f=fixture(t),proxy='http://127.0.0.1:1/'
   f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:proxy}})
@@ -74,10 +91,12 @@ test('OAuth and Agent Identity auth projections retain the selected upstream pro
     {agent_identity:{agent_runtime_id:'fixture-runtime',agent_private_key:privateKey,account_id:'fixture-org',chatgpt_user_id:'fixture-user',chatgpt_account_is_fedramp:true,task_id:'fixture-task'}}])).accounts
   assert.equal(accounts.length,2)
   for(const account of accounts){
-    const gateway=f.gateway();await gateway.start({id:randomUUID(),port:0,account,apiKey:'fixture-client'},f.store.read().settings)
-    const auth=JSON.parse(readFileSync(join(gateway.runtimeDirectory()!,'auth',account.id+'.json'),'utf8'))
-    assert.equal(auth.proxy_url,proxy)
-    await gateway.stop()
+    for(const injectNetworkProxy of [undefined,false]){
+      const gateway=f.gateway();await gateway.start({id:randomUUID(),port:0,account,apiKey:'fixture-client',injectNetworkProxy},f.store.read().settings)
+      const auth=JSON.parse(readFileSync(join(gateway.runtimeDirectory()!,'auth',account.id+'.json'),'utf8'))
+      assert.equal(auth.proxy_url,injectNetworkProxy===false?'direct':proxy)
+      await gateway.stop()
+    }
   }
 })
 

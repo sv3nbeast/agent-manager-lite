@@ -171,6 +171,18 @@ test('proxy accounts default to native and only invalid routes block continuing'
   assert.equal(ui.state.error, '')
 })
 
+test('launch preview describes the effective proxy opt-out for local API and native modes', t => {
+  const ui=mount();t.after(ui.unmount)
+  const network={mode:'proxy',source:'account',proxy:{protocol:'HTTP',server:'proxy.invalid',port:8080}}
+  ui.state.preview={connectionMode:'local_api',injectNetworkProxy:true}
+  assert.match(ui.state.previewNetworkLabel(network),/proxy\.invalid:8080/)
+  ui.state.setPreviewNetworkProxy(false)
+  assert.match(ui.state.previewNetworkLabel(network),/API 转发直连上游/)
+  assert.equal(ui.state.previewNetworkLabel(network).includes('proxy.invalid'),false)
+  ui.state.preview.connectionMode='native'
+  assert.match(ui.state.previewNetworkLabel(network),/客户端直连/)
+})
+
 test('inline login and provider creation select newly created resources with appropriate mode recommendations', async t => {
   const ui = mount([account('api_key')]); t.after(ui.unmount)
   ui.state.edit(); ui.state.addAccount()

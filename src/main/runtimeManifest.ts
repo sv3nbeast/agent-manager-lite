@@ -8,6 +8,7 @@ import type { QuotaReserveSettings } from '../shared/localAccess'
 
 export interface RuntimeProfile {
   id:string; port:number; account:StoredAccount; apiKey:string; defaultTier?:DefaultTier; providerTier?:DefaultTier
+  injectNetworkProxy?:boolean
   pool?:{settings:StoredLocalAccess;accounts:StoredAccount[];providerTiers:Record<string,DefaultTier|undefined>;tokenUsed:Record<string,number>}
 }
 export interface QuotaReserveRuntimeSnapshot {

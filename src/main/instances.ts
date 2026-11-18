@@ -492,7 +492,7 @@ export class Instances {
     const speedPreference=speedMenu?.supported?previewDesktopServiceTier(this.speedPreferenceOptions(profile.id,plan,tier.tier)):undefined
     const initialTier=speedPreference?speedPreference.tier:tier.tier
     const history=readInstanceHistory(plan.directory)
-    const proxyFingerprint=profile.connectionMode==='native'&&!injectNetworkProxy?undefined:accountProxyURL(account,state)
+    const proxyFingerprint=injectNetworkProxy?accountProxyURL(account,state):'direct'
     const fingerprint=digest([profile,view.revision,plan.application,plan.executable,plan.cliPackage,lstatSync(plan.executable).mtimeMs,lstatSync(plan.executable).ino,lstatSync(plan.workingDirectory).ino,
       ...[folder,plan.directory,plan.desktopDirectory].map(path=>[lstatSync(path).dev,lstatSync(path).ino]),
       account.id,account.kind,account.baseUrl,account.models,account.wireApi,account.credentials.apiKey,account.providerId,account.providerKeyId,providerName,language?.revision,modelContext.revision,proxyFingerprint,tier,
@@ -837,7 +837,7 @@ export class Instances {
       const gateway=this.gatewayFactory(run.profile);run.gateway=gateway
       const account={...context.account,models:[run.profile.model,...context.account.models.filter(model=>model!==run.profile.model)]}
       const status=await gateway.start({id:run.profile.id,port:0,account,apiKey:localKey,defaultTier:run.plan.speedMenuHook?'standard':run.profile.defaultTier,
-        providerTier:providerTierForAccount(this.store.read(),context.account)},this.store.read().settings,run.controller.signal)
+        providerTier:providerTierForAccount(this.store.read(),context.account),injectNetworkProxy:run.injectNetworkProxy!==false},this.store.read().settings,run.controller.signal)
       run.controller.signal.throwIfAborted()
       gateway.updateRoutingAccount(this.store.read().accounts.find(value=>value.id===run.profile.accountId)!)
       if(run.profile.externalHome)assertClientDaemonStopped(await probeClientDaemon(run.plan.directory,run.controller.signal))

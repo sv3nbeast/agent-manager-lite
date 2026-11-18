@@ -146,7 +146,9 @@ export class Gateway {
       // Freeze every route, including API keys, before creating the manifest.
       // Engine-backed routes retain their lease until this gateway stops.
       for(const account of profile.pool?.accounts??[profile.account]) {
-        let proxy=accountProxyURL(account,this.proxyState())
+        // An instance opt-out covers the whole managed request path. Use an
+        // explicit direct route so inherited environment proxies cannot win.
+        let proxy=profile.injectNetworkProxy===false?'direct':accountProxyURL(account,this.proxyState())
         if(proxy&&needsProxyTunnel(proxy)){
           if(!this.tunnels)throw new Error('代理引擎尚未接入')
           const lease=await this.tunnels.acquire(proxy,account.id,signal)

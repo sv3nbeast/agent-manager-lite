@@ -41,7 +41,7 @@ function fixture(t:Context,systemLanguages:readonly string[]=['en-US'],speedMenu
   const events:Record<string,unknown>[]=[]
   let prepare=async(id:string)=>store.read().accounts.find(value=>value.id===id)!
   let now=Date.now()
-  const create=(runtimeOverride?:DesktopRuntime)=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event));gateways.push(gateway);return gateway},id=>prepare(id),runtimeOverride??runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus)
+  const create=(runtimeOverride?:DesktopRuntime)=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event),undefined,()=>store.proxyState());gateways.push(gateway);return gateway},id=>prepare(id),runtimeOverride??runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus)
   const instances=create(),app=instances.registerApplication(application)
   t.after(async()=>{await instances.closeAll().catch(()=>{});await Promise.all(gateways.map(gateway=>gateway.stop()));await tokens.stop();rmSync(root,{recursive:true,force:true})})
   function account(url='http://127.0.0.1:9',key='fixture-upstream',models=['fixture-model']) {const a=createAPIAccount({name:`Account ${randomUUID()}`,apiKey:key,baseUrl:url,models,wireApi:'responses',defaultTier:'inherit',note:'',tags:[]});store.transaction(state=>state.accounts.push(a));return a}
@@ -100,12 +100,61 @@ test('saved proxy opt-out reaches previews and one-run overrides leave the prefe
   await f.instances.settled(current.id)
   assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
   assert.deepEqual(f.runtime.plans.at(-1)?.networkRoute,{mode:'direct'})
+  assert.equal(JSON.parse(readFileSync(join(f.gateways.at(-1)!.runtimeDirectory()!,'manifest.json'),'utf8')).apiKeys[0].providerGateway.proxyUrl,'direct')
   await f.instances.stop(current.id)
   f.instances.start(f.instances.preview({id:current.id,revision:current.revision}).ticket,true)
   await f.instances.settled(current.id)
   assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
   assert.equal(f.runtime.plans.at(-1)?.networkRoute,undefined)
   assert.equal(f.store.read().instances?.[0].injectNetworkProxy,false)
+})
+
+test('local API launches apply the proxy switch to upstream traffic without changing a shared account',async t=>{
+  const f=fixture(t)
+  let directHits=0,proxyHits=0
+  async function listen(proxied:boolean){
+    const server=createServer((req,res)=>{
+      req.resume();req.on('end',()=>{
+        if(proxied)proxyHits++;else directHits++
+        res.setHeader('Content-Type','application/json')
+        res.end(JSON.stringify({id:'resp_fixture',status:'completed',output:[],usage:{input_tokens:1,output_tokens:0}}))
+      })
+    })
+    await new Promise<void>(done=>server.listen(0,'127.0.0.1',done))
+    t.after(()=>{server.closeAllConnections();server.close()})
+    return `http://127.0.0.1:${(server.address() as {port:number}).port}`
+  }
+  const target=await listen(false),proxy=await listen(true),account=f.account(target)
+  f.store.transaction(state=>{state.upstreamProxy={revision:0,mode:'custom',url:proxy}})
+  const first=f.add(account.id,'Direct launch'),second=f.add(account.id,'Proxy launch')
+  async function start(instance:typeof first,inject?:boolean){
+    const preview=f.instances.preview({id:instance.id,revision:instance.revision})
+    f.instances.start(preview.ticket,inject);await f.instances.settled(instance.id)
+    assert.equal(f.instances.views().find(value=>value.id===instance.id)?.status,'running')
+    const {url,key}=connection(instance.directory)
+    const result=await fetch(url+'/responses',{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'synthetic',stream:false}),signal:AbortSignal.timeout(5000)})
+    assert.equal(result.status,200,await result.text())
+  }
+  await start(first,false)
+  assert.equal(directHits,1);assert.equal(proxyHits,0)
+  await start(second)
+  assert.equal(directHits,1);assert.equal(proxyHits,1)
+  assert.equal(f.store.read().instances?.find(value=>value.id===first.id)?.injectNetworkProxy,true,'Single-launch opt-out preserves the saved preference')
+  assert.equal(f.store.read().accounts.find(value=>value.id===account.id)?.proxy,undefined)
+  assert.equal(f.store.read().upstreamProxy?.url,proxy)
+  await f.instances.stop(first.id)
+  await start(first)
+  assert.equal(proxyHits,2,'The next default launch restores the configured proxy')
+})
+
+test('a saved local API proxy opt-out skips invalid account proxy validation',async t=>{
+  const f=fixture(t),account=f.account(),instance=f.add(account.id)
+  f.store.transaction(state=>{state.accounts[0].proxy={mode:'resource',resourceId:randomUUID()}})
+  f.instances.save({id:instance.id,revision:instance.revision,details:{name:instance.name,applicationId:instance.applicationId,accountId:account.id,connectionMode:'local_api',injectNetworkProxy:false,model:instance.model,extraArgs:[]}})
+  const current=f.instances.views()[0],preview=f.instances.preview({id:current.id,revision:current.revision})
+  f.instances.start(preview.ticket);await f.instances.settled(current.id)
+  assert.equal(f.instances.views()[0].status,'running',f.instances.views()[0].error)
+  assert.equal(JSON.parse(readFileSync(join(f.gateways[0].runtimeDirectory()!,'manifest.json'),'utf8')).apiKeys[0].providerGateway.proxyUrl,'direct')
 })
 
 test('history previews are scoped to a stopped instance and included in launch review without changing files',async t=>{
