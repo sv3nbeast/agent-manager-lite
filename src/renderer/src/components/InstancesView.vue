@@ -159,7 +159,11 @@ const size=(bytes:number)=>bytes<1024?`${bytes} B`:bytes<1024**2?`${(bytes/1024)
 const form=reactive<InstanceInput>({clientType:'codex',launchMode:'desktop',name:'',applicationId:'',accountId:'',connectionMode:'local_api',injectNetworkProxy:true,defaultTier:'inherit',model:'',extraArgs:[]}),args=ref('')
 const lastClientType=ref<AgentClientType>('codex'),lastLaunchMode=ref<'desktop'|'cli'>('desktop')
 const fieldErrors=reactive<Record<string,string>>({})
-let generatedName='',connectionModeTouched=false
+let generatedName=''
+// Explicit choices belong to a credential family, not every resource in the
+// draft. In particular, native OAuth must not turn a newly selected API key
+// into a direct connection. Existing profiles seed only their own family.
+let connectionModeChoices:Partial<Record<'oauth'|'api_key','native'|'local_api'>>={}
 useFormFeedback(()=>error.value||historyError.value)
 function nextInstanceName(){
   const base=clientName(form.clientType,launchMode.value)
@@ -177,6 +181,7 @@ function clearValidation(){error.value='';for(const key of Object.keys(fieldErro
 async function focusField(field:string){
   if(wizard.value)step.value=field==='applicationId'?0:['accountId','connectionMode'].includes(field)?1:2
   if(field==='extraArgs')advanced.value=['advanced']
+  if(field==='connectionMode')connectionAdvanced.value=['connection']
   await nextTick();await nextTick()
   const item=document.querySelector<HTMLElement>(`.instance-editor [data-field="${field}"]`)
   item?.scrollIntoView({block:'center',behavior:'smooth'})
@@ -258,7 +263,7 @@ watch(()=>[form.name,form.model,form.applicationId,form.accountId,supplierSelect
   const fields=['name','model','applicationId','accountId','accountId','extraArgs']
   values.forEach((value,index)=>{if(value!==previous[index]){const field=fields[index];if(error.value===fieldErrors[field])error.value='';delete fieldErrors[field]}})
 },{flush:'sync'})
-const step=ref(0),advanced=ref<string[]>([])
+const step=ref(0),advanced=ref<string[]>([]),connectionAdvanced=ref<string[]>([])
 const wizard=computed(()=>!editing.value&&editorFlow.value==='wizard')
 watch(step,async()=>{
   await nextTick()
@@ -292,6 +297,8 @@ const supplierChoices=computed(()=>{
 })
 const selectedSupplier=computed(()=>supplierChoices.value.find(item=>item.value===supplierSelection.value))
 const selectedAccount=computed(()=>availableAccounts.value.find(account=>account.id===form.accountId))
+const connectionScope=computed(()=>resourceKind.value==='provider'?'api_key':selectedAccount.value?.kind)
+const showConnectionAdvanced=computed(()=>!isClaude.value&&(connectionScope.value==='api_key'||connectionScope.value==='oauth'))
 const usesUpstreamProxy=computed(()=>hasInstanceUpstreamProxy(selectedAccount.value))
 const connectionProblem=computed(()=>{
   if(form.connectionMode!=='native')return ''
@@ -303,7 +310,7 @@ const connectionProblem=computed(()=>{
 watch(connectionProblem,problem=>{if(!problem&&fieldErrors.connectionMode){if(error.value===fieldErrors.connectionMode)error.value='';delete fieldErrors.connectionMode}})
 const connectionDescription=computed(()=>isClaudeDesktopLogin.value?'启动后在 Claude Desktop 中登录。每个实例分别保存登录状态、客户端配置与本地历史；同一账号的云端历史仍由 Claude 同步。':isClaudeDesktop.value?'使用所选密钥进入 Claude Desktop 的第三方 Code / Cowork 模式。模型来自此密钥，实际可用性由原生客户端和上游服务决定。':isClaude.value?(resourceKind.value==='account'?'Claude CLI 使用所选订阅账号，管理器负责刷新登录。每个实例分别保存配置与会话。':'Claude CLI 直接连接所选 Anthropic API 或兼容网关，使用 API Key 或 Bearer Token。每个实例分别保存配置与会话。'):form.connectionMode==='native'
   ?selectedAccount.value?.kind==='oauth'?`客户端直接登录所选 ChatGPT 账号，${launchMode.value==='desktop'?'使用官方客户端原版界面；首页、语言与可用功能由客户端及账号权限决定':'使用原生身份与账号功能'}。此模式不生成本地网关调用记录。`:resourceKind.value==='provider'?'客户端直接使用供应商密钥；API 密钥使用 API 连接界面，不会获得 ChatGPT 登录身份。此模式不生成本地网关调用记录。':'请选择支持原生连接的账号；界面与可用功能取决于所选凭据类型。'
-  :selectedAccount.value?.kind==='oauth'?`使用 ChatGPT 账号转发 API 请求；请求仍经本地 API 网关转发，管理器记录网关调用。${launchMode.value==='desktop'?'桌面应用使用本地 API 网关界面，验证账号身份不会切换接入方式。要使用官方客户端原版界面，请选择「原生账号登录」。':''}`:'通过管理器的本地 API 连接使用所选资源，支持兼容的 Chat Completions 供应商和账号网络代理；管理器记录网关调用。')
+  :selectedAccount.value?.kind==='oauth'?`使用 ChatGPT 账号转发 API 请求；请求仍经本地 API 网关转发，管理器记录网关调用。${launchMode.value==='desktop'?'桌面应用使用本地 API 网关界面。要使用原生账号登录和官方客户端原版界面，请在高级连接设置中关闭账号请求转发。':''}`:'已自动使用管理器 API 转发，支持兼容的 Responses / Chat Completions 供应商并记录调用。网络代理可单独设置。')
 const resourceLabel=computed(()=>isClaudeDesktopLogin.value?'在 Claude Desktop 中登录':resourceKind.value==='provider'?selectedSupplier.value?.label:selectedAccount.value?.name)
 function previewNetworkLabel(network:NonNullable<InstanceLaunchPreview['network']>):string {
   if(preview.value?.injectNetworkProxy===false)return '未注入管理器代理；客户端原生网络设置保留'
@@ -388,13 +395,23 @@ watch(()=>form.clientType,async clientType=>{
 watch(()=>[open.value,usesNativeModels.value,modelChoices.value,officialModelsLoading.value],()=>{
   if(open.value&&usesNativeModels.value&&!officialModelsLoading.value&&(!form.model.trim()||form.model===automaticModel.value))setAutomaticModel(currentOfficialModels.value?.defaultModelId??modelChoices.value[0]??'')
 })
-function recommendConnectionMode(){if(isClaude.value)form.connectionMode='native';else if(!connectionModeTouched)form.connectionMode=recommendedInstanceConnectionMode(form.clientType,selectedAccount.value)}
-function changeDesktopConnectionMode(){draftGeneration++;pendingLogin=undefined;providerOpen.value=false;connectionModeTouched=true;clearValidation();resourceKind.value='provider';resetResource()}
-function changeConnectionMode(){connectionModeTouched=true;clearValidation()}
-function useNativeLogin(){form.connectionMode='native';changeConnectionMode()}
+function recommendConnectionMode(){
+  if(isClaude.value){form.connectionMode='native';return}
+  const kind=connectionScope.value
+  const choice=kind==='api_key'||kind==='oauth'?connectionModeChoices[kind]:undefined
+  form.connectionMode=choice??recommendedInstanceConnectionMode(form.clientType,kind?{kind}:undefined)
+}
+function rememberConnectionMode(){
+  const kind=connectionScope.value
+  if(!isClaude.value&&(kind==='api_key'||kind==='oauth')&&form.connectionMode!=='client_login')connectionModeChoices[kind]=form.connectionMode
+}
+function changeDesktopConnectionMode(){draftGeneration++;pendingLogin=undefined;providerOpen.value=false;clearValidation();resourceKind.value='provider';resetResource()}
+function changeConnectionMode(){rememberConnectionMode();clearValidation()}
+function setApiForwardingBypass(enabled:boolean){form.connectionMode=enabled?'native':'local_api';changeConnectionMode()}
+function setAccountForwarding(enabled:boolean){form.connectionMode=enabled?'local_api':'native';changeConnectionMode()}
 function selectAccount(){recommendConnectionMode();setAutomaticModel(usesNativeModels.value?(currentOfficialModels.value?.defaultModelId??''):modelChoices.value[0]??'')}
 function selectSupplier(value:string){
-  if(isClaude.value)form.connectionMode='native';else if(!connectionModeTouched)form.connectionMode='local_api'
+  recommendConnectionMode()
   if(value!==supplierSelection.value)form.accountId=''
   supplierSelection.value=value
   form.accountId=selectedSupplier.value?.requiresKeyLink?'':selectedSupplier.value?.account?.id??''
@@ -413,7 +430,7 @@ function resetResource(){
   if(isClaudeDesktopLogin.value){form.accountId='';supplierSelection.value='';setAutomaticModel('');return}
   if(resourceKind.value==='account'){form.accountId=identityAccounts.value.find(account=>account.id===form.accountId)?.id??identityAccounts.value[0]?.id??'';selectAccount()}
   else {
-    if(isClaude.value)form.connectionMode='native';else if(!connectionModeTouched)form.connectionMode='local_api'
+    recommendConnectionMode()
     selectSupplier(supplierChoices.value.find(item=>item.value===supplierSelection.value)?.value??supplierChoices.value.find(item=>!item.disabled)?.value??supplierChoices.value[0]?.value??'')
   }
 }
@@ -446,7 +463,7 @@ function changeClient(mode?:'desktop'|'cli'){
   launchMode.value=mode??client.value.capabilities.launchModes[0]
   form.launchMode=launchMode.value;lastLaunchMode.value=launchMode.value
   form.applicationId=availableApplications.value[0]?.id??'';form.workingDirectoryId=undefined;form.extraArgs=[];args.value='';form.defaultTier='inherit'
-  connectionModeTouched=false;form.connectionMode=isClaudeDesktop.value?'client_login':isClaude.value?'native':'local_api'
+  connectionModeChoices={};connectionAdvanced.value=[];form.connectionMode=isClaudeDesktop.value?'client_login':isClaude.value?'native':'local_api'
   form.accountId='';supplierSelection.value='';resourceKind.value=isClaude.value?'provider':'account';setAutomaticModel('');resetResource()
   if(replaceName){generatedName=nextInstanceName();form.name=generatedName}
 }
@@ -457,7 +474,7 @@ async function ensureResource(generation=draftGeneration):Promise<boolean>{
   if(isClaudeDesktopLogin.value){form.accountId='';form.model='';return true}
   if(resourceKind.value==='provider'){
     const choice=selectedSupplier.value
-    if(!choice||choice.disabled){rejectField('accountId',choice?.reason??'请选择兼容的供应商密钥。');return false}
+    if(!choice||choice.disabled){rejectField(choice&&!choice.requiresKeyLink&&connectionProblem.value?'connectionMode':'accountId',choice?.reason??'请选择兼容的供应商密钥。');return false}
     if(!choice.account&&choice.provider&&choice.key){
       const provider=choice.provider,key=choice.key
       if(!await manager.execute(()=>window.manager.mutateProvider({action:'createAccount',id:provider.id,revision:provider.revision,keyId:key.id,name:(provider.name+' · '+(key.name||'默认密钥')).slice(0,120)})))return false
@@ -544,17 +561,21 @@ function edit(instance?:InstanceView) {
   cancelOfficialModelRequest();automaticModel.value=null;draftGeneration++;cancelCopyPreview();closePreview()
   let clientType:AgentClientType
   try{clientType=resolveAgentClientType(instance?instance.clientType:lastClientType.value)}catch(cause){error.value=String(cause);return}
-  step.value=0;advanced.value=[];pendingLogin=undefined
+  step.value=0;advanced.value=[];connectionAdvanced.value=[];pendingLogin=undefined
   clearHistorySource();historyMode.value='empty';historySourceKind.value='instance';editorFlow.value='wizard'
   discoveredSources.value=[];discoveryError.value='';discoveryIssues.value=[]
   sourceMode.value='copy'
   copyMode.value='sessions'
   editing.value=instance;clearValidation();manager.error='';generatedName='';form.clientType=clientType;launchMode.value=instance?savedLaunchMode(instance):lastLaunchMode.value
-  connectionModeTouched=!!instance
+  connectionModeChoices={}
   const firstAccount=availableAccounts.value.find(account=>account.kind!=='api_key')??availableAccounts.value[0]
   Object.assign(form,instance ? {clientType,launchMode:launchMode.value,name:instance.name,applicationId:instance.applicationId,accountId:instance.accountId,connectionMode:instance.connectionMode??'local_api',injectNetworkProxy:instance.injectNetworkProxy!==false,workingDirectoryId:instance.workingDirectoryId,defaultTier:instance.defaultTier,model:instance.model,extraArgs:instance.extraArgs} :
     {clientType,launchMode:launchMode.value,name:'',applicationId:availableApplications.value[0]?.id ?? '',accountId:firstAccount?.id ?? '',connectionMode:isClaudeDesktop.value?'client_login':clientType==='claude_code'?'native':recommendedInstanceConnectionMode(clientType,firstAccount),injectNetworkProxy:true,workingDirectoryId:undefined,defaultTier:'inherit',model:firstAccount?.models[0] ?? '',extraArgs:[]})
   resourceKind.value=isClaudeDesktop.value||accounts.value.find(account=>account.id===form.accountId)?.kind==='api_key'?'provider':'account'
+  if(instance){
+    rememberConnectionMode()
+    if(showConnectionAdvanced.value&&form.connectionMode!==recommendedInstanceConnectionMode(clientType,selectedAccount.value))connectionAdvanced.value=['connection']
+  }
   if(resourceKind.value==='provider')supplierSelection.value=(supplierChoices.value.find(choice=>choice.account?.id===form.accountId&&!choice.requiresKeyLink)??supplierChoices.value.find(choice=>choice.account?.id===form.accountId))?.value??''
   else supplierSelection.value=''
   if(!instance){resetResource();prepareName()}
@@ -746,12 +767,22 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
             <div v-if="selectedSupplier?.requiresKeyLink" class="instance-key-config-mismatch"><a-alert type="warning" show-icon :message="'已有独立连接「'+selectedSupplier.account?.name+'」使用不同的模型。'" description="关联后，该连接及引用它的实例将使用此密钥的模型和共享配置。也可以选择原独立连接继续使用原配置。" /><a-button type="link" :loading="manager.loading" :disabled="busy||committing" @click="linkSelectedSupplier">关联并使用密钥配置</a-button></div>
             <p v-else-if="selectedSupplier?.reusingStandalone" class="muted instance-reused-connection">使用已有 API 连接「{{selectedSupplier.account?.name}}」，保留它的模型、上下文、服务等级和网络代理配置。</p>
           </template>
-          <div class="instance-connection-options">
-            <a-form-item v-if="!isClaudeDesktop" data-field="connectionMode" label="连接方式" :validate-status="fieldErrors.connectionMode?'error':undefined" :help="fieldErrors.connectionMode"><a-select v-model:value="form.connectionMode" aria-label="实例接入方式" :options="isClaude?[{value:'native',label:resourceKind==='account'?'订阅账号':'直接 API'}]:[{value:'native',label:modeName('native',form.clientType,selectedAccount?.kind??(resourceKind==='provider'?'api_key':undefined))},{value:'local_api',label:'本地 API'}]" @change="changeConnectionMode" /></a-form-item>
+          <div class="instance-connection-options" data-field="connectionMode">
+            <p class="instance-connection-summary" aria-label="实例连接摘要"><strong>{{modeName(form.connectionMode,form.clientType,selectedAccount?.kind??(resourceKind==='provider'?'api_key':undefined))}}</strong></p>
             <p class="muted instance-connection-description">{{connectionDescription}}</p>
-            <a-alert v-if="connectionProblem" type="warning" show-icon :message="connectionProblem" />
+            <a-alert v-if="connectionProblem||fieldErrors.connectionMode" type="warning" show-icon :message="connectionProblem||fieldErrors.connectionMode" />
             <p v-if="!connectionProblem&&usesUpstreamProxy" class="muted">本地 API 模式下，账号代理用于网关上游请求；原生模式会按本次代理开关决定是否注入客户端。</p>
-            <a-button v-if="!isClaude&&!connectionProblem&&form.connectionMode==='local_api'&&selectedAccount?.kind==='oauth'" type="link" class="instance-use-native" @click="useNativeLogin">切换为原生账号登录</a-button>
+            <a-collapse v-if="showConnectionAdvanced" v-model:active-key="connectionAdvanced" ghost class="instance-connection-advanced"><a-collapse-panel key="connection" header="高级连接设置">
+              <a-form-item v-if="resourceKind==='provider'" label="绕过管理器 API 转发">
+                <a-switch :checked="form.connectionMode==='native'" checked-children="开" un-checked-children="关" aria-label="绕过管理器 API 转发" @change="setApiForwardingBypass($event===true)" />
+                <p class="muted">仅在排查转发问题或需要客户端直连时开启。需要供应商支持 Responses 协议；开启后不生成管理器网关调用记录。网络代理注入仍由下方开关独立控制。</p>
+                <p v-if="editing?.connectionMode==='native'&&form.connectionMode==='native'" class="muted instance-existing-direct-note">此实例保留原有直连 API 配置。关闭此开关并保存后，下次启动将通过管理器转发；已有会话保留。</p>
+              </a-form-item>
+              <a-form-item v-else label="通过管理器转发账号请求">
+                <a-switch :checked="form.connectionMode==='local_api'" checked-children="开" un-checked-children="关" aria-label="通过管理器转发账号请求" @change="setAccountForwarding($event===true)" />
+                <p class="muted">默认关闭，使用原生账号登录。开启后通过本地 API 网关记录调用，桌面界面与官方账号原生登录不同。已有实例保留原选择。</p>
+              </a-form-item>
+            </a-collapse-panel></a-collapse>
             <p v-if="!isClaude&&editing&&form.connectionMode!==(editing.connectionMode??'local_api')" class="muted instance-mode-history-note">切换后已有会话仍保留。若客户端列表不显示，可到「会话 → 修复可见性」选择此实例，使用「按各实例接入方式自动匹配」预览修复。</p>
           </div>
           </template>
@@ -847,7 +878,7 @@ function stopAll(){Modal.confirm({title:'停止本管理器的所有实例？',c
       <p class="muted" v-else-if="preview?.clientType==='claude_code'">直接 API：Claude CLI 使用所选密钥连接 Anthropic 或兼容网关，模型以此连接声明为准。停止后保留实例配置、会话和工作文件。首次启动会初始化欢迎流程，项目信任与密钥确认仍由 Claude 提示。此连接不生成管理器本地网关调用记录。</p>
       <p class="muted" v-else-if="preview?.connectionMode==='native'&&previewAccount?.kind==='oauth'">原生账号登录：凭据仅写入此实例的独立文件目录，客户端维护登录。停止后先保存最新令牌，再恢复原登录和配置；会话保留。此模式不生成本地网关调用记录，配置等级不代表上游已收到。</p>
       <p class="muted instance-native-api-note" v-else-if="preview?.connectionMode==='native'">直连 API：客户端直接使用绑定的供应商密钥，界面和可用功能按 API 连接提供。凭据仅写入此实例的独立目录，停止后恢复原连接配置；会话保留。此模式不生成本地网关调用记录。</p>
-      <p class="muted instance-local-api-note" v-else-if="preview?.connectionMode==='local_api'&&previewAccount?.kind==='oauth'">本地 API：使用绑定的 ChatGPT 账号转发请求，管理器记录网关调用。<span v-if="preview.launchMode!=='cli'">账号身份验证成功也会保留本地 API 网关界面。需要官方客户端原版界面时，请取消预览后编辑实例，选择「原生账号登录」。</span>停止后恢复原配置与登录文件；会话和工作文件保留。</p>
+      <p class="muted instance-local-api-note" v-else-if="preview?.connectionMode==='local_api'&&previewAccount?.kind==='oauth'">本地 API：使用绑定的 ChatGPT 账号转发请求，管理器记录网关调用。<span v-if="preview.launchMode!=='cli'">账号身份验证成功也会保留本地 API 网关界面。需要原生账号登录和官方客户端原版界面时，请取消预览后编辑实例，在高级连接设置中关闭账号请求转发。</span>停止后恢复原配置与登录文件；会话和工作文件保留。</p>
       <p class="muted" v-else>本地 API：使用所选供应商或 API 凭据连接。纯 API 凭据不会伪造 ChatGPT 登录身份；启动会创建独立连接，并备份、应用模型与连接配置。停止后恢复原配置；会话和工作文件保留。请求中的显式等级优先。</p>
       <a-alert v-if="manager.error" type="error" :message="manager.error" />
     </a-modal>

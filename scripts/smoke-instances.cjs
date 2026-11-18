@@ -60,9 +60,7 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.instance-editor .ant-radio-wrapper','供应商密钥')
       await run(`document.querySelector('[aria-label="实例供应商密钥"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
       await click('.ant-select-item-option',label)
-      await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
-      await click('.ant-select-item-option','本地 API')
-      assert.match(await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').innerText`),/本地 API/)
+      assert.match(await run(`document.querySelector('[aria-label="实例连接摘要"]').innerText`),/本地 API/)
     }
     const capture=async name=>{
       await run('Promise.all(document.getAnimations().filter(a=>a.effect?.getTiming().iterations!==Infinity).map(a=>a.finished.catch(()=>{})))')
@@ -216,8 +214,6 @@ app.on('browser-window-created',(_event,window)=>{
       await click('.instances-panel .toolbar button','刷新状态')
       await click('.instance-card button','编辑')
       await wait('!!document.querySelector(".instance-editor")')
-      await run(`document.querySelector('[aria-label="实例接入方式"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
-      await click('.ant-select-item-option','直连 API')
       await click('.instance-editor .ant-radio-wrapper','账号')
       await run(`document.querySelector('[aria-label="实例账号"]').closest('.ant-select').querySelector('.ant-select-selector').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))`)
       await click('.ant-select-item-option',native.name)

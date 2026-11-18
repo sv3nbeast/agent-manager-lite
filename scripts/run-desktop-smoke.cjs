@@ -23,11 +23,13 @@ function kill() {
   if (!child.pid) return
   try { process.platform === 'win32' ? child.kill('SIGKILL') : process.kill(-child.pid, 'SIGKILL') } catch {}
 }
+// The model suite also exercises saved direct-mode cancel/save round trips.
+const timeoutMs = process.argv.includes('--instance-models') ? 130_000 : 90_000
 const timer = setTimeout(() => {
   timedOut = true
-  console.error('Desktop smoke exceeded 90 seconds; stopping its isolated process group.')
+  console.error(`Desktop smoke exceeded ${timeoutMs / 1000} seconds; stopping its isolated process group.`)
   kill()
-}, 90_000)
+}, timeoutMs)
 const cleanup = () => { clearTimeout(timer); rmSync(directory, { recursive: true, force: true }); if(env.CML_TEST_DEFAULT_CLAUDE_DIRECTORY)rmSync(env.CML_TEST_DEFAULT_CLAUDE_DIRECTORY,{recursive:true,force:true});if(env.CML_TEST_DEFAULT_CODEX_DIRECTORY)rmSync(env.CML_TEST_DEFAULT_CODEX_DIRECTORY,{recursive:true,force:true}) }
 child.once('error', error => { console.error(error); cleanup(); process.exitCode = 1 })
 child.once('exit', code => { cleanup(); process.exitCode = timedOut ? 1 : code ?? 1 })
