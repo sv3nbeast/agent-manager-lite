@@ -127,7 +127,7 @@ func buildImageGenerationRelayRequestWithModel(rawJSON []byte, imageToolModel st
 		stream:         boolField(payload, "stream"),
 		responseFormat: normalizeImageResponseFormat(stringField(payload, "response_format")),
 		streamPrefix:   "image_generation",
-		requestedModel: imageModelOrDefault(payload),
+		requestedModel: imageRequestedModel(payload, imageToolModel),
 	}, nil
 }
 
@@ -180,7 +180,7 @@ func buildImageEditRelayRequestWithModel(c *gin.Context, imageToolModel string, 
 		stream:         boolField(payload, "stream"),
 		responseFormat: normalizeImageResponseFormat(stringField(payload, "response_format")),
 		streamPrefix:   "image_edit",
-		requestedModel: imageModelOrDefault(payload),
+		requestedModel: imageRequestedModel(payload, imageToolModel),
 	}, nil
 }
 
@@ -245,17 +245,18 @@ func buildImageEditRelayRequestFromMultipartWithModel(c *gin.Context, imageToolM
 		stream:         boolField(payload, "stream"),
 		responseFormat: normalizeImageResponseFormat(stringField(payload, "response_format")),
 		streamPrefix:   "image_edit",
-		requestedModel: imageModelOrDefault(payload),
+		requestedModel: imageRequestedModel(payload, imageToolModel),
 	}, nil
 }
 
 func (s *relayServer) handleImagesRelayRequest(c *gin.Context, imageReq imageRelayRequest) {
 	spec, _ := c.Request.Context().Value(clientAPIKeyContextKey).(*apiKeySpec)
 	requestedModel := strings.TrimSpace(imageReq.requestedModel)
+	imageToolModel := configuredImagesToolModel(s.manifest)
 	if requestedModel == "" {
-		requestedModel = defaultImagesToolModel
+		requestedModel = imageToolModel
 	}
-	if !validateClientModelVisible(s.manifest, spec, requestedModel, defaultImagesToolModel) {
+	if !validateClientModelVisible(s.manifest, spec, requestedModel, imageToolModel) {
 		writeAPIError(c, http.StatusNotFound, fmt.Sprintf("模型 %s 不在当前 API Key 的可用模型范围内", requestedModel), "model_not_available")
 		return
 	}
@@ -516,7 +517,14 @@ func normalizeImageResponseFormat(value string) string {
 }
 
 func imageModelOrDefault(payload map[string]any) string {
+	return imageRequestedModel(payload, defaultImagesToolModel)
+}
+
+func imageRequestedModel(payload map[string]any, fallback string) string {
 	if model := strings.TrimSpace(stringField(payload, "model")); model != "" {
+		return model
+	}
+	if model := strings.TrimSpace(fallback); model != "" {
 		return model
 	}
 	return defaultImagesToolModel
@@ -531,7 +539,7 @@ func buildImageToolWithModel(payload map[string]any, action string, imageToolMod
 	if strings.TrimSpace(imageToolModel) == "" {
 		imageToolModel = defaultImagesToolModel
 	}
-	if modelBase(model) != defaultImagesToolModel && modelBase(model) != legacyImagesToolModel &&
+	if !isBuiltInImagesToolModel(model) &&
 		modelBase(model) != modelBase(imageToolModel) {
 		// 已配置生图转发账号池的实例：客户端可能带着对话模型名发起生图请求，
 		// 这时回落到配置的图片模型，而不是直接报模型不支持。

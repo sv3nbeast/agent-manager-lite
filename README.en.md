@@ -48,6 +48,8 @@ These screenshots capture the running v0.1.0 application content at its default 
 
 ## Image generation and editing APIs
 
+Set a model ID in **Settings → Image generation → Default image model** and save; later model changes do not require code changes. The initial value is `gpt-image-2.6-sunburst`. Images API requests without `model` and the hosted subscription image tool use this setting. Explicit provider request models take precedence, and existing mappings and key model scopes remain enforced. Newly started local services and instances apply the saved value; active requests are unchanged, so stop and restart the relevant service to switch. Encrypted backups retain and restore the setting.
+
 Configure the image models available to a provider key, then call `/v1/images/generations` or `/v1/images/edits` with an authorized local API access key. Model routes select the provider and its connection's network proxy; image models must satisfy both provider-key and local-access-key model scopes. Generation accepts JSON, and editing accepts JSON or multipart file uploads. When the provider supports streaming, its SSE events and returned usage information are preserved.
 
 Provider image requests call its Images endpoint directly, preserving native fields, image data and response formats while applying configured model mappings. The ChatGPT OAuth image account pool continues to use the Responses `image_generation` tool through a separate upstream path. Available image models, editing fields and streaming modes depend on the provider. Configuring Responses, Chat Completions or Anthropic Messages for conversations does not establish that the service offers an Images API.

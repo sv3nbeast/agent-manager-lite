@@ -2,6 +2,7 @@ import type {ProxyResourcesView,ProxyChangePreview,ProxyResourceChange} from './
 import type {ProxyImportInput,ProxyImportPreview,ProxyAssignmentInput,ProxyAssignmentPreview} from './proxyBatch'
 import type {TrashPreviewInput,TrashActionInput,TrashPreview,TrashPage,TrashState,LegacyTrashPage,LegacyTrashImportInput} from './sessionTrash'
 import { z } from 'zod'
+import { DEFAULT_IMAGE_GENERATION_MODEL, imageGenerationModelSchema } from './imageGeneration'
 import { modelContextWindowsSchema } from './modelContextWindows'
 import { integrationTypeSchema, type IntegrationType } from './providerUsage'
 import type { HistoryFilter, HistoryQuery, HistoryPage } from './history'
@@ -52,6 +53,7 @@ export const settingsSchema = z.object({
   streamIdleTimeoutSeconds: z.number().int().min(1).max(600).default(120),
   imageStreamOpenTimeoutSeconds: z.number().int().min(0).max(600).default(0),
   imageStreamIdleTimeoutSeconds: z.number().int().min(1).max(600).default(180),
+  imageGenerationModel: imageGenerationModelSchema.default(DEFAULT_IMAGE_GENERATION_MODEL),
   launchAtLogin: z.boolean().default(false),
   closeToTray: z.boolean().default(false)
 }).strict()

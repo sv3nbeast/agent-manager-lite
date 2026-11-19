@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { createAPIAccount } from '../src/main/accounts'
 import { Gateway } from '../src/main/gateway'
 import { settingsSchema } from '../src/shared/types'
+import { DEFAULT_IMAGE_GENERATION_MODEL } from '../src/shared/imageGeneration'
 import { emptyLocalAccess, localKeyDetailsSchema, type StoredLocalKey } from '../src/shared/localAccess'
 
 const chatModel = 'fixture-chat-default'
@@ -124,10 +125,10 @@ function generationBody(model:string, stream=false):Buffer {
   return Buffer.from(`{"model":${JSON.stringify(model)},"prompt":"Draw fixture 🧪","n":2,"stream":${stream},"provider_number":9007199254740993,"provider_options":{"preserve":["未知字段",true]}}`)
 }
 
-function multipartBody(model:string) {
+function multipartBody(model?:string) {
   const boundary = 'fixture-image-boundary'
   const parts:Buffer[] = []
-  for (const [name,value] of [['model',model],['prompt','Edit fixture 🧪'],['style[]','first'],['style[]','second'],['provider_option','{"keep":"未知字段"}'],['stream','false']]) {
+  for (const [name,value] of [...(model===undefined?[]:[['model',model]]),['prompt','Edit fixture 🧪'],['style[]','first'],['style[]','second'],['provider_option','{"keep":"未知字段"}'],['stream','false']]) {
     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`))
   }
   for (const [name,filename,bytes] of [['image[]','fixture.png',imageBytes],['mask','mask.png',maskBytes]] as const) {
@@ -179,6 +180,27 @@ async function assertStream(response:Response, release:()=>void) {
   } finally { release() }
 }
 
+test('saved image defaults reach real JSON and multipart requests while explicit models and authorization remain intact', async t => {
+  for (const configured of [DEFAULT_IMAGE_GENERATION_MODEL,imageModel]) await t.test(configured, async t => {
+    const f = await fixture(t), provider = account('defaults',f.url,[chatModel,DEFAULT_IMAGE_GENERATION_MODEL,imageModel,otherImageModel])
+    const profile = {id:randomUUID(),port:0,account:provider,apiKey:'fixture-local-defaults'}
+    const status = await f.gateway.start(profile,settingsSchema.parse({imageGenerationModel:configured}))
+    const omitted = Buffer.from(generationBody('omitted').toString().replace('"model":"omitted",',''))
+    f.expected.push({path:generations,model:configured,upstreamKey:provider.credentials.apiKey!})
+    await assertJSON(await request(status.port!,generations,profile.apiKey,omitted))
+    const multipart = multipartBody()
+    f.expected.push({path:edits,model:configured,upstreamKey:provider.credentials.apiKey!})
+    await assertJSON(await request(status.port!,edits,profile.apiKey,multipart.body,multipart.contentType))
+    f.expected.push({path:generations,model:otherImageModel,upstreamKey:provider.credentials.apiKey!})
+    await assertJSON(await request(status.port!,generations,profile.apiKey,generationBody(otherImageModel)))
+    await f.gateway.stop()
+    const restarted = await f.gateway.start(profile,settingsSchema.parse({imageGenerationModel:blockedImageModel}))
+    const denied = await request(restarted.port!,generations,profile.apiKey,omitted)
+    assert.equal(denied.status,404,await denied.text())
+    assert.equal(f.received.length,3,'A default model must not expand the provider key model scope')
+  })
+})
+
 test('source-built image gateway preserves native JSON, binary edits, incremental SSE and usage for a saved API connection', {timeout:30000}, async t => {
   const f = await fixture(t), provider = account('single',f.url,[chatModel,imageModel])
   const profileId = randomUUID(), localKey = 'fixture-local-single'
@@ -213,7 +235,7 @@ test('source-built local API pool routes image requests through authorized provi
   const key = (label:string,details:Record<string,unknown>={}):StoredLocalKey => ({id:randomUUID(),revision:0,createdAt:1,key:`fixture-local-${label}`,...localKeyDetailsSchema.parse({label,enabled:true,inheritAccountPool:true,accountIds:[],modelPrefix:'',allowedModels:[imageModel,otherImageModel],excludedModels:[],tokenLimit:0,...details})})
   const pooled = key('pool'), scoped = key('scoped',{inheritAccountPool:false,accountIds:[a.id],modelPrefix:'work',allowedModels:[imageModel,blockedImageModel],excludedModels:[blockedImageModel]})
   const pool = {...emptyLocalAccess(),accountIds:[a.id,b.id],sessionAffinity:false,keys:[pooled,scoped]}
-  const status = await f.gateway.start({id:randomUUID(),port:0,account:a,apiKey:'fixture-unused-profile-key',pool:{settings:pool,accounts:[a,b],providerTiers:{},tokenUsed:{}}},settingsSchema.parse({}))
+  const status = await f.gateway.start({id:randomUUID(),port:0,account:a,apiKey:'fixture-unused-profile-key',pool:{settings:pool,accounts:[a,b],providerTiers:{},tokenUsed:{}}},settingsSchema.parse({imageGenerationModel:otherImageModel}))
   assert.ok(status.port)
   const manifest = JSON.parse(readFileSync(join(f.gateway.runtimeDirectory()!,'manifest.json'),'utf8'))
   const projected = manifest.apiKeys.find((value:{id:string}) => value.id === pooled.id)
@@ -226,13 +248,19 @@ test('source-built local API pool routes image requests through authorized provi
   f.expected.push({path:generations,model:otherImageModel,upstreamKey:b.credentials.apiKey!,stream:true})
   await assertStream(await request(status.port,generations,pooled.key,generationBody(otherImageModel,true)),f.releaseStream)
   await assertUsage(f.events,2,b.id,pooled.id,otherImageModel)
+  const omitted = Buffer.from(generationBody('omitted').toString().replace('"model":"omitted",',''))
+  f.expected.push({path:generations,model:otherImageModel,upstreamKey:b.credentials.apiKey!})
+  await assertJSON(await request(status.port,generations,pooled.key,omitted))
+  await assertUsage(f.events,3,b.id,pooled.id,otherImageModel)
   const requested = `work/${imageModel}`, multipart = multipartBody(requested)
   f.expected.push({path:edits,model:imageModel,upstreamKey:a.credentials.apiKey!})
   await assertJSON(await request(status.port,edits,scoped.key,multipart.body,multipart.contentType))
-  await assertUsage(f.events,3,a.id,scoped.id,imageModel,requested)
+  await assertUsage(f.events,4,a.id,scoped.id,imageModel,requested)
+  const deniedDefault = await request(status.port,generations,scoped.key,omitted)
+  assert.equal(deniedDefault.status,404,await deniedDefault.text())
   for (const [localKey,model,wantStatus] of [[scoped.key,`work/${otherImageModel}`,404],[scoped.key,`work/${blockedImageModel}`,404],[pooled.key,'fixture-undeclared-image',404],['fixture-wrong-key',imageModel,401]] as const) {
     const denied = await request(status.port,generations,localKey,generationBody(model))
     assert.equal(denied.status,wantStatus,await denied.text())
   }
-  assert.equal(f.received.length,3,'Keys must not escape their account or model scopes through image routes')
+  assert.equal(f.received.length,4,'Keys must not escape their account or model scopes through image routes')
 })

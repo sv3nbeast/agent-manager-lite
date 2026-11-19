@@ -31,6 +31,9 @@ func (s *relayServer) handleProviderGatewayImages(c *gin.Context, spec *apiKeySp
 		writeAPIError(c, http.StatusBadRequest, err.Error(), "invalid_request")
 		return true
 	}
+	if !input.modelSet {
+		input.model = configuredImagesToolModel(s.manifest)
+	}
 	route, upstreamModel, routeStatus := resolveModelRoutingRoute(spec, input.model)
 	automatic := spec.ModelRouting != nil && spec.ModelRouting.Automatic
 	if automatic && automaticNativeModel(spec, input.model) {
@@ -118,7 +121,7 @@ func (s *relayServer) providerGatewayImageModel(gateway *providerGatewaySpec, mo
 	if exact := declared(model); exact != "" {
 		return exact
 	}
-	if strings.EqualFold(model, legacyImagesToolModel) || strings.EqualFold(model, defaultImagesToolModel) {
+	if isConfiguredImagesToolModel(nil, model) {
 		return declared(configuredImagesToolModel(s.manifest))
 	}
 	return ""

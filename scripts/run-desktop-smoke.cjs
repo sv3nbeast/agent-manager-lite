@@ -24,7 +24,7 @@ function kill() {
   try { process.platform === 'win32' ? child.kill('SIGKILL') : process.kill(-child.pid, 'SIGKILL') } catch {}
 }
 // The model suite also exercises saved direct-mode cancel/save round trips.
-const timeoutMs = process.argv.includes('--instance-models') ? 130_000 : 90_000
+const timeoutMs = process.argv.includes('--instance-models') || process.argv.includes('--fast-settings') ? 130_000 : 90_000
 const timer = setTimeout(() => {
   timedOut = true
   console.error(`Desktop smoke exceeded ${timeoutMs / 1000} seconds; stopping its isolated process group.`)

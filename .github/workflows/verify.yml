@@ -52,6 +52,8 @@ jobs:
         run: npm run build
       - name: Verify automatic connections and saved instance settings
         run: npm run test:desktop:instance-models
+      - name: Verify saved image models and request settings
+        run: npm run test:desktop:fast-settings
       - name: Verify call history outcomes and legacy records
         run: npm run test:desktop:history
       - name: Verify instance lifetime across manager Quit and reopen

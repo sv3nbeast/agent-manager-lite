@@ -82,7 +82,7 @@ func (s *relayServer) streamTimeoutsForRequest(r *http.Request, body []byte, mod
 }
 
 func isImageGenerationRequest(r *http.Request, body []byte, model string) bool {
-	if modelBase(model) == defaultImagesToolModel || modelBase(model) == legacyImagesToolModel {
+	if isBuiltInImagesToolModel(model) {
 		return true
 	}
 	if r != nil && r.URL != nil {

@@ -95,7 +95,7 @@ test('portable encrypted restore preserves accounts, relationships, Fast, existi
 
 test('backup restore retains explicit 60 second limits and migrates unmarked legacy defaults once',async t=>{
   const source=fixture(t),target=fixture(t)
-  source.store.transaction(state=>{state.settings.streamOpenTimeoutSeconds=60;state.settings.imageStreamOpenTimeoutSeconds=60})
+  source.store.transaction(state=>{state.settings.streamOpenTimeoutSeconds=60;state.settings.imageStreamOpenTimeoutSeconds=60;state.settings.imageGenerationModel='fixture-image-backup-model'})
   await source.service.export(request(),source.file)
   const payload=await unpack(source.file)
   assert.equal(payload.state.streamOpenTimeoutDefaultsVersion,1)
@@ -104,6 +104,7 @@ test('backup restore retains explicit 60 second limits and migrates unmarked leg
   const restored=new Store(target.store.directory,target.codec).read()
   assert.equal(restored.settings.streamOpenTimeoutSeconds,60)
   assert.equal(restored.settings.imageStreamOpenTimeoutSeconds,60)
+  assert.equal(restored.settings.imageGenerationModel,'fixture-image-backup-model')
   const legacyTarget=fixture(t),cipher=await backupCipher(password)
   delete payload.state.streamOpenTimeoutDefaultsVersion
   try{await writeBackupArchive(legacyTarget.file,payload,cipher,new AbortController().signal)}finally{cipher.key.fill(0)}

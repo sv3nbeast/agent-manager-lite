@@ -61,7 +61,8 @@ export function runtimeManifest(profile:RuntimeProfile,settings:Settings,control
   }):[{id:profile.id,label:profile.account.name,key:profile.apiKey,enabled:true,accountIds:[profile.account.id],responsesWebsockets:profile.account.kind!=='api_key',
     ...(profile.account.kind==='api_key'?{providerGateway:provider(profile.account)}:{})}]
   const manifest={locale:'zh-cn',accounts:accounts.map(spec),apiKeys:[...keySpecs,{id:`${profile.id}-management`,key:controlKey,enabled:true,internal:true,accountIds:accounts.map(account=>account.id)}],
-    modelIds:[...new Set(accounts.flatMap(models))],routingStrategy:profile.pool?.settings.routingStrategy ?? 'round-robin',customRoutingRules:profile.pool?.settings.customRoutingRules??[],debugLogs:false}
+    modelIds:[...new Set(accounts.flatMap(models))],imageGenerationModel:settings.imageGenerationModel,
+    routingStrategy:profile.pool?.settings.routingStrategy ?? 'round-robin',customRoutingRules:profile.pool?.settings.customRoutingRules??[],debugLogs:false}
   const tier=tiers.get(profile.account.id)!
   const config:Record<string,unknown>={host:'127.0.0.1',port:profile.port,'api-keys':[...keySpecs.filter(key=>key.enabled).map(key=>key.key),controlKey],
     'request-log':false,'logging-to-file':false,'request-retry':0,'ws-auth':true,

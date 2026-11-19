@@ -10,7 +10,7 @@ const encrypt=safeStorage.encryptString
 safeStorage.encryptString=value=>{if(failSave)throw new Error('fixture-settings-write-failed');return encrypt(value)}
 let upstream
 app.on('will-quit',()=>{upstream?.closeAllConnections();upstream?.close()})
-const timer=setTimeout(()=>{console.error('Fast settings UI exceeded 75 seconds');app.exit(1)},75000)
+const timer=setTimeout(()=>{console.error('Settings UI exceeded 110 seconds');app.exit(1)},110000)
 const output=resolve('.local/smoke-evidence');fs.mkdirSync(output,{recursive:true})
 app.on('browser-window-created',(_event,window)=>{
  window.webContents.setBackgroundThrottling(false)
@@ -38,7 +38,7 @@ app.on('browser-window-created',(_event,window)=>{
    failSave=false
    const originalPort=(await run('window.manager.load()')).settings.port
    const settingsPage=async()=>{await click('.sidebar-bottom button','设置');await wait('!!document.querySelector(".settings-draft")')}
-   const accountPage=async()=>{await click('.ant-menu-item','账号管理 0');await wait('!!document.querySelector(".tier-strip")')}
+   const accountPage=async()=>{await run('Array.from(document.querySelectorAll(".ant-menu-item")).find(el=>el.textContent.includes("账号管理")).click()');await wait('!!document.querySelector(".tier-strip")')}
    await settingsPage();await chooseTier('.settings-draft .ant-form-item:nth-child(2)','Fast');await fill('.settings-draft .ant-input-number-input',String(originalPort+1))
    await wait('!!document.querySelector(".settings-unsaved")');await accountPage();assert.equal(await selectedTier(),'Standard','unsaved settings must not change the global shortcut')
    await chooseTier('.tier-strip','跟随请求');await wait('(await window.manager.load()).settings.defaultTier==="follow"');assert.equal((await run('window.manager.load()')).settings.port,originalPort,'quick Fast control must not save another settings draft field')
@@ -48,6 +48,24 @@ app.on('browser-window-created',(_event,window)=>{
    await chooseTier('.settings-draft .ant-form-item:nth-child(2)','Fast');failSave=true;await click('.settings-actions button','保存设置')
    await wait('document.querySelector(".error-banner")?.textContent.includes("fixture-settings-write-failed")');assert.equal(await savedTier(),'follow');assert.equal(await run('!!document.querySelector(".settings-unsaved")'),true)
    failSave=false;await click('.settings-actions button','保存设置');await wait('(await window.manager.load()).settings.defaultTier==="fast"');await wait('!document.querySelector(".settings-unsaved")');assert.equal(vault().settings.defaultTier,'fast')
+   const imageInput='[data-settings-field="imageGenerationModel"] input'
+   assert.equal(await run(`document.querySelector(${JSON.stringify(imageInput)}).value`),'gpt-image-2.6-sunburst')
+   await fill(imageInput,'');await click('.settings-actions button','保存设置')
+   await wait('document.querySelector("[data-settings-field=imageGenerationModel] .ant-form-item-explain-error")?.textContent.includes("请填写默认图片模型")')
+   assert.equal(vault().settings.imageGenerationModel,'gpt-image-2.6-sunburst')
+   await fill(imageInput,'fixture-image-from-settings');failSave=true;await click('.settings-actions button','保存设置')
+   await wait('document.querySelector(".error-banner")?.textContent.includes("fixture-settings-write-failed")')
+   assert.equal(vault().settings.imageGenerationModel,'gpt-image-2.6-sunburst')
+   failSave=false;await click('.settings-actions button','保存设置');await wait('!document.querySelector(".settings-unsaved")')
+   assert.equal(vault().settings.imageGenerationModel,'fixture-image-from-settings')
+   const reloaded=new Promise(resolve=>window.webContents.once('did-finish-load',resolve));window.webContents.reload();await reloaded
+   await settingsPage();await wait(`document.querySelector(${JSON.stringify(imageInput)})?.value==="fixture-image-from-settings"`)
+   await click('.image-generation-settings button','恢复默认模型')
+   assert.equal(vault().settings.imageGenerationModel,'fixture-image-from-settings','Reset edits only the unsaved draft')
+   await click('.settings-actions button','保存设置');await wait('!document.querySelector(".settings-unsaved")')
+   assert.equal(vault().settings.imageGenerationModel,'gpt-image-2.6-sunburst')
+   await fill(imageInput,'fixture-image-from-settings');await click('.settings-actions button','保存设置');await wait('!document.querySelector(".settings-unsaved")')
+   await run('document.querySelector(".image-generation-settings").scrollIntoView({block:"center"})');await capture('image-generation-settings.png')
    assert.deepEqual(await run('Array.from(document.querySelectorAll(".stream-timeouts input")).map(el=>el.value)'),['0','120','0','180'])
    await fill('.stream-timeouts .ant-form-item:nth-child(1) input','12')
    await click('.settings-actions button','保存设置')
@@ -66,25 +84,33 @@ app.on('browser-window-created',(_event,window)=>{
    await accountPage();await wait('document.querySelector(".tier-strip input:checked")?.closest("label")?.textContent==="Fast"')
    // Real local service and a synthetic HTTP upstream verify persisted vs running
    // defaults, restart application and explicit tier preservation.
-   const seen=[]
-   upstream=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);seen.push(body.service_tier);res.setHeader('Content-Type','application/json');res.end(JSON.stringify({id:'resp-settings',object:'response',status:'completed',service_tier:'default',output:[],usage:{input_tokens:1,output_tokens:0,total_tokens:1}}))})
+   const seen=[],imageModels=[]
+   upstream=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);res.setHeader('Content-Type','application/json');if(req.url==='/v1/images/generations'){imageModels.push(body.model);res.end(JSON.stringify({created:1,data:[{b64_json:'cG5n'}]}));return}seen.push(body.service_tier);res.end(JSON.stringify({id:'resp-settings',object:'response',status:'completed',service_tier:'default',output:[],usage:{input_tokens:1,output_tokens:0,total_tokens:1}}))})
    await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve))
    const reserve=createServer();await new Promise(resolve=>reserve.listen(0,'127.0.0.1',resolve));const port=reserve.address().port;await new Promise(resolve=>reserve.close(resolve))
    const initial=(await run('window.manager.load()')).settings
    await run(`window.manager.saveSettings(${JSON.stringify({...initial,port,defaultTier:'standard',refreshMinutes:0})})`)
-   const added=await run(`window.manager.addAccount(${JSON.stringify({name:'Fast verification',baseUrl:`http://127.0.0.1:${upstream.address().port}/v1`,apiKey:'fixture-upstream-key',models:['fixture-model'],wireApi:'responses',defaultTier:'inherit'})})`)
+   const added=await run(`window.manager.addAccount(${JSON.stringify({name:'Fast verification',baseUrl:`http://127.0.0.1:${upstream.address().port}/v1`,apiKey:'fixture-upstream-key',models:['fixture-model','fixture-image-from-settings','fixture-image-explicit'],wireApi:'responses',defaultTier:'inherit'})})`)
    const account=added.accounts[0],start=()=>run(`window.manager.startGateway(${JSON.stringify(account.id)})`)
    await start();await click('button[aria-label="重新加载账号"]','');await wait('document.querySelector(".tier-strip input:checked")?.closest("label")?.textContent==="Standard"')
    const projected=JSON.parse(fs.readFileSync(join(directory,'runtime',fs.readdirSync(join(directory,'runtime'))[0],'config.json'),'utf8'))
    assert.deepEqual(projected.streaming,{'stream-open-timeout-ms':1000,'stream-idle-timeout-ms':2000,'image-stream-open-timeout-ms':3000,'image-stream-idle-timeout-ms':4000,'stream-open-max-attempts':1})
    const request=async tier=>{const key=vault().accounts[0].credentials.localAPIKey,res=await fetch(`http://127.0.0.1:${port}/v1/responses`,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({model:'fixture-model',input:'synthetic check',...tier?{service_tier:tier}:{}})});assert.equal(res.status,200);assert.equal((await res.json()).service_tier,'default')}
    await request();assert.equal(seen.at(-1),'default')
+   const requestImage=async model=>{const key=vault().accounts[0].credentials.localAPIKey,res=await fetch(`http://127.0.0.1:${port}/v1/images/generations`,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({prompt:'synthetic image settings check',...model?{model}:{}}),signal:AbortSignal.timeout(5000)});assert.equal(res.status,200,await res.text())}
+   await requestImage();assert.equal(imageModels.at(-1),'fixture-image-from-settings')
+   await settingsPage();await fill(imageInput,'fixture-image-explicit');await click('.settings-actions button','保存设置');await wait('!document.querySelector(".settings-unsaved")')
+   await wait('Array.from(document.querySelectorAll(".ant-message-notice")).some(el=>el.textContent.includes("运行中的服务需重启"))')
+   await requestImage();assert.equal(imageModels.at(-1),'fixture-image-from-settings','Running image route must match the restart notice')
+   await accountPage()
    await chooseTier('.tier-strip','Fast');await wait('(await window.manager.load()).settings.defaultTier==="fast"');await wait('!!document.querySelector(".tier-runtime-notice")');await request();assert.equal(seen.at(-1),'default','active process must match the restart notice')
    await wait('!document.querySelector(".ant-message-notice")');await capture('fast-settings-running.png')
    await run('window.manager.stopGateway()');await start();await request();assert.equal(seen.at(-1),'priority')
+   await requestImage();assert.equal(imageModels.at(-1),'fixture-image-explicit')
+   await requestImage('fixture-image-from-settings');assert.equal(imageModels.at(-1),'fixture-image-from-settings','Explicit provider image model overrides the saved default')
    for(const tier of ['default','flex','auto']){await request(tier);assert.equal(seen.at(-1),tier)}
    await run('window.manager.stopGateway()');assert.equal(vault().settings.defaultTier,'fast')
-   console.log('Fast settings regression passed: failed quick-save rollback, settings draft isolation/discard/failure/retry, saved Fast, live restart notice, real HTTP priority after restart and explicit default/flex/auto preservation; temporary AES-GCM, no real keychain.')
+   console.log('Settings regression passed: draft isolation, failed writes, image model validation/save/reload/reset, active-route restart notice, real Images API selected model after restart and explicit override, Fast and explicit default/flex/auto preservation; temporary AES-GCM, no real keychain.')
    clearTimeout(timer);app.quit()
   }catch(error){console.error(error);await capture('fast-settings-failure.png').catch(()=>{});clearTimeout(timer);app.once('will-quit',()=>app.exit(1));app.quit()}
  })

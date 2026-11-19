@@ -4,6 +4,7 @@ import { theme, message, Modal } from 'ant-design-vue'
 import zhCN from 'ant-design-vue/es/locale/zh_CN'
 import { AppstoreOutlined, UserOutlined, DesktopOutlined, ApiOutlined, FileTextOutlined, SettingOutlined, PlusOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined, SearchOutlined, DeleteOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import { settingsSchema, type Account, type AppSnapshot, type Settings, type TierMode } from '../../shared/types'
+import { DEFAULT_IMAGE_GENERATION_MODEL } from '../../shared/imageGeneration'
 import { supportsAccountQuotaQuery } from '../../shared/providerUsage'
 import { useManager } from './store'
 import { useFormFeedback, validationErrors } from './formFeedback'
@@ -96,7 +97,7 @@ const settingsSaving = ref(false)
 const settingsDirty = computed(() => !!manager.data && (Object.keys(settings) as (keyof Settings)[]).some(key => !Object.is(settings[key], manager.data!.settings[key])))
 const settingsError = ref(''), settingsErrors = reactive<Record<string,string>>({})
 useFormFeedback(settingsError, { active: () => page.value === 'settings' })
-const settingsLabels: Record<string,string> = { theme:'主题',defaultTier:'默认服务等级',port:'本地 API 端口',refreshMinutes:'自动刷新间隔',streamOpenTimeoutSeconds:'等待上游响应',streamIdleTimeoutSeconds:'流式空闲',imageStreamOpenTimeoutSeconds:'图片请求等待响应',imageStreamIdleTimeoutSeconds:'图片流式空闲' }
+const settingsLabels: Record<string,string> = { theme:'主题',defaultTier:'默认服务等级',port:'本地 API 端口',refreshMinutes:'自动刷新间隔',streamOpenTimeoutSeconds:'等待上游响应',streamIdleTimeoutSeconds:'流式空闲',imageStreamOpenTimeoutSeconds:'图片请求等待响应',imageStreamIdleTimeoutSeconds:'图片流式空闲',imageGenerationModel:'默认图片模型' }
 function clearSettingsErrors(){settingsError.value='';for(const key of Object.keys(settingsErrors))delete settingsErrors[key]}
 watch(()=>({...settings}),(values,previous)=>{
   for(const key of Object.keys(settingsErrors))if(values[key as keyof Settings]!==previous[key as keyof Settings]){if(settingsError.value===settingsErrors[key])settingsError.value='';delete settingsErrors[key]}
@@ -169,7 +170,7 @@ async function cancelQuotaRefresh() { await manager.execute(() => window.manager
 async function persistSettings(next: Settings): Promise<boolean> {
   if (settingsSaving.value || manager.loading) return false
   const previous = manager.data?.settings
-  const requestChanged = (['defaultTier','port','streamOpenTimeoutSeconds','streamIdleTimeoutSeconds','imageStreamOpenTimeoutSeconds','imageStreamIdleTimeoutSeconds'] as const).some(key => previous?.[key] !== next[key])
+  const requestChanged = (['defaultTier','port','streamOpenTimeoutSeconds','streamIdleTimeoutSeconds','imageStreamOpenTimeoutSeconds','imageStreamIdleTimeoutSeconds','imageGenerationModel'] as const).some(key => previous?.[key] !== next[key])
   settingsSaving.value = true
   try {
     const saved = await manager.execute(() => window.manager.saveSettings(next))
@@ -381,6 +382,15 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
                 </a-form>
               </a-card>
               <UpstreamProxyPanel />
+              <a-card title="图片生成" class="settings-card image-generation-settings">
+                <a-form layout="vertical">
+                  <a-form-item data-settings-field="imageGenerationModel" :validate-status="settingsErrors.imageGenerationModel?'error':undefined" :help="settingsErrors.imageGenerationModel" label="默认图片模型" extra="可输入供应商支持的模型 ID，后续修改并保存即可，无需更改代码。">
+                    <a-input v-model:value="settings.imageGenerationModel" :placeholder="DEFAULT_IMAGE_GENERATION_MODEL" :maxlength="200" autocomplete="off" />
+                  </a-form-item>
+                  <a-button size="small" :disabled="settings.imageGenerationModel===DEFAULT_IMAGE_GENERATION_MODEL" @click="settings.imageGenerationModel=DEFAULT_IMAGE_GENERATION_MODEL">恢复默认模型</a-button>
+                </a-form>
+                <p class="muted">用于未指定模型的 Images API 请求和订阅账号图片工具。供应商请求显式指定的模型优先；所选模型仍须在供应商密钥和本地访问密钥的授权范围内。保存后，运行中的本地服务或实例需重启后应用。</p>
+              </a-card>
               <a-card title="流式请求超时" class="settings-card stream-timeouts">
                 <p class="muted">适用于 HTTP 和 WebSocket。等待首个响应事件可设为不限时（0）；流式空闲时限用于中断已建立但停止输出的请求。保存后需重启本地服务或实例。</p>
                 <a-form layout="vertical">

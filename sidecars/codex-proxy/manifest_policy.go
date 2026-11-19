@@ -56,7 +56,8 @@ const quotaReserveMaxSnapshotAge = 3 * time.Minute
 const codexAutoReviewModel = "codex-auto-review"
 const codexReserveModel = "gpt-reserve"
 const defaultImagesMainModel = "gpt-5.5"
-const defaultImagesToolModel = "gpt-image-2.5"
+const defaultImagesToolModel = "gpt-image-2.6-sunburst"
+const previousImagesToolModel = "gpt-image-2.5"
 
 // codexClientCompactionHash 是下发给 Codex 客户端的统一压缩格式哈希（comp_hash）。
 // 各模型带不同 comp_hash 时，客户端在切换模型后会触发 PreTurn 自动压缩
@@ -1118,6 +1119,15 @@ func configuredImagesToolModel(m *manifest) string {
 	return defaultImagesToolModel
 }
 
+func isBuiltInImagesToolModel(model string) bool {
+	switch modelBase(model) {
+	case defaultImagesToolModel, previousImagesToolModel, legacyImagesToolModel:
+		return true
+	default:
+		return false
+	}
+}
+
 // imageGenerationAccountIDsForSpec 返回该 API Key 配置的生图转发账号池。
 func imageGenerationAccountIDsForSpec(spec *apiKeySpec) []string {
 	if spec == nil || len(spec.ImageGenerationAccountIDs) == 0 {
@@ -1135,6 +1145,7 @@ func isConfiguredImagesToolModel(m *manifest, model string) bool {
 	for _, candidate := range []string{
 		configuredImagesToolModel(m),
 		defaultImagesToolModel,
+		previousImagesToolModel,
 		legacyImagesToolModel,
 	} {
 		if candidate != "" && strings.EqualFold(trimmed, candidate) {
@@ -2238,8 +2249,10 @@ func displayNameForModel(model string) string {
 		return "GPT-5.1 Codex Mini"
 	case "gpt-image-2":
 		return "GPT Image 2"
-	case defaultImagesToolModel:
+	case previousImagesToolModel:
 		return "GPT Image 2.5"
+	case defaultImagesToolModel:
+		return "GPT Image 2.6 Sunburst"
 	case codexAutoReviewModel:
 		return "Codex Auto Review"
 	default:
@@ -2249,7 +2262,7 @@ func displayNameForModel(model string) string {
 
 func isHiddenCodexClientModel(model string) bool {
 	switch model {
-	case codexAutoReviewModel, legacyImagesToolModel, defaultImagesToolModel, "grok-imagine-image", "grok-imagine-video", "grok-imagine-image-quality":
+	case codexAutoReviewModel, legacyImagesToolModel, previousImagesToolModel, defaultImagesToolModel, "grok-imagine-image", "grok-imagine-video", "grok-imagine-image-quality":
 		return true
 	default:
 		return false
