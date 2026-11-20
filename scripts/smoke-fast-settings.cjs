@@ -100,7 +100,7 @@ app.on('browser-window-created',(_event,window)=>{
    const requestImage=async model=>{const key=vault().accounts[0].credentials.localAPIKey,res=await fetch(`http://127.0.0.1:${port}/v1/images/generations`,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({prompt:'synthetic image settings check',...model?{model}:{}}),signal:AbortSignal.timeout(5000)});assert.equal(res.status,200,await res.text())}
    await requestImage();assert.equal(imageModels.at(-1),'fixture-image-from-settings')
    await settingsPage();await fill(imageInput,'fixture-image-explicit');await click('.settings-actions button','保存设置');await wait('!document.querySelector(".settings-unsaved")')
-   await wait('Array.from(document.querySelectorAll(".ant-message-notice")).some(el=>el.textContent.includes("运行中的服务需重启"))')
+   await wait('Array.from(document.querySelectorAll(".ant-message-notice")).some(el=>el.textContent.includes("图片插件下次调用生效")&&el.textContent.includes("直接调用本地 API"))')
    await requestImage();assert.equal(imageModels.at(-1),'fixture-image-from-settings','Running image route must match the restart notice')
    await accountPage()
    await chooseTier('.tier-strip','Fast');await wait('(await window.manager.load()).settings.defaultTier==="fast"');await wait('!!document.querySelector(".tier-runtime-notice")');await request();assert.equal(seen.at(-1),'default','active process must match the restart notice')

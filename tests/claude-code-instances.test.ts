@@ -303,7 +303,9 @@ test('Claude API and Bearer use concurrent owned native processes and consume a 
     assert.ok(!checkpoint.includes('secret'))
     assert.equal(existsSync(join(instance.directory, 'auth.json')), false)
     assert.equal(existsSync(join(instance.directory, 'config.toml')), false)
-    assert.ok(existsSync(join(instance.directory, transcriptName)))
+    // The fixture publishes process evidence before its transcript. Readiness
+    // of that first file does not imply the second write has finished.
+    await waitFor(() => existsSync(join(instance.directory, transcriptName)) ? true : undefined)
   }
   const transcript = readFileSync(join(first.directory, transcriptName), 'utf8')
   await f.instances.stop(first.id)

@@ -18,6 +18,7 @@ import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { settingsSchema, accountInputSchema } from '../shared/types'
 import { Store } from './store'
+import { InstanceImages } from './instanceImages'
 import { createAPIAccount, importIntoStore, parseAccountImport, saveOAuthAccount, saveClaudeSubscriptionAccount, markClaudeSubscriptionRefreshError, editAccount, readAccountKey, batchTags, deleteAccounts, importParsedAccounts } from './accounts'
 import { saveGroup, deleteGroup, reorderGroups, updateGroupMembers } from './groups'
 import { AccountFiles } from './accountFiles'
@@ -101,6 +102,7 @@ async function main(): Promise<void> {
   // below still reports a concrete error when the user changes it.
   try { if (!isolatedTest) applyLaunchAtLogin(app, store.read().settings.launchAtLogin) } catch (error) { console.error('无法同步开机启动设置', error) }
   const binaryRoot = app.isPackaged ? process.resourcesPath : resolve('resources')
+  const imagePlugins = new InstanceImages(store, join(binaryRoot, 'bin', process.platform === 'win32' ? 'images-mcp.exe' : 'images-mcp'))
   const history = new History(app.getPath('userData'))
   const accountFiles = new AccountFiles(store)
   const localDataMigration = new LocalDataMigration(store)
@@ -164,7 +166,7 @@ async function main(): Promise<void> {
   instances=new Instances(store,()=>{
     const instanceRunId=randomUUID()
     return new Gateway(binary,runtimeRoot,event=>history.record(instanceRunId,event),(id,identity,expected,generation)=>agents.adopt(id,identity,expected,generation),()=>store.proxyState(),proxyTunnels)
-  },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages(),undefined,new NativeProxy(binary,proxyTunnels))
+  },async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},undefined,nativeAccounts,Date.now,id=>(sessionTransfers?.busy(id)??false)||(sessionArchives?.busy(id)??false)||(sessionSync?.busy(id)??false)||(sessionTrash?.busy(id)??false),app.getPreferredSystemLanguages(),undefined,new NativeProxy(binary,proxyTunnels),undefined,imagePlugins)
   const externalInstanceSources=new ExternalInstanceSources({managerRoot:realpathSync(store.directory),managedDirectories:()=>instances.views().map(instance=>instance.directory),...(isolatedTest?{home:join(realpathSync(store.directory),'external-source-home')}:{})})
   const localAccess=new LocalAccess(store,gateway,async id=>{let account=await tokens.ensure(id);if(account.kind==='agent_identity')account=await agents.ensure(id);return account},ids=>effectiveKeyUsage(store.read(),history.keyTokenUsage(ids)))
   const codexSessionSources=new CodexSessionSources(store)
@@ -178,6 +180,7 @@ async function main(): Promise<void> {
   const sessionVisibility=new SessionVisibilityRepair(clientConfigs,id=>instances.inUse(id)||clientSwitches.usesTarget(id),id=>instances.plannedSessionProvider(id))
   sessionTrash.recover()
   await instances.recover()
+  imagePlugins.sync()
   await sessionTransfers.recover()
   await sessionSync.recover()
   const quotas = new QuotaService(store, tokens, accountNetwork.request, agents,projectRouting,maintenance)
@@ -665,7 +668,9 @@ async function main(): Promise<void> {
         }
         keepAliveInTray = next.closeToTray || hasActiveInstances()
         refreshTrayMenu?.()
-        quotas.schedule(); break
+        quotas.schedule()
+        if (imagePlugins.sync()) throw new Error('设置已保存，但部分实例的图片插件同步失败；请查看实例提示并检查图片配置权限后重试保存')
+        break
       }
       case 'addAccount': {
         const result = importParsedAccounts(store, [createAPIAccount(accountInputSchema.parse(input))])

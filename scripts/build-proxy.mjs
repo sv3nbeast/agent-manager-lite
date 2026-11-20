@@ -10,6 +10,11 @@ const result = spawnSync('go', ['build', '-trimpath', '-o', output, '.'], {
 })
 if (result.error) throw result.error
 if (result.status !== 0) process.exit(result.status ?? 1)
+const images = spawnSync('go', ['build', '-trimpath', '-o', resolve(directory, process.platform === 'win32' ? 'images-mcp.exe' : 'images-mcp'), './cmd/images-mcp'], {
+  cwd: resolve('sidecars/codex-proxy'), stdio: 'inherit', env: { ...process.env, CGO_ENABLED: '0' }
+})
+if (images.error) throw images.error
+if (images.status !== 0) process.exit(images.status ?? 1)
 if (process.platform === 'darwin') {
   const snapshot = spawnSync('xcrun', ['clang', '-O2', '-Wall', '-Wextra', '-Werror',
     'sidecars/profile-snapshot/main.c', '-o', resolve(directory, 'codex-profile-snapshot')], { stdio: 'inherit' })

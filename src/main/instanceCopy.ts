@@ -13,6 +13,7 @@ import {TomlDocument,patchToml,scalarRaw,type TomlEdit} from './tomlPatch'
 import {copiedProjectStateFile,copiedProjectStateLimit,projectCopiedProjectState} from './copiedProjectState'
 import {excludedInstanceCopyTree} from './instanceCopyScope'
 import {hasIndexedRolloutBytes} from './codexRolloutMetadata'
+import {relocateCopiedImagesPlugin} from './instanceImages'
 
 export interface CopyEntry {relative:string;directory:boolean;dev:number;ino:number;size:number;mtime:number;ctime:number;mode:number}
 type Entry=CopyEntry
@@ -141,8 +142,10 @@ export async function relocateCopiedProfile(manifest:CopyManifest,stagedHome:str
   const configs=manifest.entries.filter(entry=>!entry.directory&&!entry.relative.includes(sep)&&/^(?:config|[A-Za-z0-9_-]+\.config)\.toml$/i.test(entry.relative))
   for(const entry of configs){
     signal.throwIfAborted()
-    const configPath=join(stagedHome,entry.relative),config=readBounded(configPath,1024*1024)
-    if(config===null)throw new Error('副本配置文件缺失，未创建副本')
+    const configPath=join(stagedHome,entry.relative),originalConfig=readBounded(configPath,1024*1024)
+    if(originalConfig===null)throw new Error('副本配置文件缺失，未创建副本')
+    const config=entry.relative==='config.toml'?relocateCopiedImagesPlugin(originalConfig,manifest.root,stagedHome,finalHome):originalConfig
+    if(config!==originalConfig)atomic(configPath,config)
     const doc=new TomlDocument(config),edits:TomlEdit[]=[]
     const scopes=[[],...doc.children(['profiles']).map(name=>['profiles',name])]
     for(const scope of scopes)for(const key of ['model_catalog_json','sqlite_home','log_dir']){

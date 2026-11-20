@@ -43,6 +43,7 @@ import {repairSessionProjection} from './sessionProjectionRepair'
 import {readSessionRolloutIndex} from './sessionDisplay'
 import {readInstanceIdentityStatus} from './instanceIdentityStatus'
 import type {prepareCodexSharedSkills} from './codexSkills'
+import type {InstanceImagesServices} from './instanceImages'
 import { instanceArchiveManifestSchema, type InstanceArchiveManifest, type InstanceArchiveView, instanceArchiveSelectionSchema } from '../shared/instanceRecycle'
 
 export interface InstanceSpeedMenuServices {inspect:typeof inspectCodexSpeedMenu;prepare:typeof prepareCodexSpeedMenu;readStatus:typeof readCodexSpeedMenuStatus;inspectLocale?:typeof inspectCodexSpeedMenu;inspectCombined?:typeof inspectCodexSpeedMenu;inspectFeatures?:typeof inspectCodexDesktopUi}
@@ -72,7 +73,7 @@ export class Instances {
     private readonly prepareAccount:(id:string)=>Promise<StoredAccount>,private readonly runtime:DesktopRuntime=new MacInstanceRuntime(),
     private readonly nativeAccounts?:NativeInstanceAccounts,private readonly now:()=>number=Date.now,private readonly externalBusy:(id:string)=>boolean=()=>false,
     private readonly systemLanguages:readonly string[]=systemDesktopLanguages(),private readonly speedMenuServices:InstanceSpeedMenuServices=defaultSpeedMenuServices,private readonly nativeProxyService?:NativeProxyService,
-    private readonly skillsServices:InstanceSkillsServices=defaultSkillsServices) {this.root=realpathSync(store.directory)}
+    private readonly skillsServices:InstanceSkillsServices=defaultSkillsServices, private readonly imagePlugins?:InstanceImagesServices) {this.root=realpathSync(store.directory)}
   applications():InstanceApplication[] {
     const stored=this.store.read().instanceApplications ?? []
     return [...codexInstanceAdapter.applications(stored),...claudeCodeInstanceAdapter.applications(stored)]
@@ -158,7 +159,7 @@ export class Instances {
       return {...profile,clientType,copying:this.copyingTarget(profile.id),connectionMode:profile.connectionMode??'local_api',directory:instanceHomePath(this.root,profile),desktopDirectory:isClaudeDesktopProfile(profile)&&profile.connectionMode==='native'?`${desktopDirectory}-3p`:desktopDirectory,
         launchMode:run?.plan.mode??profile.launchMode??(isClaudeDesktopProfile(profile)?'desktop':profile.clientType==='claude_code'?'cli':applications.find(app=>app.id===profile.applicationId)?.kind??'desktop'),workingDirectory:run?.plan.workingDirectory??(profile.workingDirectoryId?this.workingDirectories().find(value=>value.id===profile.workingDirectoryId)?.path:join(this.root,'instances',profile.id,'workspace')),
         accountName:state.accounts.find(account=>account.id===profile.accountId)?.name,applicationName:applications.find(app=>app.id===profile.applicationId)?.name,
-        status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),menuNotice,localeNotice,ultraNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
+        status:clientError?'error':run?.status ?? (this.recoveryErrors.has(profile.id)?'error':'stopped'),pid:run?.child?.pid,startedAt:run?.startedAt,error:clientError ?? run?.error ?? gateway?.quotaSyncError ?? this.recoveryErrors.get(profile.id),notice:[...new Set([this.notices.get(profile.id),this.imagePlugins?.notice(profile.id),menuNotice,localeNotice,ultraNotice].filter(Boolean))].join('；')||undefined,port:gateway?.port,appliedTier:profile.connectionMode==='native'?run?.nativeTier:gateway?.defaultTier,
         speedMenu,initialTier:run?.initialTier,desktopLocaleCompatibility:localeState,ultraCompatibility:ultraState,clientVersion:run?.clientVersion,
         identityStatus:identity.status,identityEmail:identity.email,identityAccountId:identity.accountId,injectNetworkProxy:run?.injectNetworkProxy??profile.injectNetworkProxy!==false}
     })
@@ -827,6 +828,7 @@ export class Instances {
         },run.injectNetworkProxy!==false)
         run.controller.signal.throwIfAborted();run.status='starting'
         if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
+        this.imagePlugins?.prepare(run.profile)
         run.child=await this.runtime.launch(run.plan,run.controller.signal)
         run.controller.signal.throwIfAborted()
         if(run.nativeProxy&&!run.nativeProxy.alive())throw new Error('原生实例代理已退出，请重新启动')
@@ -855,6 +857,7 @@ export class Instances {
       if(!run.injectNetworkProxy)run.plan.networkRoute={mode:'direct'}
       run.status='starting'
       if(run.codexResume)await this.validateCodexCurrentRollout(run.profile,run.codexResume)
+      this.imagePlugins?.prepare(run.profile,{port:status.port!,key:localKey})
       run.child=await this.runtime.launch(run.plan,run.controller.signal)
       run.controller.signal.throwIfAborted()
       await gateway.updateCredentials(this.store.read().accounts.find(value=>value.id===run.profile.accountId)!)
@@ -868,6 +871,7 @@ export class Instances {
   private async cleanup(run:Running):Promise<void> {
     await this.runtime.stop(run.plan)
     await run.gateway?.stop()
+    this.imagePlugins?.stop(run.profile)
     await run.nativeProxy?.stop();run.nativeProxy=undefined
     if(isClaudeDesktopProfile(run.profile)){
       rmSync(join(this.folder(run.profile.id),'launch.json'),{force:true})

@@ -21,6 +21,7 @@ import { MacDesktopRuntime, desktopEnvironment, macLaunchArgs, type DesktopRunti
 import { NativeInstanceAccounts } from '../src/main/nativeInstanceAccounts'
 import { TokenAuthority } from '../src/main/tokens'
 import { selectedInstanceSessionIds } from '../src/main/instanceHistory'
+import { InstanceImages, type InstanceImagesServices } from '../src/main/instanceImages'
 
 class FixtureDesktop implements DesktopRuntime {
   readonly children=new Map<string,DesktopProcess>()
@@ -41,7 +42,7 @@ function fixture(t:Context,systemLanguages:readonly string[]=['en-US'],speedMenu
   const events:Record<string,unknown>[]=[]
   let prepare=async(id:string)=>store.read().accounts.find(value=>value.id===id)!
   let now=Date.now()
-  const create=(runtimeOverride?:DesktopRuntime)=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event),undefined,()=>store.proxyState());gateways.push(gateway);return gateway},id=>prepare(id),runtimeOverride??runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus)
+  const create=(runtimeOverride?:DesktopRuntime,images?:InstanceImagesServices)=>new Instances(store,()=>{const gateway=new Gateway(resolve('resources/bin/codex-proxy'),join(root,'runtime'),event=>events.push(event),undefined,()=>store.proxyState());gateways.push(gateway);return gateway},id=>prepare(id),runtimeOverride??runtime,nativeAccounts,()=>now,undefined,systemLanguages,speedMenus,undefined,undefined,images)
   const instances=create(),app=instances.registerApplication(application)
   t.after(async()=>{await instances.closeAll().catch(()=>{});await Promise.all(gateways.map(gateway=>gateway.stop()));await tokens.stop();rmSync(root,{recursive:true,force:true})})
   function account(url='http://127.0.0.1:9',key='fixture-upstream',models=['fixture-model']) {const a=createAPIAccount({name:`Account ${randomUUID()}`,apiKey:key,baseUrl:url,models,wireApi:'responses',defaultTier:'inherit',note:'',tags:[]});store.transaction(state=>state.accounts.push(a));return a}
@@ -89,6 +90,33 @@ test('instance views and launch previews expose local API identity semantics',t=
   const preview=f.instances.preview({id:instance.id,revision:instance.revision})
   assert.equal(preview.identityStatus,'local_api')
   assert.equal(preview.identityEmail,undefined)
+})
+
+test('Codex launch projects Images MCP through its own gateway and preserves registration after stop',async t=>{
+  const seen:Array<{model:string;authorization:string|undefined}>=[]
+  const upstream=createServer(async(req,res)=>{
+    let raw='';for await(const chunk of req)raw+=chunk
+    seen.push({model:JSON.parse(raw).model,authorization:req.headers.authorization})
+    res.setHeader('content-type','application/json');res.end(JSON.stringify({data:[{b64_json:'synthetic-route-only'}]}))
+  })
+  await new Promise<void>(resolve=>upstream.listen(0,'127.0.0.1',resolve))
+  t.after(()=>new Promise<void>(resolve=>upstream.close(()=>resolve())))
+  const f=fixture(t),account=f.account(`http://127.0.0.1:${(upstream.address() as {port:number}).port}`,'upstream-image-key',['fixture-model','custom-image'])
+  const instance=f.add(account.id),images=new InstanceImages(f.store,resolve('resources/bin/images-mcp')),instances=f.create(undefined,images)
+  f.store.transaction(state=>{state.settings.imageGenerationModel='custom-image'})
+  t.after(()=>instances.closeAll())
+  instances.start(instances.preview({id:instance.id,revision:instance.revision}).ticket);await instances.settled(instance.id)
+  const view=instances.views().find(value=>value.id===instance.id)!
+  assert.equal(view.status,'running',view.error)
+  const pluginPath=join(instance.directory,'tools','sub2api-images','config.json'),plugin=JSON.parse(readFileSync(pluginPath,'utf8'))
+  assert.equal(images.notice(instance.id),undefined)
+  assert.equal(plugin.model,'custom-image');assert.notEqual(plugin.api_key,'upstream-image-key')
+  const response=await fetch(plugin.base_url+'/images/generations',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+plugin.api_key},body:JSON.stringify({model:plugin.model,prompt:'synthetic integration check'})})
+  assert.equal(response.status,200,await response.text())
+  assert.deepEqual(seen,[{model:'custom-image',authorization:'Bearer upstream-image-key'}])
+  await instances.stop(instance.id)
+  assert.equal(JSON.parse(readFileSync(pluginPath,'utf8')).active,false)
+  assert.ok(new TomlDocument(readFileSync(join(instance.directory,'config.toml'),'utf8')).scalar(['mcp_servers','sub2api_images','command']))
 })
 
 test('saved proxy opt-out reaches previews and one-run overrides leave the preference intact',async t=>{

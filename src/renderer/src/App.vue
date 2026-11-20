@@ -170,11 +170,12 @@ async function cancelQuotaRefresh() { await manager.execute(() => window.manager
 async function persistSettings(next: Settings): Promise<boolean> {
   if (settingsSaving.value || manager.loading) return false
   const previous = manager.data?.settings
-  const requestChanged = (['defaultTier','port','streamOpenTimeoutSeconds','streamIdleTimeoutSeconds','imageStreamOpenTimeoutSeconds','imageStreamIdleTimeoutSeconds','imageGenerationModel'] as const).some(key => previous?.[key] !== next[key])
+  const requestChanged = (['defaultTier','port','streamOpenTimeoutSeconds','streamIdleTimeoutSeconds','imageStreamOpenTimeoutSeconds','imageStreamIdleTimeoutSeconds'] as const).some(key => previous?.[key] !== next[key])
+  const imageChanged = previous?.imageGenerationModel !== next.imageGenerationModel
   settingsSaving.value = true
   try {
     const saved = await manager.execute(() => window.manager.saveSettings(next))
-    if (saved) message.success({ key: 'settings-save', content: requestChanged && activeConnections.value ? '设置已保存，运行中的服务需重启后应用请求配置' : '设置已保存' })
+    if (saved) message.success({ key: 'settings-save', content: requestChanged && activeConnections.value ? '设置已保存，运行中的服务需重启后应用请求配置；管理器图片插件下次调用使用新默认模型' : imageChanged ? '图片模型已保存，管理器图片插件下次调用生效；直接调用本地 API 的默认值需重启服务' : '设置已保存' })
     return saved
   } finally { settingsSaving.value = false }
 }
@@ -389,7 +390,8 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
                   </a-form-item>
                   <a-button size="small" :disabled="settings.imageGenerationModel===DEFAULT_IMAGE_GENERATION_MODEL" @click="settings.imageGenerationModel=DEFAULT_IMAGE_GENERATION_MODEL">恢复默认模型</a-button>
                 </a-form>
-                <p class="muted">用于未指定模型的 Images API 请求和订阅账号图片工具。供应商请求显式指定的模型优先；所选模型仍须在供应商密钥和本地访问密钥的授权范围内。保存后，运行中的本地服务或实例需重启后应用。</p>
+                <p class="muted">兼容 OpenAI Images API 的供应商均可使用，不限 Sub2API。管理器图片插件在下一次调用读取保存的默认模型，无需重启实例；调用中显式指定的模型优先。新建 API 转发实例使用自己的账号及代理设置，所选模型须在密钥授权范围内。</p>
+                <p class="muted">旧版内置图片插件会自动升级并保留原连接。自定义第三方 MCP 的配置不会覆盖。直接调用本地 Images API 或订阅账号内置图片工具的默认值，仍在重启对应服务后应用。</p>
               </a-card>
               <a-card title="流式请求超时" class="settings-card stream-timeouts">
                 <p class="muted">适用于 HTTP 和 WebSocket。等待首个响应事件可设为不限时（0）；流式空闲时限用于中断已建立但停止输出的请求。保存后需重启本地服务或实例。</p>
