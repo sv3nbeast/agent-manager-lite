@@ -19,6 +19,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -168,6 +169,102 @@ func outputDirectory(path string) error {
 	return nil
 }
 
+func publicImageIP(ip net.IP) bool {
+	return ip != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified()
+}
+
+// Some compatible providers return a short-lived URL instead of b64_json.
+// Fetch only that image, with no API Authorization or cookies. Resolve and pin
+// public addresses at dial time to prevent DNS rebinding into local services;
+// the explicitly configured API origin is the only private-origin exception.
+func downloadImage(ctx context.Context, location, apiAddress string) ([]byte, error) {
+	if strings.HasPrefix(location, "data:image/") {
+		parts := strings.SplitN(location, ",", 2)
+		if len(parts) != 2 || !strings.HasSuffix(parts[0], ";base64") || len(parts[1]) > (maxImage+2)/3*4 {
+			return nil, errors.New("图片 data URL 格式无效或超过大小限制")
+		}
+		data, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil || len(data) > maxImage {
+			return nil, errors.New("图片 data URL 编码无效")
+		}
+		return data, nil
+	}
+	api, _ := url.Parse(apiAddress)
+	for redirects := 0; redirects <= 3; redirects++ {
+		u, err := url.Parse(location)
+		if err != nil || len(location) > 8192 || u.Host == "" || u.User != nil || u.Fragment != "" || strings.ContainsAny(location, "\r\n\\") {
+			return nil, errors.New("供应商图片 URL 无效")
+		}
+		sameOrigin := api != nil && strings.EqualFold(u.Scheme, api.Scheme) && strings.EqualFold(u.Host, api.Host)
+		if u.Scheme != "https" && !(sameOrigin && u.Scheme == "http") {
+			return nil, errors.New("供应商图片 URL 需要 HTTPS，或与已配置的 API 同源")
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = nil
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, errors.New("图片主机无效")
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil || len(ips) == 0 {
+				return nil, errors.New("图片主机无法解析")
+			}
+			if !sameOrigin {
+				for _, entry := range ips {
+					if !publicImageIP(entry.IP) {
+						return nil, errors.New("图片 URL 不允许访问其他本机或私有网络地址")
+					}
+				}
+			}
+			var dialer net.Dialer
+			var last error
+			for _, entry := range ips {
+				connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(entry.IP.String(), port))
+				if err == nil {
+					return connection, nil
+				}
+				last = err
+			}
+			return nil, last
+		}
+		client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			transport.CloseIdleConnections()
+			return nil, errors.New("图片下载请求无效")
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			transport.CloseIdleConnections()
+			return nil, errors.New("图片 URL 下载失败；已阻止私有地址转向，未发送 API 密钥")
+		}
+		if res.StatusCode >= 300 && res.StatusCode < 400 {
+			next, err := res.Location()
+			res.Body.Close()
+			transport.CloseIdleConnections()
+			if err != nil || next.Scheme != "https" {
+				return nil, errors.New("图片 URL 重定向无效或降级，未发送 API 密钥")
+			}
+			location = next.String()
+			continue
+		}
+		if res.StatusCode != http.StatusOK {
+			res.Body.Close()
+			transport.CloseIdleConnections()
+			return nil, fmt.Errorf("图片下载返回 HTTP %d（生成请求未重试）", res.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(res.Body, maxImage+1))
+		res.Body.Close()
+		transport.CloseIdleConnections()
+		if err != nil || len(data) > maxImage {
+			return nil, errors.New("图片下载失败或超过大小限制（生成请求未重试）")
+		}
+		return data, nil
+	}
+	return nil, errors.New("图片 URL 重定向次数过多（生成请求未重试）")
+}
+
 func generate(ctx context.Context, path string, arguments map[string]any) ([]map[string]any, error) {
 	// Reload on every call. A saved model applies to the next request, while an
 	// already-running request keeps its initial configuration and credentials.
@@ -254,12 +351,30 @@ func generate(ctx context.Context, path string, arguments map[string]any) ([]map
 	var result struct {
 		Data []struct {
 			Base64 string `json:"b64_json"`
+			URL    string `json:"url"`
 		} `json:"data"`
+		Error json.RawMessage `json:"error"`
 	}
-	if json.Unmarshal(body, &result) != nil || len(result.Data) != 1 || result.Data[0].Base64 == "" {
-		return nil, errors.New("Images API 需返回一张 b64_json 图片；当前响应格式不兼容")
+	if json.Unmarshal(body, &result) != nil {
+		return nil, errors.New("Images API 返回 HTTP 成功但不是有效 JSON 图片响应")
 	}
-	pixels, err := base64.StdEncoding.DecodeString(result.Data[0].Base64)
+	if len(result.Error) > 0 && string(result.Error) != "null" {
+		return nil, errors.New("Images API 返回 HTTP 成功但响应包含 error；请检查上游请求记录")
+	}
+	if len(result.Data) != 1 {
+		return nil, fmt.Errorf("Images API 返回 HTTP 成功，但图片数量为 %d（请求数量为 1）；请检查供应商响应", len(result.Data))
+	}
+	var pixels []byte
+	if result.Data[0].Base64 != "" {
+		pixels, err = base64.StdEncoding.DecodeString(result.Data[0].Base64)
+	} else if result.Data[0].URL != "" {
+		pixels, err = downloadImage(ctx, result.Data[0].URL, address)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, errors.New("Images API 返回 HTTP 成功但未包含 b64_json 或 url 图片数据")
+	}
 	if err != nil || len(pixels) > maxImage {
 		return nil, errors.New("Images API 图片编码无效或超过大小限制")
 	}

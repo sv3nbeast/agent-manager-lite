@@ -391,7 +391,7 @@ async function restartAfterBackup() { try { await window.manager.restartAfterBac
                   <a-button size="small" :disabled="settings.imageGenerationModel===DEFAULT_IMAGE_GENERATION_MODEL" @click="settings.imageGenerationModel=DEFAULT_IMAGE_GENERATION_MODEL">恢复默认模型</a-button>
                 </a-form>
                 <p class="muted">兼容 OpenAI Images API 的供应商均可使用，不限 Sub2API。管理器图片插件在下一次调用读取保存的默认模型，无需重启实例；调用中显式指定的模型优先。新建 API 转发实例使用自己的账号及代理设置，所选模型须在密钥授权范围内。</p>
-                <p class="muted">旧版内置图片插件会自动升级并保留原连接。自定义第三方 MCP 的配置不会覆盖。直接调用本地 Images API 或订阅账号内置图片工具的默认值，仍在重启对应服务后应用。</p>
+                <p class="muted">旧版内置图片插件会自动升级并保留原连接；已运行的旧插件需重新连接 MCP 一次。自定义第三方 MCP 的配置不会覆盖。直接调用本地 Images API 或订阅账号内置图片工具的默认值，仍在重启对应服务后应用。</p>
               </a-card>
               <a-card title="流式请求超时" class="settings-card stream-timeouts">
                 <p class="muted">适用于 HTTP 和 WebSocket。等待首个响应事件可设为不限时（0）；流式空闲时限用于中断已建立但停止输出的请求。保存后需重启本地服务或实例。</p>

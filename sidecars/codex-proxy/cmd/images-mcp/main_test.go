@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -141,7 +143,7 @@ func TestConfigPermissionsAndInvalidResponseDoNotProduceFiles(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		fmt.Fprint(w, `{"data":[{"url":"https://other.invalid/image.png"}]}`)
+		fmt.Fprint(w, `{"data":[{}]}`)
 	}))
 	defer server.Close()
 	path, _ := fixture(t, server.URL)
@@ -167,6 +169,81 @@ func TestConfigPermissionsAndInvalidResponseDoNotProduceFiles(t *testing.T) {
 	}
 	if _, err := readConfig(link); err == nil {
 		t.Fatal("symlink accepted")
+	}
+}
+
+func TestURLImagesAreDownloadedWithoutCredentials(t *testing.T) {
+	png, _ := base64.StdEncoding.DecodeString(testPNG)
+	var origin string
+	var generates, downloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/images/generations" {
+			generates.Add(1)
+			fmt.Fprintf(w, `{"data":[{"url":%q}]}`, origin+"/output.png?signature=fixture")
+			return
+		}
+		downloads.Add(1)
+		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+			t.Error("image URL received credentials")
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(png)
+	}))
+	defer server.Close()
+	origin = server.URL
+	path, _ := fixture(t, server.URL)
+	content, err := generate(context.Background(), path, map[string]any{"prompt": "test"})
+	if err != nil || len(content) != 2 {
+		t.Fatalf("URL image failed: %v", err)
+	}
+	if generates.Load() != 1 || downloads.Load() != 1 {
+		t.Fatal("unexpected request count")
+	}
+	data, err := downloadImage(context.Background(), "data:image/png;base64,"+testPNG, server.URL)
+	if err != nil || string(data) != string(png) {
+		t.Fatal("data URL failed")
+	}
+}
+
+func TestImageURLRejectsPrivateTargetsAndRedirects(t *testing.T) {
+	for _, ip := range []string{"127.0.0.1", "::1", "10.1.2.3", "169.254.169.254", "192.168.1.1", "fc00::1", "0.0.0.0"} {
+		if publicImageIP(net.ParseIP(ip)) {
+			t.Fatalf("private IP accepted: %s", ip)
+		}
+	}
+	if !publicImageIP(net.ParseIP("1.1.1.1")) {
+		t.Fatal("public IP rejected")
+	}
+	for _, target := range []string{"https://127.0.0.1/private", "http://outside.invalid/image", "https://user:secret@image.invalid/a", "file:///tmp/image.png"} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := downloadImage(ctx, target, "https://provider.invalid/v1/images/generations")
+		cancel()
+		if err == nil {
+			t.Fatalf("unsafe image URL accepted: %s", target)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatal("credential reflected")
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://127.0.0.1/private")
+		w.WriteHeader(302)
+	}))
+	defer server.Close()
+	if _, err := downloadImage(context.Background(), server.URL+"/redirect", server.URL+"/v1/images/generations"); err == nil {
+		t.Fatal("redirect to another private origin accepted")
+	}
+}
+
+func TestSuccessfulHTTPWithNoImageIsAnUpstreamFailure(t *testing.T) {
+	for _, body := range []string{`{"data":[]}`, `{"error":{"message":"private vendor error"}}`, `<html>not JSON</html>`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) }))
+		path, _ := fixture(t, server.URL)
+		_, err := generate(context.Background(), path, map[string]any{"prompt": "test"})
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), "HTTP 成功") || strings.Contains(err.Error(), "private vendor error") {
+			t.Fatalf("unsafe upstream shape error: %v", err)
+		}
 	}
 }
 
