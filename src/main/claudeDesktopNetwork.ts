@@ -89,7 +89,27 @@ export function claudeDesktopNativeSource(application: string): string {
   if (pkg.name !== '@ant/desktop' || typeof pkg.main !== 'string' || pkg.main.length > 4096 || isAbsolute(pkg.main) || /^[a-z]:/i.test(pkg.main) || /[\\\0\r\n]/.test(pkg.main)) throw new Error('entry')
   const main = pkg.main.replace(/^\.\//, '')
   if (!main.split('/').every((part: string) => part && part !== '.' && part !== '..')) throw new Error('entry')
-  return archiveFile(archive, main, 16 * 1024 * 1024).toString('utf8')
+  const maxSourceBytes = 16 * 1024 * 1024
+  const source = archiveFile(archive, main, maxSourceBytes).toString('utf8')
+  if (source.length > 128 * 1024 || source.includes('flatKey')) return source
+
+  // A small launcher can hand off its configuration to a sibling module.
+  // Only follow a single unconditional, literal require in the declared entry.
+  const program = parse(source, { ecmaVersion: 'latest', sourceType: 'module' })
+  const targets = new Set<string>()
+  for (const statement of program.body) {
+    if (statement.type !== 'ExpressionStatement') continue
+    const expression = statement.expression
+    for (const call of expression.type === 'SequenceExpression' ? expression.expressions : [expression]) {
+      if (call.type !== 'CallExpression' || call.optional || call.callee.type !== 'Identifier' || call.callee.name !== 'require' || call.arguments.length !== 1) continue
+      const argument = call.arguments[0]
+      if (argument.type === 'Literal' && typeof argument.value === 'string' && /^\.\/[\w.-]+\.(?:c|m)?js$/.test(argument.value)) targets.add(argument.value.slice(2))
+    }
+  }
+  if (targets.size !== 1) return source
+  const file = [...targets][0], separator = main.lastIndexOf('/')
+  const target = main.slice(0, separator + 1) + file
+  return target === main ? source : archiveFile(archive, target, maxSourceBytes).toString('utf8')
 }
 
 /** Probe the native config contract, rather than matching an upstream version,

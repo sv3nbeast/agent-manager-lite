@@ -1,5 +1,4 @@
-// Run the installed client with synthetic identities, a loopback provider and
-// disposable history. Never attach to a user's existing renderer or vault.
+// Run a disposable copy of the client with synthetic identities and a loopback provider.
 const assert=require('node:assert/strict')
 const {createServer}=require('node:http')
 const {execFileSync,spawn}=require('node:child_process')
@@ -13,13 +12,15 @@ const {inspectCodexDesktopUi,prepareCodexSpeedMenu,readCodexSpeedMenuStatus}=req
 const {MacDesktopRuntime}=require('../src/main/instanceRuntime.ts')
 const {reserveCodexCdpPort}=require('../src/main/codexInstanceAdapter.ts')
 const {builtInCatalog,buildModelCatalog}=require('../src/main/modelCatalog.ts')
-const {codexBundledCli}=require('../src/main/codexPrograms.ts')
+const {codexBundledCli,codexDesktopExecutable}=require('../src/main/codexPrograms.ts')
+const {withTestApplication}=require('./codex-ui-test-application.cjs')
 
-async function main(){
+async function main(application){
   assert.equal(process.platform,'darwin','native desktop smoke requires macOS')
   const forkSmoke=process.env.CML_CODEX_UI_FORK==='1'
+  const skillsSmoke=process.env.CML_CODEX_UI_SKILLS==='1'
   const unmodified=process.env.CML_CODEX_UI_UNMODIFIED==='1'
-  const application=process.env.CML_CODEX_APP_PATH??'/Applications/ChatGPT.app',executable=join(application,'Contents/MacOS/ChatGPT')
+  const executable=codexDesktopExecutable(application)
   const nativeApi=process.env.CML_CODEX_UI_NATIVE_API==='1',modelId=process.env.CML_CODEX_MODEL??'gpt-6.1-sol',modelLabel=modelId==='gpt-6.1-sol'?'6.1 Sol':modelId.split('/').at(-1)
   const inspection=inspectCodexDesktopUi({application,executable,...nativeApi||forkSmoke?{features:['locale']}: {}})
   // Capabilities are intentionally discovered from the installed bundle. A
@@ -41,6 +42,7 @@ async function main(){
     execFileSync('git',['-C',root,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','Initialize disposable fork fixture'],{stdio:'ignore'})
   }
   const runtime=new MacDesktopRuntime(),nonce=randomUUID(),cdpPort=await reserveCodexCdpPort()
+  const skillName='cml-picker-'+nonce.slice(0,8),skillDescription='Picker fixture '+nonce.slice(0,8),skillMarker='body-'+randomUUID()
   let socket,plan,capture=async()=>{};const requests=[],diagnostics=[]
   const server=createServer((req,res)=>{
     res.setHeader('content-type','application/json')
@@ -52,7 +54,11 @@ async function main(){
       const multiAgentMode=(JSON.stringify(input.input)??'').match(/<multi_agent_mode>[\s\S]*?<\/multi_agent_mode>/g)?.at(-1)??null
       const lastUserText=(input.input??[]).filter(item=>item.role==='user').at(-1)?.content
       const prompt=typeof lastUserText==='string'?lastUserText:(lastUserText??[]).map(part=>part.text??'').join('\n')
-      requests.push({model:input.model,serviceTier:input.service_tier,reasoningEffort:input.reasoning?.effort,multiAgentMode,prompt:prompt.trim()})
+      const skillEvidence=skillsSmoke?{
+        selectedSkill:(input.input??[]).some(item=>item.role==='user'&&Array.isArray(item.content)&&item.content.some(part=>part.text?.includes('<skill>')&&part.text.includes(skillMarker))),
+        priorReply:(input.input??[]).some(item=>item.role==='assistant'&&JSON.stringify(item.content).includes('Compatibility check complete.')),
+      }:{}
+      requests.push({model:input.model,serviceTier:input.service_tier,reasoningEffort:input.reasoning?.effort,multiAgentMode,prompt:prompt.trim(),...skillEvidence})
       const id='resp_'+randomUUID(),item={id:'msg_'+randomUUID(),type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'Compatibility check complete.',annotations:[]}]}
       const response={id,object:'response',created_at:Math.floor(Date.now()/1000),status:'completed',model:input.model,output:[item],usage:{input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0},output_tokens_details:{reasoning_tokens:0}}}
       if(!input.stream){res.end(JSON.stringify(response));return}
@@ -64,6 +70,11 @@ async function main(){
   })
   try{
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve))
+    if(skillsSmoke){
+      const skillDir=join(directory,'skills',skillName)
+      mkdirSync(skillDir,{recursive:true,mode:0o700})
+      writeFileSync(join(skillDir,'SKILL.md'),`---\nname: ${skillName}\ndescription: ${skillDescription}\n---\nReply with the fixture marker ${skillMarker}.\n`)
+    }
     const catalog=buildModelCatalog([{modelId,displayName:modelId,reasoningEfforts:null,contextWindow:null,autoCompactTokenLimit:null,supportsVision:null}],builtInCatalog,null,modelId)
     const model=catalog.models.find(entry=>entry.slug===modelId)
     assert.ok(model,'compatibility model must be present in the isolated catalog')
@@ -82,7 +93,7 @@ async function main(){
     writeFileSync(join(directory,'config.toml'),`model=${JSON.stringify(modelId)}\nmodel_provider=${JSON.stringify(provider)}\nforced_login_method="api"\ncli_auth_credentials_store="file"\nmodel_catalog_json=${JSON.stringify(join(directory,'catalog.json'))}\nservice_tier="default"\n[model_providers.${provider}]\nname="Compatibility Fixture"\nbase_url="http://127.0.0.1:${server.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nexperimental_bearer_token=${JSON.stringify(apiKey)}\n`)
     if(nativeApi)writeFileSync(join(directory,'auth.json'),JSON.stringify({auth_mode:'apikey',OPENAI_API_KEY:apiKey})+'\n',{mode:0o600})
     let nativeUltra
-    if(!forkSmoke&&!nativeApi&&supports('ultra')){
+    if(!skillsSmoke&&!forkSmoke&&!nativeApi&&supports('ultra')){
       const reference=join(root,'native-reference');mkdirSync(reference,{mode:0o700})
       writeFileSync(join(reference,'config.toml'),readFileSync(join(directory,'config.toml')))
       const before=requests.length
@@ -100,7 +111,7 @@ async function main(){
     const hook=unmodified?undefined:prepareCodexSpeedMenu({inspection,directory,desktopDirectory,executable,nonce})
     if(features.length)assert.ok(hook,inspection.reason)
     else assert.equal(hook,undefined,inspection.reason)
-    plan={application,executable,directory,desktopDirectory,workingDirectory:root,args:['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling',...(!hook?[`--remote-debugging-port=${cdpPort}`,'--remote-debugging-address=127.0.0.1']:[])],nonce,mode:'desktop',speedMenuHook:hook,cdpPort}
+    plan={application,executable,directory,desktopDirectory,workingDirectory:root,args:['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-background-timer-throttling',...(!hook?[`--remote-debugging-port=${cdpPort}`,'--remote-debugging-address=127.0.0.1']:[])],nonce,mode:'desktop',speedMenuHook:hook,cdpPort,isolatedDesktopTest:true}
     const child=await runtime.launch(plan,new AbortController().signal)
     let target
     for(let i=0;i<150&&!target;i++){
@@ -146,7 +157,7 @@ async function main(){
     const key=async key=>{await call('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});await call('Input.dispatchKeyEvent',{type:'keyUp',key,code:key})}
     const modelMenuTrigger='document.querySelector("[data-composer-navigation-target=reasoning]")||Array.from(document.querySelectorAll("button")).find(b=>b.innerText.includes('+JSON.stringify(modelLabel)+'))'
     const openModelMenu=async()=>{await wait(`!!(${modelMenuTrigger})`);await click(modelMenuTrigger)}
-    if(!nativeApi&& (supports('speed')||supports('ultra'))){
+    if(!skillsSmoke&&!nativeApi&&(supports('speed')||supports('ultra'))){
       await openModelMenu()
       await delay(1000)
       console.log(JSON.stringify({stage:'model-menu',text:await evaluate('document.body.innerText.slice(-2600)'),controls:await evaluate('Array.from(document.querySelectorAll("select,input,[role=menuitem],[role=menuitemradio]")).map(el=>({tag:el.tagName,role:el.getAttribute("role"),text:el.innerText,value:el.value})).slice(-25)')}))
@@ -169,7 +180,7 @@ async function main(){
       }
       await capture(fast?'codex-fast-menu.png':'codex-standard-menu.png')
     }
-    const send=async(text)=>{
+    const send=async(text,matches=request=>request.prompt===text)=>{
       const before=requests.length
       await click('document.querySelector("[contenteditable=true]")')
       await call('Input.insertText',{text})
@@ -181,10 +192,24 @@ async function main(){
       assert.equal(await evaluate(`(()=>{const b=${submit};if(!b)return false;b.click();return true})()`),true)
       const deadline=Date.now()+60000
       let request
-      while(!(request=requests.slice(before).find(request=>request.prompt===text))){assert.ok(Date.now()<deadline,'native request was not sent: '+JSON.stringify(requests.slice(before)));await delay(100)}
+      while(!(request=requests.slice(before).find(matches))){assert.ok(Date.now()<deadline,'native request was not sent: '+JSON.stringify(requests.slice(before)));await delay(100)}
       await wait('document.body.innerText.includes("Compatibility check complete.")')
       await delay(1500)
       return request
+    }
+    if(skillsSmoke){
+      await send('Start the disposable skill picker conversation.')
+      const editor='document.querySelector("[contenteditable=true]")'
+      await click(editor)
+      await call('Input.insertText',{text:'$'+skillName})
+      // Only this run's generated description can select a candidate.
+      const description=`Array.from(document.querySelectorAll('span,div,p')).find(el=>!el.children.length&&el.textContent===${JSON.stringify(skillDescription)}&&el.getBoundingClientRect().width)`
+      await wait(`!!(${description})`)
+      await click(`((el)=>el.closest('button,[role=option],[cmdk-item]')||el.parentElement)(${description})`)
+      const selected=await send(' Use the selected fixture skill.',request=>request.selectedSkill)
+      assert.ok(selected.priorReply,'the selected skill must be sent in the existing conversation')
+      console.log(JSON.stringify({stage:'skills-verified',version:inspection.version,selectedSkill:true,priorReply:true}))
+      return
     }
     if(!nativeApi&&supports('speed')){
       await chooseSpeed(false)
@@ -276,4 +301,4 @@ async function main(){
     for(let attempt=0;attempt<10;attempt++){try{rmSync(root,{recursive:true,force:true});break}catch{await delay(200)}}
   }
 }
-main().catch(error=>{console.error(error);process.exitCode=1})
+withTestApplication(process.env.CML_CODEX_APP_PATH??'/Applications/ChatGPT.app',main).catch(error=>{console.error(error);process.exitCode=1})

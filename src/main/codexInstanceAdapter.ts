@@ -103,7 +103,8 @@ export function codexMacLaunchArgs(plan:DesktopPlan,args:readonly string[]=plan.
   if(speed&&Object.keys(speed.env).some(key=>!/^CML_CODEX_SPEED_MENU_[A-Z_]+$/.test(key)))throw new Error('速度菜单启动环境无效')
   const scripts=[...(hook?[hook.script]:[]),...(speed&&speed.transport!=='cdp'?[speed.script]:[])]
   const cdp=Boolean(speed?.transport==='cdp')
-  return ['-n','-a',plan.application,'--env',`CODEX_HOME=${plan.directory}`,'--env',`CODEX_ELECTRON_USER_DATA_PATH=${plan.desktopDirectory}`,
+  return [...(plan.isolatedDesktopTest?['-g','-j']:[]),'-n','-a',plan.application,'--env',`CODEX_HOME=${plan.directory}`,'--env',`CODEX_ELECTRON_USER_DATA_PATH=${plan.desktopDirectory}`,
+    ...(plan.isolatedDesktopTest?['--env','CODEX_SPARKLE_ENABLED=false']:[]),
     ...Object.entries(networkRouteEnvironment(plan.networkRoute)).flatMap(([key,value])=>['--env',`${key}=${value}`]),
     ...(scripts.length?['--env',`NODE_OPTIONS=${scripts.map(script=>`--require="${script}"`).join(' ')}`]:[]),
     ...(hook?['--env',`CML_TEMP_LOGIN_CAPTURE=${hook.capture}`]:[]),

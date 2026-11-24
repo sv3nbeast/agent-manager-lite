@@ -414,8 +414,18 @@ function selectSupplier(value:string){
   recommendConnectionMode()
   if(value!==supplierSelection.value)form.accountId=''
   supplierSelection.value=value
-  form.accountId=selectedSupplier.value?.requiresKeyLink?'':selectedSupplier.value?.account?.id??''
-  automaticModel.value=null;form.model=modelChoices.value[0]??''
+  const choice=selectedSupplier.value
+  form.accountId=choice?.requiresKeyLink?'':choice?.account?.id??''
+  automaticModel.value=null
+  const models=modelChoices.value
+  if(editing.value&&choice&&form.model.trim()){
+    if(models.includes(form.model))return
+    if(!models.length){
+      const connection=selectedAccount.value??(choice.provider&&choice.key?{kind:'api_key' as const,...providerKeyConnection(choice.provider,choice.key)}:undefined)
+      if(connection&&accountCompatibility(form.clientType,connection,{connectionMode:resourceConnectionMode.value,launchMode:launchMode.value,model:form.model}).compatible)return
+    }
+  }
+  form.model=models[0]??''
 }
 async function linkSelectedSupplier(){
   const choice=selectedSupplier.value,generation=draftGeneration,selection=supplierSelection.value,clientType=form.clientType,mode=launchMode.value

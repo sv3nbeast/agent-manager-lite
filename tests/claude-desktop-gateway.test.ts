@@ -5,7 +5,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assertClaudeDesktopGatewayCapability, claudeDesktopGatewayBaseUrl, claudeDesktopGatewayFingerprint, prepareClaudeDesktopGateway, validateClaudeDesktopGatewayAccount } from '../src/main/claudeDesktopGateway'
-import { prepareClaudeDesktopNetwork } from '../src/main/claudeDesktopNetwork'
+import { assertClaudeDesktopNetworkCapability, prepareClaudeDesktopNetwork } from '../src/main/claudeDesktopNetwork'
 import { claudeDesktopRuntimeDirectory } from '../src/main/claudeCodeDesktopAdapter'
 import type { DesktopPlan } from '../src/main/instanceRuntime'
 import type { InstanceProfile } from '../src/shared/instances'
@@ -20,10 +20,10 @@ test('Desktop strips only a final /v1 suffix because native Messages appends /v1
   assert.equal(claudeDesktopGatewayBaseUrl('https://sub2api.example/api'), 'https://sub2api.example/api')
 })
 
-function archive(path: string, nativeSource = source, main = './dist/native.cjs') {
+function archive(path: string, nativeSource = source, main = './dist/native.cjs', modules: [string, string][] = []) {
   const files: any = { files: {} }, bodies: Buffer[] = []
   let offset = 0
-  for (const [entry, content] of [['package.json', JSON.stringify({ name: '@ant/desktop', main })], [main.replace(/^\.\//, ''), nativeSource]]) {
+  for (const [entry, content] of [['package.json', JSON.stringify({ name: '@ant/desktop', main })], [main.replace(/^\.\//, ''), nativeSource], ...modules]) {
     const body = Buffer.from(content), parts = entry.split('/')
     let parent = files
     for (const part of parts.slice(0, -1)) parent = parent.files[part] ??= { files: {} }
@@ -253,4 +253,14 @@ test('native gateway capability follows schema and declared entry instead of ver
 test('installed official Desktop exposes the gateway contract without launching', t => {
   if (process.platform !== 'darwin' || !existsSync('/Applications/Claude.app/Contents/Resources/app.asar')) return t.skip('native Desktop unavailable')
   assert.doesNotThrow(() => assertClaudeDesktopGatewayCapability('/Applications/Claude.app'))
+})
+
+test('a package launcher can delegate the gateway and network schema to a sibling module', t => {
+  const f = fixture(t), main = './dist/launcher.js'
+  const modules: [string, string][] = [['dist/configuration.js', source]]
+  archive(f.asar, 'initialize(), require("./configuration.js");', main, modules)
+  assert.doesNotThrow(() => assertClaudeDesktopGatewayCapability(f.application))
+  assert.doesNotThrow(() => assertClaudeDesktopNetworkCapability(f.application))
+  archive(f.asar, 'initialize();', main, modules)
+  assert.throws(() => assertClaudeDesktopGatewayCapability(f.application), /未提供已验证/)
 })

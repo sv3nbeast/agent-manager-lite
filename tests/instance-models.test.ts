@@ -144,6 +144,37 @@ test('a supplier with no created API connection exposes its own provider list', 
   assert.equal(ui.calls.some(call => call.method === 'official'), false)
 })
 
+for (const scenario of [
+  { name: 'keeps the saved model when the replacement key lists it second', models: ['other', 'saved-model'], expected: 'saved-model' },
+  { name: 'selects the first model when the replacement key only lists different models', models: ['replacement', 'other'], expected: 'replacement' },
+  { name: 'keeps a custom model when the replacement local API key has an empty catalog', models: [], expected: 'saved-model' },
+  { name: 'requires an advertised model for a native API key with an empty catalog', models: [], expected: '', native: true },
+  { name: 'starts a new instance with the replacement key default even when the old default is supported', models: ['other', 'saved-model'], expected: 'other', create: true },
+]) {
+  test(`selecting a different supplier key ${scenario.name}`, async t => {
+    const ui = mount({ kind: 'api_key', models: ['saved-model'] }); t.after(ui.unmount)
+    const second = ui.addSupplier(scenario.models)
+    const providerId = randomUUID(), oldKeyId = randomUUID(), newKeyId = randomUUID()
+    ui.manager.data.providers.push({ id: providerId, name: 'Fixture provider', wireApi: 'responses', models: ['legacy-provider-default'], keys: [
+      { id: oldKeyId, name: 'Old key', models: ui.account.models, accountIds: [ui.account.id] },
+      { id: newKeyId, name: 'New key', models: second.models, accountIds: [second.id] },
+    ] })
+    if (scenario.native) ui.source.connectionMode = 'native'
+    ui.state.edit(scenario.create ? undefined : ui.source); await settle()
+    assert.equal(ui.state.form.model, 'saved-model')
+    ui.state.selectSupplier(`${providerId}:${newKeyId}`); await settle()
+    assert.equal(ui.state.form.accountId, second.id)
+    assert.equal(ui.state.form.model, scenario.expected)
+    if (scenario.expected) {
+      await ui.state.save()
+      const saved = ui.calls.find(call => call.method === 'save')!.input
+      assert.equal(saved.id, scenario.create ? undefined : ui.source.id)
+      assert.equal(saved.details.accountId, second.id)
+      assert.equal(saved.details.model, scenario.expected)
+    }
+  })
+}
+
 test('an API account with an empty model list stays empty instead of inheriting ChatGPT candidates', async t => {
   const ui = mount({ kind: 'api_key' }); t.after(ui.unmount)
   ui.state.edit(); await settle()

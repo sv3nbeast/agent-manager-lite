@@ -14,7 +14,10 @@ import {prepareClaudeDesktopNetwork} from './claudeDesktopNetwork'
 
 const exec=promisify(execFile)
 interface LaunchedDesktopChild {child:ChildProcess;exited:boolean;executable:string;profile:string}
-export interface DesktopPlan { clientType?:AgentClientType;claudeDesktopConnection?:'api'; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';managedArgs?:string[];launchEnvironment?:Record<string,string>;cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number }
+export interface DesktopPlan { clientType?:AgentClientType;claudeDesktopConnection?:'api'; application:string; executable:string; directory:string; desktopDirectory:string; workingDirectory:string; args:string[]; nonce:string;mode?:'desktop'|'cli';managedArgs?:string[];launchEnvironment?:Record<string,string>;cliPackage?:CliPackage;networkRoute?:InstanceNetworkRoute;tempLoginHook?:{script:string;capture:string};speedMenuHook?:CodexSpeedMenuHook;desktopLocaleHook?:CodexSpeedMenuHook;/** Fixed loopback CDP port for startup-time response interception. */ cdpPort?:number
+  /** Launch a disposable test bundle in the background with its updater disabled. */
+  isolatedDesktopTest?:true
+}
 export interface DesktopProcess { pid:number; started:string }
 export interface DesktopRuntime {
   find(plan:DesktopPlan):Promise<DesktopProcess|undefined>

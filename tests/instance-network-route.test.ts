@@ -24,6 +24,17 @@ function launchEnvironment(args:string[]):Record<string,string> {
   return result
 }
 
+test('only an explicit test plan disables the Codex updater through LaunchServices',()=>{
+  const ordinary=plan(),normalArgs=macLaunchArgs(ordinary)
+  assert.equal(launchEnvironment(normalArgs).CODEX_SPARKLE_ENABLED,undefined)
+  const testArgs=macLaunchArgs({...ordinary,isolatedDesktopTest:true})
+  assert.equal(launchEnvironment(testArgs).CODEX_SPARKLE_ENABLED,'false')
+  const setting=testArgs.indexOf('CODEX_SPARKLE_ENABLED=false')
+  assert.equal(testArgs[setting-1],'--env')
+  assert.deepEqual(testArgs.slice(0,2),['-g','-j'])
+  assert.deepEqual(testArgs.toSpliced(setting-1,2).slice(2),normalArgs)
+})
+
 test('managed desktop routing overrides inherited proxies in both LaunchServices and child environment',()=>{
   const route:InstanceNetworkRoute={mode:'proxy',url:bridge},env=desktopEnvironment(inherited,route),args=macLaunchArgs(plan(route)),launched=launchEnvironment(args)
   for(const key of keys){
